@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=64.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spt-pipeline"
+version = "0.1.0"
+description = "Batch orchestration + napari QC viewer connecting sfwloc (localization/tracking) and diffusionkit (diffusion analysis)"
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "MIT" }
+authors = [{ name = "Daniel Elnatan", email = "delnatan@gmail.com" }]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Framework :: napari",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "numpy",
+    "polars>=1.0.0",
+    "tifffile",
+    "typer",
+    "natsort",
+    "qtpy",
+    "napari",
+    "sfwloc",
+    "sfwloc-py",
+    "diffusionkit",
+]
+
+[project.scripts]
+spt = "spt_pipeline.cli:main"
+
+[project.entry-points."napari.manifest"]
+spt-pipeline = "spt_pipeline:napari.yaml"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml"]
+
+[tool.uv.sources]
+sfwloc = { workspace = true }
+sfwloc-py = { workspace = true }
+diffusionkit = { workspace = true }

@@ -1,0 +1,12 @@
+name: spt-pipeline
+display_name: SPT Pipeline
+visibility: hidden
+categories: ["Utilities", "Visualization"]
+contributions:
+  commands:
+    - id: spt-pipeline.ExperimentListWidget
+      title: Experiment list
+      python_name: spt_pipeline.widgets.experiment_list:ExperimentListWidget
+  widgets:
+    - command: spt-pipeline.ExperimentListWidget
+      display_name: Experiment list
