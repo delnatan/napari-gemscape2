@@ -4,16 +4,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import tifffile
-
 from spt_pipeline.experiment import load_experiment
+from spt_pipeline.pipeline import load_stack
 
 
 def add_experiment_layers(viewer, experiment_dir: str | Path) -> None:
     """Clear `viewer` and add the image/points/tracks layers for one bundle."""
     points_df, tracks_df, manifest = load_experiment(experiment_dir)
     image_path = Path(manifest["source_image_path"])
-    image = tifffile.imread(image_path)
+    params = manifest.get("params", {})
+    image, _, _ = load_stack(
+        image_path, channel=params.get("channel", 0), z_index=params.get("z_index", 0)
+    )
 
     viewer.layers.clear()
     viewer.add_image(image, name=image_path.stem)

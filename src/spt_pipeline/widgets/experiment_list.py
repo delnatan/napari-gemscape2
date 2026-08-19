@@ -51,10 +51,10 @@ from spt_pipeline.experiment import (
     load_experiment,
     write_experiment,
 )
+from spt_pipeline.io_formats import SUPPORTED_SUFFIXES as SUPPORTED_FORMATS
+from spt_pipeline.io_formats import load_stack
 from spt_pipeline.pipeline import DetectTrackParams, run_detect_track
 from spt_pipeline.viewer import add_experiment_layers
-
-SUPPORTED_FORMATS = {".tif", ".tiff", ".nd2"}
 
 
 class Status(str, Enum):
@@ -272,9 +272,8 @@ class ExperimentListWidget(QWidget):
             add_experiment_layers(self.viewer, entry.experiment_dir)
         else:
             self.viewer.layers.clear()
-            import tifffile
-
-            self.viewer.add_image(tifffile.imread(entry.image_path), name=entry.image_path.stem)
+            image, _, _ = load_stack(entry.image_path)
+            self.viewer.add_image(image, name=entry.image_path.stem)
 
     def _run_items(self, items: list[ExperimentItem]) -> None:
         runnable = [item for item in items if item.entry.status is not Status.RUNNING]

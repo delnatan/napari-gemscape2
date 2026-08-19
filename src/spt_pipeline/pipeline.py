@@ -20,7 +20,6 @@ from typing import Callable, Optional
 
 import numpy as np
 import polars as pl
-import tifffile
 
 from sfwloc.report import (
     calibrate_sigma_df,
@@ -30,6 +29,7 @@ from sfwloc.report import (
     recommended_gate_px,
 )
 from sfwloc.tracking_diagnostics import check_resolvability
+from spt_pipeline.io_formats import load_stack
 
 DEFAULT_SOLVER_KWARGS = dict(
     lam=0.15,
@@ -60,21 +60,6 @@ class DetectTrackParams:
     solver_kwargs: dict = field(default_factory=lambda: dict(DEFAULT_SOLVER_KWARGS))
 
 
-def load_stack(image_path: str | Path):
-    image_path = Path(image_path)
-    with tifffile.TiffFile(image_path) as tf:
-        im = tf.asarray().astype(np.float64)
-        ij = tf.imagej_metadata or {}
-        pixel_size_um = None
-        try:
-            xres_num, xres_den = tf.pages[0].tags["XResolution"].value
-            pixel_size_um = xres_den / xres_num
-        except KeyError:
-            pass
-        dt_s = ij.get("finterval")
-    return im, pixel_size_um, dt_s
-
-
 def estimate_D_um2_s(linked_df: pl.DataFrame, dt_s: float, pixel_size_um: float, sigma_loc_um: float):
     """Single-step MSD estimate of D, corrected for localization noise:
     mean(r^2) = 4*D*dt + 4*sigma_loc_um^2."""
@@ -97,22 +82,28 @@ def run_detect_track(
     image_path: str | Path,
     pixel_size_um: Optional[float] = None,
     dt_s: Optional[float] = None,
+    channel: int = 0,
+    z_index: int = 0,
     params: Optional[DetectTrackParams] = None,
     progress_callback: Optional[ProgressCallback] = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame, dict]:
     """Run the full detect+track pipeline on one timelapse.
 
-    `pixel_size_um`/`dt_s` fall back to the file's ImageJ/TIFF metadata if
-    not given explicitly. If `progress_callback` is given, spot-finding
-    runs frame-by-frame (reporting progress each frame) instead of the
-    faster rayon-parallel `find_spots_stack_df` -- the same tradeoff
+    `image_path` can be .tif/.tiff, .nd2, or .ims (see `io_formats.load_stack`).
+    `channel`/`z_index` pick which plane to track for files with more than
+    one (both default to 0).
+
+    `pixel_size_um`/`dt_s` fall back to the file's own metadata if not
+    given explicitly. If `progress_callback` is given, spot-finding runs
+    frame-by-frame (reporting progress each frame) instead of the faster
+    rayon-parallel `find_spots_stack_df` -- the same tradeoff
     `track_beads_timelapse.py` makes for an interactively-watched run.
 
     Returns (points_df, tracks_df, manifest_extra) -- `manifest_extra` is
     meant to be passed as `experiment.build_manifest`'s `params`.
     """
     params = params or DetectTrackParams()
-    im, file_pixel_size_um, file_dt_s = load_stack(image_path)
+    im, file_pixel_size_um, file_dt_s = load_stack(image_path, channel=channel, z_index=z_index)
     pixel_size_um = pixel_size_um if pixel_size_um is not None else file_pixel_size_um
     dt_s = dt_s if dt_s is not None else file_dt_s
     if pixel_size_um is None or dt_s is None:
@@ -165,6 +156,8 @@ def run_detect_track(
     manifest_extra = {
         "pixel_size_um": pixel_size_um,
         "dt_s": dt_s,
+        "channel": channel,
+        "z_index": z_index,
         "sigma_px": sigma,
         "sigma_loc_um": sigma_loc_um,
         "D_est_um2_s": D_est,

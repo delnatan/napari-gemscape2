@@ -19,6 +19,8 @@ dependencies = [
     "numpy",
     "polars>=1.0.0",
     "tifffile",
+    "nd2",
+    "h5py",
     "typer",
     "natsort",
     "qtpy",
