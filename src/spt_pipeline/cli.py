@@ -12,14 +12,10 @@ from pathlib import Path
 
 import typer
 
-from spt_pipeline.experiment import build_manifest, git_sha, write_experiment
+from spt_pipeline.experiment import build_manifest, git_sha, repo_root_of, write_experiment
 from spt_pipeline.pipeline import DetectTrackParams, run_detect_track
 
 app = typer.Typer(no_args_is_help=True)
-
-
-def _repo_root_of(module) -> Path:
-    return Path(module.__file__).resolve().parents[2]
 
 
 @app.command("detect-track")
@@ -42,10 +38,11 @@ def detect_track(
     params = DetectTrackParams(**cfg.get("params", {}))
 
     import sfwloc
+    import spt_pipeline
 
     repo_shas = {
-        "sfwloc": git_sha(_repo_root_of(sfwloc)),
-        "spt_pipeline": git_sha(Path(__file__).resolve().parents[2]),
+        "sfwloc": git_sha(repo_root_of(sfwloc)),
+        "spt_pipeline": git_sha(repo_root_of(spt_pipeline)),
     }
 
     for entry in cfg["inputs"]:

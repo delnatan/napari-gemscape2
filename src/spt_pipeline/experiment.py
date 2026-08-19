@@ -22,6 +22,14 @@ TRACKS_FILENAME = "tracks.parquet"
 MANIFEST_FILENAME = "manifest.json"
 
 
+def repo_root_of(module) -> Path:
+    """A package's repo root, from its own `__file__` (`<repo>/src/
+    <package>/__init__.py`), for `git_sha` provenance -- works from any
+    caller regardless of that caller's own nesting depth, since it walks
+    up from the target package's `__file__`, not the caller's."""
+    return Path(module.__file__).resolve().parents[2]
+
+
 def git_sha(repo_path: str | Path) -> str | None:
     """`git rev-parse HEAD` in `repo_path`, or None if unavailable (not a
     git repo, git not installed, etc.) -- provenance is best-effort."""
