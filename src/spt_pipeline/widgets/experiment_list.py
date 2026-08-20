@@ -63,7 +63,7 @@ from napari.layers import Shapes
 from napari.qt.threading import thread_worker
 from natsort import natsorted
 from qtpy.QtCore import QModelIndex, QObject, QRect, QSize, Qt, Signal
-from qtpy.QtGui import QColor, QPainter, QPen
+from qtpy.QtGui import QColor, QFontMetrics, QPainter, QPen
 from qtpy.QtWidgets import (
     QAbstractItemView,
     QFileDialog,
@@ -75,6 +75,7 @@ from qtpy.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
     QStyle,
     QStyledItemDelegate,
@@ -208,7 +209,13 @@ class ExperimentItemDelegate(QStyledItemDelegate):
         elif entry.status is Status.ERROR and entry.error:
             label += f"   — {entry.error}"
         painter.setPen(text_color)
-        painter.drawText(text_rect, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), label)
+        # Plain drawText into a rect this narrow just hard-clips a long
+        # filename/error mid-character with no visual cue there's more --
+        # elide it instead (full path/error is still available via the
+        # item's tooltip, set in `ExperimentItem.__init__`).
+        metrics = QFontMetrics(painter.font())
+        elided = metrics.elidedText(label, Qt.TextElideMode.ElideRight, text_rect.width())
+        painter.drawText(text_rect, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), elided)
         painter.restore()
 
     def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
@@ -380,6 +387,17 @@ class ExperimentListWidget(QWidget):
         self.params_panel.newRoiRequested.connect(self._on_new_roi_requested)
 
         self.progress_label = QLabel("")
+        self.progress_label.setWordWrap(True)
+        # Without this, an unwrapped/long status string (e.g. a full file
+        # name or error message) sets its sizeHint as the label's minimum
+        # width, which propagates up through `bottom_layout` and the
+        # splitter to the dock widget itself -- making the dock refuse to
+        # shrink narrower than whatever the longest message so far was.
+        # Ignored lets the label shrink freely; word wrap keeps the text
+        # readable instead of clipping it.
+        self.progress_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         # Show actual counts, not just a bare percentage -- with the SFW
@@ -565,7 +583,12 @@ class ExperimentListWidget(QWidget):
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.progress_label.setText(f"Running: {entry.image_path.name}")
-        self.run_button.setText(f"Cancel (running: {entry.image_path.name})")
+        # Filename already shown in `progress_label` above -- a QPushButton
+        # can't wrap its text, so embedding an unbounded filename here would
+        # force the button (and the row/dock around it) wider for as long
+        # as this run's name stays the longest one seen, the same class of
+        # bug `progress_label`'s own word-wrap fix addresses.
+        self.run_button.setText("Cancel")
         self.run_button.setEnabled(True)
 
         emitter = _ProgressEmitter()
@@ -812,7 +835,7 @@ class ExperimentListWidget(QWidget):
         sigma = session.sigma if session.sigma is not None else self.params_panel.get_sigma_init()
         self.progress_label.setText(f"Finding spots: {item.entry.image_path.name}")
         self._cancel_event = threading.Event()
-        self.params_panel.set_detect_running(True, item.entry.image_path.name)
+        self.params_panel.set_detect_running(True)
         emitter = _ProgressEmitter()
         emitter.updated.connect(self._on_progress)
         # Also mirror frame-by-frame progress into the Detect tab's own

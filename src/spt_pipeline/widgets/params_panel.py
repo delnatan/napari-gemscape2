@@ -555,18 +555,18 @@ class _DetectTab(QWidget):
         else:
             self.runRequested.emit()
 
-    def set_running(self, running: bool, label: str = "") -> None:
+    def set_running(self, running: bool) -> None:
         """Repurposes the run button into a Cancel button for the duration
         of a run, mirroring the batch Run/Cancel toggle on the experiment
         list's own run button -- see `ExperimentListWidget._cancel_active_run`
-        for what cancelling actually does (cooperative, not instant)."""
+        for what cancelling actually does (cooperative, not instant). Deliberately
+        doesn't embed the running file's name in the button text: a QPushButton
+        can't wrap, so an unbounded filename here would force the button --
+        and the row/dock around it -- wider, same as the bug fixed on
+        `ExperimentListWidget.progress_label`. The experiment list's own
+        progress label already shows which file is running."""
         self._running = running
-        if not running:
-            self.run_button.setText("Run detect")
-        elif label:
-            self.run_button.setText(f"Cancel (running: {label})")
-        else:
-            self.run_button.setText("Cancel")
+        self.run_button.setText("Run detect" if not running else "Cancel")
         self.run_button.setEnabled(True)
 
     def set_status(self, text: str) -> None:
@@ -769,8 +769,8 @@ class PipelineParamsWidget(QWidget):
     def set_detect_progress(self, done: int, total: int, stage: str) -> None:
         self._detect.set_progress(done, total, stage)
 
-    def set_detect_running(self, running: bool, label: str = "") -> None:
-        self._detect.set_running(running, label)
+    def set_detect_running(self, running: bool) -> None:
+        self._detect.set_running(running)
 
     def set_track_status(self, text: str) -> None:
         self._tracking.set_status(text)
