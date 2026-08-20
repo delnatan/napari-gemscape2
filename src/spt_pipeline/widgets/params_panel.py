@@ -4,7 +4,12 @@ module docstring: calibrate sigma -> find_spots -> bootstrap/final link):
 
 - **Calibration** -- `sfwloc.report.calibrate_sigma_df` (PSF sigma
   estimation from a sparse-regime reference frame).
-- **Detect** -- `sfwloc`'s `find_spots` solver knobs.
+- **Detect** -- localizer knobs for either of two algorithms, picked via
+  an "algorithm" dropdown: `sfwloc`'s dense SFW `find_spots` solver
+  (default, handles overlapping/crowded fields), or the sparse
+  `find_spots_sparse_df` per-spot free-sigma LM fit (lighter/faster, only
+  valid for genuinely well-separated fields -- reuses `_SparseFitFields`,
+  the same knob set the Calibration tab's fit uses).
 - **Track** -- the one pre-run tracking knob (`bootstrap_gate_px`); the
   final link gate is auto-derived, not user-set (see
   `sfwloc.report.recommended_gate_px`).
@@ -49,12 +54,14 @@ from typing import Optional
 from qtpy.QtCore import Signal
 from qtpy.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFormLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QSpinBox,
+    QStackedWidget,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -64,6 +71,7 @@ from superqt import QCollapsible
 from spt_pipeline.pipeline import (
     DEFAULT_CALIBRATION_KWARGS,
     DEFAULT_SOLVER_KWARGS,
+    DEFAULT_SPARSE_KWARGS,
     DetectTrackParams,
 )
 
@@ -108,26 +116,29 @@ def _run_row(button_text: str) -> tuple[QPushButton, QLabel, QHBoxLayout]:
     return button, status, row
 
 
-class _CalibrationTab(QWidget):
-    """PSF-sigma calibration (`calibrate_sigma_df`), run once per timelapse
-    against a single reference frame (frame 0 by default, but pickable --
-    see `frame_index`). Core: the initial sigma guess, the fit box size,
-    the peak-detection threshold, and the reference frame itself -- the
-    knobs that most directly affect whether calibration finds/fits the
-    right spots on a given dataset. Expert: LM solver internals (iteration
-    budget, damping schedule, convergence tolerances) and secondary
-    peak-finder/fit-bound knobs that rarely need touching."""
+class _SparseFitFields(QWidget):
+    """Widget knobs for `sfwloc_py.calibrate_sigma_from_image`'s shared
+    parameter set -- the free-sigma, free-background bounded LM Gaussian
+    fit both the Calibration tab (fit against one reference frame) and the
+    Detect tab's sparse algorithm (that same fit run as the localizer,
+    over every processed frame) forward as `**kwargs`. Each tab owns its
+    own instance/defaults (`defaults`) rather than sharing widget state --
+    calibration-frame tuning and whole-stack detect tuning don't have to
+    match. `sigma_init`/reference-frame knobs stay with the owning tab
+    (not part of this shared fieldset) since only Calibration has a
+    reference frame and Detect's sparse mode reads its sigma_init from the
+    Calibration tab regardless (see `PipelineParamsWidget.get_sigma_init`).
 
-    runRequested = Signal()
+    Core: fit box size and peak-detection threshold -- the knobs that most
+    directly affect whether the fit finds/fits the right spots. Expert: LM
+    solver internals (iteration budget, damping schedule, convergence
+    tolerances) and secondary peak-finder/fit-bound knobs that rarely need
+    touching."""
 
-    def __init__(self) -> None:
+    def __init__(self, defaults: dict) -> None:
         super().__init__()
-        d = DEFAULT_CALIBRATION_KWARGS
+        d = defaults
 
-        self.sigma_init = _dspin(
-            1.3, 0.3, 10.0, 0.1, decimals=2,
-            tooltip="Initial PSF sigma (px) guess the LM fit starts from.",
-        )
         self.box_size = _ispin(
             d["box_size"], 3, 99,
             tooltip="Square fit-window side length (px, odd) cropped around each peak.",
@@ -137,20 +148,11 @@ class _CalibrationTab(QWidget):
             tooltip="Peak-detector threshold, relative to (max - median) matched-filter\n"
             "response. Lower finds more (dimmer/noisier) candidate peaks.",
         )
-        # Which frame gets calibrated against -- kept in core alongside the
-        # other day-to-day knobs since frame 0 isn't always the best
-        # reference (e.g. sparser or better-focused elsewhere in the
-        # stack). Clamped in `set_frame_bounds` once an image is loaded,
-        # same pattern as the Detect tab's frame range.
-        self._max_frames: Optional[int] = None
-        self.frame_index = _ispin(0, 0, 1_000_000, tooltip="Stack frame (0-based) to calibrate against.")
 
         core_form = QFormLayout()
         core_form.setContentsMargins(0, 0, 0, 0)
-        core_form.addRow("sigma init (px)", self.sigma_init)
         core_form.addRow("box size (px)", self.box_size)
         core_form.addRow("peak threshold", self.peak_threshold_rel)
-        core_form.addRow("calibration frame", self.frame_index)
 
         self.sigma_lo = _dspin(d["sigma_lo"], 0.01, 20.0, 0.1, decimals=2, tooltip="Lower bound on fitted sigma (px).")
         self.sigma_hi = _dspin(d["sigma_hi"], 0.01, 50.0, 0.1, decimals=2, tooltip="Upper bound on fitted sigma (px).")
@@ -205,6 +207,66 @@ class _CalibrationTab(QWidget):
         expert_form.addRow("LM loss_tol", self.loss_tol)
         expert_form.addRow("LM gtol", self.gtol)
 
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        layout.addLayout(core_form)
+        layout.addWidget(_expert_section(expert_form))
+        self.setLayout(layout)
+
+    def get_kwargs(self) -> dict:
+        return dict(
+            box_size=self.box_size.value(),
+            sigma_lo=self.sigma_lo.value(),
+            sigma_hi=self.sigma_hi.value(),
+            delta_bound=self.delta_bound.value(),
+            amp_upper=self.amp_upper.value(),
+            bg_upper=self.bg_upper.value(),
+            peak_threshold_rel=self.peak_threshold_rel.value(),
+            peak_footprint=self.peak_footprint.value(),
+            peak_border=self.peak_border.value(),
+            peak_top_k=self.peak_top_k.value() or None,
+            n_iter=self.n_iter.value(),
+            mu0=self.mu0.value(),
+            mu_decrease=self.mu_decrease.value(),
+            mu_increase=self.mu_increase.value(),
+            step_tol=self.step_tol.value(),
+            loss_tol=self.loss_tol.value(),
+            gtol=self.gtol.value(),
+        )
+
+
+class _CalibrationTab(QWidget):
+    """PSF-sigma calibration (`calibrate_sigma_df`), run once per timelapse
+    against a single reference frame (frame 0 by default, but pickable --
+    see `frame_index`). The fit itself (`_SparseFitFields`) is the same
+    knob set the Detect tab's sparse algorithm reuses -- see that class's
+    docstring. Core (this tab's own, alongside the fieldset's core): the
+    initial sigma guess and the reference frame."""
+
+    runRequested = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sigma_init = _dspin(
+            1.3, 0.3, 10.0, 0.1, decimals=2,
+            tooltip="Initial PSF sigma (px) guess the LM fit starts from.",
+        )
+        # Which frame gets calibrated against -- kept in core alongside the
+        # other day-to-day knobs since frame 0 isn't always the best
+        # reference (e.g. sparser or better-focused elsewhere in the
+        # stack). Clamped in `set_frame_bounds` once an image is loaded,
+        # same pattern as the Detect tab's frame range.
+        self._max_frames: Optional[int] = None
+        self.frame_index = _ispin(0, 0, 1_000_000, tooltip="Stack frame (0-based) to calibrate against.")
+
+        core_form = QFormLayout()
+        core_form.setContentsMargins(0, 0, 0, 0)
+        core_form.addRow("sigma init (px)", self.sigma_init)
+        core_form.addRow("calibration frame", self.frame_index)
+
+        self._fit_fields = _SparseFitFields(DEFAULT_CALIBRATION_KWARGS)
+
         self.run_button, self.status_label, run_row = _run_row("Run calibration")
         self.run_button.clicked.connect(self.runRequested.emit)
 
@@ -212,7 +274,7 @@ class _CalibrationTab(QWidget):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
         layout.addLayout(core_form)
-        layout.addWidget(_expert_section(expert_form))
+        layout.addWidget(self._fit_fields)
         layout.addLayout(run_row)
         layout.addStretch()
         self.setLayout(layout)
@@ -234,27 +296,7 @@ class _CalibrationTab(QWidget):
         return self.frame_index.value()
 
     def get_kwargs(self) -> dict:
-        kwargs = dict(DEFAULT_CALIBRATION_KWARGS)
-        kwargs.update(
-            box_size=self.box_size.value(),
-            sigma_lo=self.sigma_lo.value(),
-            sigma_hi=self.sigma_hi.value(),
-            delta_bound=self.delta_bound.value(),
-            amp_upper=self.amp_upper.value(),
-            bg_upper=self.bg_upper.value(),
-            peak_threshold_rel=self.peak_threshold_rel.value(),
-            peak_footprint=self.peak_footprint.value(),
-            peak_border=self.peak_border.value(),
-            peak_top_k=self.peak_top_k.value() or None,
-            n_iter=self.n_iter.value(),
-            mu0=self.mu0.value(),
-            mu_decrease=self.mu_decrease.value(),
-            mu_increase=self.mu_increase.value(),
-            step_tol=self.step_tol.value(),
-            loss_tol=self.loss_tol.value(),
-            gtol=self.gtol.value(),
-        )
-        return kwargs
+        return self._fit_fields.get_kwargs()
 
 
 class _DetectTab(QWidget):
@@ -274,6 +316,27 @@ class _DetectTab(QWidget):
         super().__init__()
         self._running = False
         d = DEFAULT_SOLVER_KWARGS
+
+        # Which localizer runs -- "dense" (find_spots/find_spots_stack's
+        # SFW solver, below) or "sparse" (find_spots_sparse_df's per-spot
+        # free-sigma LM fit, `_SparseFitFields` -- the same fit the
+        # Calibration tab uses, run per-frame as the actual localizer
+        # instead of just a one-off sigma estimate). Only one knob group is
+        # shown at a time (`_algorithm_stack`), matching whichever's
+        # actually forwarded to `run_detect_step`.
+        self.algorithm = QComboBox()
+        self.algorithm.addItem("Dense (SFW)", userData="dense")
+        self.algorithm.addItem("Sparse (well-separated)", userData="sparse")
+        self.algorithm.setToolTip(
+            "Dense: sfwloc's SFW solver -- handles overlapping/crowded fields.\n"
+            "Sparse: a lighter free-sigma LM fit per spot -- faster, but only\n"
+            "valid when spots are genuinely well-separated."
+        )
+        self.algorithm.currentIndexChanged.connect(self._on_algorithm_changed)
+        algorithm_row = QHBoxLayout()
+        algorithm_row.setContentsMargins(0, 0, 0, 0)
+        algorithm_row.addWidget(QLabel("algorithm"))
+        algorithm_row.addWidget(self.algorithm, stretch=1)
 
         self.lam = _dspin(
             d["lam"], 1e-4, 100.0, 0.01, decimals=4,
@@ -438,6 +501,20 @@ class _DetectTab(QWidget):
         expert_form.addRow("glrt_alpha", self.glrt_alpha)
         expert_form.addRow("glrt_lm_iter", self.glrt_lm_iter)
 
+        dense_group = QWidget()
+        dense_layout = QVBoxLayout(dense_group)
+        dense_layout.setContentsMargins(0, 0, 0, 0)
+        dense_layout.setSpacing(4)
+        dense_layout.addLayout(core_form)
+        dense_layout.addLayout(toggle_row)
+        dense_layout.addWidget(_expert_section(expert_form))
+
+        self._sparse_fields = _SparseFitFields(DEFAULT_SPARSE_KWARGS)
+
+        self._algorithm_stack = QStackedWidget()
+        self._algorithm_stack.addWidget(dense_group)
+        self._algorithm_stack.addWidget(self._sparse_fields)
+
         self.run_button, self.status_label, run_row = _run_row("Run detect")
         self.run_button.clicked.connect(self._on_run_button_clicked)
         self.new_roi_button.clicked.connect(self.newRoiRequested)
@@ -445,14 +522,16 @@ class _DetectTab(QWidget):
         layout = QVBoxLayout()
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
-        layout.addLayout(core_form)
-        layout.addLayout(toggle_row)
+        layout.addLayout(algorithm_row)
+        layout.addWidget(self._algorithm_stack)
         layout.addLayout(frame_row)
         layout.addLayout(roi_row)
-        layout.addWidget(_expert_section(expert_form))
         layout.addLayout(run_row)
         layout.addStretch()
         self.setLayout(layout)
+
+    def _on_algorithm_changed(self, index: int) -> None:
+        self._algorithm_stack.setCurrentIndex(index)
 
     def _on_run_button_clicked(self) -> None:
         if self._running:
@@ -509,6 +588,12 @@ class _DetectTab(QWidget):
 
     def get_use_roi_mask(self) -> bool:
         return self.use_roi_mask.isChecked()
+
+    def get_algorithm(self) -> str:
+        return self.algorithm.currentData()
+
+    def get_sparse_kwargs(self) -> dict:
+        return self._sparse_fields.get_kwargs()
 
     def get_solver_kwargs(self) -> dict:
         kwargs = dict(DEFAULT_SOLVER_KWARGS)
@@ -618,7 +703,9 @@ class PipelineParamsWidget(QWidget):
             sigma_init=self._calibration.get_sigma_init(),
             calibration_frame_index=self._calibration.get_frame_index(),
             bootstrap_gate_px=self._tracking.get_bootstrap_gate_px(),
+            algorithm=self._detect.get_algorithm(),
             solver_kwargs=self._detect.get_solver_kwargs(),
+            sparse_kwargs=self._detect.get_sparse_kwargs(),
             calibration_kwargs=self._calibration.get_kwargs(),
             frame_range=self._detect.get_frame_range(),
         )
@@ -632,8 +719,14 @@ class PipelineParamsWidget(QWidget):
     def get_calibration_kwargs(self) -> dict:
         return self._calibration.get_kwargs()
 
+    def get_algorithm(self) -> str:
+        return self._detect.get_algorithm()
+
     def get_solver_kwargs(self) -> dict:
         return self._detect.get_solver_kwargs()
+
+    def get_sparse_kwargs(self) -> dict:
+        return self._detect.get_sparse_kwargs()
 
     def get_bootstrap_gate_px(self) -> float:
         return self._tracking.get_bootstrap_gate_px()

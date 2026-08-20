@@ -98,6 +98,7 @@ from spt_pipeline.pipeline import (
     DetectTrackParams,
     PipelineCancelled,
     PipelineSession,
+    calibration_accepted,
     load_session,
     run_calibration_step,
     run_detect_step,
@@ -756,9 +757,9 @@ class ExperimentListWidget(QWidget):
         `accepted` column -- napari shows a hovered/selected point's
         features in the status bar, so every spot's fit quality is
         inspectable, not just the aggregate sigma_estimate in the status
-        label. `accepted` (green border) mirrors the same `converged &
-        laplace_ok & !at_bound` filter `calibrate_sigma_df`'s own
-        `sigma_estimate` aggregate uses -- gray-bordered points didn't
+        label. `accepted` (green border) mirrors the same filter
+        `calibrate_sigma_df`'s own `sigma_estimate` aggregate uses (see
+        `pipeline.calibration_accepted`) -- gray-bordered points didn't
         count towards it. Faces are transparent (border color only) so
         the boxes outline each fit window without occluding the
         underlying image."""
@@ -769,7 +770,7 @@ class ExperimentListWidget(QWidget):
             del self.viewer.layers["calibration spots"]
 
         features = {col: df[col].to_numpy() for col in df.columns}
-        features["accepted"] = (df["converged"] & df["laplace_ok"] & ~df["at_bound"]).to_numpy()
+        features["accepted"] = calibration_accepted(df).to_numpy()
         box_size = (session.calibration_kwargs_used or {}).get("box_size", 11)
 
         self.viewer.add_points(
@@ -823,7 +824,9 @@ class ExperimentListWidget(QWidget):
         worker = _run_detect_worker(
             session,
             sigma,
+            self.params_panel.get_algorithm(),
             self.params_panel.get_solver_kwargs(),
+            self.params_panel.get_sparse_kwargs(),
             self.params_panel.get_frame_range(),
             mask,
             self._cancel_event,
@@ -947,7 +950,9 @@ def _run_calibration_worker(
 def _run_detect_worker(
     session: PipelineSession,
     sigma: float,
+    algorithm: str,
     solver_kwargs: dict,
+    sparse_kwargs: dict,
     frame_range: Optional[tuple[int, int]],
     mask: Optional[np.ndarray],
     cancel_event: threading.Event,
@@ -959,7 +964,9 @@ def _run_detect_worker(
     return run_detect_step(
         session,
         sigma=sigma,
+        algorithm=algorithm,
         solver_kwargs=solver_kwargs,
+        sparse_kwargs=sparse_kwargs,
         frame_range=frame_range,
         mask=mask,
         progress_callback=progress_cb,

@@ -37,6 +37,7 @@ import polars as pl
 from sfwloc.report import (
     calibrate_sigma_df,
     find_spots_df,
+    find_spots_sparse_df,
     find_spots_stack_df,
     link_tracks_df,
     recommended_gate_px,
@@ -91,6 +92,13 @@ DEFAULT_CALIBRATION_KWARGS = dict(
     gtol=1e-5,
 )
 
+# Forwarded to sfwloc.report.find_spots_sparse_df (-> calibrate_sigma_df ->
+# sfwloc_py's calibrate_sigma_from_image) as **kwargs -- the sparse/well-
+# separated algorithm's own knobs, same shape as DEFAULT_CALIBRATION_KWARGS
+# (same underlying fit) but tracked as a separate default since detect-time
+# tuning on a whole stack doesn't have to match the calibration-frame fit.
+DEFAULT_SPARSE_KWARGS = dict(DEFAULT_CALIBRATION_KWARGS)
+
 # ProgressCallback(done, total, stage) -- called from whatever thread the
 # stage function executes on; the interactive widget wraps this in a
 # QObject signal to cross back onto the Qt event-loop thread safely.
@@ -118,7 +126,13 @@ class DetectTrackParams:
     sigma_init: float = 1.3
     calibration_frame_index: int = 0
     bootstrap_gate_px: float = 3.0
+    # "dense" (sfwloc's SFW solver, find_spots_df/find_spots_stack_df) --
+    # the default, for overlapping/crowded fields -- or "sparse"
+    # (find_spots_sparse_df's per-spot free-sigma LM fit), a lighter
+    # alternative for genuinely well-separated fields. See run_detect_step.
+    algorithm: str = "dense"
     solver_kwargs: dict = field(default_factory=lambda: dict(DEFAULT_SOLVER_KWARGS))
+    sparse_kwargs: dict = field(default_factory=lambda: dict(DEFAULT_SPARSE_KWARGS))
     calibration_kwargs: dict = field(default_factory=lambda: dict(DEFAULT_CALIBRATION_KWARGS))
     # (start, end) frame slice, Python-slice semantics; None, or end <= 0,
     # means through the real last frame (see _resolve_frame_range).
@@ -150,7 +164,9 @@ class PipelineSession:
     calibration_frame_used: Optional[int] = None
 
     points_df: Optional[pl.DataFrame] = None
+    algorithm_used: Optional[str] = None
     solver_kwargs_used: Optional[dict] = None
+    sparse_kwargs_used: Optional[dict] = None
     frame_range_used: Optional[tuple[int, int]] = None
     # Polygon ROI record(s) (see spt_pipeline.rois.shapes_layer_to_roi) for
     # whatever napari Shapes layer backed run_detect_step's `mask`, if any
@@ -231,6 +247,16 @@ def run_calibration_step(
     return session
 
 
+def calibration_accepted(calib_points_df: pl.DataFrame) -> pl.Series:
+    """Per-spot boolean: did this calibration candidate count towards
+    `calib_summary["sigma_estimate"]`? Mirrors the same `converged &
+    laplace_ok & !at_bound` filter `calibrate_sigma_df` applies internally
+    -- kept here as the one place that rule is written, rather than
+    re-derived wherever a caller (e.g. the calibration-spots preview
+    layer) wants to show accepted vs. rejected spots."""
+    return calib_points_df["converged"] & calib_points_df["laplace_ok"] & ~calib_points_df["at_bound"]
+
+
 def _resolve_frame_range(frame_range: Optional[tuple[int, int]], t: int) -> tuple[int, int]:
     """`frame_range` as a concrete `(start, end)` pair against a stack of
     length `t`. `None`, or an `end <= 0` (the params-panel frame-range
@@ -248,17 +274,30 @@ def _resolve_frame_range(frame_range: Optional[tuple[int, int]], t: int) -> tupl
 def run_detect_step(
     session: PipelineSession,
     sigma: Optional[float] = None,
+    algorithm: str = "dense",
     solver_kwargs: Optional[dict] = None,
+    sparse_kwargs: Optional[dict] = None,
     frame_range: Optional[tuple[int, int]] = None,
     mask: Optional[np.ndarray] = None,
     progress_callback: Optional[ProgressCallback] = None,
     cancel_event: Optional[threading.Event] = None,
 ) -> PipelineSession:
-    """`find_spots` over `session.image[start:end]` (default: every frame).
+    """Find spots over `session.image[start:end]` (default: every frame),
+    via one of two algorithms:
 
-    `sigma`, if given, is used as-is (a literal PSF sigma, skipping
-    calibration entirely). If omitted, falls back to `session.sigma` from
-    a prior `run_calibration_step` call -- raises if neither is available.
+    - `algorithm="dense"` (default): `find_spots`/`find_spots_stack`'s SFW
+      solver (`solver_kwargs`) -- the general case, handles overlapping/
+      crowded fields.
+    - `algorithm="sparse"`: `find_spots_sparse_df`'s per-spot free-sigma
+      LM fit (`sparse_kwargs`) -- a lighter, faster alternative when the
+      field genuinely is well-separated (see that function's docstring for
+      why it's not a substitute for the dense path in general).
+
+    `sigma`, if given, is used as-is: the literal PSF sigma for the dense
+    path, or the starting guess (`sigma_init`) for the sparse path's
+    per-spot free fit -- skipping calibration entirely either way. If
+    omitted, falls back to `session.sigma` from a prior
+    `run_calibration_step` call -- raises if neither is available.
 
     `frame_range`, if given, is a `(start, end)` pair (Python-slice
     semantics: `end` exclusive) restricting which frames are processed --
@@ -288,19 +327,23 @@ def run_detect_step(
     to report through.
 
     Frame-by-frame (reporting progress each frame, checking `cancel_event`
-    each frame) is used only when `progress_callback` is given -- the same
-    tradeoff `track_beads_timelapse.py` makes for an interactively-watched
-    run vs. the faster rayon-parallel `find_spots_stack_df`. Without a
-    `progress_callback`, `mask` is simply forwarded to `find_spots_stack_df`
-    -- masked or not, that's a single call, so this function doesn't need
-    to reimplement its own masked-loop fallback.
+    each frame) is used on the dense path only when `progress_callback` is
+    given -- the same tradeoff `track_beads_timelapse.py` makes for an
+    interactively-watched run vs. the faster rayon-parallel
+    `find_spots_stack_df`. Without a `progress_callback`, `mask` is simply
+    forwarded to `find_spots_stack_df` -- masked or not, that's a single
+    call, so this function doesn't need to reimplement its own masked-loop
+    fallback. The sparse path has no batched/rayon-parallel stack
+    equivalent at all (`find_spots_sparse_df` is single-frame only), so it
+    always runs its own frame-by-frame loop, `progress_callback` or not.
 
     `cancel_event`, if given, is checked before this stage starts and --
-    only on the frame-by-frame path -- again before each frame, so a
-    cancellation lands within one frame rather than only between stages
-    (see `PipelineCancelled`'s docstring). The `find_spots_stack_df` path
-    (masked or not) has no per-frame checkpoint of its own, so on that path
-    a cancellation still only takes effect before this stage starts.
+    on the sparse path, and on the dense path only when `progress_callback`
+    is given -- again before each frame, so a cancellation lands within one
+    frame rather than only between stages (see `PipelineCancelled`'s
+    docstring). The dense `find_spots_stack_df` path (masked or not, no
+    `progress_callback`) has no per-frame checkpoint of its own, so on that
+    path a cancellation still only takes effect before this stage starts.
     """
     _check_cancelled(cancel_event)
     if sigma is None:
@@ -310,30 +353,50 @@ def run_detect_step(
             )
         sigma = session.sigma
 
-    kwargs = dict(solver_kwargs) if solver_kwargs is not None else dict(DEFAULT_SOLVER_KWARGS)
     start, end = _resolve_frame_range(frame_range, session.image.shape[0])
     if end <= start:
         raise ValueError(f"empty frame_range: start={start} >= end={end}")
 
-    if progress_callback is not None:
+    if algorithm == "sparse":
+        kwargs = dict(sparse_kwargs) if sparse_kwargs is not None else dict(DEFAULT_SPARSE_KWARGS)
         frame_indices = range(start, end)
         n = len(frame_indices)
         frames = []
         for done, i in enumerate(frame_indices, start=1):
             _check_cancelled(cancel_event)
             frames.append(
-                find_spots_df(session.image[i], sigma, session.bg[i], frame_idx=i, mask=mask, **kwargs)
+                find_spots_sparse_df(session.image[i], sigma, frame_idx=i, mask=mask, **kwargs)
             )
-            progress_callback(done, n, "finding spots")
+            if progress_callback is not None:
+                progress_callback(done, n, "finding spots (sparse)")
         points_df = pl.concat(frames)
+        session.solver_kwargs_used = None
+        session.sparse_kwargs_used = kwargs
+    elif algorithm == "dense":
+        kwargs = dict(solver_kwargs) if solver_kwargs is not None else dict(DEFAULT_SOLVER_KWARGS)
+        if progress_callback is not None:
+            frame_indices = range(start, end)
+            n = len(frame_indices)
+            frames = []
+            for done, i in enumerate(frame_indices, start=1):
+                _check_cancelled(cancel_event)
+                frames.append(
+                    find_spots_df(session.image[i], sigma, session.bg[i], frame_idx=i, mask=mask, **kwargs)
+                )
+                progress_callback(done, n, "finding spots")
+            points_df = pl.concat(frames)
+        else:
+            points_df = find_spots_stack_df(
+                session.image, sigma, session.bg, mask=mask, frame_range=(start, end), **kwargs
+            )
+        session.solver_kwargs_used = kwargs
+        session.sparse_kwargs_used = None
     else:
-        points_df = find_spots_stack_df(
-            session.image, sigma, session.bg, mask=mask, frame_range=(start, end), **kwargs
-        )
+        raise ValueError(f"unknown algorithm {algorithm!r} -- expected 'dense' or 'sparse'")
 
     session.sigma = sigma
     session.points_df = points_df
-    session.solver_kwargs_used = kwargs
+    session.algorithm_used = algorithm
     session.frame_range_used = (start, end)
     return session
 
@@ -438,7 +501,9 @@ def session_manifest_extra(session: PipelineSession) -> dict:
         "resolvability_message": ts.get("resolvability_message"),
         "n_points": session.points_df.height if session.points_df is not None else 0,
         "n_tracks": session.tracks_df["track_id"].n_unique() if session.tracks_df is not None and session.tracks_df.height else 0,
+        "algorithm": session.algorithm_used,
         "solver_kwargs": session.solver_kwargs_used,
+        "sparse_kwargs": session.sparse_kwargs_used,
         "calibration_kwargs": session.calibration_kwargs_used,
         "calibration_frame": session.calibration_frame_used,
         "frame_range": list(session.frame_range_used) if session.frame_range_used is not None else None,
@@ -500,7 +565,9 @@ def run_detect_track(
     )
     run_detect_step(
         session,
+        algorithm=params.algorithm,
         solver_kwargs=params.solver_kwargs,
+        sparse_kwargs=params.sparse_kwargs,
         frame_range=params.frame_range,
         progress_callback=detect_progress,
         cancel_event=cancel_event,
