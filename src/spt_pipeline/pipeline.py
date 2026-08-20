@@ -26,6 +26,7 @@ select "Run" action, where stepwise control isn't needed.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -88,6 +89,22 @@ DEFAULT_CALIBRATION_KWARGS = dict(
 ProgressCallback = Callable[[int, int, str], None]
 
 
+class PipelineCancelled(Exception):
+    """Raised at a `cancel_event` checkpoint (see `run_detect_step`/
+    `run_track_step`/`run_calibration_step`'s `cancel_event` argument).
+    Cooperative cancellation only -- takes effect at the next frame (detect)
+    or stage boundary (calibration/track), not instantly, since
+    `calibrate_sigma_df`/`link_tracks_df` are each one opaque Rust call with
+    no interruption point of their own. Propagates like any other exception
+    through `napari.qt.threading`'s `errored` signal; the widget is
+    responsible for telling this apart from a real error."""
+
+
+def _check_cancelled(cancel_event: Optional[threading.Event]) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise PipelineCancelled("cancelled")
+
+
 @dataclass
 class DetectTrackParams:
     sigma_init: float = 1.3
@@ -127,6 +144,12 @@ class PipelineSession:
     points_df: Optional[pl.DataFrame] = None
     solver_kwargs_used: Optional[dict] = None
     frame_range_used: Optional[tuple[int, int]] = None
+    # Polygon ROI record(s) (see spt_pipeline.rois.shapes_layer_to_roi) for
+    # whatever napari Shapes layer backed run_detect_step's `mask`, if any
+    # -- set by the widget (not pipeline.py itself, which stays napari-
+    # agnostic), carried through to session_manifest_extra's caller so
+    # write_experiment can persist it alongside points/tracks.
+    roi: Optional[list[dict]] = None
 
     tracks_df: Optional[pl.DataFrame] = None
     track_summary: Optional[dict] = None
@@ -166,6 +189,7 @@ def run_calibration_step(
     sigma_init: float,
     calibration_kwargs: Optional[dict] = None,
     frame_index: int = 0,
+    cancel_event: Optional[threading.Event] = None,
 ) -> PipelineSession:
     """PSF-sigma calibration against `session.image[frame_index]` (default:
     the first frame). Sets `session.sigma`/`session.calib_summary` in place
@@ -182,7 +206,13 @@ def run_calibration_step(
     `widgets/experiment_list.py::_on_calibrate_finished`), so every
     calibration spot's fit quality is inspectable, not just the
     aggregate `sigma_estimate`.
+
+    `cancel_event`, if given, is only checked before this stage starts --
+    `calibrate_sigma_df` is one opaque Rust call with no interruption point
+    of its own, so a cancellation requested mid-fit still runs to completion
+    (see `PipelineCancelled`'s docstring).
     """
+    _check_cancelled(cancel_event)
     kwargs = dict(calibration_kwargs) if calibration_kwargs is not None else dict(DEFAULT_CALIBRATION_KWARGS)
     calib_points_df, calib_summary = calibrate_sigma_df(session.image[frame_index], sigma_init=sigma_init, **kwargs)
     session.sigma = calib_summary["sigma_estimate"]
@@ -214,6 +244,7 @@ def run_detect_step(
     frame_range: Optional[tuple[int, int]] = None,
     mask: Optional[np.ndarray] = None,
     progress_callback: Optional[ProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> PipelineSession:
     """`find_spots` over `session.image[start:end]` (default: every frame).
 
@@ -243,7 +274,15 @@ def run_detect_step(
     `progress_callback` -- the same tradeoff `track_beads_timelapse.py`
     makes for an interactively-watched run vs. the faster rayon-parallel
     `find_spots_stack_df`.
+
+    `cancel_event`, if given, is checked before this stage starts and --
+    only on the frame-by-frame path -- again before each frame, so a
+    cancellation lands within one frame rather than only between stages
+    (see `PipelineCancelled`'s docstring). The batched `find_spots_stack_df`
+    path has no per-frame checkpoint of its own, so on that path a
+    cancellation still only takes effect before this stage starts.
     """
+    _check_cancelled(cancel_event)
     if sigma is None:
         if session.sigma is None:
             raise ValueError(
@@ -261,6 +300,7 @@ def run_detect_step(
         n = len(frame_indices)
         frames = []
         for done, i in enumerate(frame_indices, start=1):
+            _check_cancelled(cancel_event)
             frames.append(
                 find_spots_df(session.image[i], sigma, session.bg[i], frame_idx=i, mask=mask, **kwargs)
             )
@@ -301,6 +341,7 @@ def run_track_step(
     session: PipelineSession,
     bootstrap_gate_px: float,
     progress_callback: Optional[ProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> PipelineSession:
     """Bootstrap link (fixed `bootstrap_gate_px` gate) -> estimate D from
     single-step MSD -> final link (auto-derived gate). Requires
@@ -310,9 +351,15 @@ def run_track_step(
     linking")` before the bootstrap pass, `(1, 2, "final linking")` before
     the final pass -- these stages don't have finer-grained progress of
     their own.
+
+    `cancel_event`, if given, is checked before each of those two passes --
+    `link_tracks_df` is one opaque Rust call with no interruption point of
+    its own, so this stage can only be skipped before it starts, not
+    interrupted mid-call (see `PipelineCancelled`'s docstring).
     """
     if session.points_df is None:
         raise ValueError("No points available -- run detect first.")
+    _check_cancelled(cancel_event)
 
     def report(done: int, total: int, stage: str) -> None:
         if progress_callback is not None:
@@ -333,6 +380,7 @@ def run_track_step(
     density_um2 = (mean_n_per_frame / active_area_um2) if mean_n_per_frame else 0.0
     resolvability = check_resolvability(D_est, session.dt_s, density_um2)
 
+    _check_cancelled(cancel_event)
     report(1, 2, "final linking")
     final_gate_px = recommended_gate_px(D_est, session.dt_s, session.pixel_size_um, sigma_loc_um=sigma_loc_um)
     tracks_df = link_tracks_df(points_df, final_gate_px)
@@ -386,6 +434,7 @@ def run_detect_track(
     z_index: int = 0,
     params: Optional[DetectTrackParams] = None,
     progress_callback: Optional[ProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame, dict]:
     """Run the full calibrate+detect+track pipeline on one timelapse in
     one call, composing `load_session`/`run_calibration_step`/
@@ -397,6 +446,11 @@ def run_detect_track(
     `channel`/`z_index` pick which plane to track for files with more than
     one (both default to 0). `pixel_size_um`/`dt_s` fall back to the
     file's own metadata if not given explicitly.
+
+    `cancel_event`, if given, is forwarded to each stage -- see
+    `PipelineCancelled`'s docstring for what "cancelled" actually means per
+    stage (cooperative, frame-granular for detect, stage-boundary-only for
+    calibration/track).
 
     Returns (points_df, tracks_df, manifest_extra) -- `manifest_extra` is
     meant to be passed as `experiment.build_manifest`'s `params`.
@@ -413,7 +467,11 @@ def run_detect_track(
 
     report(0, total_steps, "calibrating sigma")
     run_calibration_step(
-        session, params.sigma_init, params.calibration_kwargs, frame_index=params.calibration_frame_index
+        session,
+        params.sigma_init,
+        params.calibration_kwargs,
+        frame_index=params.calibration_frame_index,
+        cancel_event=cancel_event,
     )
 
     detect_progress = (
@@ -426,9 +484,10 @@ def run_detect_track(
         solver_kwargs=params.solver_kwargs,
         frame_range=params.frame_range,
         progress_callback=detect_progress,
+        cancel_event=cancel_event,
     )
 
     track_progress = lambda done, total, stage: report(n_frames + 1 + done, total_steps, stage)
-    run_track_step(session, params.bootstrap_gate_px, progress_callback=track_progress)
+    run_track_step(session, params.bootstrap_gate_px, progress_callback=track_progress, cancel_event=cancel_event)
 
     return session.points_df, session.tracks_df, session_manifest_extra(session)

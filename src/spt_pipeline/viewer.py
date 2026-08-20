@@ -6,11 +6,15 @@ from pathlib import Path
 
 from spt_pipeline.experiment import load_experiment
 from spt_pipeline.pipeline import load_stack
+from spt_pipeline.rois import roi_to_shapes_kwargs
 
 
 def add_experiment_layers(viewer, experiment_dir: str | Path) -> None:
-    """Clear `viewer` and add the image/points/tracks layers for one bundle."""
-    points_df, tracks_df, manifest = load_experiment(experiment_dir)
+    """Clear `viewer` and add the image/points/tracks/ROI layers for one
+    bundle -- any saved ROI (see `spt_pipeline.rois`) is added back as a
+    `"polygon"`-type Shapes layer under its original napari layer name, so
+    the region used for detection is visible again, not just the results."""
+    points_df, tracks_df, manifest, rois = load_experiment(experiment_dir)
     image_path = Path(manifest["source_image_path"])
     params = manifest.get("params", {})
     image, _, _ = load_stack(
@@ -34,6 +38,9 @@ def add_experiment_layers(viewer, experiment_dir: str | Path) -> None:
     if tracks_df.height > 0 and "track_id" in tracks_df.columns:
         tracks = tracks_df.select("track_id", "frame", "y", "x").to_numpy()
         viewer.add_tracks(tracks, name="tracks")
+
+    for roi in rois:
+        viewer.add_shapes(**roi_to_shapes_kwargs(roi), edge_color="yellow")
 
 
 def launch_viewer(experiment_dir: str | Path):

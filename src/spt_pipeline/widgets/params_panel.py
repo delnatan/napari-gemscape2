@@ -264,9 +264,11 @@ class _DetectTab(QWidget):
     touching per-dataset."""
 
     runRequested = Signal()
+    cancelRequested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
+        self._running = False
         d = DEFAULT_SOLVER_KWARGS
 
         self.lam = _dspin(
@@ -379,7 +381,7 @@ class _DetectTab(QWidget):
         expert_form.addRow("delta_dev_min_iter", self.delta_dev_min_iter)
 
         self.run_button, self.status_label, run_row = _run_row("Run detect")
-        self.run_button.clicked.connect(self.runRequested.emit)
+        self.run_button.clicked.connect(self._on_run_button_clicked)
 
         layout = QVBoxLayout()
         layout.setContentsMargins(4, 4, 4, 4)
@@ -392,6 +394,26 @@ class _DetectTab(QWidget):
         layout.addLayout(run_row)
         layout.addStretch()
         self.setLayout(layout)
+
+    def _on_run_button_clicked(self) -> None:
+        if self._running:
+            self.cancelRequested.emit()
+        else:
+            self.runRequested.emit()
+
+    def set_running(self, running: bool, label: str = "") -> None:
+        """Repurposes the run button into a Cancel button for the duration
+        of a run, mirroring the batch Run/Cancel toggle on the experiment
+        list's own run button -- see `ExperimentListWidget._cancel_active_run`
+        for what cancelling actually does (cooperative, not instant)."""
+        self._running = running
+        if not running:
+            self.run_button.setText("Run detect")
+        elif label:
+            self.run_button.setText(f"Cancel (running: {label})")
+        else:
+            self.run_button.setText("Cancel")
+        self.run_button.setEnabled(True)
 
     def set_status(self, text: str) -> None:
         self.status_label.setText(text)
@@ -491,6 +513,7 @@ class PipelineParamsWidget(QWidget):
 
     calibrateRequested = Signal()
     detectRequested = Signal()
+    detectCancelRequested = Signal()
     trackRequested = Signal()
 
     def __init__(self) -> None:
@@ -501,6 +524,7 @@ class PipelineParamsWidget(QWidget):
 
         self._calibration.runRequested.connect(self.calibrateRequested)
         self._detect.runRequested.connect(self.detectRequested)
+        self._detect.cancelRequested.connect(self.detectCancelRequested)
         self._tracking.runRequested.connect(self.trackRequested)
 
         tabs = QTabWidget()
@@ -553,6 +577,9 @@ class PipelineParamsWidget(QWidget):
 
     def set_detect_status(self, text: str) -> None:
         self._detect.set_status(text)
+
+    def set_detect_running(self, running: bool, label: str = "") -> None:
+        self._detect.set_running(running, label)
 
     def set_track_status(self, text: str) -> None:
         self._tracking.set_status(text)

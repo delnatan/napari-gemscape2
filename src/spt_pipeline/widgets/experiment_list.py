@@ -31,9 +31,15 @@ the whole panel now that the params form sits below it.
 Two ways to run the pipeline on the *current* selection, both threaded
 through the same `self._worker` slot (only one run -- batch or stepwise
 -- active at a time):
-- **Batch** ("Run selected" button / `R` key, possibly multi-select):
+- **Batch** ("Run selected" button / `Shift+R` key, possibly multi-select):
   always the full calibrate->detect->track pipeline
-  (`pipeline.run_detect_track`), unchanged from before.
+  (`pipeline.run_detect_track`). Only `Status.UNTOUCHED`/`Status.ERROR`
+  items run by default -- `COMPLETE`/`SKIP` are excluded so this can't
+  silently overwrite finished work; press `U` to unmark a `COMPLETE` item
+  first if a deliberate re-run is wanted. The same button doubles as
+  Cancel while a run is active (`_cancel_active_run`) -- cooperative, see
+  `pipeline.PipelineCancelled`'s docstring for what that actually
+  guarantees per stage.
 - **Stepwise** (each params-panel tab's own "Run <stage>" button, single
   current item only): calibrate, detect, and track run independently
   against a `pipeline.PipelineSession` held in `self._session`, so
@@ -45,17 +51,18 @@ through the same `self._worker` slot (only one run -- batch or stepwise
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 from napari.layers import Shapes
 from napari.qt.threading import thread_worker
 from natsort import natsorted
 from qtpy.QtCore import QModelIndex, QObject, QRect, QSize, Qt, Signal
-from qtpy.QtGui import QColor, QPainter
+from qtpy.QtGui import QColor, QPainter, QPen
 from qtpy.QtWidgets import (
     QAbstractItemView,
     QFileDialog,
@@ -85,6 +92,7 @@ from spt_pipeline.io_formats import SUPPORTED_SUFFIXES as SUPPORTED_FORMATS
 from spt_pipeline.io_formats import load_stack
 from spt_pipeline.pipeline import (
     DetectTrackParams,
+    PipelineCancelled,
     PipelineSession,
     load_session,
     run_calibration_step,
@@ -93,6 +101,7 @@ from spt_pipeline.pipeline import (
     run_track_step,
     session_manifest_extra,
 )
+from spt_pipeline.rois import shapes_layer_to_roi
 from spt_pipeline.viewer import add_experiment_layers
 from spt_pipeline.widgets.params_panel import PipelineParamsWidget
 
@@ -130,6 +139,14 @@ class ExperimentEntry:
     status: Status = Status.UNTOUCHED
     n_tracks: Optional[int] = None
     error: Optional[str] = None
+    # True while this item's session has calibration/detect results that
+    # haven't made it through "Run tracking" (which is what actually writes
+    # to disk) -- painted as an amber ring by ExperimentItemDelegate so
+    # navigating away is a visible choice, not a silent loss. Cleared once
+    # written (_on_track_finished) or once the risk has already passed
+    # (_on_selection_changed, navigating off this item drops the in-memory
+    # session for good).
+    has_unsaved_session: bool = False
 
 
 class ExperimentItem(QListWidgetItem):
@@ -174,6 +191,11 @@ class ExperimentItemDelegate(QStyledItemDelegate):
         painter.setBrush(STATUS_COLORS[entry.status])
         painter.drawEllipse(dot_rect)
 
+        if entry.has_unsaved_session:
+            painter.setPen(QPen(QColor("#f59e0b"), 1.5))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawEllipse(dot_rect.adjusted(-3, -3, 3, 3))
+
         text_rect = option.rect.adjusted(self.PADDING * 2 + self.DOT_DIAMETER, 0, -self.PADDING, 0)
         label = entry.image_path.name
         if entry.status is Status.COMPLETE and entry.n_tracks is not None:
@@ -194,7 +216,7 @@ class _ExperimentListView(QListWidget):
 
     runRequested = Signal(list)  # list[ExperimentItem]
 
-    KEYBINDINGS = "Enter: load · R: run · X: skip · U: unmark · F5: rescan"
+    KEYBINDINGS = "Enter: load · Shift+R: run · X: skip · U: unmark · F5: rescan"
 
     def __init__(self) -> None:
         super().__init__()
@@ -211,10 +233,16 @@ class _ExperimentListView(QListWidget):
         self.setItemDelegate(ExperimentItemDelegate(self))
         self.folder_path: Optional[Path] = None
         self.experiments_root: Optional[Path] = None
+        # Set by the owning ExperimentListWidget so a folder reload can be
+        # refused while a run is in flight (see load_folder) -- a fresh
+        # QListWidgetItem per row would otherwise silently detach the
+        # in-flight run's own item from the reloaded list (Finding 4).
+        self.is_busy: Callable[[], bool] = lambda: False
+        self.on_busy_blocked: Callable[[], None] = lambda: None
 
     def keyPressEvent(self, event) -> None:
         key = event.key()
-        if key == Qt.Key.Key_R:
+        if key == Qt.Key.Key_R and (event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
             self.runRequested.emit(self.selectedItems())
             return
         if key in (Qt.Key.Key_X, Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
@@ -245,6 +273,9 @@ class _ExperimentListView(QListWidget):
             self.load_folder(folder, self.experiments_root)
 
     def load_folder(self, folder_path: Path, experiments_root: Optional[Path] = None) -> None:
+        if self.is_busy():
+            self.on_busy_blocked()
+            return
         self.clear()
         self.folder_path = Path(folder_path)
         self.experiments_root = experiments_root or (self.folder_path / "experiments")
@@ -260,7 +291,7 @@ class _ExperimentListView(QListWidget):
             item = ExperimentItem(entry)
 
             if has_experiment(experiment_dir):
-                _, tracks_df, manifest = load_experiment(experiment_dir)
+                _, tracks_df, manifest, _ = load_experiment(experiment_dir)
                 n_tracks = manifest.get("params", {}).get("n_tracks")
                 if n_tracks is None and tracks_df.height:
                     n_tracks = tracks_df["track_id"].n_unique()
@@ -283,6 +314,7 @@ class ExperimentListWidget(QWidget):
         super().__init__()
         self.viewer = napari_viewer
         self._worker = None
+        self._cancel_event: Optional[threading.Event] = None
         self._session: Optional[PipelineSession] = None
         self._session_item: Optional[ExperimentItem] = None
         self.setAcceptDrops(True)
@@ -292,20 +324,26 @@ class ExperimentListWidget(QWidget):
 
         self.list_view = _ExperimentListView()
         self.list_view.currentItemChanged.connect(self._on_selection_changed)
+        self.list_view.itemSelectionChanged.connect(self._update_run_button_label)
         self.list_view.runRequested.connect(self._run_items)
+        self.list_view.is_busy = lambda: self._worker is not None
+        self.list_view.on_busy_blocked = lambda: self.progress_label.setText(
+            "a run is in progress — finishing before loading a new folder"
+        )
 
         open_button = QPushButton("Open folder…")
         open_button.clicked.connect(self._open_folder_dialog)
-        run_button = QPushButton("Run selected")
-        run_button.clicked.connect(lambda: self._run_items(self.list_view.selectedItems()))
+        self.run_button = QPushButton("Run selected")
+        self.run_button.clicked.connect(self._on_run_button_clicked)
 
         button_row = QHBoxLayout()
         button_row.addWidget(open_button)
-        button_row.addWidget(run_button)
+        button_row.addWidget(self.run_button)
 
         self.params_panel = PipelineParamsWidget()
         self.params_panel.calibrateRequested.connect(self._run_calibrate_step)
         self.params_panel.detectRequested.connect(self._run_detect_step)
+        self.params_panel.detectCancelRequested.connect(self._cancel_active_run)
         self.params_panel.trackRequested.connect(self._run_track_step)
 
         self.progress_label = QLabel("")
@@ -320,6 +358,7 @@ class ExperimentListWidget(QWidget):
         layout.addWidget(self.progress_label)
         layout.addWidget(self.progress_bar)
         self.setLayout(layout)
+        self._update_run_button_label()
 
     def _open_folder_dialog(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Select folder of timelapses")
@@ -340,11 +379,18 @@ class ExperimentListWidget(QWidget):
     def _on_selection_changed(self, current: Optional[ExperimentItem], _previous) -> None:
         if current is None:
             return
+        if self._session_item is not None:
+            # Leaving the row that held the in-progress session -- the
+            # in-memory session is about to be dropped for good below, so
+            # the "you might lose this" marker no longer applies (it's
+            # already lost); clear it rather than leave a stale warning.
+            self._session_item.entry.has_unsaved_session = False
         self._session = None
         self._session_item = None
         self.params_panel.set_calibration_status("")
         self.params_panel.set_detect_status("")
         self.params_panel.set_track_status("")
+        self.list_view.viewport().update()
 
         entry = current.entry
         if has_experiment(entry.experiment_dir):
@@ -354,18 +400,68 @@ class ExperimentListWidget(QWidget):
             image, _, _ = load_stack(entry.image_path)
             self.viewer.add_image(image, name=entry.image_path.stem)
 
-    def _run_items(self, items: list[ExperimentItem]) -> None:
-        runnable = [item for item in items if item.entry.status is not Status.RUNNING]
-        if not runnable or self._worker is not None:
+    def _update_run_button_label(self) -> None:
+        """Reflects what a click on `run_button` would actually do, given
+        the current selection -- kept a no-op while a run is active, since
+        `_run_next`/`_cancel_active_run` own the label in that state."""
+        if self._worker is not None:
             return
+        items = self.list_view.selectedItems()
+        runnable = [item for item in items if item.entry.status in (Status.UNTOUCHED, Status.ERROR)]
+        n_complete = sum(1 for item in items if item.entry.status is Status.COMPLETE)
+        if not items:
+            self.run_button.setText("Run selected")
+        elif n_complete:
+            self.run_button.setText(f"Run selected ({len(runnable)}, {n_complete} complete)")
+        else:
+            self.run_button.setText(f"Run selected ({len(runnable)})")
+        self.run_button.setEnabled(True)
+
+    def _on_run_button_clicked(self) -> None:
+        if self._worker is not None:
+            self._cancel_active_run()
+        else:
+            self._run_items(self.list_view.selectedItems())
+
+    def _cancel_active_run(self) -> None:
+        """Requests cancellation of whatever's currently running (batch or
+        stepwise Detect) -- cooperative only, see `PipelineCancelled`'s
+        docstring for how promptly this actually takes effect per stage.
+        Also drops any remaining queued batch items so they don't start."""
+        if self._cancel_event is not None:
+            self._cancel_event.set()
+        self._run_queue = []
+        self.run_button.setText("Cancelling…")
+        self.run_button.setEnabled(False)
+
+    def _run_items(self, items: list[ExperimentItem]) -> None:
+        if self._worker is not None:
+            return
+        runnable = [item for item in items if item.entry.status in (Status.UNTOUCHED, Status.ERROR)]
+        n_complete = sum(1 for item in items if item.entry.status is Status.COMPLETE)
+        n_skip = sum(1 for item in items if item.entry.status is Status.SKIP)
+        if not runnable:
+            if n_complete or n_skip:
+                self.progress_label.setText(
+                    f"nothing to run -- {n_complete} already complete, {n_skip} skipped "
+                    "(press U to unmark and re-run)"
+                )
+            return
+        if n_complete or n_skip:
+            self.progress_label.setText(
+                f"running {len(runnable)}, skipping {n_complete} complete + {n_skip} skipped"
+            )
         self._run_queue = runnable
+        self._cancel_event = threading.Event()
         self._run_next()
 
     def _run_next(self) -> None:
         if not self._run_queue:
             self._worker = None
+            self._cancel_event = None
             self.progress_bar.setVisible(False)
             self.progress_label.setText("")
+            self._update_run_button_label()
             return
 
         item = self._run_queue.pop(0)
@@ -376,11 +472,15 @@ class ExperimentListWidget(QWidget):
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.progress_label.setText(f"Running: {entry.image_path.name}")
+        self.run_button.setText(f"Cancel (running: {entry.image_path.name})")
+        self.run_button.setEnabled(True)
 
         emitter = _ProgressEmitter()
         emitter.updated.connect(self._on_progress)
 
-        worker = _run_pipeline_worker(entry.image_path, self.params_panel.get_params(), emitter)
+        worker = _run_pipeline_worker(
+            entry.image_path, self.params_panel.get_params(), self._cancel_event, emitter
+        )
         worker.returned.connect(lambda result, item=item: self._on_run_finished(item, result))
         worker.errored.connect(lambda exc, item=item: self._on_run_error(item, exc))
         self._worker = worker
@@ -416,13 +516,26 @@ class ExperimentListWidget(QWidget):
             add_experiment_layers(self.viewer, entry.experiment_dir)
 
         self._worker = None
+        self._cancel_event = None
         self._run_next()
 
     def _on_run_error(self, item: ExperimentItem, exc: Exception) -> None:
-        item.set_status(Status.ERROR, error=str(exc))
+        cancelled = isinstance(exc, PipelineCancelled)
+        if cancelled:
+            # Not a real error -- back to untouched so it's safe (and
+            # obviously re-runnable) rather than parked in Status.ERROR.
+            item.set_status(Status.UNTOUCHED)
+        else:
+            item.set_status(Status.ERROR, error=str(exc))
         self.list_view.viewport().update()
         self._worker = None
+        self._cancel_event = None
+        # _run_next()'s empty-queue branch clears progress_label -- set the
+        # "cancelled" message after, so it's the one left showing instead of
+        # being immediately overwritten by that cleanup.
         self._run_next()
+        if cancelled:
+            self.progress_label.setText("cancelled")
 
     # -- Stepwise Calibrate / Detect / Track (current selection only) --
 
@@ -438,28 +551,36 @@ class ExperimentListWidget(QWidget):
         self._session_item = item
         return session
 
-    def _build_roi_mask(self, shape: tuple[int, int]) -> np.ndarray:
+    def _build_roi_mask(self, shape: tuple[int, int]) -> tuple[np.ndarray, dict]:
         """Boolean `(H, W)` mask from the viewer's currently active Shapes
-        layer -- the union of every shape drawn on it. Raises if there
-        isn't one, or it has nothing drawn on it yet."""
+        layer -- the union of every shape drawn on it -- plus that layer's
+        polygon ROI record (`spt_pipeline.rois.shapes_layer_to_roi`), meant to be
+        stashed on `session.roi` so `_on_track_finished` can persist it
+        alongside the run's results (see `experiment.write_experiment`).
+        Raises if there isn't an active Shapes layer, or it has nothing
+        drawn on it yet."""
         active = self.viewer.layers.selection.active
         if not isinstance(active, Shapes) or len(active.data) == 0:
             raise ValueError("no active Shapes layer with a shape drawn -- select/draw one as the ROI")
-        return np.any(active.to_masks(shape), axis=0)
+        mask = np.any(active.to_masks(shape), axis=0)
+        return mask, shapes_layer_to_roi(active)
 
-    def _start_step_worker(self, worker, on_finished, indeterminate: bool = False) -> None:
+    def _start_step_worker(
+        self, worker, on_finished, indeterminate: bool = False, on_error: Optional[Callable] = None
+    ) -> None:
         if self._worker is not None:
             return
         self.progress_bar.setRange(0, 0 if indeterminate else 100)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         worker.returned.connect(on_finished)
-        worker.errored.connect(self._on_step_error)
+        worker.errored.connect(on_error or self._on_step_error)
         self._worker = worker
         worker.start()
 
     def _finish_step_worker(self) -> None:
         self._worker = None
+        self._cancel_event = None
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setVisible(False)
         self.progress_label.setText("")
@@ -497,6 +618,8 @@ class ExperimentListWidget(QWidget):
             self._finish_step_worker()
             return
         self._session = session
+        item.entry.has_unsaved_session = True
+        self.list_view.viewport().update()
         summary = session.calib_summary or {}
         self.params_panel.set_calibration_status(
             f"sigma = {session.sigma:.3f} px  "
@@ -555,15 +678,19 @@ class ExperimentListWidget(QWidget):
         self.params_panel.set_frame_bounds(session.image.shape[0])
 
         mask = None
+        session.roi = None
         if self.params_panel.get_use_roi_mask():
             try:
-                mask = self._build_roi_mask(session.image.shape[1:])
+                mask, roi = self._build_roi_mask(session.image.shape[1:])
             except Exception as exc:
                 self.params_panel.set_detect_status(f"error: {exc}")
                 return
+            session.roi = [roi]
 
         sigma = session.sigma if session.sigma is not None else self.params_panel.get_sigma_init()
         self.progress_label.setText(f"Finding spots: {item.entry.image_path.name}")
+        self._cancel_event = threading.Event()
+        self.params_panel.set_detect_running(True, item.entry.image_path.name)
         emitter = _ProgressEmitter()
         emitter.updated.connect(self._on_progress)
         worker = _run_detect_worker(
@@ -572,15 +699,23 @@ class ExperimentListWidget(QWidget):
             self.params_panel.get_solver_kwargs(),
             self.params_panel.get_frame_range(),
             mask,
+            self._cancel_event,
             emitter,
         )
-        self._start_step_worker(worker, lambda s, item=item: self._on_detect_finished(item, s))
+        self._start_step_worker(
+            worker,
+            lambda s, item=item: self._on_detect_finished(item, s),
+            on_error=lambda exc, item=item: self._on_detect_error(item, exc),
+        )
 
     def _on_detect_finished(self, item: ExperimentItem, session: PipelineSession) -> None:
+        self.params_panel.set_detect_running(False)
         if self._session_item is not item:
             self._finish_step_worker()
             return
         self._session = session
+        item.entry.has_unsaved_session = True
+        self.list_view.viewport().update()
         n_points = session.points_df.height if session.points_df is not None else 0
         start, end = session.frame_range_used or (0, session.image.shape[0])
         self.params_panel.set_detect_status(f"{n_points} points across frames {start}-{end - 1}")
@@ -593,6 +728,14 @@ class ExperimentListWidget(QWidget):
                 name="points (preview)",
                 size=4,
             )
+        self._finish_step_worker()
+
+    def _on_detect_error(self, item: ExperimentItem, exc: Exception) -> None:
+        self.params_panel.set_detect_running(False)
+        if isinstance(exc, PipelineCancelled):
+            self.params_panel.set_detect_status("cancelled")
+        else:
+            self.params_panel.set_detect_status(f"error: {exc}")
         self._finish_step_worker()
 
     def _run_track_step(self) -> None:
@@ -636,8 +779,9 @@ class ExperimentListWidget(QWidget):
             params=session_manifest_extra(session),
             repo_shas=repo_shas,
         )
-        write_experiment(entry.experiment_dir, session.points_df, session.tracks_df, manifest)
+        write_experiment(entry.experiment_dir, session.points_df, session.tracks_df, manifest, rois=session.roi)
         item.set_status(Status.COMPLETE, n_tracks=n_tracks)
+        item.entry.has_unsaved_session = False
         self.list_view.viewport().update()
 
         if self.list_view.currentItem() is item:
@@ -649,11 +793,18 @@ class ExperimentListWidget(QWidget):
 
 
 @thread_worker(start_thread=False)
-def _run_pipeline_worker(image_path: Path, params: DetectTrackParams, emitter: _ProgressEmitter):
+def _run_pipeline_worker(
+    image_path: Path,
+    params: DetectTrackParams,
+    cancel_event: threading.Event,
+    emitter: _ProgressEmitter,
+):
     def progress_cb(done: int, total: int, stage: str) -> None:
         emitter.updated.emit(done, total, stage)
 
-    return run_detect_track(image_path, params=params, progress_callback=progress_cb)
+    return run_detect_track(
+        image_path, params=params, progress_callback=progress_cb, cancel_event=cancel_event
+    )
 
 
 @thread_worker(start_thread=False)
@@ -670,6 +821,7 @@ def _run_detect_worker(
     solver_kwargs: dict,
     frame_range: Optional[tuple[int, int]],
     mask: Optional[np.ndarray],
+    cancel_event: threading.Event,
     emitter: _ProgressEmitter,
 ) -> PipelineSession:
     def progress_cb(done: int, total: int, stage: str) -> None:
@@ -682,6 +834,7 @@ def _run_detect_worker(
         frame_range=frame_range,
         mask=mask,
         progress_callback=progress_cb,
+        cancel_event=cancel_event,
     )
 
 
