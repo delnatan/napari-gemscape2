@@ -462,6 +462,18 @@ class _DetectTab(QWidget):
             tooltip="Initial per-side child separation for the K=2 split hypothesis,\n"
             "in units of sigma.",
         )
+        self.split_min_sep = _dspin(
+            d["split_min_sep"], 0.01, 10.0, 0.05, decimals=3,
+            tooltip="Minimum per-side child separation accepted by the K=2 split\n"
+            "hypothesis, in units of sigma -- below this the split is rejected\n"
+            "even if the GLRT itself passes.",
+        )
+        self.split_free_sigma = QCheckBox()
+        self.split_free_sigma.setChecked(d["split_free_sigma"])
+        self.split_free_sigma.setToolTip(
+            "Let the K=2 split hypothesis's two children fit sigma freely,\n"
+            "instead of holding it fixed at the frame's calibrated sigma."
+        )
         self.glrt_footprint_sigma = _dspin(
             d["glrt_footprint_sigma"], 0.5, 50.0, 0.5, decimals=2,
             tooltip="Local patch half-width for the birth/split GLRTs, in units of sigma.",
@@ -474,6 +486,12 @@ class _DetectTab(QWidget):
         self.glrt_lm_iter = _ispin(
             d["glrt_lm_iter"], 1, 500,
             tooltip="LM iterations for each local birth/split GLRT fit.",
+        )
+        self.glrt_local_bg = QCheckBox()
+        self.glrt_local_bg.setChecked(d["glrt_local_bg"])
+        self.glrt_local_bg.setToolTip(
+            "Fold local background into the birth/split GLRT as a free nuisance\n"
+            "parameter, instead of holding it fixed at the frame's global bg."
         )
 
         expert_form = QFormLayout()
@@ -492,9 +510,12 @@ class _DetectTab(QWidget):
         expert_form.addRow("pos_bound (px)", self.pos_bound)
         expert_form.addRow("amp_upper", self.amp_upper)
         expert_form.addRow("split_init_sep", self.split_init_sep)
+        expert_form.addRow("split_min_sep", self.split_min_sep)
+        expert_form.addRow("split_free_sigma", self.split_free_sigma)
         expert_form.addRow("glrt_footprint_sigma", self.glrt_footprint_sigma)
         expert_form.addRow("glrt_alpha", self.glrt_alpha)
         expert_form.addRow("glrt_lm_iter", self.glrt_lm_iter)
+        expert_form.addRow("glrt_local_bg", self.glrt_local_bg)
 
         dense_group = QWidget()
         dense_layout = QVBoxLayout(dense_group)
@@ -611,9 +632,12 @@ class _DetectTab(QWidget):
             birth_test=self.birth_test.isChecked(),
             split_test=self.split_test.isChecked(),
             split_init_sep=self.split_init_sep.value(),
+            split_min_sep=self.split_min_sep.value(),
+            split_free_sigma=self.split_free_sigma.isChecked(),
             glrt_footprint_sigma=self.glrt_footprint_sigma.value(),
             glrt_alpha=self.glrt_alpha.value(),
             glrt_lm_iter=self.glrt_lm_iter.value(),
+            glrt_local_bg=self.glrt_local_bg.isChecked(),
         )
         return kwargs
 

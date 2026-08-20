@@ -65,9 +65,12 @@ DEFAULT_SOLVER_KWARGS = dict(
     birth_test=True,
     split_test=False,
     split_init_sep=0.75,
+    split_min_sep=0.75,
+    split_free_sigma=False,
     glrt_footprint_sigma=4.0,
     glrt_alpha=1e-3,
     glrt_lm_iter=30,
+    glrt_local_bg=False,
 )
 
 # Forwarded to sfwloc.report.fit_spots_sparse_df (-> sfwloc_py's
