@@ -2,8 +2,9 @@
 tabbed pages that mirror the pipeline's own stages (see `pipeline.py`'s
 module docstring: calibrate sigma -> find_spots -> bootstrap/final link):
 
-- **Calibration** -- `sfwloc.report.calibrate_sigma_df` (PSF sigma
-  estimation from a sparse-regime reference frame).
+- **Calibration** -- `sfwloc.report.fit_spots_sparse_df` +
+  `sigma_from_spots` (PSF sigma estimation from a sparse-regime reference
+  frame, via Aguet's point-source detector).
 - **Detect** -- localizer knobs for either of two algorithms, picked via
   an "algorithm" dropdown: `sfwloc`'s dense SFW `find_spots` solver
   (default, handles overlapping/crowded fields), or the sparse
@@ -117,23 +118,25 @@ def _run_row(button_text: str) -> tuple[QPushButton, QLabel, QHBoxLayout]:
 
 
 class _SparseFitFields(QWidget):
-    """Widget knobs for `sfwloc_py.calibrate_sigma_from_image`'s shared
-    parameter set -- the free-sigma, free-background bounded LM Gaussian
-    fit both the Calibration tab (fit against one reference frame) and the
-    Detect tab's sparse algorithm (that same fit run as the localizer,
-    over every processed frame) forward as `**kwargs`. Each tab owns its
-    own instance/defaults (`defaults`) rather than sharing widget state --
+    """Widget knobs for `sfwloc_py.find_spots_sparse`'s shared parameter
+    set -- Aguet's point-source detector (a per-pixel significance test
+    ANDed with Laplacian-of-Gaussian local maxima) feeding a free-sigma,
+    free-background bounded LM Gaussian fit per candidate spot -- both the
+    Calibration tab (fit against one reference frame) and the Detect tab's
+    sparse algorithm (that same fit run as the localizer, over every
+    processed frame) forward as `**kwargs`. Each tab owns its own
+    instance/defaults (`defaults`) rather than sharing widget state --
     calibration-frame tuning and whole-stack detect tuning don't have to
     match. `sigma_init`/reference-frame knobs stay with the owning tab
     (not part of this shared fieldset) since only Calibration has a
     reference frame and Detect's sparse mode reads its sigma_init from the
     Calibration tab regardless (see `PipelineParamsWidget.get_sigma_init`).
 
-    Core: fit box size and peak-detection threshold -- the knobs that most
-    directly affect whether the fit finds/fits the right spots. Expert: LM
-    solver internals (iteration budget, damping schedule, convergence
-    tolerances) and secondary peak-finder/fit-bound knobs that rarely need
-    touching."""
+    Core: fit box size and the detector's significance level -- the knobs
+    that most directly affect whether the fit finds/fits the right spots.
+    Expert: the detector's kernel-window knob, LM solver internals
+    (iteration budget, damping schedule, convergence tolerances), and
+    fit-bound knobs that rarely need touching."""
 
     def __init__(self, defaults: dict) -> None:
         super().__init__()
@@ -143,16 +146,16 @@ class _SparseFitFields(QWidget):
             d["box_size"], 3, 99,
             tooltip="Square fit-window side length (px, odd) cropped around each peak.",
         )
-        self.peak_threshold_rel = _dspin(
-            d["peak_threshold_rel"], 0.0, 1.0, 0.01, decimals=3,
-            tooltip="Peak-detector threshold, relative to (max - median) matched-filter\n"
-            "response. Lower finds more (dimmer/noisier) candidate peaks.",
+        self.alpha = _dspin(
+            d["alpha"], 1e-6, 1.0, 0.01, decimals=4,
+            tooltip="Significance level for Aguet's per-pixel point-source detection\n"
+            "test. Lower finds fewer, more significant candidate peaks.",
         )
 
         core_form = QFormLayout()
         core_form.setContentsMargins(0, 0, 0, 0)
         core_form.addRow("box size (px)", self.box_size)
-        core_form.addRow("peak threshold", self.peak_threshold_rel)
+        core_form.addRow("alpha", self.alpha)
 
         self.sigma_lo = _dspin(d["sigma_lo"], 0.01, 20.0, 0.1, decimals=2, tooltip="Lower bound on fitted sigma (px).")
         self.sigma_hi = _dspin(d["sigma_hi"], 0.01, 50.0, 0.1, decimals=2, tooltip="Upper bound on fitted sigma (px).")
@@ -162,14 +165,9 @@ class _SparseFitFields(QWidget):
         )
         self.amp_upper = _dspin(d["amp_upper"], 1.0, 1e9, 100.0, decimals=1, tooltip="Upper bound on fitted amplitude.")
         self.bg_upper = _dspin(d["bg_upper"], 0.0, 1e7, 10.0, decimals=1, tooltip="Upper bound on fitted background.")
-        self.peak_footprint = _ispin(
-            d["peak_footprint"], 1, 51, tooltip="Local-maximum window size (px, odd) for the peak finder."
-        )
-        self.peak_border = _ispin(
-            d["peak_border"], 0, 100, tooltip="Pixels excluded from peak detection at the image border."
-        )
-        self.peak_top_k = _ispin(
-            0, 0, 100000, tooltip="Cap on candidate peaks considered, ranked by response strength (0 = no cap)."
+        self.truncate = _dspin(
+            d["truncate"], 1.0, 20.0, 0.5, decimals=2,
+            tooltip="Aguet detector kernel half-width, in units of sigma_init.",
         )
         self.n_iter = _ispin(d["n_iter"], 1, 500, tooltip="Maximum Levenberg-Marquardt iterations per spot fit.")
         self.mu0 = _dspin(d["mu0"], 1e-6, 1e6, 0.1, decimals=4, tooltip="Initial LM damping factor.")
@@ -196,9 +194,7 @@ class _SparseFitFields(QWidget):
         expert_form.addRow("delta bound (px)", self.delta_bound)
         expert_form.addRow("amp upper", self.amp_upper)
         expert_form.addRow("bg upper", self.bg_upper)
-        expert_form.addRow("peak footprint", self.peak_footprint)
-        expert_form.addRow("peak border", self.peak_border)
-        expert_form.addRow("peak top-k", self.peak_top_k)
+        expert_form.addRow("truncate (sigma)", self.truncate)
         expert_form.addRow("LM n_iter", self.n_iter)
         expert_form.addRow("LM mu0", self.mu0)
         expert_form.addRow("LM mu decrease", self.mu_decrease)
@@ -222,10 +218,8 @@ class _SparseFitFields(QWidget):
             delta_bound=self.delta_bound.value(),
             amp_upper=self.amp_upper.value(),
             bg_upper=self.bg_upper.value(),
-            peak_threshold_rel=self.peak_threshold_rel.value(),
-            peak_footprint=self.peak_footprint.value(),
-            peak_border=self.peak_border.value(),
-            peak_top_k=self.peak_top_k.value() or None,
+            truncate=self.truncate.value(),
+            alpha=self.alpha.value(),
             n_iter=self.n_iter.value(),
             mu0=self.mu0.value(),
             mu_decrease=self.mu_decrease.value(),
@@ -237,7 +231,8 @@ class _SparseFitFields(QWidget):
 
 
 class _CalibrationTab(QWidget):
-    """PSF-sigma calibration (`calibrate_sigma_df`), run once per timelapse
+    """PSF-sigma calibration (`fit_spots_sparse_df` + `sigma_from_spots`),
+    run once per timelapse
     against a single reference frame (frame 0 by default, but pickable --
     see `frame_index`). The fit itself (`_SparseFitFields`) is the same
     knob set the Detect tab's sparse algorithm reuses -- see that class's

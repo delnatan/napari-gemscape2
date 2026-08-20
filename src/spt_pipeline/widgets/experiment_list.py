@@ -758,7 +758,7 @@ class ExperimentListWidget(QWidget):
         features in the status bar, so every spot's fit quality is
         inspectable, not just the aggregate sigma_estimate in the status
         label. `accepted` (green border) mirrors the same filter
-        `calibrate_sigma_df`'s own `sigma_estimate` aggregate uses (see
+        `sigma_from_spots`'s own `sigma_estimate` aggregate uses (see
         `pipeline.calibration_accepted`) -- gray-bordered points didn't
         count towards it. Faces are transparent (border color only) so
         the boxes outline each fit window without occluding the

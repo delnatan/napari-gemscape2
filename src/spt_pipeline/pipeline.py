@@ -35,12 +35,13 @@ import numpy as np
 import polars as pl
 
 from sfwloc.report import (
-    calibrate_sigma_df,
     find_spots_df,
     find_spots_sparse_df,
     find_spots_stack_df,
+    fit_spots_sparse_df,
     link_tracks_df,
     recommended_gate_px,
+    sigma_from_spots,
 )
 from sfwloc.tracking_diagnostics import check_resolvability
 from spt_pipeline.io_formats import load_stack
@@ -69,9 +70,11 @@ DEFAULT_SOLVER_KWARGS = dict(
     glrt_lm_iter=30,
 )
 
-# Forwarded to sfwloc.report.calibrate_sigma_df (-> sfwloc_py's
-# calibrate_sigma_from_image) as **kwargs, alongside sigma_init -- these
-# mirror that binding's own defaults (rust/sfwloc-py/src/lib.rs).
+# Forwarded to sfwloc.report.fit_spots_sparse_df (-> sfwloc_py's
+# find_spots_sparse) as **kwargs, alongside sigma_init -- these mirror that
+# binding's own defaults (rust/sfwloc-py/src/lib.rs). Peak candidates come
+# from Aguet's per-pixel significance test (`truncate`/`alpha`) ANDed with
+# Laplacian-of-Gaussian local maxima, not a plain local-maxima threshold.
 DEFAULT_CALIBRATION_KWARGS = dict(
     box_size=11,
     sigma_lo=0.7,
@@ -79,10 +82,8 @@ DEFAULT_CALIBRATION_KWARGS = dict(
     delta_bound=1.5,
     amp_upper=1e6,
     bg_upper=1e4,
-    peak_threshold_rel=0.35,
-    peak_footprint=3,
-    peak_border=0,
-    peak_top_k=None,
+    truncate=4.0,
+    alpha=0.01,
     n_iter=30,
     mu0=1.0,
     mu_decrease=0.5,
@@ -92,10 +93,10 @@ DEFAULT_CALIBRATION_KWARGS = dict(
     gtol=1e-5,
 )
 
-# Forwarded to sfwloc.report.find_spots_sparse_df (-> calibrate_sigma_df ->
-# sfwloc_py's calibrate_sigma_from_image) as **kwargs -- the sparse/well-
-# separated algorithm's own knobs, same shape as DEFAULT_CALIBRATION_KWARGS
-# (same underlying fit) but tracked as a separate default since detect-time
+# Forwarded to sfwloc.report.find_spots_sparse_df (-> fit_spots_sparse_df ->
+# sfwloc_py's find_spots_sparse) as **kwargs -- the sparse/well-separated
+# algorithm's own knobs, same shape as DEFAULT_CALIBRATION_KWARGS (same
+# underlying fit) but tracked as a separate default since detect-time
 # tuning on a whole stack doesn't have to match the calibration-frame fit.
 DEFAULT_SPARSE_KWARGS = dict(DEFAULT_CALIBRATION_KWARGS)
 
@@ -110,7 +111,7 @@ class PipelineCancelled(Exception):
     `run_track_step`/`run_calibration_step`'s `cancel_event` argument).
     Cooperative cancellation only -- takes effect at the next frame (detect)
     or stage boundary (calibration/track), not instantly, since
-    `calibrate_sigma_df`/`link_tracks_df` are each one opaque Rust call with
+    `fit_spots_sparse_df`/`link_tracks_df` are each one opaque Rust call with
     no interruption point of their own. Propagates like any other exception
     through `napari.qt.threading`'s `errored` signal; the widget is
     responsible for telling this apart from a real error."""
@@ -222,9 +223,16 @@ def run_calibration_step(
     `frame_index` matters when the default frame isn't a good calibration
     reference -- e.g. sparser or better-focused elsewhere in the stack.
 
+    Peak candidates come from `fit_spots_sparse_df` (Aguet's per-pixel
+    significance test ANDed with Laplacian-of-Gaussian local maxima, then a
+    free-sigma/free-background bounded LM fit per spot), and the aggregate
+    sigma estimate is `sigma_from_spots`'s robust median/MAD over spots that
+    converged, passed the Laplace standard-error check, and didn't land at a
+    fit bound -- see `calibration_accepted`.
+
     `session.calib_points_df` gets the full per-spot fit table
-    (`calibrate_sigma_df`'s first return value: one row per candidate
-    peak, columns incl. `y`/`x`/`sigma`/`se_sigma`/`nll`/`converged`/
+    (`fit_spots_sparse_df`'s return value: one row per candidate peak,
+    columns incl. `y`/`x`/`sigma`/`se_sigma`/`nll`/`converged`/
     `laplace_ok`/`at_bound`) -- meant to be shown as a napari Points
     layer with `features=` set to it (see
     `widgets/experiment_list.py::_on_calibrate_finished`), so every
@@ -232,15 +240,22 @@ def run_calibration_step(
     aggregate `sigma_estimate`.
 
     `cancel_event`, if given, is only checked before this stage starts --
-    `calibrate_sigma_df` is one opaque Rust call with no interruption point
+    `fit_spots_sparse_df` is one opaque Rust call with no interruption point
     of its own, so a cancellation requested mid-fit still runs to completion
     (see `PipelineCancelled`'s docstring).
     """
     _check_cancelled(cancel_event)
     kwargs = dict(calibration_kwargs) if calibration_kwargs is not None else dict(DEFAULT_CALIBRATION_KWARGS)
-    calib_points_df, calib_summary = calibrate_sigma_df(session.image[frame_index], sigma_init=sigma_init, **kwargs)
-    session.sigma = calib_summary["sigma_estimate"]
-    session.calib_summary = calib_summary
+    calib_points_df = fit_spots_sparse_df(session.image[frame_index], sigma_init, **kwargs)
+    sigma_median, sigma_mad = sigma_from_spots(calib_points_df)
+    n_used = int(calibration_accepted(calib_points_df).sum())
+    session.sigma = sigma_median
+    session.calib_summary = {
+        "sigma_estimate": sigma_median,
+        "sigma_mad": sigma_mad,
+        "n_spots_used": n_used,
+        "n_spots_total": calib_points_df.height,
+    }
     session.calib_points_df = calib_points_df
     session.calibration_kwargs_used = kwargs
     session.calibration_frame_used = frame_index
@@ -250,7 +265,7 @@ def run_calibration_step(
 def calibration_accepted(calib_points_df: pl.DataFrame) -> pl.Series:
     """Per-spot boolean: did this calibration candidate count towards
     `calib_summary["sigma_estimate"]`? Mirrors the same `converged &
-    laplace_ok & !at_bound` filter `calibrate_sigma_df` applies internally
+    laplace_ok & !at_bound` filter `sigma_from_spots` applies internally
     -- kept here as the one place that rule is written, rather than
     re-derived wherever a caller (e.g. the calibration-spots preview
     layer) wants to show accepted vs. rejected spots."""
