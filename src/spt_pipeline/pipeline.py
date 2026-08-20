@@ -50,14 +50,22 @@ DEFAULT_SOLVER_KWARGS = dict(
     n_iter=200,
     fista_iter=20,
     n_refine=2,
+    source_refine_steps=5,
+    source_refine_step=1.0,
+    pos_bound=1.0,
     refine_iter=10,
+    amp_upper=1e5,
     varpro_fista_iter=50,
     prune_tol=1e-4,
     delta_dev_tol=1e-2,
     delta_dev_patience=3,
     delta_dev_min_iter=5,
     birth_test=True,
-    split_test=True,
+    split_test=False,
+    split_init_sep=0.75,
+    glrt_footprint_sigma=4.0,
+    glrt_alpha=1e-3,
+    glrt_lm_iter=30,
 )
 
 # Forwarded to sfwloc.report.calibrate_sigma_df (-> sfwloc_py's

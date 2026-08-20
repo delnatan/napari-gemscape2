@@ -69,9 +69,12 @@ from qtpy.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QListWidget,
+    QFrame,
     QListWidgetItem,
     QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSplitter,
     QStyle,
     QStyledItemDelegate,
     QStyleOptionViewItem,
@@ -267,6 +270,18 @@ class _ExperimentListView(QListWidget):
         else:
             event.ignore()
 
+    def dragMoveEvent(self, event) -> None:
+        # QAbstractItemView's own default dragMoveEvent re-validates every
+        # move tick against the model's canDropMimeData -- QListModel only
+        # understands its own internal "application/x-qabstractitemmodeldatalist"
+        # mime type, not an OS file drag's "text/uri-list", so without this
+        # override the drop indicator shows "forbidden" for the whole drag
+        # even though dragEnterEvent above already accepted it.
+        if event.mimeData().hasUrls():
+            event.accept()
+        else:
+            event.ignore()
+
     def dropEvent(self, event) -> None:
         folder = _dropped_folder(event)
         if folder is not None:
@@ -317,6 +332,21 @@ class ExperimentListWidget(QWidget):
         self._cancel_event: Optional[threading.Event] = None
         self._session: Optional[PipelineSession] = None
         self._session_item: Optional[ExperimentItem] = None
+        # True while a stepwise Calibrate/Detect/Track worker (as opposed to
+        # a batch run) is active against `self._session_item` -- guards
+        # `_on_selection_changed` so clicking a different row mid-run can't
+        # rug the viewer layers out from under it (Finding: napari's layer
+        # list going blank on a mid-detect selection change). Batch runs
+        # don't set this (they go through `_run_next` directly, not
+        # `_start_step_worker`) since they don't hold layers hostage the
+        # same way -- `_on_run_finished`/`_on_run_error` already only touch
+        # the viewer when the finishing item is still the current one.
+        self._step_running = False
+        # Re-entrancy guard for the `setCurrentItem` call `_on_selection_changed`
+        # makes to revert a blocked switch -- without it, that call's own
+        # `currentItemChanged` re-entry would run the "leaving this row"
+        # cleanup against the row we're refusing to leave.
+        self._reverting_selection = False
         self.setAcceptDrops(True)
 
         header = QLabel(_ExperimentListView.KEYBINDINGS)
@@ -345,18 +375,65 @@ class ExperimentListWidget(QWidget):
         self.params_panel.detectRequested.connect(self._run_detect_step)
         self.params_panel.detectCancelRequested.connect(self._cancel_active_run)
         self.params_panel.trackRequested.connect(self._run_track_step)
+        self.params_panel.newRoiRequested.connect(self._on_new_roi_requested)
 
         self.progress_label = QLabel("")
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
+        # Show actual counts, not just a bare percentage -- with the SFW
+        # solver itself not speedable, seeing "137/500" (via `_on_progress`
+        # driving the bar's range/value directly, frame-granular during
+        # detect) is the only progress signal available for a long run.
+        self.progress_bar.setFormat("%p%  (%v / %m)")
+
+        # The params panel's tabs (esp. with an "Expert settings" section
+        # expanded) want more vertical space than most dock heights
+        # comfortably offer -- nested plain QWidget/QVBoxLayouts propagate a
+        # child's full sizeHint up as their own *minimum* size, so without
+        # this, that requirement would climb all the way to the dock
+        # widget itself, capping how small it can ever be dragged (Finding:
+        # "can't really resize the widget's vertical size") and pushing the
+        # progress bar below the visible viewport on a shorter laptop
+        # screen with no way to bring it back. A QScrollArea breaks that
+        # chain -- it reports a small minimum size regardless of its
+        # content and scrolls internally instead, so only the tabs scroll
+        # when space is tight; the progress label/bar sit outside it (after
+        # it in `bottom_layout`) so they always get their own space rather
+        # than competing with the tabs for room.
+        params_scroll = QScrollArea()
+        params_scroll.setWidgetResizable(True)
+        params_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        params_scroll.setWidget(self.params_panel)
+
+        # The list and the params/progress area share a drag-resizable
+        # divider instead of a plain stacked QVBoxLayout -- the list already
+        # scrolls internally when it overflows its own height
+        # (_ExperimentListView is a plain QListWidget), so giving it less
+        # room costs nothing but visible rows. A fixed split would just
+        # trade one hidden thing for another depending on the dock's
+        # height; a splitter lets it be tuned per-session instead, and the
+        # bottom pane is pinned non-collapsible so the progress bar can
+        # never be dragged out of view entirely.
+        bottom = QWidget()
+        bottom_layout = QVBoxLayout(bottom)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_layout.addWidget(params_scroll, 1)
+        bottom_layout.addWidget(self.progress_label)
+        bottom_layout.addWidget(self.progress_bar)
+
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.addWidget(self.list_view)
+        splitter.addWidget(bottom)
+        splitter.setCollapsible(0, True)
+        splitter.setCollapsible(1, False)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 0)
+        splitter.setSizes([220, 360])
 
         layout = QVBoxLayout()
         layout.addWidget(header)
         layout.addLayout(button_row)
-        layout.addWidget(self.list_view)
-        layout.addWidget(self.params_panel)
-        layout.addWidget(self.progress_label)
-        layout.addWidget(self.progress_bar)
+        layout.addWidget(splitter)
         self.setLayout(layout)
         self._update_run_button_label()
 
@@ -377,7 +454,21 @@ class ExperimentListWidget(QWidget):
             self.list_view.load_folder(folder)
 
     def _on_selection_changed(self, current: Optional[ExperimentItem], _previous) -> None:
-        if current is None:
+        if current is None or self._reverting_selection:
+            return
+        if self._step_running and self._session_item is not None and current is not self._session_item:
+            # A calibrate/detect/track worker is still running against
+            # `self._session_item` -- switching away would otherwise wipe
+            # its viewer layers and orphan the worker's eventual result
+            # (see `_step_running`'s docstring). Snap the selection back
+            # rather than let that happen.
+            self._reverting_selection = True
+            self.list_view.setCurrentItem(self._session_item)
+            self._reverting_selection = False
+            self.progress_label.setText(
+                f"a run is in progress for {self._session_item.entry.image_path.name} "
+                "-- finishing before switching items"
+            )
             return
         if self._session_item is not None:
             # Leaving the row that held the in-progress session -- the
@@ -488,8 +579,17 @@ class ExperimentListWidget(QWidget):
 
     def _on_progress(self, done: int, total: int, stage: str) -> None:
         if total:
-            self.progress_bar.setValue(int(100 * done / total))
-        self.progress_label.setText(stage)
+            # Drive the bar's range/value with the real counts rather than
+            # a pre-computed percentage -- lets progress_bar's "%v / %m"
+            # format (set in __init__) show e.g. "137 / 500", the only
+            # concrete sense of how much is left on a long detect run that
+            # can't be sped up.
+            if self.progress_bar.maximum() != total:
+                self.progress_bar.setRange(0, total)
+            self.progress_bar.setValue(done)
+            self.progress_label.setText(f"{stage} -- {done}/{total}")
+        else:
+            self.progress_label.setText(stage)
 
     def _on_run_finished(self, item: ExperimentItem, result) -> None:
         points_df, tracks_df, manifest_extra = result
@@ -551,6 +651,24 @@ class ExperimentListWidget(QWidget):
         self._session_item = item
         return session
 
+    def _on_new_roi_requested(self) -> None:
+        """Add an empty Shapes layer for drawing the ROI, ready to draw on
+        immediately: 2D (`ndim=2`, fewer dims than an nD image stack) so a
+        shape drawn on it shows on every frame rather than only the one it
+        was drawn on -- the same trailing-`(y, x)`-only convention
+        `rois.roi_to_shapes_kwargs` uses when an ROI round-trips through
+        disk -- transparent fill so it doesn't occlude the image/points
+        underneath, and the polygon-lasso tool selected as the active mode
+        so the user can start drawing right away."""
+        layer = self.viewer.add_shapes(
+            ndim=2,
+            name="roi",
+            face_color="transparent",
+            edge_color="yellow",
+        )
+        self.viewer.layers.selection.active = layer
+        layer.mode = "add_polygon_lasso"
+
     def _build_roi_mask(self, shape: tuple[int, int]) -> tuple[np.ndarray, dict]:
         """Boolean `(H, W)` mask from the viewer's currently active Shapes
         layer -- the union of every shape drawn on it -- plus that layer's
@@ -570,6 +688,7 @@ class ExperimentListWidget(QWidget):
     ) -> None:
         if self._worker is not None:
             return
+        self._step_running = True
         self.progress_bar.setRange(0, 0 if indeterminate else 100)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
@@ -581,6 +700,7 @@ class ExperimentListWidget(QWidget):
     def _finish_step_worker(self) -> None:
         self._worker = None
         self._cancel_event = None
+        self._step_running = False
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setVisible(False)
         self.progress_label.setText("")
@@ -693,6 +813,12 @@ class ExperimentListWidget(QWidget):
         self.params_panel.set_detect_running(True, item.entry.image_path.name)
         emitter = _ProgressEmitter()
         emitter.updated.connect(self._on_progress)
+        # Also mirror frame-by-frame progress into the Detect tab's own
+        # status line -- that row (next to the Run/Cancel button) is what's
+        # actually in view while the user is watching a long detect run;
+        # the bottom progress bar can scroll out of sight on a short
+        # screen (see the params_scroll wiring in __init__).
+        emitter.updated.connect(self.params_panel.set_detect_progress)
         worker = _run_detect_worker(
             session,
             sigma,

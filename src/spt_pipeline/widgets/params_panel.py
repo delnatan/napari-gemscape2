@@ -32,10 +32,13 @@ pixels get analyzed, not how -- kept in its core section since these are
 exactly what make "explore one image incrementally" (this widget's whole
 point, vs. blindly running a batch job) practical: a frame-range pair
 (`get_frame_range`) and a "restrict to ROI" checkbox
-(`get_use_roi_mask`). This widget stays viewer-agnostic (no napari
-`Viewer` reference) -- it only reports *whether* the ROI checkbox is
-checked; `ExperimentListWidget` (which owns the viewer) is responsible
-for finding the active Shapes layer and turning it into the boolean mask
+(`get_use_roi_mask`), plus a "Draw ROI…" button (`newRoiRequested`) that
+just asks for a fresh Shapes layer to draw on -- this widget stays
+viewer-agnostic (no napari `Viewer` reference), so `ExperimentListWidget`
+(which owns the viewer) is responsible both for adding that layer
+(persistent/2D, transparent fill, polygon-lasso tool active -- see
+`_on_new_roi_requested`) and, once the ROI checkbox is checked, for
+finding the active Shapes layer and turning it into the boolean mask
 array `find_spots`'s `mask` argument expects.
 """
 
@@ -265,6 +268,7 @@ class _DetectTab(QWidget):
 
     runRequested = Signal()
     cancelRequested = Signal()
+    newRoiRequested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -332,6 +336,17 @@ class _DetectTab(QWidget):
             "active Shapes layer (find_spots's mask argument). Background/likelihood\n"
             "fitting still uses the whole frame. Draw a Shapes layer in napari first."
         )
+        self.new_roi_button = QPushButton("Draw ROI…")
+        self.new_roi_button.setToolTip(
+            "Add a new Shapes layer (transparent fill, polygon-lasso tool active)\n"
+            "for drawing the ROI -- 2D so it stays visible on every frame instead\n"
+            "of only the one it was drawn on."
+        )
+        roi_row = QHBoxLayout()
+        roi_row.setContentsMargins(0, 0, 0, 0)
+        roi_row.addWidget(self.use_roi_mask)
+        roi_row.addWidget(self.new_roi_button)
+        roi_row.addStretch()
 
         self.refine_lam = _dspin(
             d["refine_lam"], 0.0, 100.0, 0.01, decimals=4,
@@ -367,6 +382,41 @@ class _DetectTab(QWidget):
             d["delta_dev_min_iter"], 0, 100,
             tooltip="Minimum outer iterations before the deviance-plateau stop can fire.",
         )
+        self.source_refine_steps = _ispin(
+            d["source_refine_steps"], 0, 200,
+            tooltip="Gradient-descent steps for continuous source selection (warm start\n"
+            "before the birth test's own local fit takes over).",
+        )
+        self.source_refine_step = _dspin(
+            d["source_refine_step"], 1e-4, 100.0, 0.1, decimals=4,
+            tooltip="Initial step size for the source-selection search.",
+        )
+        self.pos_bound = _dspin(
+            d["pos_bound"], 0.01, 50.0, 0.1, decimals=3,
+            tooltip="Position box half-width (px) for the joint amplitude+position refiner.",
+        )
+        self.amp_upper = _dspin(
+            d["amp_upper"], 1.0, 1e9, 100.0, decimals=1,
+            tooltip="Amplitude upper bound used by the joint refiner.",
+        )
+        self.split_init_sep = _dspin(
+            d["split_init_sep"], 0.01, 10.0, 0.05, decimals=3,
+            tooltip="Initial per-side child separation for the K=2 split hypothesis,\n"
+            "in units of sigma.",
+        )
+        self.glrt_footprint_sigma = _dspin(
+            d["glrt_footprint_sigma"], 0.5, 50.0, 0.5, decimals=2,
+            tooltip="Local patch half-width for the birth/split GLRTs, in units of sigma.",
+        )
+        self.glrt_alpha = _dspin(
+            d["glrt_alpha"], 1e-9, 1.0, 1e-4, decimals=9,
+            tooltip="Nominal significance level (chi-squared df=3) for the birth/split\n"
+            "GLRTs.",
+        )
+        self.glrt_lm_iter = _ispin(
+            d["glrt_lm_iter"], 1, 500,
+            tooltip="LM iterations for each local birth/split GLRT fit.",
+        )
 
         expert_form = QFormLayout()
         expert_form.setContentsMargins(0, 0, 0, 0)
@@ -379,9 +429,18 @@ class _DetectTab(QWidget):
         expert_form.addRow("delta_dev_tol", self.delta_dev_tol)
         expert_form.addRow("delta_dev_patience", self.delta_dev_patience)
         expert_form.addRow("delta_dev_min_iter", self.delta_dev_min_iter)
+        expert_form.addRow("source_refine_steps", self.source_refine_steps)
+        expert_form.addRow("source_refine_step", self.source_refine_step)
+        expert_form.addRow("pos_bound (px)", self.pos_bound)
+        expert_form.addRow("amp_upper", self.amp_upper)
+        expert_form.addRow("split_init_sep", self.split_init_sep)
+        expert_form.addRow("glrt_footprint_sigma", self.glrt_footprint_sigma)
+        expert_form.addRow("glrt_alpha", self.glrt_alpha)
+        expert_form.addRow("glrt_lm_iter", self.glrt_lm_iter)
 
         self.run_button, self.status_label, run_row = _run_row("Run detect")
         self.run_button.clicked.connect(self._on_run_button_clicked)
+        self.new_roi_button.clicked.connect(self.newRoiRequested)
 
         layout = QVBoxLayout()
         layout.setContentsMargins(4, 4, 4, 4)
@@ -389,7 +448,7 @@ class _DetectTab(QWidget):
         layout.addLayout(core_form)
         layout.addLayout(toggle_row)
         layout.addLayout(frame_row)
-        layout.addWidget(self.use_roi_mask)
+        layout.addLayout(roi_row)
         layout.addWidget(_expert_section(expert_form))
         layout.addLayout(run_row)
         layout.addStretch()
@@ -417,6 +476,13 @@ class _DetectTab(QWidget):
 
     def set_status(self, text: str) -> None:
         self.status_label.setText(text)
+
+    def set_progress(self, done: int, total: int, stage: str) -> None:
+        """Live frame-by-frame progress while a detect run is active --
+        shown right next to the Run/Cancel button, since the SFW solver
+        itself can't be sped up and this row stays in view even when the
+        dock's own progress bar has scrolled out of sight."""
+        self.status_label.setText(f"{stage} -- {done}/{total}" if total else stage)
 
     def set_frame_bounds(self, n_frames: int) -> None:
         """Called once an image's frame count is known -- clamps the
@@ -458,8 +524,16 @@ class _DetectTab(QWidget):
             delta_dev_tol=self.delta_dev_tol.value(),
             delta_dev_patience=self.delta_dev_patience.value(),
             delta_dev_min_iter=self.delta_dev_min_iter.value(),
+            source_refine_steps=self.source_refine_steps.value(),
+            source_refine_step=self.source_refine_step.value(),
+            pos_bound=self.pos_bound.value(),
+            amp_upper=self.amp_upper.value(),
             birth_test=self.birth_test.isChecked(),
             split_test=self.split_test.isChecked(),
+            split_init_sep=self.split_init_sep.value(),
+            glrt_footprint_sigma=self.glrt_footprint_sigma.value(),
+            glrt_alpha=self.glrt_alpha.value(),
+            glrt_lm_iter=self.glrt_lm_iter.value(),
         )
         return kwargs
 
@@ -515,6 +589,7 @@ class PipelineParamsWidget(QWidget):
     detectRequested = Signal()
     detectCancelRequested = Signal()
     trackRequested = Signal()
+    newRoiRequested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -525,6 +600,7 @@ class PipelineParamsWidget(QWidget):
         self._calibration.runRequested.connect(self.calibrateRequested)
         self._detect.runRequested.connect(self.detectRequested)
         self._detect.cancelRequested.connect(self.detectCancelRequested)
+        self._detect.newRoiRequested.connect(self.newRoiRequested)
         self._tracking.runRequested.connect(self.trackRequested)
 
         tabs = QTabWidget()
@@ -577,6 +653,9 @@ class PipelineParamsWidget(QWidget):
 
     def set_detect_status(self, text: str) -> None:
         self._detect.set_status(text)
+
+    def set_detect_progress(self, done: int, total: int, stage: str) -> None:
+        self._detect.set_progress(done, total, stage)
 
     def set_detect_running(self, running: bool, label: str = "") -> None:
         self._detect.set_running(running, label)
