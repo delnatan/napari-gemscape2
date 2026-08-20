@@ -265,9 +265,14 @@ def run_detect_step(
     lets a single image be explored incrementally (a quick look at a few
     frames) rather than always committing to the whole stack. `end <= 0`
     (or the whole tuple `None`) means through the real last frame --
-    see `_resolve_frame_range`. The resulting `points_df`'s `frame` column
-    still holds true stack indices (`start`..`end-1`), not a re-based 0..n
-    range.
+    see `_resolve_frame_range`. The resolved `(start, end)` is forwarded
+    to `find_spots_stack_df`'s own `frame_range` on the non-progress path
+    below (it slices `session.image` itself and returns true stack
+    indices in `frame` directly -- this function doesn't need to slice or
+    rebase that itself anymore); on the frame-by-frame path, `range(start,
+    end)` is walked directly, so `frame` comes out the same way. Either
+    way, the resulting `points_df`'s `frame` column holds true stack
+    indices (`start`..`end-1`), not a re-based 0..n range.
 
     `mask`, if given, is a full-frame `(H, W)` boolean array restricting
     where `find_spots` may place new spikes (see
@@ -322,9 +327,9 @@ def run_detect_step(
             progress_callback(done, n, "finding spots")
         points_df = pl.concat(frames)
     else:
-        points_df = find_spots_stack_df(session.image[start:end], sigma, session.bg[start:end], mask=mask, **kwargs)
-        if start != 0:
-            points_df = points_df.with_columns((pl.col("frame") + start).alias("frame"))
+        points_df = find_spots_stack_df(
+            session.image, sigma, session.bg, mask=mask, frame_range=(start, end), **kwargs
+        )
 
     session.sigma = sigma
     session.points_df = points_df
