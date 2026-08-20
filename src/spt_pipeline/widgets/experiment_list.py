@@ -102,7 +102,7 @@ from spt_pipeline.pipeline import (
     session_manifest_extra,
 )
 from spt_pipeline.rois import shapes_layer_to_roi
-from spt_pipeline.viewer import add_experiment_layers
+from spt_pipeline.viewer import DETECTED_POINTS_STYLE, add_experiment_layers
 from spt_pipeline.widgets.params_panel import PipelineParamsWidget
 
 
@@ -723,10 +723,12 @@ class ExperimentListWidget(QWidget):
         if session.points_df is not None:
             if "points (preview)" in self.viewer.layers:
                 del self.viewer.layers["points (preview)"]
+            features = {col: session.points_df[col].to_numpy() for col in session.points_df.columns}
             self.viewer.add_points(
                 session.points_df.select(["frame", "y", "x"]).to_numpy(),
                 name="points (preview)",
-                size=4,
+                features=features,
+                **DETECTED_POINTS_STYLE,
             )
         self._finish_step_worker()
 

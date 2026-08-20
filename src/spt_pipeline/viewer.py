@@ -8,6 +8,20 @@ from spt_pipeline.experiment import load_experiment
 from spt_pipeline.pipeline import load_stack
 from spt_pipeline.rois import roi_to_shapes_kwargs
 
+# Shared look for every "detected spot" Points layer (the final "points"
+# layer here, and experiment_list.py's stepwise "points (preview)") --
+# transparent face so overlapping markers don't occlude each other or the
+# underlying image, magenta border since it's a hue absent from both
+# viridis and gray (this app's two expected image colormaps), so markers
+# stay visible regardless of which one the image layer is using.
+DETECTED_POINTS_STYLE = dict(
+    symbol="disc",
+    size=7,
+    face_color="transparent",
+    border_color="magenta",
+    border_width=0.15,
+)
+
 
 def add_experiment_layers(viewer, experiment_dir: str | Path) -> None:
     """Clear `viewer` and add the image/points/tracks/ROI layers for one
@@ -30,9 +44,8 @@ def add_experiment_layers(viewer, experiment_dir: str | Path) -> None:
         viewer.add_points(
             points,
             name="points",
-            size=4,
-            symbol="ring",
             features=features,
+            **DETECTED_POINTS_STYLE,
         )
 
     if tracks_df.height > 0 and "track_id" in tracks_df.columns:
