@@ -18,10 +18,11 @@ Detect tab's frame-range/ROI scope controls) lives in
 `widgets/params_panel.py::PipelineParamsWidget`, which stays viewer-
 agnostic; this module is what actually resolves the ROI checkbox into a
 boolean mask array, by reading the active napari Shapes layer
-(`_build_roi_mask`) -- `find_spots` only accepts a mask on its
-single-frame path, so a mask forces `run_detect_step` onto the
-frame-by-frame loop regardless of whether progress is also being
-reported (see `pipeline.run_detect_step`'s docstring).
+(`_build_roi_mask`). This widget always runs `run_detect_step` with a
+`progress_callback` (for the live frame-count/cancel UI), which is what
+actually puts it on `run_detect_step`'s frame-by-frame path -- not the
+mask itself, which `find_spots_stack_df` accepts directly (see
+`pipeline.run_detect_step`'s docstring).
 
 Drag-and-drop accepts a dropped folder anywhere on this dock widget (not
 just precisely on the list rows) -- both `_ExperimentListView` and the

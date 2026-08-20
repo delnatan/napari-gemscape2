@@ -272,23 +272,30 @@ def run_detect_step(
     `mask`, if given, is a full-frame `(H, W)` boolean array restricting
     where `find_spots` may place new spikes (see
     `sfwloc_py.find_spots`'s docstring) -- typically built from a napari
-    Shapes layer (`widgets/experiment_list.py`'s ROI handling). Only
-    `find_spots` (the single-frame binding) accepts a mask, not the
-    batched `find_spots_stack`, so a mask forces the frame-by-frame path
-    below regardless of whether `progress_callback` is given.
+    Shapes layer (`widgets/experiment_list.py`'s ROI handling). `find_spots_
+    stack_df` itself now accepts `mask` (falling back to its own per-frame
+    Python loop internally, same as below, since the Rust rayon-parallel
+    `find_spots_stack` binding it normally calls has no mask support of its
+    own -- see that function's docstring) -- so `mask` alone no longer
+    forces this function onto its own frame-by-frame path; only
+    `progress_callback` does, since neither `find_spots_stack_df` nor
+    `sfwloc_py.find_spots_stack` has any per-frame checkpoint of their own
+    to report through.
 
-    Frame-by-frame (reporting progress each frame, if `progress_callback`
-    is given) is otherwise only used when explicitly requested via
-    `progress_callback` -- the same tradeoff `track_beads_timelapse.py`
-    makes for an interactively-watched run vs. the faster rayon-parallel
-    `find_spots_stack_df`.
+    Frame-by-frame (reporting progress each frame, checking `cancel_event`
+    each frame) is used only when `progress_callback` is given -- the same
+    tradeoff `track_beads_timelapse.py` makes for an interactively-watched
+    run vs. the faster rayon-parallel `find_spots_stack_df`. Without a
+    `progress_callback`, `mask` is simply forwarded to `find_spots_stack_df`
+    -- masked or not, that's a single call, so this function doesn't need
+    to reimplement its own masked-loop fallback.
 
     `cancel_event`, if given, is checked before this stage starts and --
     only on the frame-by-frame path -- again before each frame, so a
     cancellation lands within one frame rather than only between stages
-    (see `PipelineCancelled`'s docstring). The batched `find_spots_stack_df`
-    path has no per-frame checkpoint of its own, so on that path a
-    cancellation still only takes effect before this stage starts.
+    (see `PipelineCancelled`'s docstring). The `find_spots_stack_df` path
+    (masked or not) has no per-frame checkpoint of its own, so on that path
+    a cancellation still only takes effect before this stage starts.
     """
     _check_cancelled(cancel_event)
     if sigma is None:
@@ -303,7 +310,7 @@ def run_detect_step(
     if end <= start:
         raise ValueError(f"empty frame_range: start={start} >= end={end}")
 
-    if mask is not None or progress_callback is not None:
+    if progress_callback is not None:
         frame_indices = range(start, end)
         n = len(frame_indices)
         frames = []
@@ -312,11 +319,10 @@ def run_detect_step(
             frames.append(
                 find_spots_df(session.image[i], sigma, session.bg[i], frame_idx=i, mask=mask, **kwargs)
             )
-            if progress_callback is not None:
-                progress_callback(done, n, "finding spots")
+            progress_callback(done, n, "finding spots")
         points_df = pl.concat(frames)
     else:
-        points_df = find_spots_stack_df(session.image[start:end], sigma, session.bg[start:end], **kwargs)
+        points_df = find_spots_stack_df(session.image[start:end], sigma, session.bg[start:end], mask=mask, **kwargs)
         if start != 0:
             points_df = points_df.with_columns((pl.col("frame") + start).alias("frame"))
 
