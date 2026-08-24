@@ -542,6 +542,7 @@ def run_track_step(
         "n_bootstrap_links": n_links,
         "final_gate_px": final_gate_px,
         "density_um2": density_um2,
+        "resolvability_verdict": resolvability["verdict"],
         "resolvability_message": resolvability["message"],
     }
     return session
@@ -564,6 +565,7 @@ def session_manifest_extra(session: PipelineSession) -> dict:
         "bootstrap_gate_px": session.bootstrap_gate_px_used,
         "final_gate_px": ts.get("final_gate_px"),
         "density_um2": ts.get("density_um2"),
+        "resolvability_verdict": ts.get("resolvability_verdict"),
         "resolvability_message": ts.get("resolvability_message"),
         "n_points": session.points_df.height if session.points_df is not None else 0,
         "n_tracks": session.tracks_df["track_id"].n_unique() if session.tracks_df is not None and session.tracks_df.height else 0,

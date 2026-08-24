@@ -58,6 +58,7 @@ from qtpy.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -75,6 +76,36 @@ from spt_pipeline.pipeline import (
     DEFAULT_SPARSE_KWARGS,
     DetectTrackParams,
 )
+
+
+# Shared status-label color language, echoing ExperimentItemDelegate's
+# STATUS_COLORS palette (widgets/experiment_list.py) so a green/amber/red
+# result reads the same way whether it's a status dot in the list or a
+# stage's own status line here -- kept as a separate copy rather than an
+# import to avoid this module depending on that one (params_panel stays
+# viewer/list-agnostic, see this module's docstring).
+_STATUS_LEVEL_COLORS = {
+    "neutral": "#9a9a9a",
+    "ok": "#22c55e",
+    "caution": "#f59e0b",
+    "error": "#ef4444",
+}
+
+
+def _style_status_label(label: QLabel, level: str = "neutral") -> None:
+    color = _STATUS_LEVEL_COLORS.get(level, _STATUS_LEVEL_COLORS["neutral"])
+    label.setStyleSheet(f"color: {color}; font-size: 11px;")
+
+
+def _hline() -> QFrame:
+    """A thin horizontal rule for separating a tab's logical sections
+    (core knobs / toggles / scope controls / run row) -- these tabs pack
+    several unrelated knob groups into one flat QVBoxLayout, and a rule
+    reads faster than spacing alone once "Expert settings" is expanded."""
+    line = QFrame()
+    line.setFrameShape(QFrame.Shape.HLine)
+    line.setFrameShadow(QFrame.Shadow.Sunken)
+    return line
 
 
 def _dspin(value: float, minimum: float, maximum: float, step: float, decimals: int, tooltip: str) -> QDoubleSpinBox:
@@ -108,7 +139,7 @@ def _run_row(button_text: str) -> tuple[QPushButton, QLabel, QHBoxLayout]:
     """A "Run <stage>" button + a status label sharing one row."""
     button = QPushButton(button_text)
     status = QLabel("")
-    status.setStyleSheet("color: gray; font-size: 11px;")
+    _style_status_label(status)
     status.setWordWrap(True)
     row = QHBoxLayout()
     row.setContentsMargins(0, 0, 0, 0)
@@ -269,12 +300,15 @@ class _CalibrationTab(QWidget):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
         layout.addLayout(core_form)
+        layout.addWidget(_hline())
         layout.addWidget(self._fit_fields)
+        layout.addWidget(_hline())
         layout.addLayout(run_row)
         layout.addStretch()
         self.setLayout(layout)
 
-    def set_status(self, text: str) -> None:
+    def set_status(self, text: str, level: str = "neutral") -> None:
+        _style_status_label(self.status_label, level)
         self.status_label.setText(text)
 
     def set_frame_bounds(self, n_frames: int) -> None:
@@ -540,8 +574,10 @@ class _DetectTab(QWidget):
         layout.setSpacing(4)
         layout.addLayout(algorithm_row)
         layout.addWidget(self._algorithm_stack)
+        layout.addWidget(_hline())
         layout.addLayout(frame_row)
         layout.addLayout(roi_row)
+        layout.addWidget(_hline())
         layout.addLayout(run_row)
         layout.addStretch()
         self.setLayout(layout)
@@ -568,8 +604,14 @@ class _DetectTab(QWidget):
         self._running = running
         self.run_button.setText("Run detect" if not running else "Cancel")
         self.run_button.setEnabled(True)
+        if running:
+            # A previous run may have left this label green/amber/red
+            # (set_status's level) -- reset to neutral so in-flight
+            # progress text doesn't read as a stale result.
+            _style_status_label(self.status_label)
 
-    def set_status(self, text: str) -> None:
+    def set_status(self, text: str, level: str = "neutral") -> None:
+        _style_status_label(self.status_label, level)
         self.status_label.setText(text)
 
     def set_progress(self, done: int, total: int, stage: str) -> None:
@@ -668,11 +710,13 @@ class _TrackingTab(QWidget):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
         layout.addLayout(form)
+        layout.addWidget(_hline())
         layout.addLayout(run_row)
         layout.addStretch()
         self.setLayout(layout)
 
-    def set_status(self, text: str) -> None:
+    def set_status(self, text: str, level: str = "neutral") -> None:
+        _style_status_label(self.status_label, level)
         self.status_label.setText(text)
 
     def get_bootstrap_gate_px(self) -> float:
@@ -760,11 +804,11 @@ class PipelineParamsWidget(QWidget):
         self._calibration.set_frame_bounds(n_frames)
         self._detect.set_frame_bounds(n_frames)
 
-    def set_calibration_status(self, text: str) -> None:
-        self._calibration.set_status(text)
+    def set_calibration_status(self, text: str, level: str = "neutral") -> None:
+        self._calibration.set_status(text, level)
 
-    def set_detect_status(self, text: str) -> None:
-        self._detect.set_status(text)
+    def set_detect_status(self, text: str, level: str = "neutral") -> None:
+        self._detect.set_status(text, level)
 
     def set_detect_progress(self, done: int, total: int, stage: str) -> None:
         self._detect.set_progress(done, total, stage)
@@ -772,5 +816,5 @@ class PipelineParamsWidget(QWidget):
     def set_detect_running(self, running: bool) -> None:
         self._detect.set_running(running)
 
-    def set_track_status(self, text: str) -> None:
-        self._tracking.set_status(text)
+    def set_track_status(self, text: str, level: str = "neutral") -> None:
+        self._tracking.set_status(text, level)

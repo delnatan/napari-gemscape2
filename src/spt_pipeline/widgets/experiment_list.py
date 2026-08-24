@@ -741,7 +741,7 @@ class ExperimentListWidget(QWidget):
         try:
             session = self._ensure_session(item)
         except Exception as exc:
-            self.params_panel.set_calibration_status(f"error: {exc}")
+            self.params_panel.set_calibration_status(f"error: {exc}", level="error")
             return
         self.params_panel.set_frame_bounds(session.image.shape[0])
         self.progress_label.setText(f"Calibrating: {item.entry.image_path.name}")
@@ -766,9 +766,16 @@ class ExperimentListWidget(QWidget):
         item.entry.has_unsaved_session = True
         self.list_view.viewport().update()
         summary = session.calib_summary or {}
+        n_used = summary.get("n_spots_used", 0)
+        n_total = summary.get("n_spots_total", 0)
+        if n_used == 0:
+            level = "error"
+        elif n_total and n_used < n_total * 0.5:
+            level = "caution"
+        else:
+            level = "ok"
         self.params_panel.set_calibration_status(
-            f"sigma = {session.sigma:.3f} px  "
-            f"(n={summary.get('n_spots_used', 0)}/{summary.get('n_spots_total', 0)} spots)"
+            f"sigma = {session.sigma:.3f} px  (n={n_used}/{n_total} spots)", level=level
         )
         self._add_calibration_layer(session)
         self._finish_step_worker()
@@ -818,7 +825,7 @@ class ExperimentListWidget(QWidget):
         try:
             session = self._ensure_session(item)
         except Exception as exc:
-            self.params_panel.set_detect_status(f"error: {exc}")
+            self.params_panel.set_detect_status(f"error: {exc}", level="error")
             return
         self.params_panel.set_frame_bounds(session.image.shape[0])
 
@@ -828,7 +835,7 @@ class ExperimentListWidget(QWidget):
             try:
                 mask, roi = self._build_roi_mask(session.image.shape[1:])
             except Exception as exc:
-                self.params_panel.set_detect_status(f"error: {exc}")
+                self.params_panel.set_detect_status(f"error: {exc}", level="error")
                 return
             session.roi = [roi]
 
@@ -871,7 +878,10 @@ class ExperimentListWidget(QWidget):
         self.list_view.viewport().update()
         n_points = session.points_df.height if session.points_df is not None else 0
         start, end = session.frame_range_used or (0, session.image.shape[0])
-        self.params_panel.set_detect_status(f"{n_points} points across frames {start}-{end - 1}")
+        self.params_panel.set_detect_status(
+            f"{n_points} points across frames {start}-{end - 1}",
+            level="error" if n_points == 0 else "ok",
+        )
 
         if session.points_df is not None:
             if "points (preview)" in self.viewer.layers:
@@ -890,7 +900,7 @@ class ExperimentListWidget(QWidget):
         if isinstance(exc, PipelineCancelled):
             self.params_panel.set_detect_status("cancelled")
         else:
-            self.params_panel.set_detect_status(f"error: {exc}")
+            self.params_panel.set_detect_status(f"error: {exc}", level="error")
         self._finish_step_worker()
 
     def _run_track_step(self) -> None:
@@ -899,7 +909,7 @@ class ExperimentListWidget(QWidget):
             return
         session = self._session if self._session_item is item else None
         if session is None or session.points_df is None:
-            self.params_panel.set_track_status("error: run detect first")
+            self.params_panel.set_track_status("error: run detect first", level="error")
             return
         self.progress_label.setText(f"Linking: {item.entry.image_path.name}")
         emitter = _ProgressEmitter()
@@ -916,8 +926,12 @@ class ExperimentListWidget(QWidget):
         n_tracks = (
             session.tracks_df["track_id"].n_unique() if session.tracks_df is not None and session.tracks_df.height else 0
         )
+        verdict = summary.get("resolvability_verdict", "ok")
+        level = {"ok": "ok", "caution": "caution", "unresolvable": "error"}.get(verdict, "neutral")
+        message = summary.get("resolvability_message", "")
         self.params_panel.set_track_status(
-            f"{n_tracks} tracks  D~{summary.get('D_est_um2_s', 0.0):.4f} um^2/s"
+            f"{n_tracks} tracks  D~{summary.get('D_est_um2_s', 0.0):.4f} um^2/s\n{message}",
+            level=level,
         )
 
         entry = item.entry
