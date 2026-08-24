@@ -58,7 +58,6 @@ from qtpy.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
-    QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -76,36 +75,8 @@ from spt_pipeline.pipeline import (
     DEFAULT_SPARSE_KWARGS,
     DetectTrackParams,
 )
-
-
-# Shared status-label color language, echoing ExperimentItemDelegate's
-# STATUS_COLORS palette (widgets/experiment_list.py) so a green/amber/red
-# result reads the same way whether it's a status dot in the list or a
-# stage's own status line here -- kept as a separate copy rather than an
-# import to avoid this module depending on that one (params_panel stays
-# viewer/list-agnostic, see this module's docstring).
-_STATUS_LEVEL_COLORS = {
-    "neutral": "#9a9a9a",
-    "ok": "#22c55e",
-    "caution": "#f59e0b",
-    "error": "#ef4444",
-}
-
-
-def _style_status_label(label: QLabel, level: str = "neutral") -> None:
-    color = _STATUS_LEVEL_COLORS.get(level, _STATUS_LEVEL_COLORS["neutral"])
-    label.setStyleSheet(f"color: {color}; font-size: 11px;")
-
-
-def _hline() -> QFrame:
-    """A thin horizontal rule for separating a tab's logical sections
-    (core knobs / toggles / scope controls / run row) -- these tabs pack
-    several unrelated knob groups into one flat QVBoxLayout, and a rule
-    reads faster than spacing alone once "Expert settings" is expanded."""
-    line = QFrame()
-    line.setFrameShape(QFrame.Shape.HLine)
-    line.setFrameShadow(QFrame.Shadow.Sunken)
-    return line
+from spt_pipeline.widgets.qt_helpers import hline as _hline
+from spt_pipeline.widgets.qt_helpers import style_status_label as _style_status_label
 
 
 def _dspin(value: float, minimum: float, maximum: float, step: float, decimals: int, tooltip: str) -> QDoubleSpinBox:
