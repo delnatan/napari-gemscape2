@@ -55,7 +55,18 @@ DEFAULT_SOLVER_KWARGS = dict(
     source_refine_steps=5,
     source_refine_step=1.0,
     pos_bound=1.0,
-    refine_iter=10,
+    # VarPro's outer L-BFGS-B position-refine cap. 10 was pure headroom on
+    # dense real data: it converges well within 7 steps (gtol/ftol) almost
+    # every call, so the extra iterations were being paid for and not used.
+    # Measured on beads_dense_frame184.tif (real confocal, densely packed):
+    # 7 vs 10 is ~25% faster wall time, both full-frame (183->182 spikes,
+    # final deviance +0.4%) and on a 128x128 ROI (157->157 spikes, deviance
+    # +0.02%) -- refine_iter is the dominant cost lever once a field is
+    # crowded (birth-loop cost scales with spike count K, not just H*W);
+    # varpro_fista_iter/fista_iter/source_refine_steps showed no measurable
+    # effect in the same sweep, since they're already converging via their
+    # own tolerances well before hitting their caps.
+    refine_iter=7,
     amp_upper=1e5,
     varpro_fista_iter=50,
     prune_tol=1e-4,
