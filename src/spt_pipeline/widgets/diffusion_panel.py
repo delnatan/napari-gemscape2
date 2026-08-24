@@ -19,13 +19,18 @@ signals:
   there already, aligned with track_id -- see `viewer.py`; the "points"
   layer itself has no track_id, it's the pre-linking detections table),
   with a `matplotlib.widgets.SpanSelector` on each histogram
-  to set a numeric range filter; filters AND together into a "tracks with
-  no point outside any active range" subset the other tabs can restrict
-  to.
+  to set a numeric range filter; filters AND together (with the Track
+  Explorer's min-track-length filter -- `combined_filtered_track_ids`)
+  into a "tracks that pass every active filter" subset that immediately
+  reshapes what the Track Explorer table shows, and that Classical/
+  Bayesian fit runs can optionally restrict to (a per-tab checkbox).
 - **Track Explorer** -- one row per track (`qt_helpers.DataFrameTableModel`
   in a `QTableView`), the single place all per-track numbers now live
   (classical MSD, bulk MAP, and any one-off per-track fit, each in its
-  own column group) instead of a `QLabel` text dump. Selecting a row is
+  own column group) instead of a `QLabel` text dump, plus its own
+  always-visible `min_track_length` filter (the direct complement to
+  Data Explorer's range filters, which need a histogram opened first).
+  Selecting a row is
   "the current track" for the Bayesian tab's per-track action, and is
   kept in sync with the viewer both ways: clicking a track in the Tracks
   layer selects its row here (napari's own `TrackManager.get_value` --
@@ -230,6 +235,7 @@ class _DataExplorerTab(QWidget):
         def _on_select(vmin: float, vmax: float, _column=column) -> None:
             self._filters[_column] = (vmin, vmax)
             self._update_filter_label()
+            self.host.on_filters_changed()
 
         self._span_selector = SpanSelector(
             ax, _on_select, "horizontal", useblit=True, props=dict(alpha=0.3, facecolor="crimson")
@@ -238,6 +244,7 @@ class _DataExplorerTab(QWidget):
     def _clear_filters(self) -> None:
         self._filters = {}
         self._update_filter_label()
+        self.host.on_filters_changed()
 
     def _update_filter_label(self) -> None:
         if not self._filters:
@@ -269,10 +276,28 @@ class _DataExplorerTab(QWidget):
 
 
 class _TrackExplorerTab(QWidget):
+    """The Track Explorer table is filtered live by two independent
+    controls that AND together (see `DiffusionAnalysisWidget.
+    combined_filtered_track_ids`): this tab's own `min_track_length`
+    spinbox (a direct, always-visible track-level filter -- the
+    complement to `_DataExplorerTab`'s per-point-quality range filters,
+    which need a histogram opened first). Both immediately reshape what's
+    shown here, not just what a fit run is optionally restricted to."""
+
     def __init__(self, host: "DiffusionAnalysisWidget") -> None:
         super().__init__()
         self.host = host
         self._suppress_selection_signal = False
+
+        self._min_track_length = QSpinBox()
+        self._min_track_length.setRange(1, 10_000)
+        self._min_track_length.setValue(1)
+        self._min_track_length.setToolTip("Hide tracks shorter than this (1 = show everything).")
+        self._min_track_length.valueChanged.connect(lambda _v: self.host.on_filters_changed())
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("min track length:"))
+        filter_row.addWidget(self._min_track_length)
+        filter_row.addStretch()
 
         self._model = DataFrameTableModel()
         self.table = QTableView()
@@ -283,10 +308,17 @@ class _TrackExplorerTab(QWidget):
         self.table.selectionModel().selectionChanged.connect(self._on_selection_changed)
 
         layout = QVBoxLayout()
+        layout.addLayout(filter_row)
         layout.addWidget(self.table)
         self.setLayout(layout)
 
+    def min_track_length(self) -> int:
+        return self._min_track_length.value()
+
     def reset(self) -> None:
+        self._min_track_length.blockSignals(True)
+        self._min_track_length.setValue(1)
+        self._min_track_length.blockSignals(False)
         self._model.setDataFrame(pl.DataFrame())
 
     def set_dataframe(self, df: pl.DataFrame) -> None:
@@ -631,12 +663,30 @@ class DiffusionAnalysisWidget(QWidget):
             return None
         return self._diffkit_tracks.filter(pl.col("track_id") == track_id)
 
+    def combined_filtered_track_ids(self) -> Optional[set]:
+        """The Data Explorer's per-point-quality range filters ANDed with
+        the Track Explorer's min-track-length filter -- `None` means "no
+        restriction from either source". This is both what the Track
+        Explorer table displays (`_rebuild_track_table`) and what a fit
+        run optionally restricts to (`diffkit_tracks_for_fit`)."""
+        ids = self._data_explorer.filtered_track_ids()
+        min_len = self._track_explorer.min_track_length()
+        if min_len > 1 and self._base_track_df is not None:
+            length_ids = set(
+                self._base_track_df.filter(pl.col("track_length") >= min_len)["track_id"].to_list()
+            )
+            ids = length_ids if ids is None else (ids & length_ids)
+        return ids
+
+    def on_filters_changed(self) -> None:
+        self._rebuild_track_table()
+
     def diffkit_tracks_for_fit(self, restrict_to_filtered: bool) -> Optional[pl.DataFrame]:
         if self._diffkit_tracks is None:
             return None
         if not restrict_to_filtered:
             return self._diffkit_tracks
-        ids = self._data_explorer.filtered_track_ids()
+        ids = self.combined_filtered_track_ids()
         if ids is None:
             return self._diffkit_tracks
         return self._diffkit_tracks.filter(pl.col("track_id").is_in(list(ids)))
@@ -837,6 +887,10 @@ class DiffusionAnalysisWidget(QWidget):
                 .rename({"model": "track_fit_model", "method": "track_fit_method"})
             )
             df = df.join(fit_df, on="track_id", how="left")
+
+        ids = self.combined_filtered_track_ids()
+        if ids is not None:
+            df = df.filter(pl.col("track_id").is_in(list(ids)))
         self._track_explorer.set_dataframe(df)
 
     def set_classical_results(self, full_df: pl.DataFrame, display_df: Optional[pl.DataFrame]) -> None:
