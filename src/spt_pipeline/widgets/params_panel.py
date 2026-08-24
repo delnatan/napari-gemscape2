@@ -11,9 +11,9 @@ module docstring: calibrate sigma -> find_spots -> bootstrap/final link):
   `find_spots_sparse_df` per-spot free-sigma LM fit (lighter/faster, only
   valid for genuinely well-separated fields -- reuses `_SparseFitFields`,
   the same knob set the Calibration tab's fit uses).
-- **Track** -- the one pre-run tracking knob (`bootstrap_gate_px`); the
-  final link gate is auto-derived, not user-set (see
-  `sfwloc.report.recommended_gate_px`).
+- **Track** -- the pre-run tracking knobs (`bootstrap_gate_px`,
+  `min_track_length`); the final link gate is auto-derived, not user-set
+  (see `sfwloc.report.recommended_gate_px`).
 
 Each tab shows only the handful of knobs that matter for day-to-day
 tuning; the rest collapse under a per-tab "Expert settings"
@@ -656,10 +656,13 @@ class _DetectTab(QWidget):
 
 
 class _TrackingTab(QWidget):
-    """The one pre-run tracking knob. The bootstrap pass exists only to
+    """The pre-run tracking knobs. The bootstrap pass exists only to
     get a rough D estimate for auto-deriving the *final* link gate
     (`sfwloc.report.recommended_gate_px`) -- that final gate is not
-    user-set."""
+    user-set. `min_track_length` filters the *final* tracks_df only
+    (see `pipeline.run_track_step`'s docstring) -- default 2 drops bare
+    singletons (a length-1 "track" has no displacement of its own, so
+    it's pure clutter downstream, not a meaningful trajectory)."""
 
     runRequested = Signal()
 
@@ -670,9 +673,15 @@ class _TrackingTab(QWidget):
             tooltip="Fixed, generous linking gate (px) for the bootstrap track pass used\n"
             "only to estimate D before the final auto-derived gate is computed.",
         )
+        self.min_track_length = _ispin(
+            2, 1, 10_000,
+            tooltip="Drop tracks shorter than this (frames) from the final result.\n"
+            "1 = keep everything, including singletons.",
+        )
         form = QFormLayout()
         form.setContentsMargins(0, 0, 0, 0)
         form.addRow("bootstrap gate (px)", self.bootstrap_gate_px)
+        form.addRow("min track length", self.min_track_length)
 
         self.run_button, self.status_label, run_row = _run_row("Run tracking")
         self.run_button.clicked.connect(self.runRequested.emit)
@@ -692,6 +701,9 @@ class _TrackingTab(QWidget):
 
     def get_bootstrap_gate_px(self) -> float:
         return self.bootstrap_gate_px.value()
+
+    def get_min_track_length(self) -> int:
+        return self.min_track_length.value()
 
 
 class PipelineParamsWidget(QWidget):
@@ -737,6 +749,7 @@ class PipelineParamsWidget(QWidget):
             sigma_init=self._calibration.get_sigma_init(),
             calibration_frame_index=self._calibration.get_frame_index(),
             bootstrap_gate_px=self._tracking.get_bootstrap_gate_px(),
+            min_track_length=self._tracking.get_min_track_length(),
             algorithm=self._detect.get_algorithm(),
             solver_kwargs=self._detect.get_solver_kwargs(),
             sparse_kwargs=self._detect.get_sparse_kwargs(),
@@ -764,6 +777,9 @@ class PipelineParamsWidget(QWidget):
 
     def get_bootstrap_gate_px(self) -> float:
         return self._tracking.get_bootstrap_gate_px()
+
+    def get_min_track_length(self) -> int:
+        return self._tracking.get_min_track_length()
 
     def get_frame_range(self) -> Optional[tuple[int, int]]:
         return self._detect.get_frame_range()

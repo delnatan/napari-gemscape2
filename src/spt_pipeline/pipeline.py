@@ -141,6 +141,7 @@ class DetectTrackParams:
     sigma_init: float = 1.3
     calibration_frame_index: int = 0
     bootstrap_gate_px: float = 3.0
+    min_track_length: int = 2
     # "dense" (sfwloc's SFW solver, find_spots_df/find_spots_stack_df) --
     # the default, for overlapping/crowded fields -- or "sparse"
     # (find_spots_sparse_df's per-spot free-sigma LM fit), a lighter
@@ -193,6 +194,7 @@ class PipelineSession:
     tracks_df: Optional[pl.DataFrame] = None
     track_summary: Optional[dict] = None
     bootstrap_gate_px_used: Optional[float] = None
+    min_track_length_used: Optional[int] = None
 
 
 def load_session(
@@ -488,12 +490,23 @@ def track_features_df(tracks_df: pl.DataFrame, pixel_size_um: float, dt_s: float
 def run_track_step(
     session: PipelineSession,
     bootstrap_gate_px: float,
+    min_track_length: int = 2,
     progress_callback: Optional[ProgressCallback] = None,
     cancel_event: Optional[threading.Event] = None,
 ) -> PipelineSession:
     """Bootstrap link (fixed `bootstrap_gate_px` gate) -> estimate D from
-    single-step MSD -> final link (auto-derived gate). Requires
-    `session.points_df` from a prior `run_detect_step` call.
+    single-step MSD -> final link (auto-derived gate) -> drop tracks
+    shorter than `min_track_length`. Requires `session.points_df` from a
+    prior `run_detect_step` call.
+
+    `min_track_length` defaults to 2 (drop singletons only): a
+    length-1 "track" is just an unlinked detection with no displacement
+    of its own -- it contributes nothing to `estimate_D_um2_s` (needs a
+    frame-to-frame pair) or to any diffusionkit fit downstream, so keeping
+    it around is pure clutter in the saved bundle and the tracks layer.
+    Applied only to the *final* tracks_df, not the bootstrap pass (which
+    only feeds `estimate_D_um2_s`, itself already indifferent to
+    singletons).
 
     `progress_callback`, if given, is called twice: `(0, 2, "bootstrap
     linking")` before the bootstrap pass, `(1, 2, "final linking")` before
@@ -532,10 +545,13 @@ def run_track_step(
     report(1, 2, "final linking")
     final_gate_px = recommended_gate_px(D_est, session.dt_s, session.pixel_size_um, sigma_loc_um=sigma_loc_um)
     tracks_df = link_tracks_df(points_df, final_gate_px)
+    if min_track_length > 1:
+        tracks_df = tracks_df.filter(pl.len().over("track_id") >= min_track_length)
     report(2, 2, "done")
 
     session.tracks_df = tracks_df
     session.bootstrap_gate_px_used = bootstrap_gate_px
+    session.min_track_length_used = min_track_length
     session.track_summary = {
         "sigma_loc_um": sigma_loc_um,
         "D_est_um2_s": D_est,
@@ -563,6 +579,7 @@ def session_manifest_extra(session: PipelineSession) -> dict:
         "D_est_um2_s": ts.get("D_est_um2_s"),
         "n_bootstrap_links": ts.get("n_bootstrap_links"),
         "bootstrap_gate_px": session.bootstrap_gate_px_used,
+        "min_track_length": session.min_track_length_used,
         "final_gate_px": ts.get("final_gate_px"),
         "density_um2": ts.get("density_um2"),
         "resolvability_verdict": ts.get("resolvability_verdict"),
@@ -642,6 +659,12 @@ def run_detect_track(
     )
 
     track_progress = lambda done, total, stage: report(n_frames + 1 + done, total_steps, stage)
-    run_track_step(session, params.bootstrap_gate_px, progress_callback=track_progress, cancel_event=cancel_event)
+    run_track_step(
+        session,
+        params.bootstrap_gate_px,
+        params.min_track_length,
+        progress_callback=track_progress,
+        cancel_event=cancel_event,
+    )
 
     return session.points_df, session.tracks_df, session_manifest_extra(session)

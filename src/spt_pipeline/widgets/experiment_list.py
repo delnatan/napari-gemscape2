@@ -914,7 +914,9 @@ class ExperimentListWidget(QWidget):
         self.progress_label.setText(f"Linking: {item.entry.image_path.name}")
         emitter = _ProgressEmitter()
         emitter.updated.connect(self._on_progress)
-        worker = _run_track_worker(session, self.params_panel.get_bootstrap_gate_px(), emitter)
+        worker = _run_track_worker(
+            session, self.params_panel.get_bootstrap_gate_px(), self.params_panel.get_min_track_length(), emitter
+        )
         self._start_step_worker(worker, lambda s, item=item: self._on_track_finished(item, s))
 
     def _on_track_finished(self, item: ExperimentItem, session: PipelineSession) -> None:
@@ -1012,8 +1014,10 @@ def _run_detect_worker(
 
 
 @thread_worker(start_thread=False)
-def _run_track_worker(session: PipelineSession, bootstrap_gate_px: float, emitter: _ProgressEmitter) -> PipelineSession:
+def _run_track_worker(
+    session: PipelineSession, bootstrap_gate_px: float, min_track_length: int, emitter: _ProgressEmitter
+) -> PipelineSession:
     def progress_cb(done: int, total: int, stage: str) -> None:
         emitter.updated.emit(done, total, stage)
 
-    return run_track_step(session, bootstrap_gate_px, progress_callback=progress_cb)
+    return run_track_step(session, bootstrap_gate_px, min_track_length, progress_callback=progress_cb)
