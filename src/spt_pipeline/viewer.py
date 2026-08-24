@@ -8,11 +8,9 @@ from spt_pipeline.experiment import load_experiment
 from spt_pipeline.pipeline import load_stack, track_features_df
 from spt_pipeline.rois import roi_to_shapes_kwargs
 
-# Per-vertex properties on the "tracks" layer (see track_features_df) --
 # color_by defaults to track_length so a broken/short track (a linking
 # failure) stands out from a long one at a glance, instead of napari's
 # default track_id coloring, which carries no quality signal at all.
-TRACKS_PROPERTY_COLUMNS = ("track_length", "mean_step_um", "duration_s")
 TRACKS_COLOR_BY = "track_length"
 
 # Shared look for every "detected spot" Points layer (the final "points"
@@ -45,6 +43,20 @@ def add_experiment_layers(viewer, experiment_dir: str | Path) -> None:
     viewer.layers.clear()
     viewer.add_image(image, name=image_path.stem)
 
+    pixel_size_um = params.get("pixel_size_um") or 1.0
+    dt_s = params.get("dt_s") or 1.0
+    # pixel_size_um/dt_s/experiment_dir ride along as layer metadata on both
+    # the "points" and "tracks" layers so a widget reading either one (see
+    # widgets/diffusion_panel.py, which reads the "tracks" layer) can
+    # convert its data straight to physical units and write results back
+    # to the right bundle -- no separate "load an experiment" step of its
+    # own.
+    layer_metadata = {
+        "pixel_size_um": pixel_size_um,
+        "dt_s": dt_s,
+        "experiment_dir": str(Path(experiment_dir).resolve()),
+    }
+
     if points_df.height > 0:
         points = points_df.select("frame", "y", "x").to_numpy()
         features = {col: points_df[col].to_numpy() for col in points_df.columns}
@@ -52,16 +64,30 @@ def add_experiment_layers(viewer, experiment_dir: str | Path) -> None:
             points,
             name="points",
             features=features,
+            metadata=dict(layer_metadata),
             **DETECTED_POINTS_STYLE,
         )
 
     if tracks_df.height > 0 and "track_id" in tracks_df.columns:
-        pixel_size_um = params.get("pixel_size_um") or 1.0
-        dt_s = params.get("dt_s") or 1.0
         feat_df = track_features_df(tracks_df, pixel_size_um, dt_s)
         tracks = feat_df.select("track_id", "frame", "y", "x").to_numpy()
-        properties = {col: feat_df[col].to_numpy() for col in TRACKS_PROPERTY_COLUMNS}
-        viewer.add_tracks(tracks, name="tracks", properties=properties, color_by=TRACKS_COLOR_BY)
+        # Every feat_df column rides along as a per-vertex property, not
+        # just the derived track_length/mean_step_um/duration_s -- this is
+        # what lets widgets/diffusion_panel.py read per-point QC fields
+        # (amplitude, sigma_x/y, bg, ...) straight off this one layer,
+        # already aligned with track_id, instead of a separate "points"
+        # layer lookup (which has no track_id -- it's the pre-linking
+        # detections table, see experiment.py).
+        properties = {
+            col: feat_df[col].to_numpy() for col in feat_df.columns if col not in ("track_id", "frame", "y", "x")
+        }
+        viewer.add_tracks(
+            tracks,
+            name="tracks",
+            properties=properties,
+            color_by=TRACKS_COLOR_BY,
+            metadata=dict(layer_metadata),
+        )
 
     for roi in rois:
         viewer.add_shapes(**roi_to_shapes_kwargs(roi), edge_color="yellow")

@@ -32,6 +32,8 @@ POINTS_FILENAME = "points.parquet"
 TRACKS_FILENAME = "tracks.parquet"
 MANIFEST_FILENAME = "manifest.json"
 ROIS_FILENAME = "rois.json"
+DIFFUSION_FITS_FILENAME = "diffusion_fits.parquet"
+DIFFUSION_SUMMARY_FILENAME = "diffusion_summary.json"
 
 
 def repo_root_of(module) -> Path:
@@ -108,6 +110,38 @@ def load_experiment(experiment_dir: str | Path) -> tuple[pl.DataFrame, pl.DataFr
     rois_path = experiment_dir / ROIS_FILENAME
     rois = json.loads(rois_path.read_text()) if rois_path.exists() else []
     return points_df, tracks_df, manifest, rois
+
+
+def write_diffusion_results(
+    experiment_dir: str | Path, per_track_df: pl.DataFrame, summary: dict
+) -> None:
+    """Diffusion-widget results, written like `rois.json`: an optional
+    extra on top of the core points/tracks/manifest bundle, not every
+    bundle has one. `per_track_df` holds one row per (track_id, method) --
+    the classic-MSD population fit's per-track table and any Bayesian
+    per-track fits the user has run, distinguished by a `method` column
+    (see `widgets/diffusion_panel.py`) -- so both live in one file.
+    `summary` holds the classic-MSD ensemble-level scalars (D/alpha fits,
+    localization offset)."""
+    experiment_dir = Path(experiment_dir)
+    experiment_dir.mkdir(parents=True, exist_ok=True)
+    per_track_df.write_parquet(experiment_dir / DIFFUSION_FITS_FILENAME)
+    (experiment_dir / DIFFUSION_SUMMARY_FILENAME).write_text(json.dumps(summary, indent=2))
+
+
+def load_diffusion_results(
+    experiment_dir: str | Path,
+) -> tuple[pl.DataFrame | None, dict | None]:
+    """`(per_track_df, summary)`, or `(None, None)` if this bundle has no
+    saved diffusion results yet."""
+    experiment_dir = Path(experiment_dir)
+    fits_path = experiment_dir / DIFFUSION_FITS_FILENAME
+    summary_path = experiment_dir / DIFFUSION_SUMMARY_FILENAME
+    if not fits_path.exists():
+        return None, None
+    per_track_df = pl.read_parquet(fits_path)
+    summary = json.loads(summary_path.read_text()) if summary_path.exists() else None
+    return per_track_df, summary
 
 
 def has_experiment(experiment_dir: str | Path) -> bool:
