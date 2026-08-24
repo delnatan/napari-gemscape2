@@ -71,6 +71,7 @@ from typing import Optional
 
 import analysis as dk_analysis
 import bayes as dk_bayes
+import bayes.anisotropy as dk_anisotropy
 import numpy as np
 import polars as pl
 from napari.layers import Points, Tracks
@@ -124,6 +125,24 @@ def _run_track_fit_worker(
     return dk_bayes.fit_track(track_df, dt_s, model=model, method=method)
 
 
+@thread_worker(start_thread=False)
+def _run_anisotropy_worker(
+    diffkit_tracks: pl.DataFrame,
+    dt_s: float,
+    min_track_length: int,
+    max_track_length: int,
+    fit_eps_posterior: bool,
+) -> "dk_anisotropy.AnisotropyResult":
+    return dk_anisotropy.analyze(
+        diffkit_tracks,
+        dt_s,
+        min_track_length=min_track_length,
+        max_track_length=max_track_length,
+        fit_eps_posterior=fit_eps_posterior,
+        show_progress=False,
+    )
+
+
 def _base_track_table(diffkit_tracks: pl.DataFrame, tracks_df_px: pl.DataFrame) -> pl.DataFrame:
     """One row per track: identity + context columns every tab's results
     get left-joined onto. Position columns are pixel-space (`tracks_df_px`,
@@ -172,6 +191,26 @@ def _track_fit_row(fit: "dk_bayes.TrackFit") -> dict:
 
 def _format_summary(summary: dict) -> str:
     return "\n".join(f"{key} = {value}" for key, value in summary.items())
+
+
+_ANISOTROPY_DISPLAY_COLUMNS = [
+    "track_id",
+    "log_bf10",
+    "eps_median",
+    "eps_lo",
+    "eps_hi",
+    "D_mean_median_um2_s",
+]
+
+
+def _normalize_anisotropy_table(per_track: pl.DataFrame) -> pl.DataFrame:
+    """`AnisotropyResult.per_track` trimmed to the columns worth showing
+    in the Track Explorer / offering as a spatial-map color choice --
+    `log_bf10` always present (`fit_eps_posterior=False` or `True`); the
+    `eps_*`/`D_mean_*` columns only exist after the slower full-posterior
+    run, so this degrades gracefully to just `log_bf10` before that."""
+    cols = [c for c in _ANISOTROPY_DISPLAY_COLUMNS if c in per_track.columns]
+    return per_track.select(cols)
 
 
 class _DataExplorerTab(QWidget):
@@ -581,17 +620,7 @@ class _BayesianTab(QWidget):
         style_status_label(self._map_status, "ok" if table.height else "caution")
         map_df = _normalize_map_table(table, model)
         color_by = "alpha_map" if model == "anomalous" else "D_map_um2_s"
-
-        self._color_by_picker.blockSignals(True)
-        self._color_by_picker.clear()
-        self._color_by_picker.addItems(["D_map_um2_s", "alpha_map"] if model == "anomalous" else ["D_map_um2_s"])
-        self._color_by_picker.setCurrentText(color_by)
-        self._color_by_picker.blockSignals(False)
-        self._color_by_picker.setEnabled(True)
-        self._map_histogram.setEnabled(True)
-
         self.host.set_map_results(table, map_df, model, color_by)
-        self._refresh_map_histogram(reset_range=True)
 
     def _on_map_error(self, exc: Exception) -> None:
         self._map_status.setText(f"error: {exc}")
@@ -605,6 +634,31 @@ class _BayesianTab(QWidget):
 
     def _on_map_range_changed(self, vmin: float, vmax: float) -> None:
         self.host.set_map_contrast_limits(vmin, vmax)
+
+    def on_spatial_source_registered(self, preferred_color_by: Optional[str] = None) -> None:
+        """Called by the host whenever *any* tab (this one's own MAP fit,
+        or the Anisotropy tab) adds a new spatial-map color choice --
+        repopulates the "color map by" picker with the union of every
+        registered source's columns."""
+        self.refresh_color_by_choices(prefer=preferred_color_by)
+        self._refresh_map_histogram(reset_range=True)
+
+    def refresh_color_by_choices(self, prefer: Optional[str] = None) -> None:
+        columns = self.host.spatial_color_by_columns()
+        current = prefer or self._color_by_picker.currentText()
+        self._color_by_picker.blockSignals(True)
+        self._color_by_picker.clear()
+        self._color_by_picker.addItems(columns)
+        if current in columns:
+            self._color_by_picker.setCurrentText(current)
+        elif columns:
+            self._color_by_picker.setCurrentText(columns[0])
+        self._color_by_picker.blockSignals(False)
+        enabled = bool(columns)
+        self._color_by_picker.setEnabled(enabled)
+        self._map_histogram.setEnabled(enabled)
+        if enabled:
+            self.host.set_map_color_by(self._color_by_picker.currentText())
 
     def refresh_map_histogram(self) -> None:
         """Called by the host after filters change -- the map's color
@@ -671,6 +725,147 @@ class _BayesianTab(QWidget):
         style_status_label(self._track_status, "error")
 
 
+class _AnisotropyTab(QWidget):
+    """`bayes.anisotropy.analyze` -- a model-*comparison* question (is
+    this short track more anisotropic than free diffusion) rather than a
+    point estimate, so it gets its own tab rather than a third `model=`
+    choice on the Bayesian tab's existing MAP/per-track sections. Two
+    speeds, both bulk (every eligible track in one call, like Bayesian's
+    Spatial MAP): the log Bayes factor detector alone (`log_bf10`, a
+    couple seconds), or that plus the full per-track eps/psi/D_mean/
+    D_par/D_perp posterior (tens of seconds, scales with track count --
+    `fit_eps_posterior=True`). Both register into the shared spatial-map
+    color-by picker (`DiffusionAnalysisWidget.register_spatial_source`)
+    and merge into the Track Explorer table, same as every other tab's
+    results."""
+
+    def __init__(self, host: "DiffusionAnalysisWidget") -> None:
+        super().__init__()
+        self.host = host
+        self._per_track: Optional[pl.DataFrame] = None
+        self._plot_window: Optional[PlotWindow] = None
+
+        self._min_track_length = QSpinBox()
+        self._min_track_length.setRange(2, 10_000)
+        self._min_track_length.setValue(5)
+        self._max_track_length = QSpinBox()
+        self._max_track_length.setRange(2, 10_000)
+        self._max_track_length.setValue(10)
+        for spin in (self._min_track_length, self._max_track_length):
+            spin.setToolTip(
+                "This method targets short tracks specifically (N=5-10 by "
+                "default) -- only tracks in this length range are analyzed."
+            )
+        form = QFormLayout()
+        form.addRow("min track length", self._min_track_length)
+        form.addRow("max track length", self._max_track_length)
+
+        self._restrict_checkbox = QCheckBox("restrict to filtered tracks (Data Explorer)")
+
+        self._fast_button = QPushButton("Run detector (fast)")
+        self._fast_button.clicked.connect(lambda: self._run(fit_eps_posterior=False))
+        self._full_button = QPushButton("Run full posterior (eps/psi, slower)")
+        self._full_button.clicked.connect(lambda: self._run(fit_eps_posterior=True))
+        self._status = QLabel("")
+        self._status.setWordWrap(True)
+        style_status_label(self._status)
+
+        self._summary = QLabel("")
+        self._summary.setWordWrap(True)
+
+        self._log_bf_button = QPushButton("Show log BF10 distribution")
+        self._log_bf_button.setEnabled(False)
+        self._log_bf_button.clicked.connect(self._show_log_bf_plot)
+        self._eps_vs_bf_button = QPushButton("Show eps vs log BF10")
+        self._eps_vs_bf_button.setEnabled(False)
+        self._eps_vs_bf_button.clicked.connect(self._show_eps_vs_bf_plot)
+        self._eps_forest_button = QPushButton("Show eps forest (top tracks)")
+        self._eps_forest_button.setEnabled(False)
+        self._eps_forest_button.clicked.connect(self._show_eps_forest_plot)
+
+        layout = QVBoxLayout()
+        layout.addLayout(form)
+        layout.addWidget(self._restrict_checkbox)
+        layout.addWidget(self._fast_button)
+        layout.addWidget(self._full_button)
+        layout.addWidget(self._status)
+        layout.addWidget(self._summary)
+        layout.addWidget(hline())
+        layout.addWidget(self._log_bf_button)
+        layout.addWidget(self._eps_vs_bf_button)
+        layout.addWidget(self._eps_forest_button)
+        layout.addStretch()
+        self.setLayout(layout)
+
+    def reset(self) -> None:
+        self._per_track = None
+        self._status.setText("")
+        style_status_label(self._status)
+        self._summary.setText("")
+        self._log_bf_button.setEnabled(False)
+        self._eps_vs_bf_button.setEnabled(False)
+        self._eps_forest_button.setEnabled(False)
+
+    def _run(self, fit_eps_posterior: bool) -> None:
+        tracks = self.host.diffkit_tracks_for_fit(self._restrict_checkbox.isChecked())
+        if tracks is None:
+            return
+        min_len, max_len = self._min_track_length.value(), self._max_track_length.value()
+        self._status.setText(
+            "running... (full posterior scales with track count, can take a while)"
+            if fit_eps_posterior
+            else "running..."
+        )
+        style_status_label(self._status)
+        worker = _run_anisotropy_worker(tracks, self.host.dt_s, min_len, max_len, fit_eps_posterior)
+        self.host.start_worker(worker, self._on_finished, self._on_error, [self._fast_button, self._full_button])
+
+    def _on_finished(self, result: "dk_anisotropy.AnisotropyResult") -> None:
+        self._per_track = result.per_track
+        n = self._per_track.height
+        self._status.setText(f"analyzed {n} track(s)")
+        style_status_label(self._status, "ok" if n else "caution")
+
+        has_eps = "eps_median" in self._per_track.columns
+        if n:
+            ensemble = result.ensemble.row(0, named=True)
+            self._summary.setText(
+                f"sum log BF10 = {ensemble['sum_log_bf10']:.3g} over {ensemble['n_tracks']} tracks "
+                f"(>0 favors anisotropy)"
+                + (
+                    f"\nmedian eps = {self._per_track['eps_median'].median():.3g}"
+                    if has_eps
+                    else ""
+                )
+            )
+        self._log_bf_button.setEnabled(n > 0)
+        self._eps_vs_bf_button.setEnabled(has_eps and n > 0)
+        self._eps_forest_button.setEnabled(has_eps and n > 0)
+
+        self.host.set_anisotropy_results(result.per_track, _normalize_anisotropy_table(result.per_track))
+
+    def _on_error(self, exc: Exception) -> None:
+        self._status.setText(f"error: {exc}")
+        style_status_label(self._status, "error")
+
+    def _show_plot(self, figure) -> None:
+        if self._plot_window is None:
+            self._plot_window = PlotWindow("Anisotropy", parent=self)
+        self._plot_window.show_figure(figure)
+
+    def _show_log_bf_plot(self) -> None:
+        if self._per_track is not None:
+            self._show_plot(dk_anisotropy.plot_log_bf_distribution(self._per_track, "log BF10 per track"))
+
+    def _show_eps_vs_bf_plot(self) -> None:
+        if self._per_track is not None:
+            self._show_plot(dk_anisotropy.plot_eps_vs_log_bf(self._per_track, "eps vs. log BF10"))
+
+    def _show_eps_forest_plot(self) -> None:
+        if self._per_track is not None:
+            self._show_plot(dk_anisotropy.plot_eps_forest(self._per_track, "eps posterior, top tracks"))
+
+
 class DiffusionAnalysisWidget(QWidget):
     def __init__(self, napari_viewer) -> None:
         super().__init__()
@@ -689,6 +884,12 @@ class DiffusionAnalysisWidget(QWidget):
         self._map_model: Optional[str] = None
         self._map_df: Optional[pl.DataFrame] = None
         self._map_color_by: Optional[str] = None
+        self._anisotropy_full_df: Optional[pl.DataFrame] = None
+        # name -> per-track df (track_id + one or more value columns) --
+        # every tab that produces a per-track number registers here, and
+        # the spatial map / its color-by picker draw from the union of
+        # whatever's currently registered (see register_spatial_source).
+        self._spatial_sources: dict[str, pl.DataFrame] = {}
         self._track_fit_rows: list[dict] = []
         self._current_track_id: Optional[int] = None
         self._worker = None
@@ -711,12 +912,14 @@ class DiffusionAnalysisWidget(QWidget):
         self._track_explorer = _TrackExplorerTab(self)
         self._classical = _ClassicalTab(self)
         self._bayesian = _BayesianTab(self)
+        self._anisotropy = _AnisotropyTab(self)
 
         tabs = QTabWidget()
         tabs.addTab(self._data_explorer, "Data Explorer")
         tabs.addTab(self._track_explorer, "Track Explorer")
         tabs.addTab(self._classical, "Classical (MSD)")
         tabs.addTab(self._bayesian, "Bayesian")
+        tabs.addTab(self._anisotropy, "Anisotropy")
 
         self._save_button = QPushButton("Save results")
         self._save_button.clicked.connect(self._save_results)
@@ -868,6 +1071,8 @@ class DiffusionAnalysisWidget(QWidget):
         self._map_model = None
         self._map_df = None
         self._map_color_by = None
+        self._anisotropy_full_df = None
+        self._spatial_sources = {}
         self._track_fit_rows = []
         self._current_track_id = None
         self._source_label.setText("no Tracks layer in this viewer")
@@ -875,6 +1080,7 @@ class DiffusionAnalysisWidget(QWidget):
         self._track_explorer.reset()
         self._classical.reset()
         self._bayesian.reset()
+        self._anisotropy.reset()
         self._save_button.setEnabled(False)
         self._clear_overlay_layers()
 
@@ -922,6 +1128,8 @@ class DiffusionAnalysisWidget(QWidget):
         self._map_model = None
         self._map_df = None
         self._map_color_by = None
+        self._anisotropy_full_df = None
+        self._spatial_sources = {}
         self._track_fit_rows = []
         self._current_track_id = None
 
@@ -936,6 +1144,7 @@ class DiffusionAnalysisWidget(QWidget):
         self._track_explorer.reset()
         self._classical.reset()
         self._bayesian.reset()
+        self._anisotropy.reset()
         self._rebuild_track_table()
         self._clear_overlay_layers()
 
@@ -954,7 +1163,10 @@ class DiffusionAnalysisWidget(QWidget):
 
     def _update_save_enabled(self) -> None:
         has_results = (
-            self._classical_full_df is not None or self._map_full_df is not None or bool(self._track_fit_rows)
+            self._classical_full_df is not None
+            or self._map_full_df is not None
+            or self._anisotropy_full_df is not None
+            or bool(self._track_fit_rows)
         )
         self._save_button.setEnabled(has_results and self._experiment_dir is not None)
 
@@ -968,6 +1180,9 @@ class DiffusionAnalysisWidget(QWidget):
             df = df.join(self._classical_df, on="track_id", how="left")
         if self._map_df is not None:
             df = df.join(self._map_df, on="track_id", how="left")
+        anisotropy_df = self._spatial_sources.get("anisotropy")
+        if anisotropy_df is not None:
+            df = df.join(anisotropy_df, on="track_id", how="left")
         if self._track_fit_rows:
             fit_df = (
                 pl.DataFrame(self._track_fit_rows)
@@ -989,13 +1204,38 @@ class DiffusionAnalysisWidget(QWidget):
         self._rebuild_track_table()
         self._update_save_enabled()
 
+    def register_spatial_source(self, name: str, df: pl.DataFrame) -> None:
+        """`df` must have `track_id` plus one or more value columns --
+        registers it as a spatial-map color choice (`spatial_color_by_columns`),
+        available to whichever tab produced it and every other one."""
+        self._spatial_sources[name] = df
+
+    def spatial_color_by_columns(self) -> list[str]:
+        columns: list[str] = []
+        for df in self._spatial_sources.values():
+            columns.extend(c for c in df.columns if c != "track_id" and c not in columns)
+        return columns
+
+    def _table_for_column(self, column: str) -> Optional[pl.DataFrame]:
+        for df in self._spatial_sources.values():
+            if column in df.columns:
+                return df.select("track_id", column)
+        return None
+
     def set_map_results(self, full_df: pl.DataFrame, display_df: pl.DataFrame, model: str, color_by: str) -> None:
         self._map_full_df = full_df
         self._map_model = model
         self._map_df = display_df
-        self._map_color_by = color_by
+        self.register_spatial_source("bulk_map", display_df)
         self._rebuild_track_table()
-        self._update_spatial_map_layer()
+        self._bayesian.on_spatial_source_registered(color_by)
+        self._update_save_enabled()
+
+    def set_anisotropy_results(self, full_df: pl.DataFrame, display_df: pl.DataFrame) -> None:
+        self._anisotropy_full_df = full_df
+        self.register_spatial_source("anisotropy", display_df)
+        self._rebuild_track_table()
+        self._bayesian.on_spatial_source_registered("log_bf10")
         self._update_save_enabled()
 
     def set_map_color_by(self, color_by: str) -> None:
@@ -1033,24 +1273,28 @@ class DiffusionAnalysisWidget(QWidget):
             return
         track = self._tracks_df_px.filter(pl.col("track_id") == track_id)
         positions = track.select("y", "x").to_numpy()
+        track_ids = track["track_id"].to_numpy()
         if self._highlight_layer is None:
             self._highlight_layer = self.viewer.add_points(
-                positions, name="selected track", **_HIGHLIGHT_POINTS_STYLE
+                positions, name="selected track", features={"track_id": track_ids}, **_HIGHLIGHT_POINTS_STYLE
             )
         else:
             self._highlight_layer.data = positions
+            self._highlight_layer.features = {"track_id": track_ids}
 
     def _filtered_map_df(self) -> Optional[pl.DataFrame]:
-        """The bulk-MAP table joined to pixel-space centroids, restricted
-        to `combined_filtered_track_ids()` -- the *display* subset for
-        both the spatial map layer and its remap histogram. The fit
-        itself (`self._map_df`) is untouched by this -- filters only
-        change what's shown, not what was already computed."""
-        if self._map_df is None or self._base_track_df is None:
+        """Whichever registered spatial source has the current color-by
+        column, joined to pixel-space centroids and restricted to
+        `combined_filtered_track_ids()` -- the *display* subset for both
+        the spatial map layer and its remap histogram. The underlying fit
+        results (`self._spatial_sources`) are untouched by this -- filters
+        only change what's shown, not what was already computed."""
+        if self._map_color_by is None or self._base_track_df is None:
             return None
-        merged = self._base_track_df.select("track_id", "y_px", "x_px").join(
-            self._map_df, on="track_id", how="inner"
-        )
+        source = self._table_for_column(self._map_color_by)
+        if source is None:
+            return None
+        merged = self._base_track_df.select("track_id", "y_px", "x_px").join(source, on="track_id", how="inner")
         ids = self.combined_filtered_track_ids()
         if ids is not None:
             merged = merged.filter(pl.col("track_id").is_in(list(ids)))
@@ -1074,11 +1318,12 @@ class DiffusionAnalysisWidget(QWidget):
             return
         positions = merged.select("y_px", "x_px").to_numpy()
         values = merged[color_by].to_numpy()
+        track_ids = merged["track_id"].to_numpy()
         if self._spatial_map_layer is None:
             self._spatial_map_layer = self.viewer.add_points(
                 positions,
                 name="diffusion map",
-                features={color_by: values},
+                features={color_by: values, "track_id": track_ids},
                 face_color=color_by,
                 face_colormap="viridis",
                 symbol="disc",
@@ -1086,11 +1331,34 @@ class DiffusionAnalysisWidget(QWidget):
                 border_color="black",
                 border_width=0.1,
             )
+            callback = self._make_spatial_map_click_callback()
+            self._spatial_map_layer.mouse_drag_callbacks.append(callback)
         else:
             self._spatial_map_layer.data = positions
-            self._spatial_map_layer.features = {color_by: values}
+            self._spatial_map_layer.features = {color_by: values, "track_id": track_ids}
             self._spatial_map_layer.face_color = color_by
             self._spatial_map_layer.face_colormap = "viridis"
+
+    def _make_spatial_map_click_callback(self):
+        """Click a point on the spatial map -> select that track --
+        `Points.get_value` returns an *index* into `.data` (unlike
+        `Tracks.get_value`, which returns a `track_id` directly), so this
+        looks the id up via the layer's own `track_id` feature."""
+
+        def _on_click(layer, event):
+            if event.type != "mouse_press":
+                return
+            index = layer.get_value(
+                event.position,
+                view_direction=event.view_direction,
+                dims_displayed=event.dims_displayed,
+                world=True,
+            )
+            if index is not None:
+                track_id = int(layer.features["track_id"].iloc[index])
+                self.on_viewer_track_clicked(track_id)
+
+        return _on_click
 
     # -- persistence --
 
@@ -1104,6 +1372,8 @@ class DiffusionAnalysisWidget(QWidget):
             tables.append(
                 self._map_full_df.with_columns(pl.lit(f"bayes_map_bulk_{self._map_model}").alias("method"))
             )
+        if self._anisotropy_full_df is not None:
+            tables.append(self._anisotropy_full_df.with_columns(pl.lit("bayes_anisotropy").alias("method")))
         if self._track_fit_rows:
             rows = []
             for row in self._track_fit_rows:
