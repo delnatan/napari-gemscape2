@@ -73,7 +73,6 @@ import analysis as dk_analysis
 import bayes as dk_bayes
 import numpy as np
 import polars as pl
-from matplotlib.widgets import SpanSelector
 from napari.layers import Points, Tracks
 from napari.qt.threading import thread_worker
 from qtpy.QtWidgets import (
@@ -92,7 +91,13 @@ from qtpy.QtWidgets import (
 
 from spt_pipeline.diffusion import tracks_to_diffusionkit_df
 from spt_pipeline.experiment import load_diffusion_results, write_diffusion_results
-from spt_pipeline.widgets.qt_helpers import DataFrameTableModel, PlotWindow, hline, style_status_label
+from spt_pipeline.widgets.qt_helpers import (
+    DataFrameTableModel,
+    HistogramRangeWidget,
+    PlotWindow,
+    hline,
+    style_status_label,
+)
 
 # Points-layer look for the two viewer overlays this widget owns -- kept
 # visually distinct from DETECTED_POINTS_STYLE's magenta "+" (viewer.py)
@@ -170,24 +175,35 @@ def _format_summary(summary: dict) -> str:
 
 
 class _DataExplorerTab(QWidget):
+    """Per-point QC filtering: pick a column, drag the histogram's min/max
+    handles (`qt_helpers.HistogramRangeWidget`, no pop-up window -- the
+    filter needs to stay reachable while looking at its effect on the
+    Track Explorer table right next to it). A range that covers the
+    column's full data span is treated as "no filter" for that column
+    (removed from `_filters`) rather than stored as a no-op entry."""
+
     def __init__(self, host: "DiffusionAnalysisWidget") -> None:
         super().__init__()
         self.host = host
         self._filters: dict[str, tuple[float, float]] = {}
-        self._plot_window: Optional[PlotWindow] = None
-        self._span_selector: Optional[SpanSelector] = None
+        self._current_column: Optional[str] = None
+        self._loading = False
 
         self._column_picker = QComboBox()
-        self._show_button = QPushButton("Show histogram")
-        self._show_button.clicked.connect(self._show_histogram)
+        self._column_picker.currentTextChanged.connect(self._on_column_changed)
         pick_row = QHBoxLayout()
         pick_row.addWidget(QLabel("column:"))
         pick_row.addWidget(self._column_picker, 1)
-        pick_row.addWidget(self._show_button)
+
+        self._histogram = HistogramRangeWidget()
+        self._histogram.rangeChanged.connect(self._on_range_changed)
+
+        self._reset_column_button = QPushButton("Reset this column")
+        self._reset_column_button.clicked.connect(self._reset_current_column)
 
         self._filter_label = QLabel("no filters active")
         self._filter_label.setWordWrap(True)
-        self._clear_button = QPushButton("Clear filters")
+        self._clear_button = QPushButton("Clear all filters")
         self._clear_button.clicked.connect(self._clear_filters)
         filter_row = QHBoxLayout()
         filter_row.addWidget(self._filter_label, 1)
@@ -195,6 +211,8 @@ class _DataExplorerTab(QWidget):
 
         layout = QVBoxLayout()
         layout.addLayout(pick_row)
+        layout.addWidget(self._histogram)
+        layout.addWidget(self._reset_column_button)
         layout.addWidget(hline())
         layout.addLayout(filter_row)
         layout.addStretch()
@@ -202,8 +220,11 @@ class _DataExplorerTab(QWidget):
 
     def reset(self, points_df: Optional[pl.DataFrame]) -> None:
         self._filters = {}
+        self._current_column = None
         self._update_filter_label()
+        self._column_picker.blockSignals(True)
         self._column_picker.clear()
+        self._column_picker.blockSignals(False)
         if points_df is None:
             return
         skip = {"frame", "y", "x", "track_id"}
@@ -212,37 +233,45 @@ class _DataExplorerTab(QWidget):
         ]
         self._column_picker.addItems(numeric_cols)
 
-    def _show_histogram(self) -> None:
+    def _on_column_changed(self, column: str) -> None:
         points_df = self.host.points_df
-        column = self._column_picker.currentText()
-        if points_df is None or not column:
+        if not column or points_df is None:
             return
+        self._current_column = column
+        self._loading = True
         values = points_df[column].drop_nulls().to_numpy()
-        if self._plot_window is None:
-            self._plot_window = PlotWindow(f"Data explorer -- {column}", parent=self)
+        self._histogram.set_data(values)
+        vmin, vmax = self._filters.get(column, self._histogram.data_range())
+        self._histogram.set_range(vmin, vmax)
+        self._loading = False
+
+    def _on_range_changed(self, vmin: float, vmax: float) -> None:
+        if self._loading or self._current_column is None:
+            return
+        data_min, data_max = self._histogram.data_range()
+        if vmin <= data_min and vmax >= data_max:
+            self._filters.pop(self._current_column, None)
         else:
-            self._plot_window.setWindowTitle(f"Data explorer -- {column}")
-        import matplotlib.pyplot as plt
+            self._filters[self._current_column] = (vmin, vmax)
+        self._update_filter_label()
+        self.host.on_filters_changed()
 
-        figure = plt.Figure(figsize=(6, 4.5))
-        ax = figure.add_subplot(111)
-        ax.hist(values, bins=50, color="steelblue")
-        ax.set_xlabel(column)
-        ax.set_ylabel("count")
-        figure.tight_layout()
-        self._plot_window.show_figure(figure)
-
-        def _on_select(vmin: float, vmax: float, _column=column) -> None:
-            self._filters[_column] = (vmin, vmax)
-            self._update_filter_label()
-            self.host.on_filters_changed()
-
-        self._span_selector = SpanSelector(
-            ax, _on_select, "horizontal", useblit=True, props=dict(alpha=0.3, facecolor="crimson")
-        )
+    def _reset_current_column(self) -> None:
+        if self._current_column is None:
+            return
+        self._filters.pop(self._current_column, None)
+        self._loading = True
+        self._histogram.set_range(*self._histogram.data_range())
+        self._loading = False
+        self._update_filter_label()
+        self.host.on_filters_changed()
 
     def _clear_filters(self) -> None:
         self._filters = {}
+        if self._current_column is not None:
+            self._loading = True
+            self._histogram.set_range(*self._histogram.data_range())
+            self._loading = False
         self._update_filter_label()
         self.host.on_filters_changed()
 
@@ -473,6 +502,16 @@ class _BayesianTab(QWidget):
         map_row.addWidget(self._map_button)
         map_row.addWidget(self._map_status, 1)
 
+        self._color_by_picker = QComboBox()
+        self._color_by_picker.setEnabled(False)
+        self._color_by_picker.currentTextChanged.connect(self._on_color_by_changed)
+        color_row = QHBoxLayout()
+        color_row.addWidget(QLabel("color map by:"))
+        color_row.addWidget(self._color_by_picker, 1)
+        self._map_histogram = HistogramRangeWidget()
+        self._map_histogram.setEnabled(False)
+        self._map_histogram.rangeChanged.connect(self._on_map_range_changed)
+
         self._method_picker = QComboBox()
         self._method_picker.addItems(["map", "nuts"])
         self._method_picker.setToolTip(
@@ -498,6 +537,8 @@ class _BayesianTab(QWidget):
         layout.addWidget(QLabel("<b>Spatial MAP (all tracks)</b>"))
         layout.addWidget(self._restrict_checkbox)
         layout.addLayout(map_row)
+        layout.addLayout(color_row)
+        layout.addWidget(self._map_histogram)
         layout.addWidget(hline())
         layout.addWidget(QLabel("<b>Per-track</b> (uses the Track Explorer selection)"))
         layout.addWidget(QLabel("method:"))
@@ -515,6 +556,11 @@ class _BayesianTab(QWidget):
         self._track_status.setText("")
         style_status_label(self._track_status)
         self._track_result_label.setText("")
+        self._color_by_picker.blockSignals(True)
+        self._color_by_picker.clear()
+        self._color_by_picker.blockSignals(False)
+        self._color_by_picker.setEnabled(False)
+        self._map_histogram.setEnabled(False)
 
     def _run_map(self) -> None:
         tracks = self.host.diffkit_tracks_for_fit(self._restrict_checkbox.isChecked())
@@ -535,11 +581,50 @@ class _BayesianTab(QWidget):
         style_status_label(self._map_status, "ok" if table.height else "caution")
         map_df = _normalize_map_table(table, model)
         color_by = "alpha_map" if model == "anomalous" else "D_map_um2_s"
+
+        self._color_by_picker.blockSignals(True)
+        self._color_by_picker.clear()
+        self._color_by_picker.addItems(["D_map_um2_s", "alpha_map"] if model == "anomalous" else ["D_map_um2_s"])
+        self._color_by_picker.setCurrentText(color_by)
+        self._color_by_picker.blockSignals(False)
+        self._color_by_picker.setEnabled(True)
+        self._map_histogram.setEnabled(True)
+
         self.host.set_map_results(table, map_df, model, color_by)
+        self._refresh_map_histogram(reset_range=True)
 
     def _on_map_error(self, exc: Exception) -> None:
         self._map_status.setText(f"error: {exc}")
         style_status_label(self._map_status, "error")
+
+    def _on_color_by_changed(self, column: str) -> None:
+        if not column:
+            return
+        self.host.set_map_color_by(column)
+        self._refresh_map_histogram(reset_range=True)
+
+    def _on_map_range_changed(self, vmin: float, vmax: float) -> None:
+        self.host.set_map_contrast_limits(vmin, vmax)
+
+    def refresh_map_histogram(self) -> None:
+        """Called by the host after filters change -- the map's color
+        range stays as the user set it, only the underlying data (and
+        thus the histogram bars) needs to reflect the new filtered set."""
+        self._refresh_map_histogram(reset_range=False)
+
+    def _refresh_map_histogram(self, reset_range: bool) -> None:
+        values = self.host.map_values_for_histogram()
+        if values is None or values.size == 0:
+            return
+        self._map_histogram.blockSignals(True)
+        self._map_histogram.set_data(values)
+        if reset_range:
+            lo, hi = np.percentile(values, [2, 98])
+            if lo >= hi:
+                lo, hi = self._map_histogram.data_range()
+            self._map_histogram.set_range(float(lo), float(hi))
+            self.host.set_map_contrast_limits(float(lo), float(hi))
+        self._map_histogram.blockSignals(False)
 
     def _run_track_fit(self) -> None:
         track_id = self.host.selected_track_id
@@ -603,6 +688,7 @@ class DiffusionAnalysisWidget(QWidget):
         self._map_full_df: Optional[pl.DataFrame] = None
         self._map_model: Optional[str] = None
         self._map_df: Optional[pl.DataFrame] = None
+        self._map_color_by: Optional[str] = None
         self._track_fit_rows: list[dict] = []
         self._current_track_id: Optional[int] = None
         self._worker = None
@@ -680,6 +766,8 @@ class DiffusionAnalysisWidget(QWidget):
 
     def on_filters_changed(self) -> None:
         self._rebuild_track_table()
+        self._update_spatial_map_layer()
+        self._bayesian.refresh_map_histogram()
 
     def diffkit_tracks_for_fit(self, restrict_to_filtered: bool) -> Optional[pl.DataFrame]:
         if self._diffkit_tracks is None:
@@ -779,6 +867,7 @@ class DiffusionAnalysisWidget(QWidget):
         self._map_full_df = None
         self._map_model = None
         self._map_df = None
+        self._map_color_by = None
         self._track_fit_rows = []
         self._current_track_id = None
         self._source_label.setText("no Tracks layer in this viewer")
@@ -832,6 +921,7 @@ class DiffusionAnalysisWidget(QWidget):
         self._map_full_df = None
         self._map_model = None
         self._map_df = None
+        self._map_color_by = None
         self._track_fit_rows = []
         self._current_track_id = None
 
@@ -903,9 +993,18 @@ class DiffusionAnalysisWidget(QWidget):
         self._map_full_df = full_df
         self._map_model = model
         self._map_df = display_df
+        self._map_color_by = color_by
         self._rebuild_track_table()
-        self._update_spatial_map_layer(display_df, color_by)
+        self._update_spatial_map_layer()
         self._update_save_enabled()
+
+    def set_map_color_by(self, color_by: str) -> None:
+        self._map_color_by = color_by
+        self._update_spatial_map_layer()
+
+    def set_map_contrast_limits(self, vmin: float, vmax: float) -> None:
+        if self._spatial_map_layer is not None and vmin < vmax:
+            self._spatial_map_layer.face_contrast_limits = (vmin, vmax)
 
     def set_track_fit_result(self, row: dict) -> None:
         self._track_fit_rows.append(row)
@@ -941,16 +1040,40 @@ class DiffusionAnalysisWidget(QWidget):
         else:
             self._highlight_layer.data = positions
 
-    def _update_spatial_map_layer(self, map_df: pl.DataFrame, color_by: str) -> None:
-        if self._base_track_df is None:
-            return
+    def _filtered_map_df(self) -> Optional[pl.DataFrame]:
+        """The bulk-MAP table joined to pixel-space centroids, restricted
+        to `combined_filtered_track_ids()` -- the *display* subset for
+        both the spatial map layer and its remap histogram. The fit
+        itself (`self._map_df`) is untouched by this -- filters only
+        change what's shown, not what was already computed."""
+        if self._map_df is None or self._base_track_df is None:
+            return None
         merged = self._base_track_df.select("track_id", "y_px", "x_px").join(
-            map_df, on="track_id", how="inner"
+            self._map_df, on="track_id", how="inner"
         )
+        ids = self.combined_filtered_track_ids()
+        if ids is not None:
+            merged = merged.filter(pl.col("track_id").is_in(list(ids)))
+        return merged
+
+    def map_values_for_histogram(self) -> Optional[np.ndarray]:
+        merged = self._filtered_map_df()
+        if merged is None or self._map_color_by is None or self._map_color_by not in merged.columns:
+            return None
+        return merged[self._map_color_by].drop_nulls().to_numpy()
+
+    def _update_spatial_map_layer(self) -> None:
+        merged = self._filtered_map_df()
+        if merged is None or self._map_color_by is None:
+            return
+        color_by = self._map_color_by
+        merged = merged.filter(pl.col(color_by).is_not_null())
         if merged.height == 0:
+            if self._spatial_map_layer is not None:
+                self._spatial_map_layer.data = np.empty((0, 2))
             return
         positions = merged.select("y_px", "x_px").to_numpy()
-        values = merged[color_by].fill_null(merged[color_by].mean() or 0.0).to_numpy()
+        values = merged[color_by].to_numpy()
         if self._spatial_map_layer is None:
             self._spatial_map_layer = self.viewer.add_points(
                 positions,
