@@ -24,7 +24,7 @@ dependencies = [
     "typer",
     "natsort",
     "qtpy",
-    "napari",
+    "napari[pyqt6]",
     "sfwloc",
     "sfwloc-py",
     "diffusionkit",
@@ -46,6 +46,6 @@ where = ["src"]
 "*" = ["*.yaml"]
 
 [tool.uv.sources]
-sfwloc = { workspace = true }
-sfwloc-py = { workspace = true }
-diffusionkit = { workspace = true }
+sfwloc = { path = "../sfwloc", editable = true }
+sfwloc-py = { path = "../sfwloc/rust/sfwloc-py", editable = true }
+diffusionkit = { path = "../diffusionkit", editable = true }
