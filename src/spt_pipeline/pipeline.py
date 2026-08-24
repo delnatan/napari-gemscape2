@@ -448,6 +448,43 @@ def estimate_D_um2_s(linked_df: pl.DataFrame, dt_s: float, pixel_size_um: float,
     return D_est, valid.height
 
 
+def track_features_df(tracks_df: pl.DataFrame, pixel_size_um: float, dt_s: float) -> pl.DataFrame:
+    """`tracks_df` with three per-track quality features broadcast onto
+    every one of that track's own rows: `track_length` (points survived by
+    linking), `duration_s` (span between its first and last frame),
+    `mean_step_um` (mean single-step displacement -- the same quantity
+    `estimate_D_um2_s` pools across every track, kept per-track here
+    instead). Presentation-layer only (napari's Tracks layer `properties=`,
+    for `color_by`/hover) -- not used by the pipeline itself.
+
+    A track with a single point has no step to average, so its
+    `mean_step_um` is 0.0 rather than null (`color_by` on a napari Tracks
+    layer requires a fully-populated numeric column)."""
+    if tracks_df.height == 0 or "track_id" not in tracks_df.columns:
+        return tracks_df.with_columns(
+            pl.lit(0, dtype=pl.UInt32).alias("track_length"),
+            pl.lit(0.0).alias("duration_s"),
+            pl.lit(0.0).alias("mean_step_um"),
+        )
+    df = tracks_df.sort(["track_id", "frame"]).with_columns(
+        pl.col("frame").diff().over("track_id").alias("_dframe"),
+        (pl.col("y").diff().over("track_id") * pixel_size_um).alias("_dy_um"),
+        (pl.col("x").diff().over("track_id") * pixel_size_um).alias("_dx_um"),
+    )
+    df = df.with_columns(
+        pl.when(pl.col("_dframe") == 1)
+        .then((pl.col("_dy_um") ** 2 + pl.col("_dx_um") ** 2).sqrt())
+        .alias("_step_um")
+    )
+    agg = df.group_by("track_id").agg(
+        pl.len().alias("track_length"),
+        (pl.col("frame").max() - pl.col("frame").min()).alias("_span_frames"),
+        pl.col("_step_um").mean().fill_null(0.0).alias("mean_step_um"),
+    )
+    agg = agg.with_columns((pl.col("_span_frames") * dt_s).alias("duration_s")).drop("_span_frames")
+    return df.drop("_dframe", "_dy_um", "_dx_um", "_step_um").join(agg, on="track_id", how="left")
+
+
 def run_track_step(
     session: PipelineSession,
     bootstrap_gate_px: float,

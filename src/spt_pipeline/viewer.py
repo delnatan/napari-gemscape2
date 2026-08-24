@@ -5,8 +5,15 @@ from __future__ import annotations
 from pathlib import Path
 
 from spt_pipeline.experiment import load_experiment
-from spt_pipeline.pipeline import load_stack
+from spt_pipeline.pipeline import load_stack, track_features_df
 from spt_pipeline.rois import roi_to_shapes_kwargs
+
+# Per-vertex properties on the "tracks" layer (see track_features_df) --
+# color_by defaults to track_length so a broken/short track (a linking
+# failure) stands out from a long one at a glance, instead of napari's
+# default track_id coloring, which carries no quality signal at all.
+TRACKS_PROPERTY_COLUMNS = ("track_length", "mean_step_um", "duration_s")
+TRACKS_COLOR_BY = "track_length"
 
 # Shared look for every "detected spot" Points layer (the final "points"
 # layer here, and experiment_list.py's stepwise "points (preview)") --
@@ -49,8 +56,12 @@ def add_experiment_layers(viewer, experiment_dir: str | Path) -> None:
         )
 
     if tracks_df.height > 0 and "track_id" in tracks_df.columns:
-        tracks = tracks_df.select("track_id", "frame", "y", "x").to_numpy()
-        viewer.add_tracks(tracks, name="tracks")
+        pixel_size_um = params.get("pixel_size_um") or 1.0
+        dt_s = params.get("dt_s") or 1.0
+        feat_df = track_features_df(tracks_df, pixel_size_um, dt_s)
+        tracks = feat_df.select("track_id", "frame", "y", "x").to_numpy()
+        properties = {col: feat_df[col].to_numpy() for col in TRACKS_PROPERTY_COLUMNS}
+        viewer.add_tracks(tracks, name="tracks", properties=properties, color_by=TRACKS_COLOR_BY)
 
     for roi in rois:
         viewer.add_shapes(**roi_to_shapes_kwargs(roi), edge_color="yellow")
