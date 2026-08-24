@@ -350,7 +350,17 @@ class _TrackExplorerTab(QWidget):
     spinbox (a direct, always-visible track-level filter -- the
     complement to `_DataExplorerTab`'s per-point-quality range filters,
     which need a histogram opened first). Both immediately reshape what's
-    shown here, not just what a fit run is optionally restricted to."""
+    shown here, not just what a fit run is optionally restricted to.
+
+    The "sync tracks display to filter" checkbox extends that same filter
+    to the viewer's own `tracks` layer -- off by default, since it
+    rewrites that layer's data/properties (restored from
+    `DiffusionAnalysisWidget._tracks_df_px`, the full unfiltered table
+    kept around specifically for this) rather than something this widget
+    otherwise only reads from. Without it, filtering only ever narrowed
+    this table and the spatial map, while the actual trajectories drawn
+    in the viewer kept showing everything -- a real inconsistency between
+    "what I filtered to" and "what's on screen"."""
 
     def __init__(self, host: "DiffusionAnalysisWidget") -> None:
         super().__init__()
@@ -367,6 +377,13 @@ class _TrackExplorerTab(QWidget):
         filter_row.addWidget(self._min_track_length)
         filter_row.addStretch()
 
+        self._sync_display_checkbox = QCheckBox("sync tracks display to filter")
+        self._sync_display_checkbox.setToolTip(
+            "When checked, the viewer's own 'tracks' layer shows only the "
+            "currently filtered tracks too, not just this table."
+        )
+        self._sync_display_checkbox.toggled.connect(lambda _checked: self.host.on_filters_changed())
+
         self._model = DataFrameTableModel()
         self.table = QTableView()
         self.table.setModel(self._model)
@@ -377,16 +394,23 @@ class _TrackExplorerTab(QWidget):
 
         layout = QVBoxLayout()
         layout.addLayout(filter_row)
+        layout.addWidget(self._sync_display_checkbox)
         layout.addWidget(self.table)
         self.setLayout(layout)
 
     def min_track_length(self) -> int:
         return self._min_track_length.value()
 
+    def sync_display_enabled(self) -> bool:
+        return self._sync_display_checkbox.isChecked()
+
     def reset(self) -> None:
         self._min_track_length.blockSignals(True)
         self._min_track_length.setValue(1)
         self._min_track_length.blockSignals(False)
+        self._sync_display_checkbox.blockSignals(True)
+        self._sync_display_checkbox.setChecked(False)
+        self._sync_display_checkbox.blockSignals(False)
         self._model.setDataFrame(pl.DataFrame())
 
     def set_dataframe(self, df: pl.DataFrame) -> None:
@@ -1057,7 +1081,21 @@ class DiffusionAnalysisWidget(QWidget):
 
         return _on_click
 
+    def _restore_previous_tracks_layer_if_synced(self) -> None:
+        """If "sync tracks display to filter" left the *previous*
+        tracks layer showing a filtered subset, put it back to its full
+        set before this widget stops tracking it -- otherwise switching
+        away (a different Tracks layer, or no layer at all) leaves that
+        old layer silently stuck filtered in the viewer."""
+        if (
+            self._tracks_layer is not None
+            and self._tracks_df_px is not None
+            and self._track_explorer.sync_display_enabled()
+        ):
+            self._set_tracks_layer_data(self._tracks_df_px)
+
     def _clear_loaded_state(self) -> None:
+        self._restore_previous_tracks_layer_if_synced()
         self._detach_mouse_callback()
         self._experiment_dir = None
         self._tracks_layer = None
@@ -1094,6 +1132,7 @@ class DiffusionAnalysisWidget(QWidget):
             )
             return
 
+        self._restore_previous_tracks_layer_if_synced()
         self._detach_mouse_callback()
         self._tracks_layer = layer
 
@@ -1198,6 +1237,16 @@ class DiffusionAnalysisWidget(QWidget):
             df = df.filter(pl.col("track_id").is_in(list(ids)))
         self._track_explorer.set_dataframe(df)
 
+        if self._current_track_id is not None and self._current_track_id not in set(df["track_id"].to_list()):
+            # The selected track just got filtered out -- clear it rather
+            # than leave a stale highlight in the viewer and a stale
+            # target for "Fit selected track" pointing at a track that
+            # isn't even in the table anymore.
+            self._current_track_id = None
+            self._clear_highlight_layer()
+
+        self._sync_tracks_layer_display(ids)
+
     def set_classical_results(self, full_df: pl.DataFrame, display_df: Optional[pl.DataFrame]) -> None:
         self._classical_full_df = full_df
         self._classical_df = display_df
@@ -1263,10 +1312,13 @@ class DiffusionAnalysisWidget(QWidget):
     # -- viewer overlays --
 
     def _clear_overlay_layers(self) -> None:
-        if self._highlight_layer is not None:
-            self._highlight_layer.data = np.empty((0, 2))
+        self._clear_highlight_layer()
         if self._spatial_map_layer is not None:
             self._spatial_map_layer.data = np.empty((0, 2))
+
+    def _clear_highlight_layer(self) -> None:
+        if self._highlight_layer is not None:
+            self._highlight_layer.data = np.empty((0, 2))
 
     def _update_highlight_layer(self, track_id: Optional[int]) -> None:
         if self._tracks_df_px is None or track_id is None:
@@ -1281,6 +1333,36 @@ class DiffusionAnalysisWidget(QWidget):
         else:
             self._highlight_layer.data = positions
             self._highlight_layer.features = {"track_id": track_ids}
+
+    def _sync_tracks_layer_display(self, filtered_ids: Optional[set]) -> None:
+        """When Track Explorer's "sync tracks display to filter" is on,
+        rewrite the viewer's own `tracks` layer to the filtered subset
+        (restored from `self._tracks_df_px`, the full unfiltered table
+        this widget keeps around specifically for this) -- otherwise
+        restore it to the full set, in case it was left filtered from a
+        moment ago when the checkbox was on."""
+        if self._tracks_layer is None or self._tracks_df_px is None:
+            return
+        if self._track_explorer.sync_display_enabled() and filtered_ids is not None:
+            df = self._tracks_df_px.filter(pl.col("track_id").is_in(list(filtered_ids)))
+        else:
+            df = self._tracks_df_px
+        self._set_tracks_layer_data(df)
+
+    def _set_tracks_layer_data(self, df: pl.DataFrame) -> None:
+        layer = self._tracks_layer
+        # Tracks.data's own setter clears .features (and with it,
+        # color_by falls back to track_id) before this gets a chance to
+        # hand the new properties back -- restore whatever it was
+        # colored by afterward, or a resync silently strips the
+        # track_length coloring viewer.py set up.
+        previous_color_by = layer.color_by
+        data = df.select("track_id", "frame", "y", "x").to_numpy()
+        properties = {c: df[c].to_numpy() for c in df.columns if c not in ("track_id", "frame", "y", "x")}
+        layer.data = data
+        layer.properties = properties
+        if previous_color_by in layer.properties_to_color_by:
+            layer.color_by = previous_color_by
 
     def _filtered_map_df(self) -> Optional[pl.DataFrame]:
         """Whichever registered spatial source has the current color-by
@@ -1327,9 +1409,11 @@ class DiffusionAnalysisWidget(QWidget):
                 face_color=color_by,
                 face_colormap="viridis",
                 symbol="disc",
-                size=6,
-                border_color="black",
-                border_width=0.1,
+                # Small and border-free on purpose: this sits directly on
+                # top of the tracks layer, and a size-6+bordered marker
+                # was obscuring the trajectory it's meant to annotate.
+                size=2.5,
+                border_width=0.0,
             )
             callback = self._make_spatial_map_click_callback()
             self._spatial_map_layer.mouse_drag_callbacks.append(callback)
