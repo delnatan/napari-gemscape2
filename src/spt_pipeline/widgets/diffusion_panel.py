@@ -92,12 +92,15 @@ from qtpy.QtWidgets import (
 
 from spt_pipeline.diffusion import tracks_to_diffusionkit_df
 from spt_pipeline.experiment import load_diffusion_results, write_diffusion_results
+from spt_pipeline.joint_plot import numeric_columns, plot_property_joint
 from spt_pipeline.widgets.qt_helpers import (
     DataFrameTableModel,
     HistogramRangeWidget,
+    JointPlotControl,
     PlotWindow,
     hline,
     style_status_label,
+    tabify_with_open_widget,
 )
 
 # Points-layer look for the two viewer overlays this widget owns -- kept
@@ -448,6 +451,7 @@ class _ClassicalTab(QWidget):
         self.host = host
         self._fit: Optional["dk_analysis.PopulationFit"] = None
         self._plot_window: Optional[PlotWindow] = None
+        self._joint_plot_window: Optional[PlotWindow] = None
 
         self._min_track_length = QSpinBox()
         self._min_track_length.setRange(2, 10_000)
@@ -472,11 +476,17 @@ class _ClassicalTab(QWidget):
         self._summary = QLabel("")
         self._summary.setWordWrap(True)
 
+        self._joint_plot_control = JointPlotControl()
+        self._joint_plot_control.plotRequested.connect(self._show_joint_plot)
+
         layout = QVBoxLayout()
         layout.addLayout(form)
         layout.addWidget(self._restrict_checkbox)
         layout.addLayout(run_row)
         layout.addWidget(self._summary)
+        layout.addWidget(hline())
+        layout.addWidget(QLabel("<b>Joint plot</b> (any two per-track properties)"))
+        layout.addWidget(self._joint_plot_control)
         layout.addStretch()
         self.setLayout(layout)
 
@@ -489,6 +499,7 @@ class _ClassicalTab(QWidget):
         self._status.setText("")
         style_status_label(self._status)
         self._summary.setText("")
+        self._joint_plot_control.clear()
 
     def report_saved(self, text: str) -> None:
         self._status.setText(text)
@@ -510,6 +521,11 @@ class _ClassicalTab(QWidget):
         self._fit = fit
         self._status.setText(f"fit {fit.per_track.height} tracks")
         style_status_label(self._status, "ok" if fit.per_track.height else "caution")
+        if fit.per_track.height:
+            columns = numeric_columns(fit.per_track)
+            self._joint_plot_control.set_columns(columns, prefer_x="D_um2_s", prefer_y="alpha")
+        else:
+            self._joint_plot_control.clear()
 
         normal = fit.ensemble_normal_fit
         anomalous = fit.ensemble_anomalous_fit
@@ -542,6 +558,19 @@ class _ClassicalTab(QWidget):
         self._status.setText(f"error: {exc}")
         style_status_label(self._status, "error")
 
+    def _show_joint_plot(self) -> None:
+        if self._fit is None or self._fit.per_track.height == 0:
+            return
+        x_col, y_col, log_x, log_y = self._joint_plot_control.selection()
+        if not x_col or not y_col:
+            return
+        figure = plot_property_joint(
+            self._fit.per_track, x_col, y_col, log_x=log_x, log_y=log_y, title="Classical MSD fit"
+        )
+        if self._joint_plot_window is None:
+            self._joint_plot_window = PlotWindow("Classical: joint plot", parent=self)
+        self._joint_plot_window.show_figure(figure)
+
 
 class _BayesianTab(QWidget):
     def __init__(self, host: "DiffusionAnalysisWidget") -> None:
@@ -549,7 +578,9 @@ class _BayesianTab(QWidget):
         self.host = host
         self._map_full: Optional[pl.DataFrame] = None
         self._map_model: Optional[str] = None
+        self._map_by_model: dict[str, pl.DataFrame] = {}
         self._track_plot_window: Optional[PlotWindow] = None
+        self._joint_plot_window: Optional[PlotWindow] = None
 
         self._model_picker = QComboBox()
         self._model_picker.addItems(["anomalous", "normal"])
@@ -574,6 +605,14 @@ class _BayesianTab(QWidget):
         self._map_histogram = HistogramRangeWidget()
         self._map_histogram.setEnabled(False)
         self._map_histogram.rangeChanged.connect(self._on_map_range_changed)
+
+        self._joint_plot_control = JointPlotControl()
+        self._joint_plot_control.setToolTip(
+            "Columns from every MAP fit run so far (normal and/or anomalous) "
+            "-- e.g. compare the generalized-diffusion K (D_alpha_median_um2_s_alpha) "
+            "against the normal-model D (D_median_um2_s), or either against alpha."
+        )
+        self._joint_plot_control.plotRequested.connect(self._show_joint_plot)
 
         self._method_picker = QComboBox()
         self._method_picker.addItems(["map", "nuts"])
@@ -603,6 +642,9 @@ class _BayesianTab(QWidget):
         layout.addLayout(color_row)
         layout.addWidget(self._map_histogram)
         layout.addWidget(hline())
+        layout.addWidget(QLabel("<b>Joint plot</b> (any two per-track properties)"))
+        layout.addWidget(self._joint_plot_control)
+        layout.addWidget(hline())
         layout.addWidget(QLabel("<b>Per-track</b> (uses the Track Explorer selection)"))
         layout.addWidget(QLabel("method:"))
         layout.addWidget(self._method_picker)
@@ -614,6 +656,7 @@ class _BayesianTab(QWidget):
     def reset(self) -> None:
         self._map_full = None
         self._map_model = None
+        self._map_by_model = {}
         self._map_status.setText("")
         style_status_label(self._map_status)
         self._track_status.setText("")
@@ -624,6 +667,7 @@ class _BayesianTab(QWidget):
         self._color_by_picker.blockSignals(False)
         self._color_by_picker.setEnabled(False)
         self._map_histogram.setEnabled(False)
+        self._joint_plot_control.clear()
 
     def _run_map(self) -> None:
         tracks = self.host.diffkit_tracks_for_fit(self._restrict_checkbox.isChecked())
@@ -640,8 +684,16 @@ class _BayesianTab(QWidget):
     def _on_map_finished(self, table: pl.DataFrame, model: str) -> None:
         self._map_full = table
         self._map_model = model
+        self._map_by_model[model] = table
         self._map_status.setText(f"fit {table.height} tracks")
         style_status_label(self._map_status, "ok" if table.height else "caution")
+
+        combined = self._combined_map_table()
+        columns = numeric_columns(combined) if combined is not None else []
+        prefer_x = "D_alpha_median_um2_s_alpha" if "D_alpha_median_um2_s_alpha" in columns else "D_median_um2_s"
+        prefer_y = "alpha" if "alpha" in columns else None
+        self._joint_plot_control.set_columns(columns, prefer_x=prefer_x, prefer_y=prefer_y)
+
         map_df = _normalize_map_table(table, model)
         color_by = "alpha_map" if model == "anomalous" else "D_map_um2_s"
         self.host.set_map_results(table, map_df, model, color_by)
@@ -649,6 +701,35 @@ class _BayesianTab(QWidget):
     def _on_map_error(self, exc: Exception) -> None:
         self._map_status.setText(f"error: {exc}")
         style_status_label(self._map_status, "error")
+
+    def _combined_map_table(self) -> Optional[pl.DataFrame]:
+        """Every MAP fit run so far (normal and/or anomalous), left-joined
+        on track_id into one wide table -- the two models never share a
+        result column name (besides track_id), so this is what lets the
+        joint-plot picker offer e.g. the generalized-diffusion K from the
+        anomalous fit *and* D from the normal fit at the same time, without
+        requiring both to have been run in the same call."""
+        tables = list(self._map_by_model.values())
+        if not tables:
+            return None
+        combined = tables[0]
+        for table in tables[1:]:
+            combined = combined.join(table, on="track_id", how="full", coalesce=True)
+        return combined
+
+    def _show_joint_plot(self) -> None:
+        combined = self._combined_map_table()
+        if combined is None:
+            return
+        x_col, y_col, log_x, log_y = self._joint_plot_control.selection()
+        if not x_col or not y_col:
+            return
+        figure = plot_property_joint(
+            combined, x_col, y_col, log_x=log_x, log_y=log_y, title="Bayesian MAP fit"
+        )
+        if self._joint_plot_window is None:
+            self._joint_plot_window = PlotWindow("Bayesian: joint plot", parent=self)
+        self._joint_plot_window.show_figure(figure)
 
     def _on_color_by_changed(self, column: str) -> None:
         if not column:
@@ -960,6 +1041,7 @@ class DiffusionAnalysisWidget(QWidget):
         self.viewer.layers.events.removed.connect(self._refresh_layer_combo)
         self.viewer.layers.events.reordered.connect(self._refresh_layer_combo)
         self._refresh_layer_combo()
+        tabify_with_open_widget(napari_viewer, self, "ExperimentListWidget")
 
     # -- shared read accessors used by the tabs --
 

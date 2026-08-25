@@ -9,13 +9,26 @@ dock widget can import it without pulling in unrelated state.
 from __future__ import annotations
 
 import math
+from typing import Optional
 
 import numpy as np
 import polars as pl
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from qtpy.QtCore import QAbstractTableModel, QModelIndex, QRectF, Qt, Signal
 from qtpy.QtGui import QBrush, QColor, QPainter, QPalette, QPen
-from qtpy.QtWidgets import QDialog, QDoubleSpinBox, QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from qtpy.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDoubleSpinBox,
+    QFormLayout,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 
 STATUS_LEVEL_COLORS = {
     "neutral": "#9a9a9a",
@@ -28,6 +41,39 @@ STATUS_LEVEL_COLORS = {
 def style_status_label(label: QLabel, level: str = "neutral") -> None:
     color = STATUS_LEVEL_COLORS.get(level, STATUS_LEVEL_COLORS["neutral"])
     label.setStyleSheet(f"color: {color}; font-size: 11px;")
+
+
+def tabify_with_open_widget(napari_viewer, widget: QWidget, sibling_class_name: str) -> None:
+    """Land `widget`'s dock as a tab on an already-open dock widget whose
+    inner widget's class is named `sibling_class_name`, instead of
+    napari's default of stacking a second same-area dock widget below the
+    first. Matched by class name (not an imported type) so
+    experiment_list.py and diffusion_panel.py don't have to import each
+    other. Deferred via `QTimer.singleShot(0, ...)` because this runs from
+    `__init__`, before napari wraps `widget` in its `QtViewerDockWidget`
+    and docks it (see `_instantiate_dock_widget` in
+    `napari._qt.qt_main_window`) -- by the next event-loop tick that
+    wrapping is done, whether or not a sibling happens to be open yet."""
+    from qtpy.QtCore import QTimer
+
+    def _do_tabify() -> None:
+        own_dock = widget.parent()
+        if own_dock is None:
+            return
+        for inner in napari_viewer.window.dock_widgets.values():
+            if type(inner).__name__ == sibling_class_name:
+                sibling_dock = inner.parent()
+                if sibling_dock is not None and sibling_dock is not own_dock:
+                    # `_qt_window` (the QMainWindow) is private API, but
+                    # it's the same route napari itself uses internally
+                    # to tabify dock widgets -- there's no public
+                    # equivalent (see `Window._add_viewer_dock_widget`).
+                    napari_viewer.window._qt_window.tabifyDockWidget(sibling_dock, own_dock)
+                    own_dock.show()
+                    own_dock.raise_()
+                return
+
+    QTimer.singleShot(0, _do_tabify)
 
 
 def hline() -> QFrame:
@@ -73,6 +119,75 @@ class PlotWindow(QDialog):
         self.show()
         self.raise_()
         self.activateWindow()
+
+
+class JointPlotControl(QWidget):
+    """Reusable x/y column picker + log-scale toggles + "Show plot" button
+    for the generic scatter+KDE joint-distribution plot
+    (`spt_pipeline.joint_plot.plot_property_joint`) -- one instance per tab
+    that wants to let the user compare any two of its own per-track result
+    columns, rather than a single hardcoded property pair. The tab owns the
+    actual dataframe and plotting call; this widget only tracks the
+    picker/checkbox state and tells the tab when to plot."""
+
+    plotRequested = Signal()
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._x_picker = QComboBox()
+        self._y_picker = QComboBox()
+        self._log_x = QCheckBox("log x")
+        self._log_x.setChecked(True)
+        self._log_y = QCheckBox("log y")
+        self._button = QPushButton("Show plot")
+        self._button.setEnabled(False)
+        self._button.clicked.connect(self.plotRequested)
+
+        form = QFormLayout()
+        form.addRow("x:", self._x_picker)
+        form.addRow("y:", self._y_picker)
+        log_row = QHBoxLayout()
+        log_row.addWidget(self._log_x)
+        log_row.addWidget(self._log_y)
+        log_row.addStretch()
+
+        layout = QVBoxLayout()
+        layout.addLayout(form)
+        layout.addLayout(log_row)
+        layout.addWidget(self._button)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.setLayout(layout)
+
+    def set_columns(
+        self,
+        columns: list[str],
+        prefer_x: Optional[str] = None,
+        prefer_y: Optional[str] = None,
+    ) -> None:
+        for picker, prefer in ((self._x_picker, prefer_x), (self._y_picker, prefer_y)):
+            current = prefer or picker.currentText()
+            picker.blockSignals(True)
+            picker.clear()
+            picker.addItems(columns)
+            if current in columns:
+                picker.setCurrentText(current)
+            elif columns:
+                picker.setCurrentIndex(0)
+            picker.blockSignals(False)
+        self._button.setEnabled(bool(columns))
+
+    def clear(self) -> None:
+        self._x_picker.clear()
+        self._y_picker.clear()
+        self._button.setEnabled(False)
+
+    def selection(self) -> tuple[str, str, bool, bool]:
+        return (
+            self._x_picker.currentText(),
+            self._y_picker.currentText(),
+            self._log_x.isChecked(),
+            self._log_y.isChecked(),
+        )
 
 
 def _format_cell(value: object) -> str:
