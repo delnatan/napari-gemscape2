@@ -14,7 +14,8 @@ and subprocess-batch-script implementations of the same pipeline.
 Deliberately excluded (see the project plan): an in-app code-exec tab and
 the diffusion-analysis step -- this widget's job is browse/load/run-
 detect-track, nothing else. Pipeline parameter tuning (including the
-Detect tab's frame-range/ROI scope controls) lives in
+Detect tab's PSF-width preview loop and frame-range/ROI scope controls)
+lives in
 `widgets/params_panel.py::PipelineParamsWidget`, which stays viewer-
 agnostic; this module is what actually resolves the ROI checkbox into a
 boolean mask array, by reading the active napari Shapes layer
@@ -41,13 +42,28 @@ through the same `self._worker` slot (only one run -- batch or stepwise
   Cancel while a run is active (`_cancel_active_run`) -- cooperative, see
   `pipeline.PipelineCancelled`'s docstring for what that actually
   guarantees per stage.
-- **Stepwise** (each params-panel tab's own "Run <stage>" button, single
-  current item only): calibrate, detect, and track run independently
-  against a `pipeline.PipelineSession` held in `self._session`, so
-  changing one stage's knobs and re-running it doesn't force redoing the
-  earlier stages. The session resets on selection change (see
+- **Stepwise** (the params-panel tabs' own buttons, single current item
+  only): preview, detect and track run independently against a
+  `pipeline.PipelineSession` held in `self._session`, so changing one
+  stage's knobs and re-running it doesn't force redoing the earlier
+  stages. The session resets on selection change (see
   `_on_selection_changed`) -- it's scoped to "the image currently being
   worked on", not persisted across items.
+
+  Stepwise runs write **nothing** until "Save experiment" is pressed
+  (`_save_experiment`). The filter histograms on both tabs are the reason:
+  the cuts they set are chosen by looking at a finished stage's output, so
+  committing the bundle the instant linking returned would mean saving
+  before the decision that shapes it had been made. Batch runs still write
+  on completion -- nobody is dragging a handle during one. `has_unsaved_
+  session` on the list row is what marks the gap in between.
+
+  Filters also drive the viewer live: `_update_points_layer` and
+  `_update_tracks_layer` redraw the "points (preview)"/"tracks (preview)"
+  layers through the current cuts on every handle move, so a spot that
+  fails a cut leaves the image as the cut is made. That immediacy is the
+  point of keeping the histogram next to the viewer instead of in a
+  report.
 """
 
 from __future__ import annotations
@@ -99,16 +115,23 @@ from spt_pipeline.pipeline import (
     DetectTrackParams,
     PipelineCancelled,
     PipelineSession,
-    calibration_accepted,
+    apply_track_filters,
+    filter_mask,
     load_session,
-    run_calibration_step,
     run_detect_step,
     run_detect_track,
+    run_preview_frame,
     run_track_step,
     session_manifest_extra,
+    track_features_df,
+    track_metrics_df,
 )
 from spt_pipeline.rois import shapes_layer_to_roi
-from spt_pipeline.viewer import DETECTED_POINTS_STYLE, add_experiment_layers
+from spt_pipeline.viewer import (
+    DETECTED_POINTS_STYLE,
+    TRACKS_COLOR_BY,
+    add_experiment_layers,
+)
 from spt_pipeline.widgets.params_panel import PipelineParamsWidget
 
 
@@ -380,11 +403,14 @@ class ExperimentListWidget(QWidget):
         button_row.addWidget(self.run_button)
 
         self.params_panel = PipelineParamsWidget()
-        self.params_panel.calibrateRequested.connect(self._run_calibrate_step)
+        self.params_panel.previewRequested.connect(self._run_preview_step)
         self.params_panel.detectRequested.connect(self._run_detect_step)
         self.params_panel.detectCancelRequested.connect(self._cancel_active_run)
         self.params_panel.trackRequested.connect(self._run_track_step)
+        self.params_panel.saveRequested.connect(self._save_experiment)
         self.params_panel.newRoiRequested.connect(self._on_new_roi_requested)
+        self.params_panel.pointFiltersChanged.connect(self._on_point_filters_changed)
+        self.params_panel.trackFiltersChanged.connect(self._on_track_filters_changed)
 
         self.progress_label = QLabel("")
         self.progress_label.setWordWrap(True)
@@ -498,14 +524,24 @@ class ExperimentListWidget(QWidget):
             self._session_item.entry.has_unsaved_session = False
         self._session = None
         self._session_item = None
-        self.params_panel.set_calibration_status("")
+        self.params_panel.set_preview_result(None)
         self.params_panel.set_detect_status("")
         self.params_panel.set_track_status("")
+        self.params_panel.set_save_status("")
+        self.params_panel.set_save_enabled(False)
+        # The histogram ranges belong to a table that's about to be
+        # unloaded -- carrying them onto the next image would apply cuts
+        # chosen against a different population, which is exactly the
+        # mistake the histograms exist to prevent.
+        self.params_panel.clear_filters()
+        self.params_panel.set_point_filter_source(None)
+        self.params_panel.set_track_filter_source(None)
         self.list_view.viewport().update()
 
         entry = current.entry
         if has_experiment(entry.experiment_dir):
             add_experiment_layers(self.viewer, entry.experiment_dir)
+            self._restore_filters_from_bundle(entry.experiment_dir)
         else:
             self.viewer.layers.clear()
             image, _, _ = load_stack(entry.image_path)
@@ -620,11 +656,11 @@ class ExperimentListWidget(QWidget):
         points_df, tracks_df, manifest_extra = result
         entry = item.entry
 
+        import spotsolve
         import spt_pipeline
-        import sfwloc
 
         repo_shas = {
-            "sfwloc": git_sha(repo_root_of(sfwloc)),
+            "spotsolve": git_sha(repo_root_of(spotsolve)),
             "spt_pipeline": git_sha(repo_root_of(spt_pipeline)),
         }
         manifest = build_manifest(
@@ -734,28 +770,47 @@ class ExperimentListWidget(QWidget):
         self.progress_label.setText(f"error: {exc}")
         self._finish_step_worker()
 
-    def _run_calibrate_step(self) -> None:
+    def _run_preview_step(self) -> None:
+        """Localize ONE frame with the reporting band off and show every
+        fit, so `sigma` can be chosen by looking at the `fit_sigma`
+        distribution instead of by trusting `calibrate_sigma`'s median --
+        see `params_panel`'s module docstring for why this replaced the
+        Calibration tab."""
         item = self.list_view.currentItem()
         if item is None:
             return
         try:
             session = self._ensure_session(item)
         except Exception as exc:
-            self.params_panel.set_calibration_status(f"error: {exc}", level="error")
+            self.params_panel.set_preview_status(f"error: {exc}", level="error")
             return
         self.params_panel.set_frame_bounds(session.image.shape[0])
-        self.progress_label.setText(f"Calibrating: {item.entry.image_path.name}")
-        worker = _run_calibration_worker(
+
+        mask = None
+        if self.params_panel.get_use_roi_mask():
+            try:
+                mask, _roi = self._build_roi_mask(session.image.shape[1:])
+            except Exception as exc:
+                self.params_panel.set_preview_status(f"error: {exc}", level="error")
+                return
+
+        frame_index = self.params_panel.get_preview_frame_index()
+        self.progress_label.setText(f"Previewing frame {frame_index}: {item.entry.image_path.name}")
+        self.params_panel.set_preview_status("previewing…")
+        worker = _run_preview_worker(
             session,
-            self.params_panel.get_sigma_init(),
-            self.params_panel.get_calibration_kwargs(),
-            self.params_panel.get_calibration_frame_index(),
+            self.params_panel.get_sigma(),
+            frame_index,
+            self.params_panel.get_camera_kwargs(),
+            self.params_panel.get_detect_kwargs(),
+            self.params_panel.get_agg_ratio(),
+            mask,
         )
         self._start_step_worker(
-            worker, lambda s, item=item: self._on_calibrate_finished(item, s), indeterminate=True
+            worker, lambda s, item=item: self._on_preview_finished(item, s), indeterminate=True
         )
 
-    def _on_calibrate_finished(self, item: ExperimentItem, session: PipelineSession) -> None:
+    def _on_preview_finished(self, item: ExperimentItem, session: PipelineSession) -> None:
         if self._session_item is not item:
             # Selection changed to a different item while this ran --
             # `_on_selection_changed` already reset `self._session`;
@@ -763,49 +818,57 @@ class ExperimentListWidget(QWidget):
             self._finish_step_worker()
             return
         self._session = session
-        item.entry.has_unsaved_session = True
-        self.list_view.viewport().update()
-        summary = session.calib_summary or {}
-        n_used = summary.get("n_spots_used", 0)
-        n_total = summary.get("n_spots_total", 0)
-        if n_used == 0:
-            level = "error"
-        elif n_total and n_used < n_total * 0.5:
-            level = "caution"
-        else:
-            level = "ok"
-        self.params_panel.set_calibration_status(
-            f"sigma = {session.sigma:.3f} px  (n={n_used}/{n_total} spots)", level=level
-        )
-        self._add_calibration_layer(session)
+        summary = session.preview_summary or {}
+        n_fits = summary.get("n_fits", 0)
+        # A preview that found nothing is a real answer (wrong sigma,
+        # wrong camera gain, blank frame) -- say so in red rather than
+        # leaving an empty status that reads like it never ran.
+        self.params_panel.set_preview_result(summary, level="error" if n_fits == 0 else "ok")
+        self._add_preview_layer(session)
+        # Preview is also where the filter histograms come from before any
+        # full run exists -- tune the cuts on one frame, then run the range.
+        # Deliberately only when a real detect hasn't already produced a
+        # bigger table: one frame is a worse population to judge against.
+        if session.points_df is None:
+            self.params_panel.set_point_filter_source(session.preview_points_df)
         self._finish_step_worker()
 
-    def _add_calibration_layer(self, session: PipelineSession) -> None:
-        """One box-shaped point per calibration spot, `features=` set to
-        the full per-spot fit table (`y`/`x`/`sigma`/`se_sigma`/`nll`/
-        `converged`/`laplace_ok`/`at_bound`/...) plus a derived
-        `accepted` column -- napari shows a hovered/selected point's
-        features in the status bar, so every spot's fit quality is
-        inspectable, not just the aggregate sigma_estimate in the status
-        label. `accepted` (green border) mirrors the same filter
-        `sigma_from_spots`'s own `sigma_estimate` aggregate uses (see
-        `pipeline.calibration_accepted`) -- gray-bordered points didn't
-        count towards it. Faces are transparent (border color only) so
-        the boxes outline each fit window without occluding the
-        underlying image."""
-        df = session.calib_points_df
+    def _add_preview_layer(self, session: PipelineSession) -> None:
+        """One box-shaped point per previewed fit, `features=` set to the
+        full per-spot table (`loctable.LOCALIZATION_SCHEMA`:
+        `y`/`x`/`fit_sigma`/`sigma_ratio`/`se_*`/`flux`/...) plus the
+        derived `accepted` -- napari shows a hovered/selected point's
+        features in the status bar, so every fit is inspectable, not just
+        the median in the status label.
+
+        `accepted` (green border) is whether a detect run at this sigma
+        would report the spot at all, or reject it as out-of-band (see
+        `pipeline.calibration_accepted`); gray-bordered points are the
+        out-of-band fits, which the preview includes precisely because it
+        runs with the band off. That is what makes the band choosable:
+        both populations are on the image at once.
+
+        Faces are transparent (border color only) so the boxes outline
+        each fit without occluding the underlying image."""
+        df = session.preview_points_df
         if df is None or df.height == 0:
+            if "preview spots" in self.viewer.layers:
+                del self.viewer.layers["preview spots"]
             return
-        if "calibration spots" in self.viewer.layers:
-            del self.viewer.layers["calibration spots"]
+        if "preview spots" in self.viewer.layers:
+            del self.viewer.layers["preview spots"]
 
         features = {col: df[col].to_numpy() for col in df.columns}
-        features["accepted"] = calibration_accepted(df).to_numpy()
-        box_size = (session.calibration_kwargs_used or {}).get("box_size", 11)
+        # Sized off the sigma previewed at rather than a fit-window
+        # parameter -- spotsolve's boxes are an internal of the search, not
+        # a knob, so there is no box_size to read back. ~6 sigma is wide
+        # enough to frame the spot it marks at a glance.
+        sigma = (session.preview_summary or {}).get("sigma_used") or session.sigma or 1.3
+        box_size = max(3.0, 6.0 * sigma)
 
         self.viewer.add_points(
             df.select(["y", "x"]).to_numpy(),
-            name="calibration spots",
+            name="preview spots",
             features=features,
             symbol="square",
             size=box_size,
@@ -817,6 +880,11 @@ class ExperimentListWidget(QWidget):
             ],
             border_width=0.15,
         )
+        if session.preview_frame_used is not None and self.viewer.dims.ndim:
+            # Step the viewer to the frame just previewed -- the boxes are
+            # 2D and show on every frame, so without this they'd be drawn
+            # over whichever frame happens to be displayed.
+            self.viewer.dims.set_current_step(0, session.preview_frame_used)
 
     def _run_detect_step(self) -> None:
         item = self.list_view.currentItem()
@@ -839,7 +907,11 @@ class ExperimentListWidget(QWidget):
                 return
             session.roi = [roi]
 
-        sigma = session.sigma if session.sigma is not None else self.params_panel.get_sigma_init()
+        # The Detect tab's sigma box, always -- not `session.sigma` from
+        # some earlier run. It IS the setting now that the preview loop
+        # feeds it (params_panel's docstring), so honoring a stale session
+        # value would mean the number on screen isn't the one that ran.
+        sigma = self.params_panel.get_sigma()
         self.progress_label.setText(f"Finding spots: {item.entry.image_path.name}")
         self._cancel_event = threading.Event()
         self.params_panel.set_detect_running(True)
@@ -854,9 +926,9 @@ class ExperimentListWidget(QWidget):
         worker = _run_detect_worker(
             session,
             sigma,
-            self.params_panel.get_algorithm(),
-            self.params_panel.get_solver_kwargs(),
-            self.params_panel.get_sparse_kwargs(),
+            self.params_panel.get_camera_kwargs(),
+            self.params_panel.get_detect_kwargs(),
+            self.params_panel.get_agg_ratio(),
             self.params_panel.get_frame_range(),
             mask,
             self._cancel_event,
@@ -878,21 +950,43 @@ class ExperimentListWidget(QWidget):
         self.list_view.viewport().update()
         n_points = session.points_df.height if session.points_df is not None else 0
         start, end = session.frame_range_used or (0, session.image.shape[0])
+        # The reject/aggregate counts are the reason frames_df is kept: a
+        # run that found plenty of spots but binned most of them as
+        # out-of-band is a focus or sigma problem, and that's only visible
+        # if the numbers are shown next to the detection count.
+        extra = ""
+        frames = session.frames_df
+        if frames is not None and frames.height:
+            n_rejected = int(
+                frames["n_too_narrow"].sum() + frames["n_too_wide"].sum() + frames["n_edge"].sum()
+            )
+            n_flagged = int(frames["n_locs_flagged"].sum())
+            parts = []
+            if n_rejected:
+                parts.append(f"{n_rejected} out-of-band")
+            if n_flagged:
+                parts.append(f"{n_flagged} aggregate")
+            if parts:
+                extra = "  (" + ", ".join(parts) + ")"
         self.params_panel.set_detect_status(
-            f"{n_points} points across frames {start}-{end - 1}",
+            f"{n_points} points across frames {start}-{end - 1}{extra}",
             level="error" if n_points == 0 else "ok",
         )
 
-        if session.points_df is not None:
-            if "points (preview)" in self.viewer.layers:
-                del self.viewer.layers["points (preview)"]
-            features = {col: session.points_df[col].to_numpy() for col in session.points_df.columns}
-            self.viewer.add_points(
-                session.points_df.select(["frame", "y", "x"]).to_numpy(),
-                name="points (preview)",
-                features=features,
-                **DETECTED_POINTS_STYLE,
-            )
+        # Hand the real run's detections to the filter histograms (they
+        # may have been showing a single preview frame's) and draw the
+        # layer through whatever cuts are already set. The Detect tab
+        # pages through its steps rather than scrolling, so leaf it to the
+        # filter page too -- that histogram is what there is to do next,
+        # and it is no longer just below the Run button.
+        self.params_panel.set_point_filter_source(session.points_df)
+        self.params_panel.show_tab("Detect", "Filter")
+        if "preview spots" in self.viewer.layers:
+            # The preview's one frame is superseded by the real run; two
+            # overlapping spot layers on the same frame is just confusing.
+            del self.viewer.layers["preview spots"]
+        self._update_points_layer()
+        self.params_panel.set_save_enabled(False)
         self._finish_step_worker()
 
     def _on_detect_error(self, item: ExperimentItem, exc: Exception) -> None:
@@ -915,7 +1009,14 @@ class ExperimentListWidget(QWidget):
         emitter = _ProgressEmitter()
         emitter.updated.connect(self._on_progress)
         worker = _run_track_worker(
-            session, self.params_panel.get_bootstrap_gate_px(), self.params_panel.get_min_track_length(), emitter
+            session,
+            self.params_panel.get_min_track_length(),
+            self.params_panel.get_drop_aggregates(),
+            # The Detect tab's cuts decide what the linker sees -- applied
+            # here rather than to `points_df`, which keeps every detection
+            # (see run_track_step's docstring).
+            self.params_panel.get_point_filters(),
+            emitter,
         )
         self._start_step_worker(worker, lambda s, item=item: self._on_track_finished(item, s))
 
@@ -924,6 +1025,7 @@ class ExperimentListWidget(QWidget):
             self._finish_step_worker()
             return
         self._session = session
+        item.entry.has_unsaved_session = True
         summary = session.track_summary or {}
         n_tracks = (
             session.tracks_df["track_id"].n_unique() if session.tracks_df is not None and session.tracks_df.height else 0
@@ -931,36 +1033,242 @@ class ExperimentListWidget(QWidget):
         verdict = summary.get("resolvability_verdict", "ok")
         level = {"ok": "ok", "caution": "caution", "unresolvable": "error"}.get(verdict, "neutral")
         message = summary.get("resolvability_message", "")
+        # Both D estimates, because they answer the question two ways: the
+        # MSD moment of the finished tracks, and the linker's own fitted
+        # population mean. Agreement is reassuring; a large gap means the
+        # linking is suspect, and neither number alone would show it.
+        dropped = summary.get("n_points_dropped_by_filter") or 0
+        filtered = f"  ({dropped} points cut by filters)" if dropped else ""
         self.params_panel.set_track_status(
-            f"{n_tracks} tracks  D~{summary.get('D_est_um2_s', 0.0):.4f} um^2/s\n{message}",
+            f"{n_tracks} tracks  D~{summary.get('D_est_um2_s', 0.0):.4f} um^2/s "
+            f"(linker fit {summary.get('D_link_um2_s', 0.0):.4f}, "
+            f"immobile {summary.get('immobile_fraction', 0.0):.0%}){filtered}\n{message}",
             level=level,
         )
 
+        # Feed the Track tab's histograms one row per track, then draw the
+        # layer through whatever cuts survive. Nothing is written yet --
+        # `_save_experiment` is the finalize step now, so the filters can
+        # be tuned against the linked result before it's committed.
+        self.params_panel.set_track_filter_source(self._track_metrics())
+        self._update_tracks_layer()
+        self.params_panel.set_save_enabled(session.tracks_df is not None and session.tracks_df.height > 0)
+        self.params_panel.set_save_status("not saved yet", level="caution")
+        self.params_panel.show_tab("Track", "Filter")
+        self.list_view.viewport().update()
+        self._finish_step_worker()
+
+    # -- Filters -> viewer (live) --
+
+    def _track_metrics(self):
+        """One row per track for the Track tab's filter histograms, or None
+        with nothing linked."""
+        session = self._session
+        if session is None or session.tracks_df is None or session.tracks_df.height == 0:
+            return None
+        return track_metrics_df(session.tracks_df, session.pixel_size_um, session.dt_s)
+
+    def _on_point_filters_changed(self) -> None:
+        self._update_points_layer()
+        if self._session is not None and self._session.tracks_df is not None:
+            # The linked tracks were produced under the previous cuts, so
+            # they no longer follow from what's on screen. Say so instead
+            # of letting a stale track layer look current.
+            self.params_panel.set_track_status(
+                "detection filters changed — re-run tracking", level="caution"
+            )
+            self.params_panel.set_save_enabled(False)
+
+    def _on_track_filters_changed(self) -> None:
+        self._update_tracks_layer()
+        if self.params_panel.get_track_filters():
+            self.params_panel.set_save_status("filters changed — save to apply", level="caution")
+
+    def _update_points_layer(self) -> None:
+        """Redraw the detections layer showing only what passes the Detect
+        tab's cuts -- filtered spots vanish from the image as the handle
+        moves, which is the whole point of putting the histogram next to
+        the viewer rather than in a report."""
+        session = self._session
+        if session is None or session.points_df is None:
+            return
+        df = session.points_df
+        filters = self.params_panel.get_point_filters()
+        if filters:
+            df = df.filter(filter_mask(df, filters))
+        if "points (preview)" in self.viewer.layers:
+            del self.viewer.layers["points (preview)"]
+        if df.height == 0:
+            return
+        features = {col: df[col].to_numpy() for col in df.columns}
+        self.viewer.add_points(
+            df.select(["frame", "y", "x"]).to_numpy(),
+            name="points (preview)",
+            features=features,
+            **DETECTED_POINTS_STYLE,
+        )
+
+    def _update_tracks_layer(self) -> None:
+        """Redraw the linked tracks showing only those passing the Track
+        tab's cuts, the same way `_update_points_layer` does for
+        detections."""
+        session = self._session
+        if session is None or session.tracks_df is None:
+            return
+        df = self._filtered_tracks()
+        if "tracks (preview)" in self.viewer.layers:
+            del self.viewer.layers["tracks (preview)"]
+        if df is None or df.height == 0:
+            return
+        feat_df = track_features_df(df, session.pixel_size_um, session.dt_s)
+        properties = {
+            col: feat_df[col].to_numpy()
+            for col in feat_df.columns
+            if col not in ("track_id", "frame", "y", "x")
+        }
+        self.viewer.add_tracks(
+            feat_df.select("track_id", "frame", "y", "x").to_numpy(),
+            name="tracks (preview)",
+            properties=properties,
+            color_by=TRACKS_COLOR_BY,
+            metadata={
+                "pixel_size_um": session.pixel_size_um,
+                "dt_s": session.dt_s,
+                "experiment_dir": str(self._session_item.entry.experiment_dir.resolve())
+                if self._session_item is not None
+                else None,
+            },
+        )
+
+    def _filtered_tracks(self):
+        session = self._session
+        if session is None or session.tracks_df is None:
+            return None
+        return apply_track_filters(
+            session.tracks_df,
+            self.params_panel.get_track_filters(),
+            session.pixel_size_um,
+            session.dt_s,
+        )
+
+    # -- Finalize (explicit save) --
+
+    def _save_experiment(self) -> None:
+        """Write the bundle for the current stepwise session: every
+        detection in points.parquet, the tracks that pass the Track tab's
+        cuts in tracks.parquet, and both filter specs in manifest.json.
+
+        Explicit rather than automatic on a finished track run, so the
+        filters can be tuned against a linked result before it's committed
+        -- press it again after moving a handle and the same bundle is
+        rewritten."""
+        item = self.list_view.currentItem()
+        session = self._session if (item is not None and self._session_item is item) else None
+        if session is None or session.tracks_df is None:
+            self.params_panel.set_save_status("nothing to save — run tracking first", level="error")
+            return
+
+        tracks_df = self._filtered_tracks()
+        if tracks_df is None or tracks_df.height == 0:
+            self.params_panel.set_save_status(
+                "nothing to save — the track filters reject every track", level="error"
+            )
+            return
+
+        # Record what the save actually used, so `session_manifest_extra`
+        # reports the cuts the bundle was written under rather than the
+        # ones the link step happened to run with.
+        session.track_filters_used = self.params_panel.get_track_filters() or None
+        session.point_filters_used = self.params_panel.get_point_filters() or None
+
         entry = item.entry
+        import spotsolve
         import spt_pipeline
-        import sfwloc
 
         repo_shas = {
-            "sfwloc": git_sha(repo_root_of(sfwloc)),
+            "spotsolve": git_sha(repo_root_of(spotsolve)),
             "spt_pipeline": git_sha(repo_root_of(spt_pipeline)),
         }
+        manifest_params = session_manifest_extra(session)
+        # n_tracks comes off the session's unfiltered table; the bundle is
+        # getting the filtered one, so correct it before it's written.
+        manifest_params["n_tracks"] = tracks_df["track_id"].n_unique()
         manifest = build_manifest(
             experiment_id=entry.experiment_dir.name,
             source_image_path=entry.image_path,
-            params=session_manifest_extra(session),
+            params=manifest_params,
             repo_shas=repo_shas,
         )
-        write_experiment(entry.experiment_dir, session.points_df, session.tracks_df, manifest, rois=session.roi)
+        try:
+            write_experiment(
+                entry.experiment_dir, session.points_df, tracks_df, manifest, rois=session.roi
+            )
+        except Exception as exc:
+            self.params_panel.set_save_status(f"error: {exc}", level="error")
+            return
+
+        n_tracks = manifest_params["n_tracks"]
         item.set_status(Status.COMPLETE, n_tracks=n_tracks)
         item.entry.has_unsaved_session = False
         self.list_view.viewport().update()
+        self.params_panel.set_save_status(
+            f"saved {n_tracks} tracks → {entry.experiment_dir.name}", level="ok"
+        )
 
         if self.list_view.currentItem() is item:
-            if "points (preview)" in self.viewer.layers:
-                del self.viewer.layers["points (preview)"]
+            for name in ("points (preview)", "tracks (preview)", "preview spots"):
+                if name in self.viewer.layers:
+                    del self.viewer.layers[name]
             add_experiment_layers(self.viewer, entry.experiment_dir)
 
-        self._finish_step_worker()
+    def _restore_filters_from_bundle(self, experiment_dir: Path) -> None:
+        """Put a saved bundle's recorded filter ranges back on the
+        histograms when its row is selected -- the manifest is the record
+        of which cuts produced it, so re-opening it should show those cuts
+        rather than an empty panel. Sources come from the bundle's own
+        tables, so the histograms are the distributions those ranges were
+        chosen against.
+
+        A restored *track* filter will usually read as inactive, and that
+        is correct rather than a failure: tracks.parquet holds only the
+        tracks that passed it, so within the saved table the recorded
+        range covers everything. The row is still put back at its recorded
+        bounds, so what the cut was stays visible. Point filters do survive
+        as live cuts, because points.parquet keeps the detections they
+        rejected.
+
+        Best-effort: a bundle written before filters existed, or one whose
+        manifest can't be read, just leaves the panels empty."""
+        try:
+            points_df, tracks_df, manifest, _rois = load_experiment(experiment_dir)
+        except Exception:
+            return
+        params = manifest.get("params", {}) or {}
+        pixel_size_um = params.get("pixel_size_um") or 1.0
+        dt_s = params.get("dt_s") or 1.0
+
+        self.params_panel.set_point_filter_source(points_df if points_df.height else None)
+        metrics = (
+            track_metrics_df(tracks_df, pixel_size_um, dt_s)
+            if tracks_df.height and "track_id" in tracks_df.columns
+            else None
+        )
+        self.params_panel.set_track_filter_source(metrics)
+        self.params_panel.set_point_filters(_filter_spec(params.get("point_filters")))
+        self.params_panel.set_track_filters(_filter_spec(params.get("track_filters")))
+        n_tracks = params.get("n_tracks")
+        self.params_panel.set_save_status(
+            f"saved bundle — {n_tracks} tracks" if n_tracks is not None else "saved bundle",
+            level="ok",
+        )
+
+
+def _filter_spec(recorded: Optional[dict]) -> Optional[dict]:
+    """A manifest's `{column: [lo, hi]}` back as `{column: (lo, hi)}` --
+    JSON has no tuples, and `pipeline.FilterSpec` is written in them."""
+    if not recorded:
+        return None
+    return {col: (float(bounds[0]), float(bounds[1])) for col, bounds in recorded.items()}
 
 
 @thread_worker(start_thread=False)
@@ -979,19 +1287,33 @@ def _run_pipeline_worker(
 
 
 @thread_worker(start_thread=False)
-def _run_calibration_worker(
-    session: PipelineSession, sigma_init: float, calibration_kwargs: dict, frame_index: int
+def _run_preview_worker(
+    session: PipelineSession,
+    sigma: float,
+    frame_index: int,
+    camera_kwargs: dict,
+    detect_kwargs: dict,
+    agg_ratio: float,
+    mask: Optional[np.ndarray],
 ) -> PipelineSession:
-    return run_calibration_step(session, sigma_init, calibration_kwargs, frame_index=frame_index)
+    return run_preview_frame(
+        session,
+        sigma,
+        frame_index=frame_index,
+        camera_kwargs=camera_kwargs,
+        detect_kwargs=detect_kwargs,
+        agg_ratio=agg_ratio,
+        mask=mask,
+    )
 
 
 @thread_worker(start_thread=False)
 def _run_detect_worker(
     session: PipelineSession,
     sigma: float,
-    algorithm: str,
-    solver_kwargs: dict,
-    sparse_kwargs: dict,
+    camera_kwargs: dict,
+    detect_kwargs: dict,
+    agg_ratio: float,
     frame_range: Optional[tuple[int, int]],
     mask: Optional[np.ndarray],
     cancel_event: threading.Event,
@@ -1003,9 +1325,9 @@ def _run_detect_worker(
     return run_detect_step(
         session,
         sigma=sigma,
-        algorithm=algorithm,
-        solver_kwargs=solver_kwargs,
-        sparse_kwargs=sparse_kwargs,
+        camera_kwargs=camera_kwargs,
+        detect_kwargs=detect_kwargs,
+        agg_ratio=agg_ratio,
         frame_range=frame_range,
         mask=mask,
         progress_callback=progress_cb,
@@ -1015,9 +1337,19 @@ def _run_detect_worker(
 
 @thread_worker(start_thread=False)
 def _run_track_worker(
-    session: PipelineSession, bootstrap_gate_px: float, min_track_length: int, emitter: _ProgressEmitter
+    session: PipelineSession,
+    min_track_length: int,
+    drop_aggregates: bool,
+    point_filters: dict,
+    emitter: _ProgressEmitter,
 ) -> PipelineSession:
     def progress_cb(done: int, total: int, stage: str) -> None:
         emitter.updated.emit(done, total, stage)
 
-    return run_track_step(session, bootstrap_gate_px, min_track_length, progress_callback=progress_cb)
+    return run_track_step(
+        session,
+        min_track_length,
+        drop_aggregates=drop_aggregates,
+        point_filters=point_filters,
+        progress_callback=progress_cb,
+    )

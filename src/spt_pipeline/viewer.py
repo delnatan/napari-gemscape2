@@ -15,14 +15,18 @@ TRACKS_COLOR_BY = "track_length"
 
 # Shared look for every "detected spot" Points layer (the final "points"
 # layer here, and experiment_list.py's stepwise "points (preview)") --
-# a small "+" so spots that are close together stay distinguishable at any
-# zoom level, instead of overlapping discs merging into a blob. Transparent
-# border so only the "+" face is visible; magenta since it's a hue absent
-# from both viridis and gray (this app's two expected image colormaps), so
-# markers stay visible regardless of which one the image layer is using.
+# a "+" so spots that are close together stay distinguishable at any
+# zoom level, instead of overlapping discs merging into a blob. Size is
+# in data pixels, so the marker keeps its scale relative to the image as
+# you zoom; napari's "cross" symbol is a filled plus whose arms are a
+# third of that wide, which at size 4 is thin enough to read the PSF
+# through. Transparent border so only the "+" face is visible; magenta
+# since it's a hue absent from both viridis and gray (this app's two
+# expected image colormaps), so markers stay visible regardless of which
+# one the image layer is using.
 DETECTED_POINTS_STYLE = dict(
     symbol="cross",
-    size=1.5,
+    size=4,
     face_color="magenta",
     border_color="transparent",
 )
@@ -74,10 +78,10 @@ def add_experiment_layers(viewer, experiment_dir: str | Path) -> None:
         # Every feat_df column rides along as a per-vertex property, not
         # just the derived track_length/mean_step_um/duration_s -- this is
         # what lets widgets/diffusion_panel.py read per-point QC fields
-        # (amplitude, sigma_x/y, bg, ...) straight off this one layer,
-        # already aligned with track_id, instead of a separate "points"
-        # layer lookup (which has no track_id -- it's the pre-linking
-        # detections table, see experiment.py).
+        # (flux, se_y/se_x, bg, fit_sigma, ...) straight off this one
+        # layer, already aligned with track_id, instead of a separate
+        # "points" layer lookup (which has no track_id -- it's the
+        # pre-linking detections table, see experiment.py).
         properties = {
             col: feat_df[col].to_numpy() for col in feat_df.columns if col not in ("track_id", "frame", "y", "x")
         }

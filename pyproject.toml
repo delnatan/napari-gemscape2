@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "spt-pipeline"
 version = "0.1.0"
-description = "Batch orchestration + napari QC viewer connecting sfwloc (localization/tracking) and diffusionkit (diffusion analysis)"
+description = "Batch orchestration + napari QC viewer connecting spotsolve (localization/tracking) and diffusionkit (diffusion analysis)"
 readme = "README.md"
 requires-python = ">=3.13"
 license = { text = "MIT" }
@@ -25,9 +25,19 @@ dependencies = [
     "natsort",
     "qtpy",
     "napari[pyqt6]",
-    "sfwloc",
-    "sfwloc-py",
-    "diffusionkit",
+    "spotsolve",
+    # The Rust extension `spotsolve` needs at import time. Not published:
+    # built from the sibling crate at ../spotsolve/rust/spotsolve-py (see
+    # [tool.uv.sources]), which is why it is named here explicitly rather
+    # than pulled in as one of spotsolve's own dependencies.
+    "spotsolve-rs",
+    # The [nested] extra (jaxns) is not optional for this project: the
+    # diffusion widget's Anisotropy tab calls diffusionkit.bayes.anisotropy,
+    # whose per-track evidence now comes from nested sampling. jaxns is
+    # imported lazily inside the fit, so without the extra the tab imports
+    # fine and then fails on the first run -- exactly the failure mode worth
+    # spending a dependency to avoid.
+    "diffusionkit[nested]",
 ]
 
 [project.scripts]
@@ -46,6 +56,8 @@ where = ["src"]
 "*" = ["*.yaml"]
 
 [tool.uv.sources]
-sfwloc = { path = "../sfwloc", editable = true }
-sfwloc-py = { path = "../sfwloc/rust/sfwloc-py", editable = true }
+spotsolve = { path = "../spotsolve", editable = true }
+# Not editable: a compiled extension has nothing to pick up from the
+# source tree, and a plain path install builds it via maturin in release.
+spotsolve-rs = { path = "../spotsolve/rust/spotsolve-py" }
 diffusionkit = { path = "../diffusionkit", editable = true }

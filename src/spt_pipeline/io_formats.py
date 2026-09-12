@@ -3,8 +3,8 @@
 Adapted from pyvistra.io (github.com/delnatan/pyvistra, same author) but
 deliberately not a dependency on pyvistra itself: pyvistra's lazy 5D
 proxy/memmap machinery exists to support its interactive viewer, and this
-pipeline always wants the full stack in memory anyway (`find_spots_stack`
-is rayon-parallel over the whole array). Keeping this module self-contained
+pipeline always wants the full stack in memory anyway
+(`spotsolve.localize_stack` is rayon-parallel over the whole array). Keeping this module self-contained
 (numpy/tifffile/h5py + the optional `nd2` package) also means spt-pipeline
 doesn't need to drag in pyvistra's viewer/app dependencies, which matters
 since this package is meant to eventually stand alone outside the

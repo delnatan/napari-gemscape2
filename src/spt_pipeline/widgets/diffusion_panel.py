@@ -13,35 +13,40 @@ selection, so each tab holds a plain reference to this module's
 `DiffusionAnalysisWidget` (`self.host`) rather than talking through Qt
 signals:
 
-- **Data Explorer** -- histograms of per-point quality fields
-  (amplitude, sigma_x/y, bg, ...) read straight off the selected Tracks
+- **Data Explorer** -- a stack of histogram range filters
+  (`widgets/feature_filters.FeatureFilterPanel`, the same component the
+  params panel's Detect and Track tabs use) over per-point quality fields
+  (flux, se_y/se_x, bg, fit_sigma, ...) read straight off the selected Tracks
   layer's own per-vertex properties (every points_df column rides along
   there already, aligned with track_id -- see `viewer.py`; the "points"
-  layer itself has no track_id, it's the pre-linking detections table),
-  with a `matplotlib.widgets.SpanSelector` on each histogram
-  to set a numeric range filter; filters AND together (with the Track
-  Explorer's min-track-length filter -- `combined_filtered_track_ids`)
-  into a "tracks that pass every active filter" subset that immediately
-  reshapes what the Track Explorer table shows, and that Classical/
-  Bayesian fit runs can optionally restrict to (a per-tab checkbox).
+  layer itself has no track_id, it's the pre-linking detections table).
+  A track is kept only if every one of its points passes every cut;
+  those cuts AND together with the Track Explorer's two
+  (`combined_filtered_track_ids`) into a "tracks that pass every active
+  filter" subset that immediately reshapes what the Track Explorer table
+  shows, and that Classical/Bayesian fit runs can optionally restrict to
+  (a per-tab checkbox).
 - **Track Explorer** -- one row per track (`qt_helpers.DataFrameTableModel`
   in a `QTableView`), the single place all per-track numbers now live
   (classical MSD, bulk MAP, and any one-off per-track fit, each in its
   own column group) instead of a `QLabel` text dump, plus its own
-  always-visible `min_track_length` filter (the direct complement to
-  Data Explorer's range filters, which need a histogram opened first).
+  `min_track_length` spinbox and a second `FeatureFilterPanel` over
+  whatever columns that table currently holds -- which after a fit run
+  includes `D_um2_s` and `alpha`, so a per-track fit result is filterable
+  by the same drag as any other feature.
   Selecting a row is
   "the current track" for the Bayesian tab's per-track action, and is
   kept in sync with the viewer both ways: clicking a track in the Tracks
   layer selects its row here (napari's own `TrackManager.get_value` --
   see `DiffusionAnalysisWidget._make_click_callback` -- already resolves
   a click to a `track_id`, no proxy layer needed), and selecting a row
-  here draws that track's vertices as a small highlight overlay
-  (`self._highlight_layer`, a plain `Points` layer since Tracks layers
-  have no selection-highlight of their own).
+  here boxes that track in the viewer (`self._highlight_layer`, a
+  `Shapes` layer holding one rectangle on the track's principal axes --
+  see `oriented_track_box` -- since Tracks layers have no
+  selection-highlight of their own).
 - **Classical (MSD)** -- `analysis.fit_population`, visually and
   column-wise separate from the Bayesian numbers per-request.
-- **Bayesian** -- *Spatial MAP*: `bayes.fit_population(engine="map")`
+- **Bayesian** -- *Spatial MAP*: `diffusionkit.bayes.fit_population`
   batched over every eligible track, fast enough to run on the whole
   field of view; besides filling in Track Explorer columns, it also
   places a `Points` layer in the viewer (`self._spatial_map_layer`, one
@@ -69,12 +74,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-import analysis as dk_analysis
-import bayes as dk_bayes
-import bayes.anisotropy as dk_anisotropy
 import numpy as np
 import polars as pl
-from napari.layers import Points, Tracks
+from diffusionkit import bayes as dk_bayes
+from diffusionkit import classic as dk_analysis
+from diffusionkit.bayes import anisotropy as dk_anisotropy
+from diffusionkit.bayes import viz as dk_bayes_viz
+from diffusionkit.classic import viz as dk_analysis_viz
+from napari.layers import Points, Shapes, Tracks
 from napari.qt.threading import thread_worker
 from qtpy.QtWidgets import (
     QCheckBox,
@@ -93,6 +100,8 @@ from qtpy.QtWidgets import (
 from spt_pipeline.diffusion import tracks_to_diffusionkit_df
 from spt_pipeline.experiment import load_diffusion_results, write_diffusion_results
 from spt_pipeline.joint_plot import numeric_columns, plot_property_joint
+from spt_pipeline.pipeline import filter_mask
+from spt_pipeline.widgets.feature_filters import FeatureFilterPanel
 from spt_pipeline.widgets.qt_helpers import (
     DataFrameTableModel,
     HistogramRangeWidget,
@@ -103,10 +112,79 @@ from spt_pipeline.widgets.qt_helpers import (
     tabify_with_open_widget,
 )
 
-# Points-layer look for the two viewer overlays this widget owns -- kept
-# visually distinct from DETECTED_POINTS_STYLE's magenta "+" (viewer.py)
-# so a highlighted/mapped track never gets mistaken for a raw detection.
-_HIGHLIGHT_POINTS_STYLE = dict(symbol="ring", size=4, face_color="transparent", border_color="yellow", border_width=0.3)
+# Look for the two viewer overlays this widget owns -- kept visually
+# distinct from DETECTED_POINTS_STYLE's magenta "+" (viewer.py) so a
+# highlighted/mapped track never gets mistaken for a raw detection.
+#
+# The selected track is one rotated rectangle (`oriented_track_box`)
+# rather than a marker per vertex: at a marker's scale a selected track is
+# indistinguishable from the detections around it until you're already
+# zoomed onto it, whereas a box reads at any zoom, and it leaves the
+# Tracks layer's own colored path -- which is what actually shows where
+# the molecule went -- unobscured. Drawn on the track's principal axes, so
+# its aspect ratio is a free read on whether the motion is anisotropic,
+# ahead of (and independent of) the Bayesian tab's formal test.
+_TRACK_BOX_STYLE = dict(
+    shape_type="rectangle",
+    face_color="transparent",
+    edge_color="yellow",
+    # Data pixels, like every other size here. Thicker than the hairline
+    # the detection markers use -- this one is meant to be findable in a
+    # zoomed-out field, not to sit unobtrusively on top of a PSF.
+    edge_width=1.0,
+)
+_TRACK_BOX_TEXT = dict(
+    string="track {track_id}",
+    size=8,
+    color="yellow",
+    anchor="upper_left",
+    translation=[-4, 0],
+)
+# Padding around the track's own extent, and a floor on the half-extent so
+# a confined (or single-point) track still gets a box you can see instead
+# of a sub-pixel sliver -- the confined case being exactly the one worth
+# looking at. Both pad the short side as much as the long one, so for a
+# track only a few pixels across the box's aspect ratio understates the
+# anisotropy; it's a read to follow up in the Bayesian tab, not a measure.
+_TRACK_BOX_PAD_PX = 2.0
+_TRACK_BOX_MIN_HALF_PX = 4.0
+
+
+def oriented_track_box(
+    positions: np.ndarray,
+    pad_px: float = _TRACK_BOX_PAD_PX,
+    min_half_px: float = _TRACK_BOX_MIN_HALF_PX,
+) -> np.ndarray:
+    """The four corners, in order, of the padded rectangle enclosing an
+    (N, 2) array of y/x track positions on its own principal axes.
+
+    The box is built in the PCA frame and mapped back, so it is centred on
+    the track's centroid and its long side follows the track's dominant
+    direction: for a directed or confined-but-elongated track it hugs the
+    motion instead of the much larger axis-aligned box a diagonal track
+    would get. Degenerate input (one point, or every point identical) has
+    no principal direction, so it falls back to the image axes, where
+    `min_half_px` keeps the result visible."""
+    positions = np.asarray(positions, dtype=float)
+    center = positions.mean(axis=0)
+    centered = positions - center
+
+    axes = np.eye(2)
+    if len(positions) > 1:
+        # eigh (not eig) since a covariance matrix is symmetric: real
+        # eigenvalues, orthonormal eigenvectors, ascending order -- so the
+        # principal axis is the LAST column, and [::-1] puts it first.
+        _, eigenvectors = np.linalg.eigh(np.cov(centered, rowvar=False))
+        axes = eigenvectors.T[::-1]
+
+    # Half-extent along each axis measured from the centroid, so the box is
+    # symmetric about it -- max|projection| rather than the projections'
+    # own range, which would only be centred for a symmetric track.
+    half = np.abs(centered @ axes.T).max(axis=0) + pad_px
+    half = np.maximum(half, min_half_px)
+
+    signs = np.array([[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]])
+    return center + (signs * half) @ axes
 
 
 @thread_worker(start_thread=False)
@@ -118,7 +196,10 @@ def _run_population_fit_worker(
 
 @thread_worker(start_thread=False)
 def _run_bulk_map_worker(diffkit_tracks: pl.DataFrame, dt_s: float, model: str) -> pl.DataFrame:
-    return dk_bayes.fit_population(diffkit_tracks, dt_s, model=model, engine="map", show_progress=False)
+    # No `engine=`: diffusionkit now always uses the batched exact-MAP
+    # engine here. It dropped the SVI alternative because SVI reported
+    # uncertainty 3-10x too narrow, so there is no longer a choice to pass.
+    return dk_bayes.fit_population(diffkit_tracks, dt_s, model=model, show_progress=False)
 
 
 @thread_worker(start_thread=False)
@@ -133,15 +214,11 @@ def _run_anisotropy_worker(
     diffkit_tracks: pl.DataFrame,
     dt_s: float,
     min_track_length: int,
-    max_track_length: int,
-    fit_eps_posterior: bool,
-) -> "dk_anisotropy.AnisotropyResult":
+) -> pl.DataFrame:
     return dk_anisotropy.analyze(
         diffkit_tracks,
         dt_s,
         min_track_length=min_track_length,
-        max_track_length=max_track_length,
-        fit_eps_posterior=fit_eps_posterior,
         show_progress=False,
     )
 
@@ -158,7 +235,7 @@ def _base_track_table(diffkit_tracks: pl.DataFrame, tracks_df_px: pl.DataFrame) 
 
 
 def _normalize_map_table(table: pl.DataFrame, model: str) -> pl.DataFrame:
-    """`bayes.fit_population(..., engine="map")`'s output, trimmed to one
+    """`diffusionkit.bayes.fit_population`'s output, trimmed to one
     D-like column and one alpha-like column regardless of `model` --
     `normal` has no alpha, `anomalous` names its D column differently
     (`D_alpha_median_um2_s_alpha` vs `D_median_um2_s`)."""
@@ -199,161 +276,112 @@ def _format_summary(summary: dict) -> str:
 _ANISOTROPY_DISPLAY_COLUMNS = [
     "track_id",
     "log_bf10",
+    "log_bf10_stderr",
+    "evidence",
     "eps_median",
     "eps_lo",
     "eps_hi",
-    "D_mean_median_um2_s",
+    "psi_median_rad",
+    "D_arith_mean_median_um2_s",
+    "D_par_median_um2_s",
+    "D_perp_median_um2_s",
 ]
 
 
 def _normalize_anisotropy_table(per_track: pl.DataFrame) -> pl.DataFrame:
-    """`AnisotropyResult.per_track` trimmed to the columns worth showing
-    in the Track Explorer / offering as a spatial-map color choice --
-    `log_bf10` always present (`fit_eps_posterior=False` or `True`); the
-    `eps_*`/`D_mean_*` columns only exist after the slower full-posterior
-    run, so this degrades gracefully to just `log_bf10` before that."""
+    """`anisotropy.analyze`'s table trimmed to the columns worth showing
+    in the Track Explorer / offering as a spatial-map color choice.
+
+    One nested-sampling run now yields the evidence AND the posterior it
+    came from, so `eps_*`/`psi_*`/`D_*` are always present -- there is no
+    longer a fast-vs-full split to degrade across. The intersection is
+    still taken rather than assumed, so a diffusionkit that adds or drops
+    a column doesn't break the table."""
     cols = [c for c in _ANISOTROPY_DISPLAY_COLUMNS if c in per_track.columns]
     return per_track.select(cols)
 
 
 class _DataExplorerTab(QWidget):
-    """Per-point QC filtering: pick a column, drag the histogram's min/max
-    handles (`qt_helpers.HistogramRangeWidget`, no pop-up window -- the
-    filter needs to stay reachable while looking at its effect on the
-    Track Explorer table right next to it). A range that covers the
-    column's full data span is treated as "no filter" for that column
-    (removed from `_filters`) rather than stored as a no-op entry."""
+    """Per-point QC filtering: a stack of histogram range filters
+    (`widgets/feature_filters.FeatureFilterPanel`) over the detections
+    behind the loaded tracks -- the same component the Detect tab uses
+    while a run is being tuned, here post-hoc on a saved bundle.
+
+    A track is kept only if EVERY one of its points passes every cut. A
+    trajectory built partly from detections you have judged untrustworthy
+    is not a shorter good trajectory; it is a trajectory whose links were
+    scored against points you would have excluded."""
 
     def __init__(self, host: "DiffusionAnalysisWidget") -> None:
         super().__init__()
         self.host = host
-        self._filters: dict[str, tuple[float, float]] = {}
-        self._current_column: Optional[str] = None
-        self._loading = False
 
-        self._column_picker = QComboBox()
-        self._column_picker.currentTextChanged.connect(self._on_column_changed)
-        pick_row = QHBoxLayout()
-        pick_row.addWidget(QLabel("column:"))
-        pick_row.addWidget(self._column_picker, 1)
+        self.filters = FeatureFilterPanel(
+            noun="points",
+            hint="Select a Tracks layer to filter its detections.",
+        )
+        self.filters.filtersChanged.connect(self.host.on_filters_changed)
 
-        self._histogram = HistogramRangeWidget()
-        self._histogram.rangeChanged.connect(self._on_range_changed)
-
-        self._reset_column_button = QPushButton("Reset this column")
-        self._reset_column_button.clicked.connect(self._reset_current_column)
-
-        self._filter_label = QLabel("no filters active")
-        self._filter_label.setWordWrap(True)
-        self._clear_button = QPushButton("Clear all filters")
-        self._clear_button.clicked.connect(self._clear_filters)
-        filter_row = QHBoxLayout()
-        filter_row.addWidget(self._filter_label, 1)
-        filter_row.addWidget(self._clear_button)
+        self._track_label = QLabel("")
+        self._track_label.setWordWrap(True)
 
         layout = QVBoxLayout()
-        layout.addLayout(pick_row)
-        layout.addWidget(self._histogram)
-        layout.addWidget(self._reset_column_button)
+        layout.addWidget(self.filters)
         layout.addWidget(hline())
-        layout.addLayout(filter_row)
+        layout.addWidget(self._track_label)
         layout.addStretch()
         self.setLayout(layout)
 
     def reset(self, points_df: Optional[pl.DataFrame]) -> None:
-        self._filters = {}
-        self._current_column = None
-        self._update_filter_label()
-        self._column_picker.blockSignals(True)
-        self._column_picker.clear()
-        self._column_picker.blockSignals(False)
-        if points_df is None:
-            return
-        skip = {"frame", "y", "x", "track_id"}
-        numeric_cols = [
-            c for c, dt in zip(points_df.columns, points_df.dtypes) if c not in skip and dt.is_numeric()
-        ]
-        self._column_picker.addItems(numeric_cols)
-
-    def _on_column_changed(self, column: str) -> None:
-        points_df = self.host.points_df
-        if not column or points_df is None:
-            return
-        self._current_column = column
-        self._loading = True
-        values = points_df[column].drop_nulls().to_numpy()
-        self._histogram.set_data(values)
-        vmin, vmax = self._filters.get(column, self._histogram.data_range())
-        self._histogram.set_range(vmin, vmax)
-        self._loading = False
-
-    def _on_range_changed(self, vmin: float, vmax: float) -> None:
-        if self._loading or self._current_column is None:
-            return
-        data_min, data_max = self._histogram.data_range()
-        if vmin <= data_min and vmax >= data_max:
-            self._filters.pop(self._current_column, None)
-        else:
-            self._filters[self._current_column] = (vmin, vmax)
-        self._update_filter_label()
-        self.host.on_filters_changed()
-
-    def _reset_current_column(self) -> None:
-        if self._current_column is None:
-            return
-        self._filters.pop(self._current_column, None)
-        self._loading = True
-        self._histogram.set_range(*self._histogram.data_range())
-        self._loading = False
-        self._update_filter_label()
-        self.host.on_filters_changed()
-
-    def _clear_filters(self) -> None:
-        self._filters = {}
-        if self._current_column is not None:
-            self._loading = True
-            self._histogram.set_range(*self._histogram.data_range())
-            self._loading = False
-        self._update_filter_label()
-        self.host.on_filters_changed()
-
-    def _update_filter_label(self) -> None:
-        if not self._filters:
-            self._filter_label.setText("no filters active")
-            return
-        n_tracks = None
-        ids = self.filtered_track_ids()
-        if ids is not None:
-            n_tracks = len(ids)
-        parts = [f"{col}: [{lo:.4g}, {hi:.4g}]" for col, (lo, hi) in self._filters.items()]
-        suffix = f" -- {n_tracks} tracks pass" if n_tracks is not None else ""
-        self._filter_label.setText("; ".join(parts) + suffix)
+        self.filters.set_filters(None)
+        self.filters.set_source(points_df)
+        self._update_track_label()
 
     def filtered_track_ids(self) -> Optional[set]:
+        """Track ids where every point passes -- `None` for "no cut from
+        this tab", which `combined_filtered_track_ids` reads as no
+        restriction rather than as an empty set."""
         points_df = self.host.points_df
-        if not self._filters or points_df is None:
+        filters = self.filters.filters()
+        if not filters or points_df is None:
             return None
-        expr = None
-        for col, (lo, hi) in self._filters.items():
-            if col not in points_df.columns:
-                continue
-            cond = (pl.col(col) >= lo) & (pl.col(col) <= hi)
-            expr = cond if expr is None else expr & cond
-        if expr is None:
-            return None
-        bad_ids = set(points_df.filter(~expr)["track_id"].unique().to_list())
+        passes = filter_mask(points_df, filters)
+        bad_ids = set(points_df.filter(~passes)["track_id"].unique().to_list())
         all_ids = set(points_df["track_id"].unique().to_list())
         return all_ids - bad_ids
 
+    def on_filters_changed(self) -> None:
+        self._update_track_label()
+
+    def _update_track_label(self) -> None:
+        ids = self.filtered_track_ids()
+        if ids is None:
+            self._track_label.setText("no point filters active")
+            return
+        points_df = self.host.points_df
+        total = points_df["track_id"].n_unique() if points_df is not None else 0
+        self._track_label.setText(
+            f"{len(ids)} of {total} tracks have every point inside these ranges"
+        )
+
 
 class _TrackExplorerTab(QWidget):
-    """The Track Explorer table is filtered live by two independent
+    """The Track Explorer table is filtered live by three independent
     controls that AND together (see `DiffusionAnalysisWidget.
     combined_filtered_track_ids`): this tab's own `min_track_length`
-    spinbox (a direct, always-visible track-level filter -- the
-    complement to `_DataExplorerTab`'s per-point-quality range filters,
-    which need a histogram opened first). Both immediately reshape what's
-    shown here, not just what a fit run is optionally restricted to.
+    spinbox, its histogram filters over the table's own per-track
+    columns, and `_DataExplorerTab`'s per-point-quality cuts. All three
+    immediately reshape what's shown here, not just what a fit run is
+    optionally restricted to.
+
+    The histogram filters are the same `FeatureFilterPanel` the params
+    panel uses, pointed at this table -- which means they cover whatever
+    columns it currently holds. Before any fit that is just
+    `track_length`/`mean_step_um`/`duration_s`; after a Classical or
+    Bayesian run it is also `D_um2_s`, `alpha` and the rest, so "keep the
+    tracks whose fitted alpha is below 0.8 and look at where they are"
+    is the same two drags as any other cut. That is the reason a per-track
+    filter lives here rather than only on per-point quality.
 
     The "sync tracks display to filter" checkbox extends that same filter
     to the viewer's own `tracks` layer -- off by default, since it
@@ -387,6 +415,12 @@ class _TrackExplorerTab(QWidget):
         )
         self._sync_display_checkbox.toggled.connect(lambda _checked: self.host.on_filters_changed())
 
+        self.filters = FeatureFilterPanel(
+            noun="tracks",
+            hint="Filter on any per-track column below — including fit results once you run one.",
+        )
+        self.filters.filtersChanged.connect(self.host.on_filters_changed)
+
         self._model = DataFrameTableModel()
         self.table = QTableView()
         self.table.setModel(self._model)
@@ -398,7 +432,8 @@ class _TrackExplorerTab(QWidget):
         layout = QVBoxLayout()
         layout.addLayout(filter_row)
         layout.addWidget(self._sync_display_checkbox)
-        layout.addWidget(self.table)
+        layout.addWidget(self.filters)
+        layout.addWidget(self.table, 1)
         self.setLayout(layout)
 
     def min_track_length(self) -> int:
@@ -407,6 +442,25 @@ class _TrackExplorerTab(QWidget):
     def sync_display_enabled(self) -> bool:
         return self._sync_display_checkbox.isChecked()
 
+    def filtered_track_ids(self) -> Optional[set]:
+        """Track ids passing this tab's histogram cuts, or `None` for no
+        cut. Read against the unfiltered joined table the host keeps
+        (`DiffusionAnalysisWidget._joined_track_df`) rather than the
+        displayed one, which has already had the other filters applied --
+        filtering a filtered table would make each cut depend on the order
+        the others were dragged in."""
+        df = self.host.joined_track_df
+        filters = self.filters.filters()
+        if not filters or df is None or df.height == 0:
+            return None
+        return set(df.filter(filter_mask(df, filters))["track_id"].to_list())
+
+    def set_filter_source(self, df: Optional[pl.DataFrame]) -> None:
+        """Point the histograms at the current joined table. Silent, so
+        re-running a fit (which adds columns) doesn't re-emit a filter
+        change while `_rebuild_track_table` is midway through one."""
+        self.filters.set_source(df)
+
     def reset(self) -> None:
         self._min_track_length.blockSignals(True)
         self._min_track_length.setValue(1)
@@ -414,6 +468,8 @@ class _TrackExplorerTab(QWidget):
         self._sync_display_checkbox.blockSignals(True)
         self._sync_display_checkbox.setChecked(False)
         self._sync_display_checkbox.blockSignals(False)
+        self.filters.set_filters(None)
+        self.filters.set_source(None)
         self._model.setDataFrame(pl.DataFrame())
 
     def set_dataframe(self, df: pl.DataFrame) -> None:
@@ -537,7 +593,7 @@ class _ClassicalTab(QWidget):
             f"mean localization offset = {fit.mean_localization_offset_um2:.4g} um^2"
         )
 
-        figure = dk_analysis.plot_ensemble_fit(fit.ensemble, normal, anomalous)
+        figure = dk_analysis_viz.plot_ensemble_fit(fit.ensemble, normal, anomalous)
         if self._plot_window is None:
             self._plot_window = PlotWindow("Population MSD fit", parent=self)
         self._plot_window.show_figure(figure)
@@ -817,8 +873,8 @@ class _BayesianTab(QWidget):
         if fit.method == "nuts":
             samples_dict, _mcmc = fit.raw
             param_names = list(fit.params.keys())
-            flat, _trace = dk_bayes.samples_dict_to_arrays(samples_dict, param_names)
-            figure = dk_bayes.plot_posterior_corner(flat, param_names)
+            flat, _trace = dk_bayes_viz.samples_dict_to_arrays(samples_dict, param_names)
+            figure = dk_bayes_viz.plot_posterior_corner(flat, param_names)
             if self._track_plot_window is None:
                 self._track_plot_window = PlotWindow("Posterior (per-track)", parent=self)
             self._track_plot_window.show_figure(figure)
@@ -831,18 +887,39 @@ class _BayesianTab(QWidget):
 
 
 class _AnisotropyTab(QWidget):
-    """`bayes.anisotropy.analyze` -- a model-*comparison* question (is
-    this short track more anisotropic than free diffusion) rather than a
-    point estimate, so it gets its own tab rather than a third `model=`
-    choice on the Bayesian tab's existing MAP/per-track sections. Two
-    speeds, both bulk (every eligible track in one call, like Bayesian's
-    Spatial MAP): the log Bayes factor detector alone (`log_bf10`, a
-    couple seconds), or that plus the full per-track eps/psi/D_mean/
-    D_par/D_perp posterior (tens of seconds, scales with track count --
-    `fit_eps_posterior=True`). Both register into the shared spatial-map
-    color-by picker (`DiffusionAnalysisWidget.register_spatial_source`)
-    and merge into the Track Explorer table, same as every other tab's
-    results."""
+    """`diffusionkit.bayes.anisotropy.analyze` -- a model-*comparison*
+    question (is this track diffusing anisotropically) rather than a point
+    estimate, so it gets its own tab rather than a third `model=` choice
+    on the Bayesian tab's existing MAP/per-track sections. One bulk run
+    over every eligible track, like Bayesian's Spatial MAP; results
+    register into the shared spatial-map color-by picker
+    (`DiffusionAnalysisWidget.register_spatial_source`) and merge into the
+    Track Explorer table, same as every other tab's.
+
+    This tab used to offer two speeds -- a fast log-BF detector and a
+    slower "full posterior" pass -- and an upper track-length cap.
+    diffusionkit removed all three, and the tab follows rather than
+    emulating them:
+
+      - The evidence now comes from nested sampling, and ONE run yields
+        both `log_bf10` and the eps/psi/D posterior. There is nothing left
+        for a second, slower button to compute.
+      - The old cap (`max_track_length=10`) existed because the previous
+        Monte-Carlo estimator broke above it, which had the effect of
+        restricting the analysis to exactly the tracks too short to answer
+        the question. Nested sampling stays valid as tracks get long, so
+        only a lower bound remains.
+      - There is no ensemble score. Summing per-track log BF10 answers
+        "does each track have its own independent anisotropy", not "do
+        these tracks share an axis", and it manufactures anisotropy out of
+        ordinary D-heterogeneity. The summary below therefore counts
+        tracks by Jeffreys-scale `evidence` label instead of reporting one
+        pooled number.
+
+    Read `log_bf10` against `log_bf10_stderr`: on a short track the
+    sampler's own uncertainty is larger than the evidence, and the
+    `evidence` column says so in words rather than leaving a near-zero
+    number to be over-read."""
 
     def __init__(self, host: "DiffusionAnalysisWidget") -> None:
         super().__init__()
@@ -853,24 +930,23 @@ class _AnisotropyTab(QWidget):
         self._min_track_length = QSpinBox()
         self._min_track_length.setRange(2, 10_000)
         self._min_track_length.setValue(5)
-        self._max_track_length = QSpinBox()
-        self._max_track_length.setRange(2, 10_000)
-        self._max_track_length.setValue(10)
-        for spin in (self._min_track_length, self._max_track_length):
-            spin.setToolTip(
-                "This method targets short tracks specifically (N=5-10 by "
-                "default) -- only tracks in this length range are analyzed."
-            )
+        self._min_track_length.setToolTip(
+            "Skip tracks shorter than this. There is no upper bound: nested "
+            "sampling stays valid as a track gets long, and long tracks are "
+            "the ones that can actually answer the question."
+        )
         form = QFormLayout()
         form.addRow("min track length", self._min_track_length)
-        form.addRow("max track length", self._max_track_length)
 
         self._restrict_checkbox = QCheckBox("restrict to filtered tracks (Data Explorer)")
 
-        self._fast_button = QPushButton("Run detector (fast)")
-        self._fast_button.clicked.connect(lambda: self._run(fit_eps_posterior=False))
-        self._full_button = QPushButton("Run full posterior (eps/psi, slower)")
-        self._full_button.clicked.connect(lambda: self._run(fit_eps_posterior=True))
+        self._run_button = QPushButton("Run anisotropy analysis")
+        self._run_button.setToolTip(
+            "Nested sampling per track -- scales with track count and can take\n"
+            "tens of seconds or more. Yields the evidence and the eps/psi/D\n"
+            "posterior in one pass."
+        )
+        self._run_button.clicked.connect(self._run)
         self._status = QLabel("")
         self._status.setWordWrap(True)
         style_status_label(self._status)
@@ -891,8 +967,7 @@ class _AnisotropyTab(QWidget):
         layout = QVBoxLayout()
         layout.addLayout(form)
         layout.addWidget(self._restrict_checkbox)
-        layout.addWidget(self._fast_button)
-        layout.addWidget(self._full_button)
+        layout.addWidget(self._run_button)
         layout.addWidget(self._status)
         layout.addWidget(self._summary)
         layout.addWidget(hline())
@@ -911,43 +986,56 @@ class _AnisotropyTab(QWidget):
         self._eps_vs_bf_button.setEnabled(False)
         self._eps_forest_button.setEnabled(False)
 
-    def _run(self, fit_eps_posterior: bool) -> None:
+    def _run(self) -> None:
         tracks = self.host.diffkit_tracks_for_fit(self._restrict_checkbox.isChecked())
         if tracks is None:
             return
-        min_len, max_len = self._min_track_length.value(), self._max_track_length.value()
-        self._status.setText(
-            "running... (full posterior scales with track count, can take a while)"
-            if fit_eps_posterior
-            else "running..."
-        )
+        self._status.setText("running... (nested sampling per track, can take a while)")
         style_status_label(self._status)
-        worker = _run_anisotropy_worker(tracks, self.host.dt_s, min_len, max_len, fit_eps_posterior)
-        self.host.start_worker(worker, self._on_finished, self._on_error, [self._fast_button, self._full_button])
+        worker = _run_anisotropy_worker(
+            tracks, self.host.dt_s, self._min_track_length.value()
+        )
+        self.host.start_worker(worker, self._on_finished, self._on_error, [self._run_button])
 
-    def _on_finished(self, result: "dk_anisotropy.AnisotropyResult") -> None:
-        self._per_track = result.per_track
-        n = self._per_track.height
+    def _on_finished(self, per_track: pl.DataFrame) -> None:
+        self._per_track = per_track
+        n = per_track.height
         self._status.setText(f"analyzed {n} track(s)")
         style_status_label(self._status, "ok" if n else "caution")
 
-        has_eps = "eps_median" in self._per_track.columns
+        has_eps = "eps_median" in per_track.columns
         if n:
-            ensemble = result.ensemble.row(0, named=True)
-            self._summary.setText(
-                f"sum log BF10 = {ensemble['sum_log_bf10']:.3g} over {ensemble['n_tracks']} tracks "
-                f"(>0 favors anisotropy)"
-                + (
-                    f"\nmedian eps = {self._per_track['eps_median'].median():.3g}"
-                    if has_eps
-                    else ""
-                )
-            )
+            self._summary.setText(self._summarize(per_track))
         self._log_bf_button.setEnabled(n > 0)
         self._eps_vs_bf_button.setEnabled(has_eps and n > 0)
         self._eps_forest_button.setEnabled(has_eps and n > 0)
 
-        self.host.set_anisotropy_results(result.per_track, _normalize_anisotropy_table(result.per_track))
+        self.host.set_anisotropy_results(per_track, _normalize_anisotropy_table(per_track))
+
+    @staticmethod
+    def _summarize(per_track: pl.DataFrame) -> str:
+        """Counts by Jeffreys-scale `evidence` label, plus the median eps.
+
+        Deliberately not a pooled score: see this class's docstring for why
+        summing per-track log BF10 answers a different question than the
+        one it appears to. Counting labels keeps the per-track structure
+        visible -- "3 of 200 tracks show strong evidence" is a statement a
+        reader can act on, and a sum is not."""
+        lines = []
+        if "evidence" in per_track.columns:
+            counts = (
+                per_track.group_by("evidence")
+                .len()
+                .sort("len", descending=True)
+            )
+            lines.append(
+                "  ".join(
+                    f"{row['len']}x {row['evidence']}" for row in counts.iter_rows(named=True)
+                )
+            )
+        if "eps_median" in per_track.columns:
+            lines.append(f"median eps = {per_track['eps_median'].median():.3g}")
+        return "\n".join(lines)
 
     def _on_error(self, exc: Exception) -> None:
         self._status.setText(f"error: {exc}")
@@ -983,6 +1071,7 @@ class DiffusionAnalysisWidget(QWidget):
         self._tracks_df_px: Optional[pl.DataFrame] = None
         self._points_df: Optional[pl.DataFrame] = None
         self._base_track_df: Optional[pl.DataFrame] = None
+        self._joined_track_df: Optional[pl.DataFrame] = None
         self._classical_full_df: Optional[pl.DataFrame] = None
         self._classical_df: Optional[pl.DataFrame] = None
         self._map_full_df: Optional[pl.DataFrame] = None
@@ -1000,7 +1089,7 @@ class DiffusionAnalysisWidget(QWidget):
         self._worker = None
 
         self._tracks_layer: Optional[Tracks] = None
-        self._highlight_layer: Optional[Points] = None
+        self._highlight_layer: Optional[Shapes] = None
         self._spatial_map_layer: Optional[Points] = None
         self._mouse_callback = None
 
@@ -1058,12 +1147,20 @@ class DiffusionAnalysisWidget(QWidget):
             return None
         return self._diffkit_tracks.filter(pl.col("track_id") == track_id)
 
+    @property
+    def joined_track_df(self) -> Optional[pl.DataFrame]:
+        """The per-track table with every computed result joined in, BEFORE
+        any filter -- what the Track Explorer's own histogram cuts are read
+        against (see `_TrackExplorerTab.filtered_track_ids`)."""
+        return self._joined_track_df
+
     def combined_filtered_track_ids(self) -> Optional[set]:
-        """The Data Explorer's per-point-quality range filters ANDed with
-        the Track Explorer's min-track-length filter -- `None` means "no
-        restriction from either source". This is both what the Track
-        Explorer table displays (`_rebuild_track_table`) and what a fit
-        run optionally restricts to (`diffkit_tracks_for_fit`)."""
+        """The Data Explorer's per-point-quality cuts ANDed with the Track
+        Explorer's min-track-length spinbox and its per-track histogram
+        cuts -- `None` means "no restriction from any source". This is both
+        what the Track Explorer table displays (`_rebuild_track_table`) and
+        what a fit run optionally restricts to
+        (`diffkit_tracks_for_fit`)."""
         ids = self._data_explorer.filtered_track_ids()
         min_len = self._track_explorer.min_track_length()
         if min_len > 1 and self._base_track_df is not None:
@@ -1071,9 +1168,13 @@ class DiffusionAnalysisWidget(QWidget):
                 self._base_track_df.filter(pl.col("track_length") >= min_len)["track_id"].to_list()
             )
             ids = length_ids if ids is None else (ids & length_ids)
+        track_ids = self._track_explorer.filtered_track_ids()
+        if track_ids is not None:
+            ids = track_ids if ids is None else (ids & track_ids)
         return ids
 
     def on_filters_changed(self) -> None:
+        self._data_explorer.on_filters_changed()
         self._rebuild_track_table()
         self._update_spatial_map_layer()
         self._bayesian.refresh_map_histogram()
@@ -1185,6 +1286,7 @@ class DiffusionAnalysisWidget(QWidget):
         self._tracks_df_px = None
         self._points_df = None
         self._base_track_df = None
+        self._joined_track_df = None
         self._classical_full_df = None
         self._classical_df = None
         self._map_full_df = None
@@ -1206,10 +1308,16 @@ class DiffusionAnalysisWidget(QWidget):
 
     def _load_from_layer(self, layer: Tracks) -> None:
         props = layer.properties
-        if "sigma_x" not in props or "sigma_y" not in props:
+        # `se_y`/`se_x` are spotsolve's per-detection CRLB (see
+        # spt_pipeline.diffusion for the rename to diffusionkit's
+        # `sigma_*`). Requiring them is how a Tracks layer from this
+        # pipeline is told apart from any other Tracks layer in the
+        # viewer: without a position error there is no noise term to fit,
+        # so the check is load-bearing, not cosmetic.
+        if "se_x" not in props or "se_y" not in props:
             self._clear_loaded_state()
             self._source_label.setText(
-                f"'{layer.name}' has no sigma_x/sigma_y properties -- only Tracks "
+                f"'{layer.name}' has no se_x/se_y properties -- only Tracks "
                 "layers produced by this project's pipeline can be analyzed here."
             )
             return
@@ -1225,12 +1333,12 @@ class DiffusionAnalysisWidget(QWidget):
             "y": data[:, 2],
             "x": data[:, 3],
         }
-        # Every per-vertex property the layer carries (sigma_x/y plus
-        # whatever QC/derived columns viewer.py put there -- amplitude,
-        # bg, psf_sigma, track_length, ...), aligned with track_id: one
-        # table serves both diffusionkit conversion (needs track_id/frame/
-        # y/x/sigma_x/sigma_y) and the Data Explorer's QC histograms
-        # (wants everything else too).
+        # Every per-vertex property the layer carries (se_y/se_x plus
+        # whatever QC/derived columns viewer.py put there -- flux,
+        # flux_snr, bg, fit_sigma, sigma_ratio, track_length, ...),
+        # aligned with track_id: one table serves both the diffusionkit
+        # conversion (needs track_id/frame/y/x/se_y/se_x) and the Data
+        # Explorer's QC histograms (wants everything else too).
         extra_cols = {name: np.asarray(values) for name, values in props.items() if name != "track_id"}
         track_points_df = pl.DataFrame({**base_cols, **extra_cols})
         self._tracks_df_px = track_points_df
@@ -1313,6 +1421,13 @@ class DiffusionAnalysisWidget(QWidget):
                 .rename({"model": "track_fit_model", "method": "track_fit_method"})
             )
             df = df.join(fit_df, on="track_id", how="left")
+
+        # Keep the unfiltered join around and hand it to the Track
+        # Explorer's histograms BEFORE narrowing: a filter has to be drawn
+        # against the whole population, or each cut would reshape the
+        # distribution the next one is chosen on.
+        self._joined_track_df = df
+        self._track_explorer.set_filter_source(df)
 
         ids = self.combined_filtered_track_ids()
         if ids is not None:
@@ -1400,21 +1515,36 @@ class DiffusionAnalysisWidget(QWidget):
 
     def _clear_highlight_layer(self) -> None:
         if self._highlight_layer is not None:
-            self._highlight_layer.data = np.empty((0, 2))
+            self._highlight_layer.data = []
 
     def _update_highlight_layer(self, track_id: Optional[int]) -> None:
+        """Box the selected track (see `oriented_track_box`). The box is
+        2D, so napari shows it on every frame rather than only the ones
+        the track is alive for -- "where is the track I just selected" is
+        a question asked while scrubbing through the stack."""
         if self._tracks_df_px is None or track_id is None:
             return
         track = self._tracks_df_px.filter(pl.col("track_id") == track_id)
-        positions = track.select("y", "x").to_numpy()
-        track_ids = track["track_id"].to_numpy()
+        if track.height == 0:
+            self._clear_highlight_layer()
+            return
+        corners = oriented_track_box(track.select("y", "x").to_numpy())
+        features = {"track_id": np.array([track_id])}
         if self._highlight_layer is None:
-            self._highlight_layer = self.viewer.add_points(
-                positions, name="selected track", features={"track_id": track_ids}, **_HIGHLIGHT_POINTS_STYLE
+            self._highlight_layer = self.viewer.add_shapes(
+                [corners],
+                name="selected track",
+                features=features,
+                text=dict(_TRACK_BOX_TEXT),
+                **_TRACK_BOX_STYLE,
             )
         else:
-            self._highlight_layer.data = positions
-            self._highlight_layer.features = {"track_id": track_ids}
+            # Data first, then features: assigning `data` resizes the
+            # feature table (filling new rows with defaults), so writing
+            # the label before the box would leave the text showing the
+            # default track_id of 0 whenever the box had been cleared.
+            self._highlight_layer.data = [corners]
+            self._highlight_layer.features = features
 
     def _sync_tracks_layer_display(self, filtered_ids: Optional[set]) -> None:
         """When Track Explorer's "sync tracks display to filter" is on,

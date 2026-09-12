@@ -37,11 +37,11 @@ def detect_track(
     experiments_root = Path(cfg.get("experiments_root", "experiments"))
     params = DetectTrackParams(**cfg.get("params", {}))
 
-    import sfwloc
+    import spotsolve
     import spt_pipeline
 
     repo_shas = {
-        "sfwloc": git_sha(repo_root_of(sfwloc)),
+        "spotsolve": git_sha(repo_root_of(spotsolve)),
         "spt_pipeline": git_sha(repo_root_of(spt_pipeline)),
     }
 
