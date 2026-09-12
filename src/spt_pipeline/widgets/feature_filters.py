@@ -20,10 +20,14 @@ here and not inside any one of them:
   - `params_panel._TrackingTab` -- per-track metrics
     (`pipeline.TRACK_METRIC_COLUMNS`). Decides which tracks the bundle
     keeps.
-  - `diffusion_panel._DataExplorerTab` -- the same per-detection columns
-    again, post-hoc on a loaded bundle, plus whatever per-track fit
+  - `diffusion_panel._TracksPane` -- per-track columns again, post-hoc on
+    a loaded bundle: the same per-detection QC fields aggregated to the
+    track (`flux_min`, `se_x_max`, ...), plus whatever per-track fit
     results (diffusionkit's `D`, `alpha`) have been computed into the
-    track table.
+    track table. One panel over one table, rather than a second one at
+    per-detection granularity -- a cut like "every point in this track has
+    acceptable flux" is a statement about the track's min, so it belongs
+    beside the cut on the track's fitted alpha.
 
 `filters()` returns a `pipeline.FilterSpec` -- plain
 `{column: (lo, hi)}` -- which is what `pipeline.filter_mask` applies and

@@ -14,7 +14,7 @@ from typing import Optional
 import numpy as np
 import polars as pl
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
-from qtpy.QtCore import QAbstractTableModel, QModelIndex, QRectF, Qt, Signal
+from qtpy.QtCore import QAbstractTableModel, QModelIndex, QPoint, QRect, QRectF, QSize, Qt, Signal
 from qtpy.QtGui import QBrush, QColor, QPainter, QPalette, QPen
 from qtpy.QtWidgets import (
     QCheckBox,
@@ -25,7 +25,11 @@ from qtpy.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -41,6 +45,220 @@ STATUS_LEVEL_COLORS = {
 def style_status_label(label: QLabel, level: str = "neutral") -> None:
     color = STATUS_LEVEL_COLORS.get(level, STATUS_LEVEL_COLORS["neutral"])
     label.setStyleSheet(f"color: {color}; font-size: 11px;")
+
+
+def status_label(text: str = "") -> QLabel:
+    """A neutral-styled status/summary label that can never widen its dock.
+
+    A word-wrapped `QLabel` still reports its longest *unwrapped* line as
+    its `sizeHint`, and that hint propagates up as the containing dock's
+    minimum width -- so a single long error message or file path
+    permanently stops the dock from being dragged narrower again
+    (`ExperimentListWidget.progress_label` hit this first). `Ignored`
+    horizontally lets the label shrink to whatever it is given and wrap
+    inside it instead. Every status line in a dock should come from here
+    rather than hand-rolling the four calls.
+    """
+    label = QLabel(text)
+    label.setWordWrap(True)
+    label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+    style_status_label(label)
+    return label
+
+
+# Floor for any internally-scrolling region, in px -- small enough that a
+# dock can be dragged genuinely short, tall enough to still show a row or
+# two of whatever is inside rather than a bare pair of scrollbars.
+_SCROLL_MIN_HEIGHT_PX = 56
+
+
+def scrolled(widget: QWidget) -> QScrollArea:
+    """Wrap `widget` so its height stops dictating its container's minimum
+    height -- plain nested layouts propagate a child's full `sizeHint` up
+    as the parent's *minimum* size, which is how a tall tab ends up pushing
+    a dock's footer buttons off the bottom of a laptop screen with no way
+    to reach them. A `QScrollArea` reports a small minimum regardless of
+    its content and scrolls internally instead."""
+    area = QScrollArea()
+    area.setWidgetResizable(True)
+    area.setFrameShape(QFrame.Shape.NoFrame)
+    area.setWidget(widget)
+    # QAbstractScrollArea's own minimumSizeHint is derived from its
+    # scrollbars and frame, which still adds up to ~90px per nested area.
+    # An explicit floor is what actually lets a stack of these collapse:
+    # a few scrollable rows is a usable pane, and it is always reachable
+    # by scrolling, unlike content pushed off the bottom of the dock.
+    area.setMinimumHeight(_SCROLL_MIN_HEIGHT_PX)
+    return area
+
+
+class FlowLayout(QLayout):
+    """A horizontal layout that wraps onto as many lines as it needs.
+
+    A `QHBoxLayout` of small controls has a hard minimum width: the sum of
+    all of them. In a napari dock that is the single biggest thing
+    stopping the panel from being dragged narrow -- one row of a label, a
+    spinbox and two checkboxes was pinning this widget to 350px on its
+    own, wider than anything else in it. Reflowing costs a line of height
+    at narrow widths and nothing at wide ones, and drops the minimum width
+    to that of the widest *single* control.
+
+    This is Qt's documented flow-layout pattern: `heightForWidth` reports
+    what the wrap would cost, and `_do_layout` either measures or places
+    depending on `test_only`.
+    """
+
+    def __init__(self, parent=None, margin: int = 0, spacing: int = 4) -> None:
+        super().__init__(parent)
+        self._items: list = []
+        self.setContentsMargins(margin, margin, margin, margin)
+        self.setSpacing(spacing)
+
+    # -- QLayout plumbing --
+
+    def addItem(self, item) -> None:  # noqa: N802 (Qt virtual)
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int):  # noqa: N802
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index: int):  # noqa: N802
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):  # noqa: N802
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802
+        return True
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802
+        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect: QRect) -> None:  # noqa: N802
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:  # noqa: N802
+        # The widest single item, not their sum -- the whole point.
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        return size + QSize(
+            margins.left() + margins.right(), margins.top() + margins.bottom()
+        )
+
+    def _do_layout(self, rect: QRect, test_only: bool) -> int:
+        margins = self.contentsMargins()
+        effective = rect.adjusted(
+            margins.left(), margins.top(), -margins.right(), -margins.bottom()
+        )
+        x, y, line_height = effective.x(), effective.y(), 0
+        for item in self._items:
+            widget = item.widget()
+            space_x = space_y = self.spacing()
+            if widget is not None:
+                style = widget.style()
+                space_x = self.spacing() + style.layoutSpacing(
+                    QSizePolicy.ControlType.PushButton,
+                    QSizePolicy.ControlType.PushButton,
+                    Qt.Orientation.Horizontal,
+                )
+                space_y = self.spacing() + style.layoutSpacing(
+                    QSizePolicy.ControlType.PushButton,
+                    QSizePolicy.ControlType.PushButton,
+                    Qt.Orientation.Vertical,
+                )
+            hint = item.sizeHint()
+            next_x = x + hint.width() + space_x
+            if next_x - space_x > effective.right() and line_height > 0:
+                x = effective.x()
+                y = y + line_height + space_y
+                next_x = x + hint.width() + space_x
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x = next_x
+            line_height = max(line_height, hint.height())
+        return y + line_height - rect.y() + margins.bottom()
+
+
+def flow_row(*widgets: QWidget, spacing: int = 4) -> QWidget:
+    """A `FlowLayout` of `widgets` in a container sized to actually use it.
+
+    A widget whose layout has `hasHeightForWidth` only gets the taller
+    geometry it asks for when its own size policy advertises the same, so
+    the policy is set here rather than left to each caller to remember.
+    """
+    container = QWidget()
+    layout = FlowLayout(container, spacing=spacing)
+    for widget in widgets:
+        layout.addWidget(widget)
+    policy = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+    policy.setHeightForWidth(True)
+    container.setSizePolicy(policy)
+    return container
+
+
+class CollapsibleSection(QWidget):
+    """A titled section whose body folds away, for controls that are tall
+    but only touched occasionally -- a stack of filter histograms, a
+    joint-plot picker.
+
+    In a napari dock, vertical space is the scarce resource, and these
+    bodies are the widgets that eat it: one `FeatureFilterPanel` row is a
+    histogram plus two spinboxes. Folding them is what lets the same dock
+    show a useful number of table rows without the user first dragging a
+    splitter. The header keeps a disclosure triangle and the title
+    visible while collapsed, so what is hidden is never a mystery --
+    unlike a splitter pane dragged to zero, which leaves nothing to
+    click back."""
+
+    def __init__(self, title: str, content: QWidget, expanded: bool = False) -> None:
+        super().__init__()
+        self._content = content
+
+        self._toggle = QToolButton()
+        self._toggle.setText(title)
+        self._toggle.setCheckable(True)
+        self._toggle.setChecked(expanded)
+        self._toggle.setStyleSheet("QToolButton { border: none; font-weight: bold; }")
+        self._toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._toggle.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+        self._toggle.toggled.connect(self._on_toggled)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.addWidget(self._toggle)
+        header.addStretch()
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        layout.addLayout(header)
+        layout.addWidget(content)
+        self.setLayout(layout)
+        content.setVisible(expanded)
+
+    def _on_toggled(self, checked: bool) -> None:
+        self._toggle.setArrowType(
+            Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow
+        )
+        self._content.setVisible(checked)
+
+    def set_expanded(self, expanded: bool) -> None:
+        self._toggle.setChecked(expanded)
+
+    def set_title(self, title: str) -> None:
+        self._toggle.setText(title)
 
 
 def tabify_with_open_widget(napari_viewer, widget: QWidget, sibling_class_name: str) -> None:
