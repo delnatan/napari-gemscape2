@@ -1,6 +1,6 @@
 """Generic 2D scatter+KDE joint-distribution plot for any pair of per-track
 properties. diffusionkit ships this exact diagnostic for D vs alpha
-(`bayes.plot_D_alpha_joint`), but hardcodes a log10 transform on the D
+(`bayes.plot_K_joint`), but hardcodes a log10 transform on the D
 column and always draws an alpha=1 Brownian reference line -- both specific
 to that one comparison. This generalizes it to arbitrary columns/labels/log
 scaling so any two trajectory properties (classical vs Bayesian D, alpha,

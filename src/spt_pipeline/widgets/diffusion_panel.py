@@ -70,7 +70,10 @@ never pin the dock's minimum width.
 
 All fits run through `napari.qt.threading.thread_worker`, sharing one
 `self._worker` slot host-wide (`start_worker`) so only one fit -- of any
-kind -- runs at a time.
+kind -- runs at a time. That one slot is also why there is one progress
+bar, in the footer, rather than one per tab: it shows tracks done / total
+for the bulk fits diffusionkit can report on (MAP, anisotropy), and a busy
+indicator for the ones it can't (the MSD fit, a single-track fit).
 
 Track/spatial-map positions used for viewer overlays are kept in
 *pixels* (`self._tracks_df_px`, the same coordinate space as the image
@@ -90,10 +93,11 @@ from diffusionkit import bayes as dk_bayes
 from diffusionkit import classic as dk_analysis
 from diffusionkit.bayes import anisotropy as dk_anisotropy
 from diffusionkit.bayes import viz as dk_bayes_viz
+from diffusionkit.classic import track_geometry
 from diffusionkit.classic import viz as dk_analysis_viz
 from napari.layers import Points, Shapes, Tracks
 from napari.qt.threading import thread_worker
-from qtpy.QtCore import Qt, QTimer
+from qtpy.QtCore import QObject, Qt, QTimer, Signal
 from qtkit import (
     CollapsibleSection,
     ColumnTableModel,
@@ -113,6 +117,7 @@ from qtpy.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
     QLabel,
+    QProgressBar,
     QPushButton,
     QSizePolicy,
     QSpinBox,
@@ -212,11 +217,13 @@ def _run_population_fit_worker(
 
 
 @thread_worker(start_thread=False)
-def _run_bulk_map_worker(diffkit_tracks: pl.DataFrame, dt_s: float, model: str) -> pl.DataFrame:
+def _run_bulk_map_worker(diffkit_tracks: pl.DataFrame, dt_s: float, model: str, progress) -> pl.DataFrame:
     # No `engine=`: diffusionkit now always uses the batched exact-MAP
     # engine here. It dropped the SVI alternative because SVI reported
     # uncertainty 3-10x too narrow, so there is no longer a choice to pass.
-    return dk_bayes.fit_population(diffkit_tracks, dt_s, model=model, show_progress=False)
+    return dk_bayes.fit_population(
+        diffkit_tracks, dt_s, model=model, show_progress=False, progress=progress
+    )
 
 
 @thread_worker(start_thread=False)
@@ -231,13 +238,24 @@ def _run_anisotropy_worker(
     diffkit_tracks: pl.DataFrame,
     dt_s: float,
     min_track_length: int,
+    progress,
 ) -> pl.DataFrame:
     return dk_anisotropy.analyze(
         diffkit_tracks,
         dt_s,
         min_track_length=min_track_length,
         show_progress=False,
+        progress=progress,
     )
+
+
+class _ProgressRelay(QObject):
+    """Carries diffusionkit's `progress(done, total)` callback -- which it
+    calls from the worker thread -- back to the GUI thread. The relay lives
+    on the GUI thread, so emitting from the worker is a queued connection
+    and the progress bar is only ever touched where Qt allows it."""
+
+    progress = Signal(int, int)
 
 
 # Per-vertex columns that are position, identity, or already per-track --
@@ -296,8 +314,10 @@ def _qc_aggregate_table(tracks_df_px: pl.DataFrame) -> tuple[pl.DataFrame, list[
 def _base_track_table(
     diffkit_tracks: pl.DataFrame, tracks_df_px: pl.DataFrame
 ) -> tuple[pl.DataFrame, list[str]]:
-    """One row per track: identity, position, and detection-quality context
-    columns that every tab's results get left-joined onto, plus the names of
+    """One row per track: identity, position, shape
+    (`diffusionkit.classic.track_geometry` -- radius of gyration,
+    straightness, ...) and detection-quality context columns that every
+    tab's results get left-joined onto, plus the names of
     the aggregate QC columns (so the tracks pane can hide that group from
     the table when it is not being used -- there are three per detector
     field, and they are the widest group in the table).
@@ -308,10 +328,12 @@ def _base_track_table(
         pl.col("y").mean().alias("y_px"), pl.col("x").mean().alias("x_px")
     )
     lengths = diffkit_tracks.group_by("track_id").agg(pl.col("track_length").first())
+    geometry = track_geometry(diffkit_tracks)
     qc, per_point = _qc_aggregate_table(tracks_df_px)
     qc_columns = [c for c in qc.columns if c != "track_id"]
     table = (
         lengths.join(centroids, on="track_id", how="left")
+        .join(geometry, on="track_id", how="left")
         .join(qc, on="track_id", how="left")
         .sort("track_id")
     )
@@ -338,19 +360,24 @@ def _shared_tracks_unchanged(old: Optional[pl.DataFrame], new: pl.DataFrame) -> 
 
 
 def _normalize_map_table(table: pl.DataFrame, model: str) -> pl.DataFrame:
-    """`diffusionkit.bayes.fit_population`'s output, trimmed to one
-    D-like column and one alpha-like column regardless of `model` --
-    `normal` has no alpha, `anomalous` names its D column differently
-    (`D_alpha_median_um2_s_alpha` vs `D_median_um2_s`)."""
+    """`diffusionkit.bayes.fit_population`'s output trimmed to its point
+    estimates, under names that stay distinct across models so running
+    both keeps both in the tracks pane: `D_map_um2_s` from `normal`,
+    `K_map_um2_s_alpha` and `alpha_map` from `anomalous`. K, the
+    generalized diffusion coefficient, has units of um^2/s^alpha -- it is
+    not a D, and sharing a column with one would put two different
+    quantities on the same axis.
+
+    Physical units only. diffusionkit fits D in log space and also returns
+    `log10_D`, but that is exactly `log10(D_median)`, so it would be a
+    second copy of the same number for the joint plot's "log" checkbox to
+    reproduce. The intervals, stderrs, sigma and `converged` stay in the
+    full table that Save writes."""
     if model == "normal":
-        return table.select(
-            "track_id",
-            pl.col("D_median_um2_s").alias("D_map_um2_s"),
-            pl.lit(None, dtype=pl.Float64).alias("alpha_map"),
-        )
+        return table.select("track_id", pl.col("D_median_um2_s").alias("D_map_um2_s"))
     return table.select(
         "track_id",
-        pl.col("D_alpha_median_um2_s_alpha").alias("D_map_um2_s"),
+        pl.col("K_median_um2_s_alpha").alias("K_map_um2_s_alpha"),
         pl.col("alpha").alias("alpha_map"),
     )
 
@@ -358,16 +385,17 @@ def _normalize_map_table(table: pl.DataFrame, model: str) -> pl.DataFrame:
 def _track_fit_row(fit: "dk_bayes.TrackFit") -> dict:
     """One ad-hoc single-track fit (`method` "map" or "nuts"), normalized
     the same way as `_normalize_map_table` so both land in the same
-    `D_track_fit_um2_s`/`alpha_track_fit` tracks-pane columns --
+    `D_track_fit_um2_s` (normal) / `K_track_fit_um2_s_alpha` +
+    `alpha_track_fit` (anomalous) tracks-pane columns --
     deliberately separate from the bulk MAP columns even when `method`
     happens to be "map" too, since a bulk fit and a one-off single-track
     fit are different actions the user can compare against each other."""
-    D = fit.params["D"] if fit.model == "normal" else fit.params["D_alpha"]
     return {
         "track_id": fit.track_id,
         "model": fit.model,
         "method": fit.method,
-        "D_track_fit_um2_s": D,
+        "D_track_fit_um2_s": fit.params.get("D"),
+        "K_track_fit_um2_s_alpha": fit.params.get("K"),
         "alpha_track_fit": fit.params.get("alpha"),
     }
 
@@ -429,6 +457,15 @@ class _TracksPane(QWidget):
     max and was only ever displayed as a per-point histogram because that
     was the table it happened to hold.
 
+    The "Joint plot" section scatters any two of those same columns
+    against each other, over the rows the table is currently showing -- so
+    "D against flux_mean, for the tracks with alpha below 0.8" is a cut and
+    a plot on one table. It used to be a separate picker on the Classical
+    and Bayesian tabs, each over only that tab's own raw fit output; that
+    could not put a fit result against a track property at all, and it
+    offered diffusionkit's `log10_*` columns next to the physical ones they
+    are the log of, duplicating the picker's own "log x"/"log y" toggles.
+
     Those QC aggregates come three-per-detector-field, which is the widest
     column group in the table and usually not what you are reading, so the
     "QC columns" checkbox hides them from the *view* only -- the filter
@@ -450,6 +487,8 @@ class _TracksPane(QWidget):
         self.host = host
         self._suppress_selection_signal = False
         self._qc_columns: list[str] = []
+        self._displayed_df: Optional[pl.DataFrame] = None
+        self._joint_plot_window: Optional[PlotWindow] = None
 
         self._min_track_length = QSpinBox()
         self._min_track_length.setRange(1, 10_000)
@@ -495,6 +534,14 @@ class _TracksPane(QWidget):
         self.filters.filtersCommitted.connect(self.host.on_filters_changed)
         self._filter_section = CollapsibleSection("Filters", self.filters, expanded=False)
 
+        self._joint_plot_control = AxisPicker()
+        self._joint_plot_control.setToolTip(
+            "Any two per-track columns from the table -- track shape, detection "
+            "quality, and every fit run so far -- over the tracks currently shown."
+        )
+        self._joint_plot_control.plotRequested.connect(self._show_joint_plot)
+        self._plot_section = CollapsibleSection("Joint plot", self._joint_plot_control, expanded=False)
+
         self._model = ColumnTableModel()
         # Can carry 40+ columns after three fits (hence fixed-width
         # columns), and is the one thing here that should soak up spare
@@ -509,6 +556,7 @@ class _TracksPane(QWidget):
         layout.setSpacing(3)
         layout.addWidget(control_row)
         layout.addWidget(self._filter_section)
+        layout.addWidget(self._plot_section)
         layout.addWidget(self.table, 1)
         layout.addWidget(self._count_label)
         self.setLayout(layout)
@@ -564,11 +612,14 @@ class _TracksPane(QWidget):
         self.filters.set_filters(None)
         self.filters.set_source(None)
         self._model.clear()
+        self._displayed_df = None
+        self._joint_plot_control.clear()
         self._count_label.setText("")
 
     def set_dataframe(self, df: pl.DataFrame, total: int) -> None:
         current = self.host.selected_track_id
         hidden = set(self.hidden_columns())
+        self._displayed_df = df
         self._model.set_frame(df.select([c for c in df.columns if c not in hidden]))
         self._count_label.setText(f"{df.height} of {total} tracks")
         style_status_label(
@@ -576,6 +627,42 @@ class _TracksPane(QWidget):
         )
         if current is not None:
             self.select_track_id(current)
+
+    def set_plot_columns(
+        self, df: pl.DataFrame, prefer_x: Optional[str] = None, prefer_y: Optional[str] = None
+    ) -> None:
+        """Offer every numeric column of the joined table (hidden QC columns
+        included) as a joint-plot axis, keeping the current choice unless a
+        fit that just finished names a better default."""
+        columns = [c for c in numeric_columns(df) if c not in ("y_px", "x_px")]
+        self._joint_plot_control.set_columns(
+            columns,
+            prefer_x=prefer_x if prefer_x in columns else None,
+            prefer_y=prefer_y if prefer_y in columns else None,
+        )
+
+    def _show_joint_plot(self) -> None:
+        df = self._displayed_df
+        x_col, y_col, log_x, log_y = self._joint_plot_control.selection()
+        if df is None or not x_col or not y_col:
+            return
+        usable = df.select(x_col, y_col).drop_nulls()
+        if log_x:
+            usable = usable.filter(pl.col(x_col) > 0)
+        if log_y:
+            usable = usable.filter(pl.col(y_col) > 0)
+        if usable.height < 2:
+            self._count_label.setText(
+                f"not enough tracks with both {x_col} and {y_col}"
+                + (" (> 0 for log)" if log_x or log_y else "")
+                + " to plot"
+            )
+            style_status_label(self._count_label, "caution")
+            return
+        figure = plot_property_joint(df, x_col, y_col, log_x=log_x, log_y=log_y, title="Tracks")
+        if self._joint_plot_window is None:
+            self._joint_plot_window = PlotWindow("Tracks: joint plot", parent=self)
+        self._joint_plot_window.show_figure(figure)
 
     def _on_selection_changed(self, *_args) -> None:
         if self._suppress_selection_signal:
@@ -603,7 +690,6 @@ class _ClassicalTab(QWidget):
         self.host = host
         self._fit: Optional["dk_analysis.PopulationFit"] = None
         self._plot_window: Optional[PlotWindow] = None
-        self._joint_plot_window: Optional[PlotWindow] = None
 
         # A fit requirement, not a display filter: an MSD fit needs
         # several lag times to have anything to regress. Deliberately
@@ -627,9 +713,6 @@ class _ClassicalTab(QWidget):
 
         self._summary = status_label("")
 
-        self._joint_plot_control = AxisPicker()
-        self._joint_plot_control.plotRequested.connect(self._show_joint_plot)
-
         layout = QVBoxLayout()
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
@@ -637,12 +720,6 @@ class _ClassicalTab(QWidget):
         layout.addWidget(self._run_button)
         layout.addWidget(self._status)
         layout.addWidget(self._summary)
-        layout.addWidget(hline())
-        layout.addWidget(
-            CollapsibleSection(
-                "Joint plot (any two per-track properties)", self._joint_plot_control
-            )
-        )
         layout.addStretch()
         self.setLayout(layout)
 
@@ -655,7 +732,6 @@ class _ClassicalTab(QWidget):
         self._status.setText("")
         style_status_label(self._status)
         self._summary.setText("")
-        self._joint_plot_control.clear()
 
     def report_saved(self, text: str) -> None:
         self._status.setText(text)
@@ -671,24 +747,19 @@ class _ClassicalTab(QWidget):
         self._status.setText("running...")
         style_status_label(self._status)
         worker = _run_population_fit_worker(tracks, self.host.dt_s, self._min_track_length.value())
-        self.host.start_worker(worker, self._on_finished, self._on_error, [self._run_button])
+        self.host.start_worker(worker, self._on_finished, self._on_error, [self._run_button], "MSD fit")
 
     def _on_finished(self, fit: "dk_analysis.PopulationFit") -> None:
         self._fit = fit
         self._status.setText(f"fit {fit.per_track.height} tracks")
         style_status_label(self._status, "ok" if fit.per_track.height else "caution")
-        if fit.per_track.height:
-            columns = numeric_columns(fit.per_track)
-            self._joint_plot_control.set_columns(columns, prefer_x="D_um2_s", prefer_y="alpha")
-        else:
-            self._joint_plot_control.clear()
 
         normal = fit.ensemble_normal_fit
         anomalous = fit.ensemble_anomalous_fit
         self._summary.setText(
             f"D = {normal.D_um2_s:.4g} um^2/s (R^2={normal.r_squared:.3f})\n"
             f"alpha = {anomalous.alpha:.3f}, "
-            f"D_alpha = {anomalous.D_alpha_um2_s_alpha:.4g} um^2/s^alpha "
+            f"K = {anomalous.K_um2_s_alpha:.4g} um^2/s^alpha "
             f"(R^2={anomalous.r_squared:.3f})\n"
             f"mean localization offset = {fit.mean_localization_offset_um2:.4g} um^2"
         )
@@ -714,29 +785,12 @@ class _ClassicalTab(QWidget):
         self._status.setText(f"error: {exc}")
         style_status_label(self._status, "error")
 
-    def _show_joint_plot(self) -> None:
-        if self._fit is None or self._fit.per_track.height == 0:
-            return
-        x_col, y_col, log_x, log_y = self._joint_plot_control.selection()
-        if not x_col or not y_col:
-            return
-        figure = plot_property_joint(
-            self._fit.per_track, x_col, y_col, log_x=log_x, log_y=log_y, title="Classical MSD fit"
-        )
-        if self._joint_plot_window is None:
-            self._joint_plot_window = PlotWindow("Classical: joint plot", parent=self)
-        self._joint_plot_window.show_figure(figure)
-
 
 class _BayesianTab(QWidget):
     def __init__(self, host: "DiffusionAnalysisWidget") -> None:
         super().__init__()
         self.host = host
-        self._map_full: Optional[pl.DataFrame] = None
-        self._map_model: Optional[str] = None
-        self._map_by_model: dict[str, pl.DataFrame] = {}
         self._track_plot_window: Optional[PlotWindow] = None
-        self._joint_plot_window: Optional[PlotWindow] = None
 
         self._model_picker = QComboBox()
         self._model_picker.addItems(["anomalous", "normal"])
@@ -765,14 +819,6 @@ class _BayesianTab(QWidget):
         self._map_histogram = HistogramRangeWidget()
         self._map_histogram.setEnabled(False)
         self._map_histogram.rangeChanged.connect(self._on_map_range_changed)
-
-        self._joint_plot_control = AxisPicker()
-        self._joint_plot_control.setToolTip(
-            "Columns from every MAP fit run so far (normal and/or anomalous) "
-            "-- e.g. compare the generalized-diffusion K (D_alpha_median_um2_s_alpha) "
-            "against the normal-model D (D_median_um2_s), or either against alpha."
-        )
-        self._joint_plot_control.plotRequested.connect(self._show_joint_plot)
 
         self._method_picker = QComboBox()
         self._method_picker.addItems(["map", "nuts"])
@@ -827,19 +873,11 @@ class _BayesianTab(QWidget):
         layout.addLayout(model_form)
         layout.addWidget(hline())
         layout.addWidget(self._map_section)
-        layout.addWidget(
-            CollapsibleSection(
-                "Joint plot (any two per-track properties)", self._joint_plot_control
-            )
-        )
         layout.addWidget(self._track_section)
         layout.addStretch()
         self.setLayout(layout)
 
     def reset(self) -> None:
-        self._map_full = None
-        self._map_model = None
-        self._map_by_model = {}
         self._map_status.setText("")
         style_status_label(self._map_status)
         self._track_status.setText("")
@@ -850,7 +888,6 @@ class _BayesianTab(QWidget):
         self._color_by_picker.blockSignals(False)
         self._color_by_picker.setEnabled(False)
         self._map_histogram.setEnabled(False)
-        self._joint_plot_control.clear()
 
     def _run_map(self) -> None:
         tracks = self.host.diffkit_tracks_for_fit()
@@ -859,24 +896,19 @@ class _BayesianTab(QWidget):
         model = self._model_picker.currentText()
         self._map_status.setText("running...")
         style_status_label(self._map_status)
-        worker = _run_bulk_map_worker(tracks, self.host.dt_s, model)
+        worker = _run_bulk_map_worker(tracks, self.host.dt_s, model, self.host.progress_callback)
         self.host.start_worker(
-            worker, lambda table, m=model: self._on_map_finished(table, m), self._on_map_error, [self._map_button]
+            worker,
+            lambda table, m=model: self._on_map_finished(table, m),
+            self._on_map_error,
+            [self._map_button],
+            f"MAP ({model})",
+            reports_progress=True,
         )
 
     def _on_map_finished(self, table: pl.DataFrame, model: str) -> None:
-        self._map_full = table
-        self._map_model = model
-        self._map_by_model[model] = table
-        self._map_status.setText(f"fit {table.height} tracks")
+        self._map_status.setText(f"fit {table.height} tracks ({model})")
         style_status_label(self._map_status, "ok" if table.height else "caution")
-
-        combined = self._combined_map_table()
-        columns = numeric_columns(combined) if combined is not None else []
-        prefer_x = "D_alpha_median_um2_s_alpha" if "D_alpha_median_um2_s_alpha" in columns else "D_median_um2_s"
-        prefer_y = "alpha" if "alpha" in columns else None
-        self._joint_plot_control.set_columns(columns, prefer_x=prefer_x, prefer_y=prefer_y)
-
         map_df = _normalize_map_table(table, model)
         color_by = "alpha_map" if model == "anomalous" else "D_map_um2_s"
         self.host.set_map_results(table, map_df, model, color_by)
@@ -884,35 +916,6 @@ class _BayesianTab(QWidget):
     def _on_map_error(self, exc: Exception) -> None:
         self._map_status.setText(f"error: {exc}")
         style_status_label(self._map_status, "error")
-
-    def _combined_map_table(self) -> Optional[pl.DataFrame]:
-        """Every MAP fit run so far (normal and/or anomalous), left-joined
-        on track_id into one wide table -- the two models never share a
-        result column name (besides track_id), so this is what lets the
-        joint-plot picker offer e.g. the generalized-diffusion K from the
-        anomalous fit *and* D from the normal fit at the same time, without
-        requiring both to have been run in the same call."""
-        tables = list(self._map_by_model.values())
-        if not tables:
-            return None
-        combined = tables[0]
-        for table in tables[1:]:
-            combined = combined.join(table, on="track_id", how="full", coalesce=True)
-        return combined
-
-    def _show_joint_plot(self) -> None:
-        combined = self._combined_map_table()
-        if combined is None:
-            return
-        x_col, y_col, log_x, log_y = self._joint_plot_control.selection()
-        if not x_col or not y_col:
-            return
-        figure = plot_property_joint(
-            combined, x_col, y_col, log_x=log_x, log_y=log_y, title="Bayesian MAP fit"
-        )
-        if self._joint_plot_window is None:
-            self._joint_plot_window = PlotWindow("Bayesian: joint plot", parent=self)
-        self._joint_plot_window.show_figure(figure)
 
     def _on_color_by_changed(self, column: str) -> None:
         if not column:
@@ -987,7 +990,13 @@ class _BayesianTab(QWidget):
         )
         style_status_label(self._track_status)
         worker = _run_track_fit_worker(track_df, self.host.dt_s, model, method)
-        self.host.start_worker(worker, self._on_track_fit_finished, self._on_track_fit_error, [self._track_fit_button])
+        self.host.start_worker(
+            worker,
+            self._on_track_fit_finished,
+            self._on_track_fit_error,
+            [self._track_fit_button],
+            f"{method.upper()} fit, track {track_id}",
+        )
 
     def _on_track_fit_finished(self, fit: "dk_bayes.TrackFit") -> None:
         self._track_status.setText(f"track {fit.track_id} fit (n={fit.track_length})")
@@ -1129,9 +1138,16 @@ class _AnisotropyTab(QWidget):
         self._status.setText("running... (nested sampling per track, can take a while)")
         style_status_label(self._status)
         worker = _run_anisotropy_worker(
-            tracks, self.host.dt_s, self._min_track_length.value()
+            tracks, self.host.dt_s, self._min_track_length.value(), self.host.progress_callback
         )
-        self.host.start_worker(worker, self._on_finished, self._on_error, [self._run_button])
+        self.host.start_worker(
+            worker,
+            self._on_finished,
+            self._on_error,
+            [self._run_button],
+            "anisotropy",
+            reports_progress=True,
+        )
 
     def _on_finished(self, per_track: pl.DataFrame) -> None:
         self._per_track = per_track
@@ -1214,9 +1230,12 @@ class DiffusionAnalysisWidget(QWidget):
         self._joined_track_df: Optional[pl.DataFrame] = None
         self._classical_full_df: Optional[pl.DataFrame] = None
         self._classical_df: Optional[pl.DataFrame] = None
-        self._map_full_df: Optional[pl.DataFrame] = None
-        self._map_model: Optional[str] = None
-        self._map_df: Optional[pl.DataFrame] = None
+        # model name -> that model's latest bulk MAP table: the full
+        # diffusionkit output (what Save writes) and its trimmed point
+        # estimates (what the tracks pane shows). Keyed by model so running
+        # "normal" after "anomalous" adds columns instead of replacing them.
+        self._map_full_by_model: dict[str, pl.DataFrame] = {}
+        self._map_df_by_model: dict[str, pl.DataFrame] = {}
         self._map_color_by: Optional[str] = None
         self._anisotropy_full_df: Optional[pl.DataFrame] = None
         # name -> per-track df (track_id + one or more value columns) --
@@ -1227,6 +1246,9 @@ class DiffusionAnalysisWidget(QWidget):
         self._track_fit_rows: list[dict] = []
         self._current_track_id: Optional[int] = None
         self._worker = None
+        self._progress_label = ""
+        self._progress_relay = _ProgressRelay(self)
+        self._progress_relay.progress.connect(self._on_worker_progress)
 
         self._tracks_layer: Optional[Tracks] = None
         self._highlight_layer: Optional[Shapes] = None
@@ -1287,6 +1309,10 @@ class DiffusionAnalysisWidget(QWidget):
 
         footer = flow_row(self._restrict_checkbox, self._save_button)
 
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setTextVisible(True)
+        self._progress_bar.hide()
+
         # The tracks table and the analysis tabs both want more height than
         # a docked panel has, and which one deserves it changes by the
         # minute (scanning rows vs. reading a fit's output), so it is a
@@ -1307,6 +1333,7 @@ class DiffusionAnalysisWidget(QWidget):
         layout.addLayout(layer_row)
         layout.addWidget(self._source_label)
         layout.addWidget(splitter, 1)
+        layout.addWidget(self._progress_bar)
         layout.addWidget(footer)
         self.setLayout(layout)
 
@@ -1369,28 +1396,62 @@ class DiffusionAnalysisWidget(QWidget):
             return self._diffkit_tracks
         return self._diffkit_tracks.filter(pl.col("track_id").is_in(list(ids)))
 
-    def start_worker(self, worker, on_finished, on_error, busy_widgets: list) -> None:
+    @property
+    def progress_callback(self):
+        """What to hand diffusionkit as `progress=`: safe to call from the
+        worker thread (see `_ProgressRelay`)."""
+        return self._progress_relay.progress.emit
+
+    def start_worker(
+        self,
+        worker,
+        on_finished,
+        on_error,
+        busy_widgets: list,
+        label: str,
+        reports_progress: bool = False,
+    ) -> None:
+        """Run `worker` in the one host-wide slot. `reports_progress` means
+        its function was given `progress_callback`; until the first report
+        arrives (and throughout, for a worker that never reports) the bar
+        is a busy indicator, since a bulk fit's first batch includes JAX
+        compilation and can sit at 0 for a while."""
         if self._worker is not None:
             return
         for widget in busy_widgets:
             widget.setEnabled(False)
+        self._progress_label = label
+        self._progress_bar.setRange(0, 0)
+        self._progress_bar.setFormat(f"{label}...")
+        self._progress_bar.show()
 
-        def _finished(result, _widgets=busy_widgets) -> None:
+        def _done(_widgets=busy_widgets) -> None:
             self._worker = None
+            self._progress_bar.hide()
             for w in _widgets:
                 w.setEnabled(True)
+
+        def _finished(result) -> None:
+            _done()
             on_finished(result)
 
-        def _errored(exc, _widgets=busy_widgets) -> None:
-            self._worker = None
-            for w in _widgets:
-                w.setEnabled(True)
+        def _errored(exc) -> None:
+            _done()
             on_error(exc)
 
         worker.returned.connect(_finished)
         worker.errored.connect(_errored)
         self._worker = worker
         worker.start()
+
+    def _on_worker_progress(self, done: int, total: int) -> None:
+        if self._worker is None or total <= 0 or done <= 0:
+            # Stay a busy indicator through the first (compiling) batch; a
+            # determinate bar parked at 0% reads as hung.
+            return
+        self._progress_bar.setRange(0, total)
+        self._progress_bar.setValue(done)
+        self._progress_bar.setFormat(f"{self._progress_label}: {done}/{total} tracks")
 
     # -- tracks-layer selection --
 
@@ -1489,9 +1550,8 @@ class DiffusionAnalysisWidget(QWidget):
         self._joined_track_df = None
         self._classical_full_df = None
         self._classical_df = None
-        self._map_full_df = None
-        self._map_model = None
-        self._map_df = None
+        self._map_full_by_model = {}
+        self._map_df_by_model = {}
         self._map_color_by = None
         self._anisotropy_full_df = None
         self._spatial_sources = {}
@@ -1578,9 +1638,8 @@ class DiffusionAnalysisWidget(QWidget):
 
         self._classical_full_df = None
         self._classical_df = None
-        self._map_full_df = None
-        self._map_model = None
-        self._map_df = None
+        self._map_full_by_model = {}
+        self._map_df_by_model = {}
         self._map_color_by = None
         self._anisotropy_full_df = None
         self._spatial_sources = {}
@@ -1593,6 +1652,9 @@ class DiffusionAnalysisWidget(QWidget):
         self._bayesian.reset()
         self._anisotropy.reset()
         self._rebuild_track_table()
+        self._tracks_pane.set_plot_columns(
+            self._joined_track_df, prefer_x="radius_of_gyration_um", prefer_y="flux_mean"
+        )
         self._clear_overlay_layers()
 
         self._mouse_callback = self._make_click_callback()
@@ -1640,7 +1702,7 @@ class DiffusionAnalysisWidget(QWidget):
     def _update_save_enabled(self) -> None:
         has_results = (
             self._classical_full_df is not None
-            or self._map_full_df is not None
+            or bool(self._map_full_by_model)
             or self._anisotropy_full_df is not None
             or bool(self._track_fit_rows)
         )
@@ -1654,8 +1716,8 @@ class DiffusionAnalysisWidget(QWidget):
         df = self._base_track_df
         if self._classical_df is not None:
             df = df.join(self._classical_df, on="track_id", how="left")
-        if self._map_df is not None:
-            df = df.join(self._map_df, on="track_id", how="left")
+        for map_df in self._map_df_by_model.values():
+            df = df.join(map_df, on="track_id", how="left")
         anisotropy_df = self._spatial_sources.get("anisotropy")
         if anisotropy_df is not None:
             df = df.join(anisotropy_df, on="track_id", how="left")
@@ -1664,7 +1726,9 @@ class DiffusionAnalysisWidget(QWidget):
                 pl.DataFrame(self._track_fit_rows)
                 .group_by("track_id", maintain_order=True)
                 .last()
-                .select("track_id", "D_track_fit_um2_s", "alpha_track_fit", "model", "method")
+                .select(
+                    "track_id", "D_track_fit_um2_s", "K_track_fit_um2_s_alpha", "alpha_track_fit", "model", "method"
+                )
                 .rename({"model": "track_fit_model", "method": "track_fit_method"})
             )
             df = df.join(fit_df, on="track_id", how="left")
@@ -1675,6 +1739,7 @@ class DiffusionAnalysisWidget(QWidget):
         # distribution the next one is chosen on.
         self._joined_track_df = df
         self._tracks_pane.set_filter_source(df)
+        self._tracks_pane.set_plot_columns(df)
 
         total = df.height
         ids = self.combined_filtered_track_ids()
@@ -1696,6 +1761,10 @@ class DiffusionAnalysisWidget(QWidget):
         self._classical_full_df = full_df
         self._classical_df = display_df
         self._rebuild_track_table()
+        if display_df is not None:
+            self._tracks_pane.set_plot_columns(
+                self._joined_track_df, prefer_x="D_classical_um2_s", prefer_y="alpha_classical"
+            )
         self._update_save_enabled()
 
     def register_spatial_source(self, name: str, df: pl.DataFrame) -> None:
@@ -1717,11 +1786,15 @@ class DiffusionAnalysisWidget(QWidget):
         return None
 
     def set_map_results(self, full_df: pl.DataFrame, display_df: pl.DataFrame, model: str, color_by: str) -> None:
-        self._map_full_df = full_df
-        self._map_model = model
-        self._map_df = display_df
-        self.register_spatial_source("bulk_map", display_df)
+        self._map_full_by_model[model] = full_df
+        self._map_df_by_model[model] = display_df
+        self.register_spatial_source(f"bulk_map_{model}", display_df)
         self._rebuild_track_table()
+        if model == "anomalous":
+            prefer_x, prefer_y = "K_map_um2_s_alpha", "alpha_map"
+        else:
+            prefer_x, prefer_y = "D_map_um2_s", "alpha_map" if "anomalous" in self._map_df_by_model else None
+        self._tracks_pane.set_plot_columns(self._joined_track_df, prefer_x=prefer_x, prefer_y=prefer_y)
         self._bayesian.on_spatial_source_registered(color_by)
         self._update_save_enabled()
 
@@ -1914,10 +1987,8 @@ class DiffusionAnalysisWidget(QWidget):
         tables = []
         if self._classical_full_df is not None:
             tables.append(self._classical_full_df.with_columns(pl.lit("classic_msd").alias("method")))
-        if self._map_full_df is not None:
-            tables.append(
-                self._map_full_df.with_columns(pl.lit(f"bayes_map_bulk_{self._map_model}").alias("method"))
-            )
+        for model, map_full_df in self._map_full_by_model.items():
+            tables.append(map_full_df.with_columns(pl.lit(f"bayes_map_bulk_{model}").alias("method")))
         if self._anisotropy_full_df is not None:
             tables.append(self._anisotropy_full_df.with_columns(pl.lit("bayes_anisotropy").alias("method")))
         if self._track_fit_rows:
@@ -1940,7 +2011,7 @@ class DiffusionAnalysisWidget(QWidget):
                 "normal_D_um2_s": fit.ensemble_normal_fit.D_um2_s,
                 "normal_r_squared": fit.ensemble_normal_fit.r_squared,
                 "anomalous_alpha": fit.ensemble_anomalous_fit.alpha,
-                "anomalous_D_alpha_um2_s_alpha": fit.ensemble_anomalous_fit.D_alpha_um2_s_alpha,
+                "anomalous_K_um2_s_alpha": fit.ensemble_anomalous_fit.K_um2_s_alpha,
                 "anomalous_r_squared": fit.ensemble_anomalous_fit.r_squared,
             }
 
