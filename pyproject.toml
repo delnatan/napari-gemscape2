@@ -62,4 +62,7 @@ spotsolve = { path = "../spotsolve", editable = true }
 # source tree, and a plain path install builds it via maturin in release.
 spotsolve-rs = { path = "../spotsolve/rust/spotsolve-py" }
 diffusionkit = { path = "../diffusionkit", editable = true }
-qtkit = { path = "../qtkit", editable = true }
+# Developed on its own (and as an editable member of the microscopy
+# workspace); this follows its main branch, and `uv lock --upgrade-package
+# qtkit` is what brings a newer commit in.
+qtkit = { git = "https://github.com/delnatan/qtkit.git", branch = "main" }

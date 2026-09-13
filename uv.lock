@@ -2017,29 +2017,11 @@ wheels = [
 [[package]]
 name = "qtkit"
 version = "0.1.0"
-source = { editable = "../qtkit" }
+source = { git = "https://github.com/delnatan/qtkit.git?branch=main#8962d857ef1e10ef34778a763bd89927888ae34b" }
 dependencies = [
     { name = "numpy" },
     { name = "qtpy" },
     { name = "superqt" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "matplotlib", marker = "extra == 'plot'" },
-    { name = "numpy" },
-    { name = "qtpy" },
-    { name = "superqt" },
-]
-provides-extras = ["plot"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "matplotlib" },
-    { name = "polars" },
-    { name = "pyqt6" },
-    { name = "pytest" },
-    { name = "pytest-qt" },
 ]
 
 [[package]]
@@ -2392,7 +2374,7 @@ requires-dist = [
     { name = "nd2" },
     { name = "numpy" },
     { name = "polars", specifier = ">=1.0.0" },
-    { name = "qtkit", editable = "../qtkit" },
+    { name = "qtkit", git = "https://github.com/delnatan/qtkit.git?branch=main" },
     { name = "qtpy" },
     { name = "spotsolve", editable = "../spotsolve" },
     { name = "spotsolve-rs", directory = "../spotsolve/rust/spotsolve-py" },
