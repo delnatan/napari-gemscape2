@@ -108,7 +108,7 @@ class ImarisReader:
 
         # Try strict cast
         try:
-            if type_func == bool:
+            if type_func is bool:
                 return str_val.lower() == "true"
             return type_func(str_val)
         except (ValueError, TypeError):
