@@ -161,12 +161,14 @@ def _check_cancelled(cancel_event: Optional[threading.Event]) -> None:
 
 
 # A filter spec: {column name -> (lo, hi)}, inclusive on both ends, ANDed
-# across columns. This is what the Detect/Track tabs' histogram filters
+# across columns, either side None for unbounded (`qtkit.FilterSpec`; JSON
+# writes it as null, and TOML, which has no null, takes a number past the
+# data instead). This is what the Detect/Track tabs' histogram filters
 # serialize to, what `manifest.json` records, and what a headless config
 # can set directly -- one shape for all three, so a range dragged in the
 # UI and a range typed into a TOML mean exactly the same thing. See
 # `filter_mask`.
-FilterSpec = dict[str, tuple[float, float]]
+FilterSpec = dict[str, tuple[Optional[float], Optional[float]]]
 
 
 def filter_mask(df: pl.DataFrame, filters: Optional[FilterSpec]) -> pl.Series:
@@ -188,8 +190,14 @@ def filter_mask(df: pl.DataFrame, filters: Optional[FilterSpec]) -> pl.Series:
     for col, (lo, hi) in (filters or {}).items():
         if col not in df.columns:
             continue
-        cond = (pl.col(col) >= lo) & (pl.col(col) <= hi)
-        expr = cond if expr is None else expr & cond
+        # A None side is unbounded -- the same rule as qtkit.filter_mask,
+        # which the filter panels preview with.
+        for cond in (
+            (pl.col(col) >= lo) if lo is not None else None,
+            (pl.col(col) <= hi) if hi is not None else None,
+        ):
+            if cond is not None:
+                expr = cond if expr is None else expr & cond
     if expr is None:
         return pl.Series("pass", np.ones(df.height, dtype=bool))
     return df.select(expr.fill_null(False).alias("pass"))["pass"]

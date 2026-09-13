@@ -38,6 +38,7 @@ dependencies = [
     # fine and then fails on the first run -- exactly the failure mode worth
     # spending a dependency to avoid.
     "diffusionkit[nested]",
+    "qtkit",
 ]
 
 [project.scripts]
@@ -61,3 +62,4 @@ spotsolve = { path = "../spotsolve", editable = true }
 # source tree, and a plain path install builds it via maturin in release.
 spotsolve-rs = { path = "../spotsolve/rust/spotsolve-py" }
 diffusionkit = { path = "../diffusionkit", editable = true }
+qtkit = { path = "../qtkit", editable = true }

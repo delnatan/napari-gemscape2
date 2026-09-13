@@ -89,6 +89,7 @@ import polars as pl
 from napari.layers import Shapes
 from napari.qt.threading import thread_worker
 from natsort import natsorted
+from qtkit.napari import live_layer
 from qtpy.QtCore import QModelIndex, QObject, QRect, QSize, Qt, QTimer, Signal
 from qtpy.QtGui import QColor, QFontMetrics, QPainter, QPen
 from qtpy.QtWidgets import (
@@ -1310,7 +1311,7 @@ class ExperimentListWidget(QWidget):
         """`layer` if it is still in the viewer, else None -- a held layer
         can be deleted from under us at any time (by the user, or by a
         `layers.clear()`)."""
-        return layer if layer is not None and layer in self.viewer.layers else None
+        return live_layer(self.viewer, layer)
 
     def _track_tables(self) -> tuple:
         """`(metrics, features)` for the session's tracks: one row per track
@@ -1588,10 +1589,14 @@ class ExperimentListWidget(QWidget):
 
 def _filter_spec(recorded: Optional[dict]) -> Optional[dict]:
     """A manifest's `{column: [lo, hi]}` back as `{column: (lo, hi)}` --
-    JSON has no tuples, and `pipeline.FilterSpec` is written in them."""
+    JSON has no tuples, and `pipeline.FilterSpec` is written in them. A
+    null side stays None (unbounded)."""
     if not recorded:
         return None
-    return {col: (float(bounds[0]), float(bounds[1])) for col, bounds in recorded.items()}
+    def side(value):
+        return None if value is None else float(value)
+
+    return {col: (side(lo), side(hi)) for col, (lo, hi) in recorded.items()}
 
 
 def _debounce_timer(parent: QObject, slot: Callable[[], None], msec: int = 40) -> QTimer:

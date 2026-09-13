@@ -2015,6 +2015,34 @@ wheels = [
 ]
 
 [[package]]
+name = "qtkit"
+version = "0.1.0"
+source = { editable = "../qtkit" }
+dependencies = [
+    { name = "numpy" },
+    { name = "qtpy" },
+    { name = "superqt" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "matplotlib", marker = "extra == 'plot'" },
+    { name = "numpy" },
+    { name = "qtpy" },
+    { name = "superqt" },
+]
+provides-extras = ["plot"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "matplotlib" },
+    { name = "polars" },
+    { name = "pyqt6" },
+    { name = "pytest" },
+    { name = "pytest-qt" },
+]
+
+[[package]]
 name = "qtpy"
 version = "2.4.3"
 source = { registry = "https://pypi.org/simple" }
@@ -2347,6 +2375,7 @@ dependencies = [
     { name = "nd2" },
     { name = "numpy" },
     { name = "polars" },
+    { name = "qtkit" },
     { name = "qtpy" },
     { name = "spotsolve" },
     { name = "spotsolve-rs" },
@@ -2363,6 +2392,7 @@ requires-dist = [
     { name = "nd2" },
     { name = "numpy" },
     { name = "polars", specifier = ">=1.0.0" },
+    { name = "qtkit", editable = "../qtkit" },
     { name = "qtpy" },
     { name = "spotsolve", editable = "../spotsolve" },
     { name = "spotsolve-rs", directory = "../spotsolve/rust/spotsolve-py" },

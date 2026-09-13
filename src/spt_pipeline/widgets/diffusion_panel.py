@@ -15,7 +15,7 @@ filters here decide what a fit runs on. Behind a tab, running a fit and
 seeing its result were two different screens, and "Fit selected track"
 pointed at a selection you could not see.
 
-- **Tracks pane** -- one row per track (`qt_helpers.DataFrameTableModel` in
+- **Tracks pane** -- one row per track (`qtkit.ColumnTableModel` in
   a `QTableView`), the single place all per-track numbers live (classical
   MSD, bulk MAP, anisotropy, and any one-off per-track fit, each in its own
   column group), plus a `min_track_length` spinbox and a
@@ -63,9 +63,9 @@ about what the last run actually covered.
 
 Tight space is a hard constraint here, not a polish item: this dock shares
 a napari window with the canvas and often with the experiment list, so
-every tall region is either collapsible (`qt_helpers.CollapsibleSection`),
-scrollable (`qt_helpers.scrolled`), or on a splitter, and every status
-line comes from `qt_helpers.status_label` so a long error message can
+every tall region is either collapsible (`qtkit.CollapsibleSection`),
+scrollable (`qtkit.scrolled`), or on a splitter, and every status
+line comes from `qtkit.status_label` so a long error message can
 never pin the dock's minimum width.
 
 All fits run through `napari.qt.threading.thread_worker`, sharing one
@@ -94,19 +94,29 @@ from diffusionkit.classic import viz as dk_analysis_viz
 from napari.layers import Points, Shapes, Tracks
 from napari.qt.threading import thread_worker
 from qtpy.QtCore import Qt, QTimer
+from qtkit import (
+    CollapsibleSection,
+    ColumnTableModel,
+    HistogramRangeWidget,
+    flow_row,
+    hline,
+    scrolled,
+    status_label,
+    style_status_label,
+    table_view,
+)
+from qtkit.napari import live_layer, tabify_with_open_widget
+from qtkit.plot import AxisPicker, PlotWindow
 from qtpy.QtWidgets import (
-    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QFormLayout,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QPushButton,
     QSizePolicy,
     QSpinBox,
     QSplitter,
-    QTableView,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -118,19 +128,6 @@ from spt_pipeline.joint_plot import numeric_columns, plot_property_joint
 from spt_pipeline.pipeline import filter_mask
 from spt_pipeline.viewer import set_tracks_layer_data
 from spt_pipeline.widgets.feature_filters import FeatureFilterPanel
-from spt_pipeline.widgets.qt_helpers import (
-    CollapsibleSection,
-    DataFrameTableModel,
-    HistogramRangeWidget,
-    JointPlotControl,
-    PlotWindow,
-    flow_row,
-    hline,
-    scrolled,
-    status_label,
-    style_status_label,
-    tabify_with_open_widget,
-)
 
 # Look for the two viewer overlays this widget owns -- kept visually
 # distinct from DETECTED_POINTS_STYLE's magenta "+" (viewer.py) so a
@@ -493,33 +490,16 @@ class _TracksPane(QWidget):
             noun="tracks",
             hint="Filter on any per-track column — detection quality, or fit results once you run one.",
         )
-        self.filters.filtersChanged.connect(self.host.on_filters_changed)
+        # On release, not per mouse-move: a change re-joins and redraws the
+        # whole table, the spatial map and (if synced) the tracks layer.
+        self.filters.filtersCommitted.connect(self.host.on_filters_changed)
         self._filter_section = CollapsibleSection("Filters", self.filters, expanded=False)
 
-        self._model = DataFrameTableModel()
-        self.table = QTableView()
-        self.table.setModel(self._model)
-        self.table.setSortingEnabled(True)
-        self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QTableView.SelectionMode.SingleSelection)
-        self.table.setAlternatingRowColors(True)
-        self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(18)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        self.table.horizontalHeader().setStretchLastSection(True)
-        # Interactive (not ResizeToContents) plus an explicit small default:
-        # the table can carry 40+ columns after three fits, and sizing each
-        # to its widest cell makes horizontal scrolling the only way to
-        # reach any of them.
-        self.table.horizontalHeader().setDefaultSectionSize(88)
-        self.table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        # Same reason as `status_label`: without this the table's own
-        # content-derived size hints become the dock's minimum size. The
-        # table is the one thing here that should soak up spare height, so
-        # it expands -- but it must also be willing to give all of it back,
-        # hence the explicit small floor rather than its default 90px hint.
-        self.table.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
-        self.table.setMinimumHeight(56)
+        self._model = ColumnTableModel()
+        # Can carry 40+ columns after three fits (hence fixed-width
+        # columns), and is the one thing here that should soak up spare
+        # height while giving all of it back on demand.
+        self.table = table_view(self._model)
         self.table.selectionModel().selectionChanged.connect(self._on_selection_changed)
 
         self._count_label = status_label("")
@@ -583,13 +563,13 @@ class _TracksPane(QWidget):
         self._qc_columns = []
         self.filters.set_filters(None)
         self.filters.set_source(None)
-        self._model.setDataFrame(pl.DataFrame())
+        self._model.clear()
         self._count_label.setText("")
 
     def set_dataframe(self, df: pl.DataFrame, total: int) -> None:
         current = self.host.selected_track_id
         hidden = set(self.hidden_columns())
-        self._model.setDataFrame(df.select([c for c in df.columns if c not in hidden]))
+        self._model.set_frame(df.select([c for c in df.columns if c not in hidden]))
         self._count_label.setText(f"{df.height} of {total} tracks")
         style_status_label(
             self._count_label, "ok" if df.height else "caution" if total else "neutral"
@@ -608,13 +588,9 @@ class _TracksPane(QWidget):
             self.host.on_table_row_selected(int(track_id))
 
     def select_track_id(self, track_id: int) -> None:
-        df = self._model.dataframe()
-        if df.height == 0 or "track_id" not in df.columns:
+        row = self._model.find_row("track_id", track_id)
+        if row is None:
             return
-        ids = df["track_id"].to_list()
-        if track_id not in ids:
-            return
-        row = ids.index(track_id)
         self._suppress_selection_signal = True
         self.table.selectRow(row)
         self.table.scrollTo(self._model.index(row, 0))
@@ -651,7 +627,7 @@ class _ClassicalTab(QWidget):
 
         self._summary = status_label("")
 
-        self._joint_plot_control = JointPlotControl()
+        self._joint_plot_control = AxisPicker()
         self._joint_plot_control.plotRequested.connect(self._show_joint_plot)
 
         layout = QVBoxLayout()
@@ -790,7 +766,7 @@ class _BayesianTab(QWidget):
         self._map_histogram.setEnabled(False)
         self._map_histogram.rangeChanged.connect(self._on_map_range_changed)
 
-        self._joint_plot_control = JointPlotControl()
+        self._joint_plot_control = AxisPicker()
         self._joint_plot_control.setToolTip(
             "Columns from every MAP fit run so far (normal and/or anomalous) "
             "-- e.g. compare the generalized-diffusion K (D_alpha_median_um2_s_alpha) "
@@ -1781,13 +1757,11 @@ class DiffusionAnalysisWidget(QWidget):
     # -- viewer overlays --
 
     def _live(self, layer):
-        """`layer` if it is still in the viewer, else None. The overlay
-        layers this widget adds can be deleted by anyone -- the user, or
-        the experiment list clearing the viewer for the next image -- and a
-        held reference to a deleted layer can be written to all day without
-        anything appearing, which is how the selected-track box and the
-        diffusion map used to stop showing for the rest of a session."""
-        return layer if layer is not None and layer in self.viewer.layers else None
+        """`layer` if it is still in the viewer (`qtkit.napari.live_layer`).
+        The overlay layers this widget adds can be deleted by anyone -- the
+        user, or the experiment list clearing the viewer for the next
+        image."""
+        return live_layer(self.viewer, layer)
 
     def _clear_overlay_layers(self) -> None:
         self._clear_highlight_layer()

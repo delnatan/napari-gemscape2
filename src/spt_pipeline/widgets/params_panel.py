@@ -11,10 +11,10 @@ TrackMate use for spot detection:
              tracks it linked, then [Save results])
 
 Each arrow there is a page, not a scroll: within a tab the steps are a
-`_StepPager` -- one step visible at a time, `‹`/`›` to leaf between them,
+`qtkit.StepPager` -- one step visible at a time, `‹`/`›` to leaf between them,
 the title a menu to jump. The dock is narrow and short, only one step is
 ever being tuned, and a stacked column put that step's Run button
-off-screen as often as not. See `_StepPager` for why the height actually
+off-screen as often as not. See `qtkit.StepPager` for why the height actually
 shrinks (a stacked widget otherwise reserves its tallest page). Stage
 completions leaf for you: `ExperimentListWidget` calls
 `show_tab("Detect", "Filter")` when a detect run lands, and
@@ -60,7 +60,7 @@ prints the current px window under those two rows, recomputed whenever
 
 Each tab shows only the handful of knobs that matter for day-to-day
 tuning; the rest collapse under a per-tab "Expert settings"
-(`superqt.QCollapsible`, collapsed by default). Tabs across stages and
+(`qtkit.CollapsibleSection`, collapsed by default). Tabs across stages and
 pages within one keep the dock panel's height bounded to a single step
 rather than to the whole form.
 
@@ -115,25 +115,20 @@ from typing import Optional
 
 import polars as pl
 import spotsolve
-from qtpy.QtCore import Qt, Signal
+from qtpy.QtCore import Signal
 from qtpy.QtWidgets import (
     QCheckBox,
     QComboBox,
-    QDoubleSpinBox,
     QFormLayout,
     QHBoxLayout,
     QLabel,
-    QMenu,
     QPushButton,
-    QSizePolicy,
     QSpinBox,
-    QStackedWidget,
     QTabWidget,
-    QToolButton,
     QVBoxLayout,
     QWidget,
 )
-from superqt import QCollapsible
+from qtkit import CollapsibleSection, StepPager, double_spinbox, hline, note_label, style_status_label, wrapping_label
 
 from spt_pipeline.pipeline import (
     DEFAULT_CALIBRATION_KWARGS,
@@ -144,18 +139,6 @@ from spt_pipeline.pipeline import (
     FilterSpec,
 )
 from spt_pipeline.widgets.feature_filters import FeatureFilterPanel
-from spt_pipeline.widgets.qt_helpers import hline as _hline
-from spt_pipeline.widgets.qt_helpers import style_status_label as _style_status_label
-
-
-def _dspin(value: float, minimum: float, maximum: float, step: float, decimals: int, tooltip: str) -> QDoubleSpinBox:
-    box = QDoubleSpinBox()
-    box.setRange(minimum, maximum)
-    box.setDecimals(decimals)
-    box.setSingleStep(step)
-    box.setValue(value)
-    box.setToolTip(tooltip)
-    return box
 
 
 def _ispin(value: int, minimum: int, maximum: int, tooltip: str) -> QSpinBox:
@@ -166,152 +149,17 @@ def _ispin(value: int, minimum: int, maximum: int, tooltip: str) -> QSpinBox:
     return box
 
 
-def _expert_section(form: QFormLayout) -> QCollapsible:
+def _expert_section(form: QFormLayout) -> CollapsibleSection:
     body = QWidget()
     body.setLayout(form)
-    section = QCollapsible("Expert settings")
-    section.addWidget(body)
-    section.collapse(animate=False)
-    return section
-
-
-class _StepPager(QWidget):
-    """One stage's steps shown a page at a time, behind a
-    `‹  2 / 4 · Detect ▾  ›` header.
-
-    The steps used to be stacked group boxes in one long column, which
-    meant the dock scrolled and the Run button for the step you were
-    tuning was as often as not off-screen. Only one step is ever being
-    worked on at a time, so this shows one: `‹`/`›` leaf between them and
-    the title is a menu for jumping straight to one. The flow it presents
-    is unchanged -- same widgets, same order, same signals -- the column
-    is just cut into pages.
-
-    The height saving is real rather than cosmetic, which takes one
-    trick: a `QStackedWidget` normally reserves the height of its
-    *tallest* page, so every page would still be as tall as the filter
-    stack. Giving the pages that aren't showing a vertical size policy of
-    `Ignored` drops them out of the stack's size hint entirely (a
-    `QWidgetItem` with an ignored policy hints at zero), so the pager --
-    and the dock around it -- is exactly as tall as the step in view and
-    resizes as you leaf.
-    """
-
-    pageChanged = Signal(int)
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._titles: list[str] = []
-
-        self._prev = QToolButton()
-        self._prev.setArrowType(Qt.ArrowType.LeftArrow)
-        self._prev.setAutoRaise(True)
-        self._prev.clicked.connect(lambda: self.set_page(self.current_page() - 1))
-        self._next = QToolButton()
-        self._next.setArrowType(Qt.ArrowType.RightArrow)
-        self._next.setAutoRaise(True)
-        self._next.clicked.connect(lambda: self.set_page(self.current_page() + 1))
-
-        # The title doubles as the step picker, so a four-page flow never
-        # costs four clicks to cross. Ignored width for the usual reason
-        # (see `_note`): a long step name must not set the dock's minimum
-        # width.
-        self._title = QToolButton()
-        self._title.setAutoRaise(True)
-        self._title.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-        self._title.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        self._title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        self._title.setToolTip("Jump to a step")
-        self._menu = QMenu(self._title)
-        self._title.setMenu(self._menu)
-
-        self._stack = QStackedWidget()
-        self._stack.currentChanged.connect(self._on_current_changed)
-
-        header = QHBoxLayout()
-        header.setContentsMargins(0, 0, 0, 0)
-        header.setSpacing(2)
-        header.addWidget(self._prev)
-        header.addWidget(self._title, stretch=1)
-        header.addWidget(self._next)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
-        layout.addLayout(header)
-        layout.addWidget(_hline())
-        layout.addWidget(self._stack)
-
-    def add_page(self, title: str, widget: QWidget) -> int:
-        # Title first: adding the stack's first page emits currentChanged
-        # synchronously, and `_on_current_changed` reads `_titles[index]`.
-        self._titles.append(title)
-        index = self._stack.addWidget(widget)
-        action = self._menu.addAction(title)
-        action.triggered.connect(lambda _checked=False, i=index: self.set_page(i))
-        self._on_current_changed(self._stack.currentIndex())
-        return index
-
-    def current_page(self) -> int:
-        return self._stack.currentIndex()
-
-    def set_page(self, index: int) -> None:
-        if 0 <= index < self._stack.count():
-            self._stack.setCurrentIndex(index)
-
-    def show_step(self, title: str) -> None:
-        """Bring one step to the front by name -- what a finished run
-        calls so the filters over what it just produced are the page in
-        view. Unknown names are ignored, deliberately: the caller naming a
-        step is reporting a result, and a renamed page is no reason to
-        drop that result on the floor."""
-        for index, existing in enumerate(self._titles):
-            if existing.lower() == title.lower():
-                self.set_page(index)
-                return
-
-    def _on_current_changed(self, index: int) -> None:
-        total = self._stack.count()
-        if total == 0 or index < 0:
-            return
-        for i in range(total):
-            page = self._stack.widget(i)
-            policy = page.sizePolicy()
-            policy.setVerticalPolicy(
-                QSizePolicy.Policy.Preferred if i == index else QSizePolicy.Policy.Ignored
-            )
-            page.setSizePolicy(policy)
-        self._title.setText(f"{index + 1} / {total} · {self._titles[index]}")
-        self._prev.setEnabled(index > 0)
-        self._next.setEnabled(index < total - 1)
-        self._prev.setToolTip(f"Back to {self._titles[index - 1]}" if index > 0 else "")
-        self._next.setToolTip(
-            f"On to {self._titles[index + 1]}" if index < total - 1 else ""
-        )
-        for i, action in enumerate(self._menu.actions()):
-            action.setEnabled(i != index)
-        self._stack.updateGeometry()
-        self.pageChanged.emit(index)
-
-
-def _note(text: str) -> QLabel:
-    """A dimmed, wrapping, width-ignoring explanatory line. Ignored width
-    so a long note can't set the dock's minimum width (same reason as
-    `ExperimentListWidget.progress_label`)."""
-    label = QLabel(text)
-    label.setWordWrap(True)
-    label.setEnabled(False)
-    label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-    return label
+    return CollapsibleSection("Expert settings", body)
 
 
 def _run_row(button_text: str) -> tuple[QPushButton, QLabel, QHBoxLayout]:
     """A "Run <stage>" button + a status label sharing one row."""
     button = QPushButton(button_text)
-    status = QLabel("")
-    _style_status_label(status)
-    status.setWordWrap(True)
-    status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+    status = wrapping_label("")
+    style_status_label(status)
     row = QHBoxLayout()
     row.setContentsMargins(0, 0, 0, 0)
     row.addWidget(button)
@@ -336,17 +184,17 @@ class _CameraFields(QWidget):
 
     def __init__(self, defaults: dict) -> None:
         super().__init__()
-        self.offset = _dspin(
+        self.offset = double_spinbox(
             defaults["offset"], 0.0, 1e6, 1.0, decimals=2,
             tooltip="Camera offset / baseline, ADU -- subtracted before the\n"
             "photoelectron conversion.",
         )
-        self.read_noise = _dspin(
+        self.read_noise = double_spinbox(
             defaults["read_noise"], 0.0, 1e4, 0.1, decimals=3,
             tooltip="Read noise, electrons rms -- the variance floor added to\n"
             "the Poisson term.",
         )
-        self.gain = _dspin(
+        self.gain = double_spinbox(
             1.0, 1e-6, 1e6, 0.1, decimals=4,
             tooltip="Gain, ADU per photoelectron. Prefer a measured value:\n"
             "a per-frame estimate drifts with the sample and rescales every\n"
@@ -389,7 +237,7 @@ class _CameraFields(QWidget):
 
 class _DetectTab(QWidget):
     """Four pages -- Camera, PSF width, Detect, Filter -- leafed through
-    with the `_StepPager` header: the camera, the PSF width, the
+    with the `qtkit.StepPager` header: the camera, the PSF width, the
     `spotsolve.localize` knobs plus scope and the two actions that produce
     something to look at (preview one frame / run the range), then a
     filter stack over what they found.
@@ -432,7 +280,7 @@ class _DetectTab(QWidget):
         band_lo, band_hi = d["band"]
 
         # --- PSF width, and the preview loop that measures it ----------
-        self.sigma = _dspin(
+        self.sigma = double_spinbox(
             1.3, 0.3, 10.0, 0.1, decimals=3,
             tooltip="In-focus PSF sigma in PIXELS -- the width the search runs\n"
             "at. Each emitter still gets its own fitted width (fit_sigma);\n"
@@ -487,10 +335,8 @@ class _DetectTab(QWidget):
         preview_row.addWidget(self.use_measured_button)
         preview_row.addStretch()
 
-        self.preview_status = QLabel("")
-        _style_status_label(self.preview_status)
-        self.preview_status.setWordWrap(True)
-        self.preview_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.preview_status = wrapping_label("")
+        style_status_label(self.preview_status)
 
         psf_form = QFormLayout()
         psf_form.setContentsMargins(0, 0, 0, 0)
@@ -514,7 +360,7 @@ class _DetectTab(QWidget):
         # directions (see `DEFAULT_DETECT_KWARGS`): the seed cut decides
         # what gets searched and is derived per frame by default; the birth
         # cut decides what gets tried inside a box and is a constant.
-        self.seed_threshold = _dspin(
+        self.seed_threshold = double_spinbox(
             4.0, 0.0, 1e9, 0.1, decimals=2,
             tooltip="Which peaks in the frame get a box searched around them, in sd\n"
             "of the LoG filter's noise. Loose costs only time -- a seed still has\n"
@@ -537,7 +383,7 @@ class _DetectTab(QWidget):
         seed_threshold_row.addWidget(self.seed_threshold)
         seed_threshold_row.addWidget(self.derive_seed_threshold)
 
-        self.birth_threshold = _dspin(
+        self.birth_threshold = double_spinbox(
             d["birth_threshold"], 0.0, 1e9, 0.1, decimals=2,
             tooltip="How strong a leftover residual peak inside a box must be before\n"
             "another emitter is tried there, in sd of the LoG filter's noise.\n"
@@ -550,7 +396,7 @@ class _DetectTab(QWidget):
         # drift over a long movie. Detections above it are flagged, not
         # deleted (see pipeline.run_detect_step); the Track tab decides
         # whether linking sees them.
-        self.agg_ratio = _dspin(
+        self.agg_ratio = double_spinbox(
             spotsolve.AGG_AMP_RATIO, 1.0, 1e6, 1.0, decimals=2,
             tooltip="Flag a detection as an aggregate when its flux exceeds this\n"
             "multiple of the frame's median detection. Flagged, never deleted --\n"
@@ -629,20 +475,20 @@ class _DetectTab(QWidget):
         # an out-of-band reject (too narrow / too wide / edge), which is how
         # out-of-focus and non-PSF-shaped junk stays out of the table;
         # `frames_df` counts them per frame.
-        self.slack_lo = _dspin(
+        self.slack_lo = double_spinbox(
             slack_lo, 0.1, 10.0, 0.05, decimals=3,
             tooltip="Narrowest width a fit may take, as a MULTIPLE OF SIGMA.",
         )
-        self.slack_hi = _dspin(
+        self.slack_hi = double_spinbox(
             slack_hi, 0.1, 20.0, 0.05, decimals=3,
             tooltip="Widest width a fit may take, as a MULTIPLE OF SIGMA.",
         )
-        self.band_lo = _dspin(
+        self.band_lo = double_spinbox(
             band_lo, 0.1, 10.0, 0.05, decimals=3,
             tooltip="Narrowest width reported as a detection, as a MULTIPLE OF\n"
             "SIGMA -- spotsolve tests it against sigma_ratio = fit_sigma/sigma.",
         )
-        self.band_hi = _dspin(
+        self.band_hi = double_spinbox(
             band_hi, 0.1, 20.0, 0.05, decimals=3,
             tooltip="Widest width reported as a detection, as a MULTIPLE OF\n"
             "SIGMA -- spotsolve tests it against sigma_ratio = fit_sigma/sigma.",
@@ -669,7 +515,7 @@ class _DetectTab(QWidget):
         band_row.addWidget(QLabel("to"))
         band_row.addWidget(self.band_hi)
 
-        self._band_note = _note("")
+        self._band_note = note_label("")
         expert_form = QFormLayout()
         expert_form.setContentsMargins(0, 0, 0, 0)
         expert_form.addRow("slack (x sigma)", slack_row)
@@ -693,14 +539,14 @@ class _DetectTab(QWidget):
         detect_layout.setContentsMargins(0, 0, 0, 0)
         detect_layout.setSpacing(2)
         detect_layout.addLayout(core_form)
-        detect_layout.addWidget(_hline())
+        detect_layout.addWidget(hline())
         detect_layout.addLayout(frame_row)
         detect_layout.addLayout(roi_row)
         detect_layout.addWidget(_expert_section(expert_form))
-        detect_layout.addWidget(_hline())
+        detect_layout.addWidget(hline())
         detect_layout.addLayout(run_row)
 
-        self.pager = _StepPager()
+        self.pager = StepPager()
         self.pager.add_page("Camera", self._camera)
         self.pager.add_page("PSF width", psf_body)
         self.pager.add_page("Detect", detect_body)
@@ -762,7 +608,7 @@ class _DetectTab(QWidget):
         self.set_preview_status("  ·  ".join(parts), level)
 
     def set_preview_status(self, text: str, level: str = "neutral") -> None:
-        _style_status_label(self.preview_status, level)
+        style_status_label(self.preview_status, level)
         self.preview_status.setText(text)
 
     def get_sigma(self) -> float:
@@ -808,10 +654,10 @@ class _DetectTab(QWidget):
             # A previous run may have left this label green/amber/red
             # (set_status's level) -- reset to neutral so in-flight
             # progress text doesn't read as a stale result.
-            _style_status_label(self.status_label)
+            style_status_label(self.status_label)
 
     def set_status(self, text: str, level: str = "neutral") -> None:
-        _style_status_label(self.status_label, level)
+        style_status_label(self.status_label, level)
         self.status_label.setText(text)
 
     def set_progress(self, done: int, total: int, stage: str) -> None:
@@ -967,12 +813,12 @@ class _TrackingTab(QWidget):
         link_layout.addLayout(form)
         link_layout.addWidget(self.drop_aggregates)
         link_layout.addWidget(
-            _note(
+            note_label(
                 "No gate to set: linking parameters are measured from the movie. "
                 "The Detect tab's filters decide which detections the linker sees."
             )
         )
-        link_layout.addWidget(_hline())
+        link_layout.addWidget(hline())
         link_layout.addLayout(run_row)
 
         self.filters = FeatureFilterPanel(
@@ -992,10 +838,8 @@ class _TrackingTab(QWidget):
             "press it again to rewrite the same bundle."
         )
         self.save_button.clicked.connect(self.saveRequested.emit)
-        self.save_status = QLabel("")
-        _style_status_label(self.save_status)
-        self.save_status.setWordWrap(True)
-        self.save_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.save_status = wrapping_label("")
+        style_status_label(self.save_status)
         save_row = QHBoxLayout()
         save_row.setContentsMargins(0, 0, 0, 0)
         save_row.addWidget(self.save_button)
@@ -1007,7 +851,7 @@ class _TrackingTab(QWidget):
         save_layout.setSpacing(2)
         save_layout.addLayout(save_row)
 
-        self.pager = _StepPager()
+        self.pager = StepPager()
         self.pager.add_page("Link", link_body)
         self.pager.add_page("Filter", self.filters)
         self.pager.add_page("Save", save_body)
@@ -1023,11 +867,11 @@ class _TrackingTab(QWidget):
         self.pager.show_step(title)
 
     def set_status(self, text: str, level: str = "neutral") -> None:
-        _style_status_label(self.status_label, level)
+        style_status_label(self.status_label, level)
         self.status_label.setText(text)
 
     def set_save_status(self, text: str, level: str = "neutral") -> None:
-        _style_status_label(self.save_status, level)
+        style_status_label(self.save_status, level)
         self.save_status.setText(text)
 
     def set_save_enabled(self, enabled: bool) -> None:
