@@ -68,7 +68,12 @@ through the same `self._worker` slot (only one run -- batch or stepwise
   layers through the current cuts on every handle move, so a spot that
   fails a cut leaves the image as the cut is made. That immediacy is the
   point of keeping the histogram next to the viewer instead of in a
-  report.
+  report. Saving then hands those same layers their final names
+  (`_promote_preview_layers`) without touching the image layer or the ROI
+  layers, so the view doesn't reset out from under the user at the moment
+  the work is committed. Every layer here is built by
+  `viewer.py`'s `add_image_layer`/`add_points_layer`/`add_tracks_layer`,
+  which is what makes preview and final look identical.
 """
 
 from __future__ import annotations
@@ -128,14 +133,14 @@ from spt_pipeline.pipeline import (
     run_preview_frame,
     run_track_step,
     session_manifest_extra,
-    track_features_df,
     track_metrics_df,
 )
 from spt_pipeline.rois import shapes_layer_to_roi
 from spt_pipeline.viewer import (
-    DETECTED_POINTS_STYLE,
-    TRACKS_COLOR_BY,
     add_experiment_layers,
+    add_image_layer,
+    add_points_layer,
+    add_tracks_layer,
 )
 from spt_pipeline.widgets.params_panel import PipelineParamsWidget
 
@@ -567,7 +572,7 @@ class ExperimentListWidget(QWidget):
         else:
             self.viewer.layers.clear()
             image, _, _ = load_stack(entry.image_path)
-            self.viewer.add_image(image, name=entry.image_path.stem)
+            add_image_layer(self.viewer, image, entry.image_path.stem)
 
     def _update_run_button_label(self) -> None:
         """Reflects what a click on `run_button` would actually do, given
@@ -1161,28 +1166,38 @@ class ExperimentListWidget(QWidget):
         if self.params_panel.get_track_filters():
             self.params_panel.set_save_status("filters changed — save to apply", level="caution")
 
+    def _session_layer_metadata(self) -> dict:
+        """The same `pixel_size_um`/`dt_s`/`experiment_dir` metadata
+        `viewer.add_experiment_layers` puts on a saved bundle's layers, for
+        the in-memory session's layers -- so a widget reading either (e.g.
+        widgets/diffusion_panel.py) works the same on a preview as on a
+        loaded bundle."""
+        session = self._session
+        return {
+            "pixel_size_um": session.pixel_size_um if session is not None else 1.0,
+            "dt_s": session.dt_s if session is not None else 1.0,
+            "experiment_dir": str(self._session_item.entry.experiment_dir.resolve())
+            if self._session_item is not None
+            else None,
+        }
+
+    def _filtered_points(self):
+        session = self._session
+        if session is None or session.points_df is None:
+            return None
+        df = session.points_df
+        filters = self.params_panel.get_point_filters()
+        return df.filter(filter_mask(df, filters)) if filters else df
+
     def _update_points_layer(self) -> None:
         """Redraw the detections layer showing only what passes the Detect
         tab's cuts -- filtered spots vanish from the image as the handle
         moves, which is the whole point of putting the histogram next to
         the viewer rather than in a report."""
-        session = self._session
-        if session is None or session.points_df is None:
+        if self._session is None or self._session.points_df is None:
             return
-        df = session.points_df
-        filters = self.params_panel.get_point_filters()
-        if filters:
-            df = df.filter(filter_mask(df, filters))
-        if "points (preview)" in self.viewer.layers:
-            del self.viewer.layers["points (preview)"]
-        if df.height == 0:
-            return
-        features = {col: df[col].to_numpy() for col in df.columns}
-        self.viewer.add_points(
-            df.select(["frame", "y", "x"]).to_numpy(),
-            name="points (preview)",
-            features=features,
-            **DETECTED_POINTS_STYLE,
+        add_points_layer(
+            self.viewer, self._filtered_points(), "points (preview)", self._session_layer_metadata()
         )
 
     def _update_tracks_layer(self) -> None:
@@ -1192,29 +1207,13 @@ class ExperimentListWidget(QWidget):
         session = self._session
         if session is None or session.tracks_df is None:
             return
-        df = self._filtered_tracks()
-        if "tracks (preview)" in self.viewer.layers:
-            del self.viewer.layers["tracks (preview)"]
-        if df is None or df.height == 0:
-            return
-        feat_df = track_features_df(df, session.pixel_size_um, session.dt_s)
-        properties = {
-            col: feat_df[col].to_numpy()
-            for col in feat_df.columns
-            if col not in ("track_id", "frame", "y", "x")
-        }
-        self.viewer.add_tracks(
-            feat_df.select("track_id", "frame", "y", "x").to_numpy(),
-            name="tracks (preview)",
-            properties=properties,
-            color_by=TRACKS_COLOR_BY,
-            metadata={
-                "pixel_size_um": session.pixel_size_um,
-                "dt_s": session.dt_s,
-                "experiment_dir": str(self._session_item.entry.experiment_dir.resolve())
-                if self._session_item is not None
-                else None,
-            },
+        add_tracks_layer(
+            self.viewer,
+            self._filtered_tracks(),
+            session.pixel_size_um,
+            session.dt_s,
+            "tracks (preview)",
+            self._session_layer_metadata(),
         )
 
     def _filtered_tracks(self):
@@ -1293,10 +1292,32 @@ class ExperimentListWidget(QWidget):
         )
 
         if self.list_view.currentItem() is item:
-            for name in ("points (preview)", "tracks (preview)", "preview spots"):
-                if name in self.viewer.layers:
-                    del self.viewer.layers[name]
-            add_experiment_layers(self.viewer, entry.experiment_dir)
+            self._promote_preview_layers(session, tracks_df)
+
+    def _promote_preview_layers(self, session: PipelineSession, tracks_df) -> None:
+        """Swap the stepwise "(preview)" layers for the final "points"/
+        "tracks" ones the saved bundle would load as.
+
+        Built from the session's own tables rather than by re-running
+        `add_experiment_layers` on the bundle just written: that clears the
+        viewer and re-reads the image off disk, which for a large stack is
+        a visible stall and -- more to the point -- throws away the image
+        layer's state (colormap, contrast, zoom) along with any ROI layers
+        drawn, so pressing Save made the whole view flinch. The data is
+        identical either way; `tracks_df` is the filtered table actually
+        written, so what's on screen still matches what's in the bundle.
+
+        The ROI layers are deliberately left alone -- they were the input
+        to this run, they were just saved with it, and re-adding them from
+        `rois.json` would only duplicate what is already on screen."""
+        for name in ("points (preview)", "tracks (preview)", "preview spots"):
+            if name in self.viewer.layers:
+                del self.viewer.layers[name]
+        metadata = self._session_layer_metadata()
+        add_points_layer(self.viewer, session.points_df, "points", metadata)
+        add_tracks_layer(
+            self.viewer, tracks_df, session.pixel_size_um, session.dt_s, "tracks", metadata
+        )
 
     def _restore_filters_from_bundle(self, experiment_dir: Path) -> None:
         """Put a saved bundle's recorded filter ranges back on the
