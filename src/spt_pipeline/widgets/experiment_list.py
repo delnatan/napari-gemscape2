@@ -85,10 +85,11 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
+import polars as pl
 from napari.layers import Shapes
 from napari.qt.threading import thread_worker
 from natsort import natsorted
-from qtpy.QtCore import QModelIndex, QObject, QRect, QSize, Qt, Signal
+from qtpy.QtCore import QModelIndex, QObject, QRect, QSize, Qt, QTimer, Signal
 from qtpy.QtGui import QColor, QFontMetrics, QPainter, QPen
 from qtpy.QtWidgets import (
     QAbstractItemView,
@@ -98,6 +99,7 @@ from qtpy.QtWidgets import (
     QListWidget,
     QFrame,
     QListWidgetItem,
+    QMessageBox,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -120,11 +122,11 @@ from spt_pipeline.experiment import (
     write_experiment,
 )
 from spt_pipeline.io_formats import SUPPORTED_SUFFIXES as SUPPORTED_FORMATS
-from spt_pipeline.io_formats import load_stack
 from spt_pipeline.pipeline import (
     DetectTrackParams,
     PipelineCancelled,
     PipelineSession,
+    apply_filters,
     apply_track_filters,
     filter_mask,
     load_session,
@@ -133,14 +135,22 @@ from spt_pipeline.pipeline import (
     run_preview_frame,
     run_track_step,
     session_manifest_extra,
+    track_features_df,
     track_metrics_df,
 )
 from spt_pipeline.rois import shapes_layer_to_roi
 from spt_pipeline.viewer import (
-    add_experiment_layers,
+    ImageDisplay,
+    ResultDisplay,
     add_image_layer,
     add_points_layer,
     add_tracks_layer,
+    load_image_display,
+    load_result_display,
+    set_points_layer_data,
+    set_tracks_layer_data,
+    show_image,
+    show_result,
 )
 from spt_pipeline.widgets.params_panel import PipelineParamsWidget
 
@@ -178,13 +188,11 @@ class ExperimentEntry:
     status: Status = Status.UNTOUCHED
     n_tracks: Optional[int] = None
     error: Optional[str] = None
-    # True while this item's session has calibration/detect results that
-    # haven't made it through "Run tracking" (which is what actually writes
-    # to disk) -- painted as an amber ring by ExperimentItemDelegate so
-    # navigating away is a visible choice, not a silent loss. Cleared once
-    # written (_on_track_finished) or once the risk has already passed
-    # (_on_selection_changed, navigating off this item drops the in-memory
-    # session for good).
+    # True while this item's session holds results (a detect or link run,
+    # or filters moved since the last save) that aren't in its bundle --
+    # painted as an amber ring by ExperimentItemDelegate. Leaving the item
+    # while it is set asks first (`_confirm_leave_session`). Cleared by a
+    # save, or by choosing to discard.
     has_unsaved_session: bool = False
 
 
@@ -284,6 +292,10 @@ class _ExperimentListView(QListWidget):
         # in-flight run's own item from the reloaded list (Finding 4).
         self.is_busy: Callable[[], bool] = lambda: False
         self.on_busy_blocked: Callable[[], None] = lambda: None
+        # Asked before a reload replaces every row (and with them the
+        # in-memory session of whichever row was being worked on); False
+        # keeps the current list.
+        self.confirm_reload: Callable[[], bool] = lambda: True
 
     def keyPressEvent(self, event) -> None:
         key = event.key()
@@ -332,6 +344,8 @@ class _ExperimentListView(QListWidget):
     def load_folder(self, folder_path: Path, experiments_root: Optional[Path] = None) -> None:
         if self.is_busy():
             self.on_busy_blocked()
+            return
+        if not self.confirm_reload():
             return
         self.clear()
         self.folder_path = Path(folder_path)
@@ -395,6 +409,39 @@ class ExperimentListWidget(QWidget):
         # record would lose track of the target at exactly that moment
         # (see `_on_roi_layers_changed`).
         self._roi_target: Optional[Shapes] = None
+
+        # The session's own detections/tracks layers, held as layers rather
+        # than looked up by name: a filter drag redraws them in place, Save
+        # renames them, and the user may rename them too. Checked for still
+        # being in the viewer before each use (`_live`), since anything can
+        # remove a layer.
+        self._points_layer = None
+        self._tracks_layer = None
+        # Per-track metrics and per-vertex features for the session's
+        # current `tracks_df`, computed once per link run rather than on
+        # every handle move: `(tracks_df, metrics, features)`.
+        self._track_cache: Optional[tuple] = None
+        # Filter drags redraw the viewer through these rather than on every
+        # mouse-move event: a Tracks layer rebuild is far slower than the
+        # rate a handle emits, and queuing one per event made dragging lag.
+        self._points_redraw = _debounce_timer(self, self._update_points_layer)
+        self._tracks_redraw = _debounce_timer(self, self._update_tracks_layer)
+
+        # Showing a row's image (or bundle) runs in a worker, started after
+        # a short pause in row changes so that arrowing down the list does
+        # not queue a full stack read per row passed over. The generation
+        # counter is how a load that finishes after the user moved on (or
+        # started working on the row) knows to discard its result.
+        self._load_generation = 0
+        self._pending_load_item: Optional[ExperimentItem] = None
+        self._load_timer = QTimer(self)
+        self._load_timer.setSingleShot(True)
+        self._load_timer.setInterval(150)
+        self._load_timer.timeout.connect(self._start_item_load)
+        self._loading_text = ""
+        # The last row load that landed, kept so the session for that row
+        # reuses the stack already in memory instead of reading it again.
+        self._loaded: Optional[tuple[ExperimentItem, ImageDisplay]] = None
         self.setAcceptDrops(True)
 
         header = QLabel(_ExperimentListView.KEYBINDINGS)
@@ -408,6 +455,7 @@ class ExperimentListWidget(QWidget):
         self.list_view.on_busy_blocked = lambda: self.progress_label.setText(
             "a run is in progress — finishing before loading a new folder"
         )
+        self.list_view.confirm_reload = self._confirm_reload
 
         open_button = QPushButton("Open folder…")
         open_button.clicked.connect(self._open_folder_dialog)
@@ -543,14 +591,13 @@ class ExperimentListWidget(QWidget):
                 "-- finishing before switching items"
             )
             return
-        if self._session_item is not None:
-            # Leaving the row that held the in-progress session -- the
-            # in-memory session is about to be dropped for good below, so
-            # the "you might lose this" marker no longer applies (it's
-            # already lost); clear it rather than leave a stale warning.
-            self._session_item.entry.has_unsaved_session = False
-        self._session = None
-        self._session_item = None
+        if self._session_item is not None and current is not self._session_item:
+            if not self._confirm_leave_session():
+                self._reverting_selection = True
+                self.list_view.setCurrentItem(self._session_item)
+                self._reverting_selection = False
+                return
+        self._drop_session()
         self.params_panel.set_preview_result(None)
         self.params_panel.set_detect_status("")
         self.params_panel.set_track_status("")
@@ -565,14 +612,117 @@ class ExperimentListWidget(QWidget):
         self.params_panel.set_track_filter_source(None)
         self.list_view.viewport().update()
 
-        entry = current.entry
-        if has_experiment(entry.experiment_dir):
-            add_experiment_layers(self.viewer, entry.experiment_dir)
-            self._restore_filters_from_bundle(entry.experiment_dir)
+        # Blank the viewer now rather than when the load lands: until then
+        # the previous row's layers would sit there looking like this one's.
+        self.viewer.layers.clear()
+        self._request_item_load(current)
+
+    def _drop_session(self) -> None:
+        """Forget the in-memory session and everything derived from it."""
+        if self._session_item is not None:
+            self._session_item.entry.has_unsaved_session = False
+        self._session = None
+        self._session_item = None
+        self._track_cache = None
+        self._points_layer = None
+        self._tracks_layer = None
+        self._points_redraw.stop()
+        self._tracks_redraw.stop()
+
+    def _confirm_leave_session(self) -> bool:
+        """Whether it is fine to drop the current session: True straight
+        away if nothing in it is unsaved, otherwise the user's answer to a
+        Save / Discard / Stay prompt. Leaving used to discard silently --
+        one arrow-key press in the list was enough to lose a finished
+        detect-and-link."""
+        item, session = self._session_item, self._session
+        if item is None or session is None or not item.entry.has_unsaved_session:
+            return True
+        savable = session.tracks_df is not None and session.tracks_df.height > 0
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Unsaved results")
+        box.setText(f"{item.entry.image_path.name} has results that haven't been saved.")
+        box.setInformativeText(
+            "Save writes its experiment bundle first; Discard drops them."
+            if savable
+            else "It hasn't been linked yet, so there is nothing to save — leaving drops it."
+        )
+        save = box.addButton("Save", QMessageBox.ButtonRole.AcceptRole) if savable else None
+        discard = box.addButton("Discard", QMessageBox.ButtonRole.DestructiveRole)
+        stay = box.addButton("Stay", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(stay)
+        box.setEscapeButton(stay)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is discard:
+            return True
+        if save is not None and clicked is save:
+            return self._save_experiment(item)
+        return False
+
+    def _confirm_reload(self) -> bool:
+        """`_ExperimentListView.confirm_reload`: a reload replaces every
+        row, so it leaves the session's row just as a selection change
+        does."""
+        if not self._confirm_leave_session():
+            return False
+        self._drop_session()
+        self._loaded = None
+        return True
+
+    # -- Showing a row (off the GUI thread) --
+
+    def _request_item_load(self, item: ExperimentItem) -> None:
+        """Show `item`'s bundle, or its raw image if it has none, once the
+        row has been sat on briefly (`_load_timer`)."""
+        self._load_generation += 1
+        self._pending_load_item = item
+        self._loaded = None
+        self._load_timer.start()
+
+    def _start_item_load(self) -> None:
+        item = self._pending_load_item
+        if item is None or self.list_view.currentItem() is not item:
+            return
+        generation = self._load_generation
+        entry = item.entry
+        self._loading_text = f"loading {entry.image_path.name}…"
+        self.progress_label.setText(self._loading_text)
+        worker = _load_item_worker(entry.image_path, entry.experiment_dir)
+        worker.returned.connect(
+            lambda loaded, item=item, g=generation: self._on_item_loaded(item, g, loaded)
+        )
+        worker.errored.connect(
+            lambda exc, item=item, g=generation: self._on_item_load_error(item, g, exc)
+        )
+        worker.start()
+
+    def _load_is_current(self, item: ExperimentItem, generation: int) -> bool:
+        return generation == self._load_generation and self.list_view.currentItem() is item
+
+    def _clear_loading_text(self) -> None:
+        # Only our own message: a batch run shares this label.
+        if self.progress_label.text() == self._loading_text:
+            self.progress_label.setText("")
+
+    def _on_item_loaded(self, item: ExperimentItem, generation: int, loaded) -> None:
+        if not self._load_is_current(item, generation):
+            return
+        self._clear_loading_text()
+        image = loaded.image if isinstance(loaded, ResultDisplay) else loaded
+        self._loaded = (item, image)
+        self.params_panel.set_frame_bounds(image.image.shape[0])
+        if isinstance(loaded, ResultDisplay):
+            show_result(self.viewer, loaded)
+            self._restore_filters_from_bundle(loaded)
         else:
-            self.viewer.layers.clear()
-            image, _, _ = load_stack(entry.image_path)
-            add_image_layer(self.viewer, image, entry.image_path.stem)
+            show_image(self.viewer, loaded)
+
+    def _on_item_load_error(self, item: ExperimentItem, generation: int, exc: Exception) -> None:
+        if not self._load_is_current(item, generation):
+            return
+        self.progress_label.setText(f"could not load {item.entry.image_path.name}: {exc}")
 
     def _update_run_button_label(self) -> None:
         """Reflects what a click on `run_button` would actually do, given
@@ -700,8 +850,8 @@ class ExperimentListWidget(QWidget):
         item.set_status(Status.COMPLETE, n_tracks=manifest_extra["n_tracks"])
         self.list_view.viewport().update()
 
-        if self.list_view.currentItem() is item:
-            add_experiment_layers(self.viewer, entry.experiment_dir)
+        if self.list_view.currentItem() is item and self._session_item is not item:
+            self._request_item_load(item)
 
         self._worker = None
         self._cancel_event = None
@@ -734,7 +884,23 @@ class ExperimentListWidget(QWidget):
         first click for a freshly-selected item)."""
         if self._session is not None and self._session_item is item:
             return self._session
-        session = load_session(item.entry.image_path)
+        # Starting work on the row outranks a load of it still in flight:
+        # that load would clear the viewer out from under this session.
+        self._load_generation += 1
+        self._load_timer.stop()
+        self._clear_loading_text()
+        loaded = self._loaded[1] if self._loaded is not None and self._loaded[0] is item else None
+        if loaded is None:
+            # The row's load never landed, so its image isn't on screen.
+            # Added under whatever is there (an ROI drawn meanwhile, say)
+            # rather than clearing it away.
+            session = load_session(item.entry.image_path)
+            layer = add_image_layer(self.viewer, session.image, item.entry.image_path.stem)
+            self.viewer.layers.move(self.viewer.layers.index(layer), 0)
+        else:
+            session = load_session(
+                item.entry.image_path, stack=(loaded.image, loaded.pixel_size_um, loaded.dt_s)
+            )
         self._session = session
         self._session_item = item
         return session
@@ -1067,7 +1233,7 @@ class ExperimentListWidget(QWidget):
             # The preview's one frame is superseded by the real run; two
             # overlapping spot layers on the same frame is just confusing.
             del self.viewer.layers["preview spots"]
-        self._update_points_layer()
+        self._update_points_layer(new_data=True)
         self.params_panel.set_save_enabled(False)
         self._finish_step_worker()
 
@@ -1132,8 +1298,9 @@ class ExperimentListWidget(QWidget):
         # layer through whatever cuts survive. Nothing is written yet --
         # `_save_experiment` is the finalize step now, so the filters can
         # be tuned against the linked result before it's committed.
-        self.params_panel.set_track_filter_source(self._track_metrics())
-        self._update_tracks_layer()
+        self._track_cache = None
+        self.params_panel.set_track_filter_source(self._track_tables()[0])
+        self._update_tracks_layer(new_data=True)
         self.params_panel.set_save_enabled(session.tracks_df is not None and session.tracks_df.height > 0)
         self.params_panel.set_save_status("not saved yet", level="caution")
         self.params_panel.show_tab("Track", "Filter")
@@ -1142,16 +1309,37 @@ class ExperimentListWidget(QWidget):
 
     # -- Filters -> viewer (live) --
 
-    def _track_metrics(self):
-        """One row per track for the Track tab's filter histograms, or None
-        with nothing linked."""
+    def _live(self, layer):
+        """`layer` if it is still in the viewer, else None -- a held layer
+        can be deleted from under us at any time (by the user, or by a
+        `layers.clear()`)."""
+        return layer if layer is not None and layer in self.viewer.layers else None
+
+    def _track_tables(self) -> tuple:
+        """`(metrics, features)` for the session's tracks: one row per track
+        for the Track tab's histograms, and the per-vertex table the Tracks
+        layer draws. Cached per `tracks_df`, so a filter drag only filters
+        them rather than re-aggregating every track. `(None, None)` with
+        nothing linked."""
         session = self._session
         if session is None or session.tracks_df is None or session.tracks_df.height == 0:
-            return None
-        return track_metrics_df(session.tracks_df, session.pixel_size_um, session.dt_s)
+            return None, None
+        cached = self._track_cache
+        if cached is None or cached[0] is not session.tracks_df:
+            metrics = track_metrics_df(session.tracks_df, session.pixel_size_um, session.dt_s)
+            features = track_features_df(session.tracks_df, session.pixel_size_um, session.dt_s)
+            self._track_cache = cached = (session.tracks_df, metrics, features)
+        return cached[1], cached[2]
+
+    def _mark_unsaved(self) -> None:
+        if self._session_item is not None and not self._session_item.entry.has_unsaved_session:
+            self._session_item.entry.has_unsaved_session = True
+            self.list_view.viewport().update()
 
     def _on_point_filters_changed(self) -> None:
-        self._update_points_layer()
+        self._points_redraw.start()
+        if self._session is not None and self._session.points_df is not None:
+            self._mark_unsaved()
         if self._session is not None and self._session.tracks_df is not None:
             # The linked tracks were produced under the previous cuts, so
             # they no longer follow from what's on screen. Say so instead
@@ -1162,14 +1350,15 @@ class ExperimentListWidget(QWidget):
             self.params_panel.set_save_enabled(False)
 
     def _on_track_filters_changed(self) -> None:
-        self._update_tracks_layer()
-        if self.params_panel.get_track_filters():
+        self._tracks_redraw.start()
+        if self._session is not None and self._session.tracks_df is not None:
+            self._mark_unsaved()
             self.params_panel.set_save_status("filters changed — save to apply", level="caution")
 
     def _session_layer_metadata(self) -> dict:
         """The same `pixel_size_um`/`dt_s`/`experiment_dir` metadata
-        `viewer.add_experiment_layers` puts on a saved bundle's layers, for
-        the in-memory session's layers -- so a widget reading either (e.g.
+        `viewer.show_result` puts on a saved bundle's layers, for the
+        in-memory session's layers -- so a widget reading either (e.g.
         widgets/diffusion_panel.py) works the same on a preview as on a
         loaded bundle."""
         session = self._session
@@ -1181,40 +1370,76 @@ class ExperimentListWidget(QWidget):
             else None,
         }
 
-    def _filtered_points(self):
+    def _update_points_layer(self, new_data: bool = False) -> None:
+        """Show only the detections that pass the Detect tab's cuts --
+        filtered spots vanish from the image as the handle moves, which is
+        the whole point of putting the histogram next to the viewer rather
+        than in a report.
+
+        A cut only toggles the layer's `shown` mask; the layer is created
+        once, and its data replaced in place (`new_data`) only when a
+        detect run produced a new table. It used to be deleted and re-added
+        on every mouse-move of a handle."""
+        self._points_redraw.stop()
         session = self._session
         if session is None or session.points_df is None:
-            return None
+            return
         df = session.points_df
+        layer = self._live(self._points_layer)
+        if df.height == 0:
+            if layer is not None:
+                self.viewer.layers.remove(layer)
+            self._points_layer = None
+            return
+        if layer is None:
+            layer = add_points_layer(
+                self.viewer, df, "points (preview)", self._session_layer_metadata()
+            )
+            self._points_layer = layer
+        elif new_data:
+            set_points_layer_data(layer, df)
+            # A re-run after a save: this is a preview again until saved.
+            layer.name = "points (preview)"
         filters = self.params_panel.get_point_filters()
-        return df.filter(filter_mask(df, filters)) if filters else df
+        layer.shown = filter_mask(df, filters).to_numpy() if filters else True
 
-    def _update_points_layer(self) -> None:
-        """Redraw the detections layer showing only what passes the Detect
-        tab's cuts -- filtered spots vanish from the image as the handle
-        moves, which is the whole point of putting the histogram next to
-        the viewer rather than in a report."""
-        if self._session is None or self._session.points_df is None:
-            return
-        add_points_layer(
-            self.viewer, self._filtered_points(), "points (preview)", self._session_layer_metadata()
-        )
-
-    def _update_tracks_layer(self) -> None:
-        """Redraw the linked tracks showing only those passing the Track
-        tab's cuts, the same way `_update_points_layer` does for
-        detections."""
+    def _update_tracks_layer(self, new_data: bool = False) -> None:
+        """Show only the linked tracks that pass the Track tab's cuts, redrawn
+        in place (`viewer.set_tracks_layer_data`) so the layer -- and the
+        diffusion panel reading it -- survives the drag. A Tracks layer has
+        no per-track visibility, so unlike detections this replaces the
+        layer's data with the passing tracks; with none passing, the layer
+        is removed."""
+        self._tracks_redraw.stop()
         session = self._session
-        if session is None or session.tracks_df is None:
+        metrics, features = self._track_tables()
+        if session is None or features is None:
             return
-        add_tracks_layer(
-            self.viewer,
-            self._filtered_tracks(),
-            session.pixel_size_um,
-            session.dt_s,
-            "tracks (preview)",
-            self._session_layer_metadata(),
-        )
+        filters = self.params_panel.get_track_filters()
+        tracks_df = session.tracks_df
+        if filters:
+            keep = pl.col("track_id").is_in(apply_filters(metrics, filters)["track_id"])
+            features = features.filter(keep)
+            tracks_df = tracks_df.filter(keep)
+        layer = self._live(self._tracks_layer)
+        if features.height == 0:
+            if layer is not None:
+                self.viewer.layers.remove(layer)
+            self._tracks_layer = None
+            return
+        if layer is None:
+            self._tracks_layer = add_tracks_layer(
+                self.viewer,
+                tracks_df,
+                session.pixel_size_um,
+                session.dt_s,
+                "tracks (preview)",
+                self._session_layer_metadata(),
+            )
+            return
+        set_tracks_layer_data(layer, features)
+        if new_data:
+            layer.name = "tracks (preview)"
 
     def _filtered_tracks(self):
         session = self._session
@@ -1229,27 +1454,30 @@ class ExperimentListWidget(QWidget):
 
     # -- Finalize (explicit save) --
 
-    def _save_experiment(self) -> None:
-        """Write the bundle for the current stepwise session: every
-        detection in points.parquet, the tracks that pass the Track tab's
-        cuts in tracks.parquet, and both filter specs in manifest.json.
+    def _save_experiment(self, item: Optional[ExperimentItem] = None) -> bool:
+        """Write the bundle for the stepwise session of `item` (default: the
+        current row): every detection in points.parquet, the tracks that
+        pass the Track tab's cuts in tracks.parquet, and both filter specs
+        in manifest.json. Returns whether it was written.
 
         Explicit rather than automatic on a finished track run, so the
         filters can be tuned against a linked result before it's committed
         -- press it again after moving a handle and the same bundle is
-        rewritten."""
-        item = self.list_view.currentItem()
+        rewritten. `item` is passed by the leave-this-row prompt, which
+        runs while the list's current row is already the one being moved
+        to."""
+        item = item if item is not None else self.list_view.currentItem()
         session = self._session if (item is not None and self._session_item is item) else None
         if session is None or session.tracks_df is None:
             self.params_panel.set_save_status("nothing to save — run tracking first", level="error")
-            return
+            return False
 
         tracks_df = self._filtered_tracks()
         if tracks_df is None or tracks_df.height == 0:
             self.params_panel.set_save_status(
                 "nothing to save — the track filters reject every track", level="error"
             )
-            return
+            return False
 
         # Record what the save actually used, so `session_manifest_extra`
         # reports the cuts the bundle was written under rather than the
@@ -1281,7 +1509,7 @@ class ExperimentListWidget(QWidget):
             )
         except Exception as exc:
             self.params_panel.set_save_status(f"error: {exc}", level="error")
-            return
+            return False
 
         n_tracks = manifest_params["n_tracks"]
         item.set_status(Status.COMPLETE, n_tracks=n_tracks)
@@ -1292,34 +1520,40 @@ class ExperimentListWidget(QWidget):
         )
 
         if self.list_view.currentItem() is item:
-            self._promote_preview_layers(session, tracks_df)
+            self._promote_preview_layers()
+        return True
 
-    def _promote_preview_layers(self, session: PipelineSession, tracks_df) -> None:
-        """Swap the stepwise "(preview)" layers for the final "points"/
-        "tracks" ones the saved bundle would load as.
+    def _promote_preview_layers(self) -> None:
+        """Give the session's "(preview)" layers the final "points"/"tracks"
+        names the saved bundle loads under.
 
-        Built from the session's own tables rather than by re-running
-        `add_experiment_layers` on the bundle just written: that clears the
-        viewer and re-reads the image off disk, which for a large stack is
-        a visible stall and -- more to the point -- throws away the image
-        layer's state (colormap, contrast, zoom) along with any ROI layers
-        drawn, so pressing Save made the whole view flinch. The data is
-        identical either way; `tracks_df` is the filtered table actually
-        written, so what's on screen still matches what's in the bundle.
+        A rename rather than a rebuild. The layers already show exactly what
+        was written -- every detection, filtered through the same `shown`
+        cuts, and the tracks passing the Track tab's filters (the redraw is
+        flushed first, in case a drag's debounce is still pending) -- so
+        rebuilding them only threw state away: their layer-control
+        settings, their place in the layer list, and the diffusion panel's
+        fits, which it drops when the Tracks layer it is reading goes away.
 
-        The ROI layers are deliberately left alone -- they were the input
-        to this run, they were just saved with it, and re-adding them from
-        `rois.json` would only duplicate what is already on screen."""
-        for name in ("points (preview)", "tracks (preview)", "preview spots"):
-            if name in self.viewer.layers:
-                del self.viewer.layers[name]
+        A "points"/"tracks" pair from this row's previously saved bundle is
+        superseded by the one just written, so it is removed. The ROI layers
+        are left alone -- they were this run's input and are already on
+        screen."""
+        self._update_points_layer()
+        self._update_tracks_layer()
+        if "preview spots" in self.viewer.layers:
+            del self.viewer.layers["preview spots"]
         metadata = self._session_layer_metadata()
-        add_points_layer(self.viewer, session.points_df, "points", metadata)
-        add_tracks_layer(
-            self.viewer, tracks_df, session.pixel_size_um, session.dt_s, "tracks", metadata
-        )
+        for layer, final_name in ((self._points_layer, "points"), (self._tracks_layer, "tracks")):
+            layer = self._live(layer)
+            if layer is None:
+                continue
+            if final_name in self.viewer.layers and self.viewer.layers[final_name] is not layer:
+                del self.viewer.layers[final_name]
+            layer.metadata.update(metadata)
+            layer.name = final_name
 
-    def _restore_filters_from_bundle(self, experiment_dir: Path) -> None:
+    def _restore_filters_from_bundle(self, loaded: ResultDisplay) -> None:
         """Put a saved bundle's recorded filter ranges back on the
         histograms when its row is selected -- the manifest is the record
         of which cuts produced it, so re-opening it should show those cuts
@@ -1333,15 +1567,9 @@ class ExperimentListWidget(QWidget):
         range covers everything. The row is still put back at its recorded
         bounds, so what the cut was stays visible. Point filters do survive
         as live cuts, because points.parquet keeps the detections they
-        rejected.
-
-        Best-effort: a bundle written before filters existed, or one whose
-        manifest can't be read, just leaves the panels empty."""
-        try:
-            points_df, tracks_df, manifest, _rois = load_experiment(experiment_dir)
-        except Exception:
-            return
-        params = manifest.get("params", {}) or {}
+        rejected."""
+        points_df, tracks_df = loaded.points_df, loaded.tracks_df
+        params = loaded.manifest.get("params", {}) or {}
         pixel_size_um = params.get("pixel_size_um") or 1.0
         dt_s = params.get("dt_s") or 1.0
 
@@ -1367,6 +1595,26 @@ def _filter_spec(recorded: Optional[dict]) -> Optional[dict]:
     if not recorded:
         return None
     return {col: (float(bounds[0]), float(bounds[1])) for col, bounds in recorded.items()}
+
+
+def _debounce_timer(parent: QObject, slot: Callable[[], None], msec: int = 40) -> QTimer:
+    """A single-shot timer that calls `slot` once `msec` after the last of
+    a burst of `start()` calls -- restarting a running QTimer pushes its
+    timeout back."""
+    timer = QTimer(parent)
+    timer.setSingleShot(True)
+    timer.setInterval(msec)
+    timer.timeout.connect(slot)
+    return timer
+
+
+@thread_worker(start_thread=False)
+def _load_item_worker(image_path: Path, experiment_dir: Path):
+    """A row's saved bundle if it has one, else its raw image -- read off
+    the GUI thread, shown by `ExperimentListWidget._on_item_loaded`."""
+    if has_experiment(experiment_dir):
+        return load_result_display(experiment_dir)
+    return load_image_display(image_path)
 
 
 @thread_worker(start_thread=False)

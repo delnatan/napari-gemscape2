@@ -93,7 +93,7 @@ from diffusionkit.bayes import viz as dk_bayes_viz
 from diffusionkit.classic import viz as dk_analysis_viz
 from napari.layers import Points, Shapes, Tracks
 from napari.qt.threading import thread_worker
-from qtpy.QtCore import Qt
+from qtpy.QtCore import Qt, QTimer
 from qtpy.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -116,6 +116,7 @@ from spt_pipeline.diffusion import tracks_to_diffusionkit_df
 from spt_pipeline.experiment import load_diffusion_results, write_diffusion_results
 from spt_pipeline.joint_plot import numeric_columns, plot_property_joint
 from spt_pipeline.pipeline import filter_mask
+from spt_pipeline.viewer import set_tracks_layer_data
 from spt_pipeline.widgets.feature_filters import FeatureFilterPanel
 from spt_pipeline.widgets.qt_helpers import (
     CollapsibleSection,
@@ -321,6 +322,22 @@ def _base_track_table(
     # per-track ones (duration_s, mean_step_um) are core context.
     hideable = [c for c in qc_columns if any(c.startswith(f"{col}_") for col in per_point)]
     return table, hideable
+
+
+def _shared_tracks_unchanged(old: Optional[pl.DataFrame], new: pl.DataFrame) -> bool:
+    """Whether every track_id present in both vertex tables has identical
+    vertices in each -- i.e. `new` differs from `old` only by whole tracks
+    added or removed (a filter), not by tracks being re-linked. False when
+    they share no track at all, since then nothing carries over anyway."""
+    if old is None:
+        return False
+    columns = ["track_id", "frame", "y", "x"]
+    shared = old.select("track_id").unique().join(new.select("track_id").unique(), on="track_id")
+    if shared.height == 0:
+        return False
+    a = old.select(columns).join(shared, on="track_id").sort("track_id", "frame")
+    b = new.select(columns).join(shared, on="track_id").sort("track_id", "frame")
+    return a.equals(b)
 
 
 def _normalize_map_table(table: pl.DataFrame, model: str) -> pl.DataFrame:
@@ -1239,6 +1256,18 @@ class DiffusionAnalysisWidget(QWidget):
         self._highlight_layer: Optional[Shapes] = None
         self._spatial_map_layer: Optional[Points] = None
         self._mouse_callback = None
+        # True while this widget is itself rewriting the tracks layer
+        # ("sync viewer"), so that write isn't mistaken for someone else
+        # changing the tracks under us.
+        self._writing_tracks_layer = False
+        # The tracks layer's data and properties are set in two steps (and
+        # its data setter empties the properties in between), so a change
+        # from outside is picked up once, on the next event-loop pass,
+        # after both have landed.
+        self._external_change_timer = QTimer(self)
+        self._external_change_timer.setSingleShot(True)
+        self._external_change_timer.setInterval(0)
+        self._external_change_timer.timeout.connect(self._on_tracks_layer_changed_externally)
 
         self._layer_combo = QComboBox()
         self._layer_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
@@ -1395,6 +1424,10 @@ class DiffusionAnalysisWidget(QWidget):
     def _refresh_layer_combo(self, event=None) -> None:
         current = self._layer_combo.currentData()
         layers = self._tracks_layers()
+        for layer in layers:
+            # A rename is an event on the layer, not the list. napari's
+            # emitters ignore a duplicate connect, so this can run freely.
+            layer.events.name.connect(self._on_tracks_layer_renamed)
         self._layer_combo.blockSignals(True)
         self._layer_combo.clear()
         for layer in layers:
@@ -1416,13 +1449,29 @@ class DiffusionAnalysisWidget(QWidget):
         else:
             self._load_from_layer(layer)
 
+    def _on_tracks_layer_renamed(self, event=None) -> None:
+        for index in range(self._layer_combo.count()):
+            layer = self._layer_combo.itemData(index)
+            if layer is not None:
+                self._layer_combo.setItemText(index, layer.name)
+        if self._tracks_layer is not None:
+            self._update_source_label()
+
     def _detach_mouse_callback(self) -> None:
-        if self._mouse_callback is not None and self._tracks_layer is not None:
-            try:
-                self._tracks_layer.mouse_drag_callbacks.remove(self._mouse_callback)
-            except ValueError:
-                pass
+        if self._tracks_layer is not None:
+            if self._mouse_callback is not None:
+                try:
+                    self._tracks_layer.mouse_drag_callbacks.remove(self._mouse_callback)
+                except ValueError:
+                    pass
+            self._tracks_layer.events.data.disconnect(self._on_tracks_layer_event)
+            self._tracks_layer.events.properties.disconnect(self._on_tracks_layer_event)
+        self._external_change_timer.stop()
         self._mouse_callback = None
+
+    def _on_tracks_layer_event(self, event=None) -> None:
+        if not self._writing_tracks_layer:
+            self._external_change_timer.start()
 
     def _make_click_callback(self):
         def _on_click(layer, event):
@@ -1480,26 +1529,22 @@ class DiffusionAnalysisWidget(QWidget):
         self._save_button.setEnabled(False)
         self._clear_overlay_layers()
 
-    def _load_from_layer(self, layer: Tracks) -> None:
+    @staticmethod
+    def _layer_track_table(layer: Tracks) -> Optional[pl.DataFrame]:
+        """The layer's vertices plus every per-vertex property (se_y/se_x
+        and whatever QC/derived columns viewer.py put there -- flux, bg,
+        fit_sigma, track_length, ...), aligned with track_id: one table
+        serves both the diffusionkit conversion (needs
+        track_id/frame/y/x/se_y/se_x) and the per-track QC aggregates.
+
+        None when the layer has no `se_y`/`se_x` (spotsolve's per-detection
+        CRLB, renamed for diffusionkit in spt_pipeline.diffusion). Requiring
+        them is how a Tracks layer from this pipeline is told apart from
+        any other: without a position error there is no noise term to fit,
+        so the check is load-bearing, not cosmetic."""
         props = layer.properties
-        # `se_y`/`se_x` are spotsolve's per-detection CRLB (see
-        # spt_pipeline.diffusion for the rename to diffusionkit's
-        # `sigma_*`). Requiring them is how a Tracks layer from this
-        # pipeline is told apart from any other Tracks layer in the
-        # viewer: without a position error there is no noise term to fit,
-        # so the check is load-bearing, not cosmetic.
         if "se_x" not in props or "se_y" not in props:
-            self._clear_loaded_state()
-            self._source_label.setText(
-                f"'{layer.name}' has no se_x/se_y properties -- only Tracks "
-                "layers produced by this project's pipeline can be analyzed here."
-            )
-            return
-
-        self._restore_previous_tracks_layer_if_synced()
-        self._detach_mouse_callback()
-        self._tracks_layer = layer
-
+            return None
         data = layer.data
         base_cols = {
             "track_id": data[:, 0].astype(np.int64),
@@ -1507,16 +1552,15 @@ class DiffusionAnalysisWidget(QWidget):
             "y": data[:, 2],
             "x": data[:, 3],
         }
-        # Every per-vertex property the layer carries (se_y/se_x plus
-        # whatever QC/derived columns viewer.py put there -- flux,
-        # flux_snr, bg, fit_sigma, sigma_ratio, track_length, ...),
-        # aligned with track_id: one table serves both the diffusionkit
-        # conversion (needs track_id/frame/y/x/se_y/se_x) and the Data
-        # Explorer's QC histograms (wants everything else too).
         extra_cols = {name: np.asarray(values) for name, values in props.items() if name != "track_id"}
-        track_points_df = pl.DataFrame({**base_cols, **extra_cols})
-        self._tracks_df_px = track_points_df
+        return pl.DataFrame({**base_cols, **extra_cols})
 
+    def _adopt_track_table(self, layer: Tracks, track_points_df: pl.DataFrame) -> None:
+        """Take `track_points_df` (read off `layer`) as the loaded track set:
+        the pixel-space table, its diffusionkit conversion, the per-track
+        base table and the layer's units/bundle metadata. Leaves every fit
+        result alone -- callers decide whether those still apply."""
+        self._tracks_df_px = track_points_df
         raw_experiment_dir = layer.metadata.get("experiment_dir")
         self._experiment_dir = Path(raw_experiment_dir) if raw_experiment_dir else None
         self.pixel_size_um = layer.metadata.get("pixel_size_um") or 1.0
@@ -1525,6 +1569,36 @@ class DiffusionAnalysisWidget(QWidget):
         self._base_track_df, self._qc_columns = _base_track_table(
             self._diffkit_tracks, track_points_df
         )
+        self._update_source_label()
+
+    def _update_source_label(self) -> None:
+        layer = self._tracks_layer
+        if layer is None:
+            return
+        if self._experiment_dir is not None:
+            self._source_label.setText(f"'{layer.name}' -> {self._experiment_dir}")
+        else:
+            self._source_label.setText(
+                f"'{layer.name}' (no known experiment bundle -- results can't be saved)"
+            )
+
+    def _load_from_layer(self, layer: Tracks) -> None:
+        track_points_df = self._layer_track_table(layer)
+        if track_points_df is None:
+            self._clear_loaded_state()
+            self._source_label.setText(
+                f"'{layer.name}' has no se_x/se_y properties -- only Tracks "
+                "layers produced by this project's pipeline can be analyzed here."
+            )
+            return
+
+        if layer is not self._tracks_layer:
+            # Not when re-reading the same layer after an outside change:
+            # "restoring" it would write the old tracks back over the new.
+            self._restore_previous_tracks_layer_if_synced()
+        self._detach_mouse_callback()
+        self._tracks_layer = layer
+        self._adopt_track_table(layer, track_points_df)
 
         self._classical_full_df = None
         self._classical_df = None
@@ -1537,13 +1611,6 @@ class DiffusionAnalysisWidget(QWidget):
         self._track_fit_rows = []
         self._current_track_id = None
 
-        if self._experiment_dir is not None:
-            self._source_label.setText(f"'{layer.name}' -> {self._experiment_dir}")
-        else:
-            self._source_label.setText(
-                f"'{layer.name}' (no known experiment bundle -- results can't be saved)"
-            )
-
         self._tracks_pane.reset()
         self._tracks_pane.set_qc_columns(self._qc_columns)
         self._classical.reset()
@@ -1554,6 +1621,8 @@ class DiffusionAnalysisWidget(QWidget):
 
         self._mouse_callback = self._make_click_callback()
         layer.mouse_drag_callbacks.append(self._mouse_callback)
+        layer.events.data.connect(self._on_tracks_layer_event)
+        layer.events.properties.connect(self._on_tracks_layer_event)
 
         saved_per_track, saved_summary = (
             load_diffusion_results(self._experiment_dir) if self._experiment_dir is not None else (None, None)
@@ -1563,6 +1632,33 @@ class DiffusionAnalysisWidget(QWidget):
             self._classical.show_loaded_summary("Loaded saved results:\n" + _format_summary(saved_summary))
         if n_saved:
             self._classical.report_saved(f"{n_saved} saved fit(s) found")
+        self._update_save_enabled()
+
+    def _on_tracks_layer_changed_externally(self) -> None:
+        """The loaded Tracks layer was redrawn in place by someone else --
+        the experiment list narrowing it to its Track-tab filters, or
+        replacing it with a re-linked result.
+
+        Fit results are keyed by track_id, so they stay valid for as long
+        as the tracks they were fitted on are the same tracks. A filter
+        change only adds or removes whole tracks and leaves every shared
+        one vertex-for-vertex identical, so the fits are kept and the table
+        is re-joined over the new track set. A re-link renumbers and
+        re-shapes tracks, so a shared track_id no longer means the same
+        track: that is a new data set, and everything resets as if the
+        layer had just been picked."""
+        layer = self._tracks_layer
+        if layer is None or layer not in self.viewer.layers:
+            return
+        track_points_df = self._layer_track_table(layer)
+        if track_points_df is None or not _shared_tracks_unchanged(self._tracks_df_px, track_points_df):
+            self._load_from_layer(layer)
+            return
+        self._adopt_track_table(layer, track_points_df)
+        self._tracks_pane.set_qc_columns(self._qc_columns)
+        self._rebuild_track_table()
+        self._update_spatial_map_layer()
+        self._bayesian.refresh_map_histogram()
         self._update_save_enabled()
 
     def _update_save_enabled(self) -> None:
@@ -1665,7 +1761,7 @@ class DiffusionAnalysisWidget(QWidget):
         self._update_spatial_map_layer()
 
     def set_map_contrast_limits(self, vmin: float, vmax: float) -> None:
-        if self._spatial_map_layer is not None and vmin < vmax:
+        if self._live(self._spatial_map_layer) is not None and vmin < vmax:
             self._spatial_map_layer.face_contrast_limits = (vmin, vmax)
 
     def set_track_fit_result(self, row: dict) -> None:
@@ -1684,13 +1780,22 @@ class DiffusionAnalysisWidget(QWidget):
 
     # -- viewer overlays --
 
+    def _live(self, layer):
+        """`layer` if it is still in the viewer, else None. The overlay
+        layers this widget adds can be deleted by anyone -- the user, or
+        the experiment list clearing the viewer for the next image -- and a
+        held reference to a deleted layer can be written to all day without
+        anything appearing, which is how the selected-track box and the
+        diffusion map used to stop showing for the rest of a session."""
+        return layer if layer is not None and layer in self.viewer.layers else None
+
     def _clear_overlay_layers(self) -> None:
         self._clear_highlight_layer()
-        if self._spatial_map_layer is not None:
+        if self._live(self._spatial_map_layer) is not None:
             self._spatial_map_layer.data = np.empty((0, 2))
 
     def _clear_highlight_layer(self) -> None:
-        if self._highlight_layer is not None:
+        if self._live(self._highlight_layer) is not None:
             self._highlight_layer.data = []
 
     def _update_highlight_layer(self, track_id: Optional[int]) -> None:
@@ -1706,7 +1811,7 @@ class DiffusionAnalysisWidget(QWidget):
             return
         corners = oriented_track_box(track.select("y", "x").to_numpy())
         features = {"track_id": np.array([track_id])}
-        if self._highlight_layer is None:
+        if self._live(self._highlight_layer) is None:
             self._highlight_layer = self.viewer.add_shapes(
                 [corners],
                 name="selected track",
@@ -1739,18 +1844,13 @@ class DiffusionAnalysisWidget(QWidget):
 
     def _set_tracks_layer_data(self, df: pl.DataFrame) -> None:
         layer = self._tracks_layer
-        # Tracks.data's own setter clears .features (and with it,
-        # color_by falls back to track_id) before this gets a chance to
-        # hand the new properties back -- restore whatever it was
-        # colored by afterward, or a resync silently strips the
-        # track_length coloring viewer.py set up.
-        previous_color_by = layer.color_by
-        data = df.select("track_id", "frame", "y", "x").to_numpy()
-        properties = {c: df[c].to_numpy() for c in df.columns if c not in ("track_id", "frame", "y", "x")}
-        layer.data = data
-        layer.properties = properties
-        if previous_color_by in layer.properties_to_color_by:
-            layer.color_by = previous_color_by
+        if layer is None or layer not in self.viewer.layers:
+            return
+        self._writing_tracks_layer = True
+        try:
+            set_tracks_layer_data(layer, df)
+        finally:
+            self._writing_tracks_layer = False
 
     def _filtered_map_df(self) -> Optional[pl.DataFrame]:
         """Whichever registered spatial source has the current color-by
@@ -1783,13 +1883,13 @@ class DiffusionAnalysisWidget(QWidget):
         color_by = self._map_color_by
         merged = merged.filter(pl.col(color_by).is_not_null())
         if merged.height == 0:
-            if self._spatial_map_layer is not None:
+            if self._live(self._spatial_map_layer) is not None:
                 self._spatial_map_layer.data = np.empty((0, 2))
             return
         positions = merged.select("y_px", "x_px").to_numpy()
         values = merged[color_by].to_numpy()
         track_ids = merged["track_id"].to_numpy()
-        if self._spatial_map_layer is None:
+        if self._live(self._spatial_map_layer) is None:
             self._spatial_map_layer = self.viewer.add_points(
                 positions,
                 name="diffusion map",

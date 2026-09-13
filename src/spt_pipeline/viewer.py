@@ -13,9 +13,13 @@ pixel-for-pixel the same but for the name.
 
 from __future__ import annotations
 
+import warnings
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
+import polars as pl
 
 from spt_pipeline.experiment import load_experiment
 from spt_pipeline.pipeline import load_stack, track_features_df
@@ -113,8 +117,10 @@ def add_image_layer(viewer, image, name: str, **kwargs):
     contrast stretch, so a freshly-loaded stack is readable without a trip
     to the layer controls. Any explicit kwarg (e.g. one carried over by
     `image_display_carryover`) wins over the defaults."""
-    display = dict(colormap=IMAGE_COLORMAP, contrast_limits=percentile_contrast_limits(image))
+    display = dict(colormap=IMAGE_COLORMAP)
     display.update(kwargs)
+    if "contrast_limits" not in display:
+        display["contrast_limits"] = percentile_contrast_limits(image)
     return viewer.add_image(image, name=name, **display)
 
 
@@ -155,14 +161,9 @@ def add_tracks_layer(
         del viewer.layers[name]
     if tracks_df is None or tracks_df.height == 0 or "track_id" not in tracks_df.columns:
         return None
-    feat_df = track_features_df(tracks_df, pixel_size_um, dt_s)
-    properties = {
-        col: feat_df[col].to_numpy()
-        for col in feat_df.columns
-        if col not in ("track_id", "frame", "y", "x")
-    }
+    data, properties = _tracks_layer_arrays(track_features_df(tracks_df, pixel_size_um, dt_s))
     return viewer.add_tracks(
-        feat_df.select("track_id", "frame", "y", "x").to_numpy(),
+        data,
         name=name,
         properties=properties,
         color_by=TRACKS_COLOR_BY,
@@ -170,23 +171,138 @@ def add_tracks_layer(
     )
 
 
-def add_experiment_layers(viewer, experiment_dir: str | Path) -> None:
-    """Clear `viewer` and add the image/points/tracks/ROI layers for one
-    bundle -- any saved ROI (see `spt_pipeline.rois`) is added back as a
-    `"polygon"`-type Shapes layer under its original napari layer name, so
-    the region used for detection is visible again, not just the results."""
-    points_df, tracks_df, manifest, rois = load_experiment(experiment_dir)
-    image_path = Path(manifest["source_image_path"])
-    params = manifest.get("params", {})
-    image, _, _ = load_stack(
-        image_path, channel=params.get("channel", 0), z_index=params.get("z_index", 0)
+# The Tracks layer's own `data` columns; everything else on a track table
+# rides along as a per-vertex property.
+_TRACK_DATA_COLUMNS = ("track_id", "frame", "y", "x")
+
+
+def _tracks_layer_arrays(feat_df: pl.DataFrame) -> tuple[np.ndarray, dict]:
+    data = feat_df.select(*_TRACK_DATA_COLUMNS).to_numpy()
+    properties = {
+        col: feat_df[col].to_numpy() for col in feat_df.columns if col not in _TRACK_DATA_COLUMNS
+    }
+    return data, properties
+
+
+def set_tracks_layer_data(layer, feat_df: pl.DataFrame) -> None:
+    """Replace an existing Tracks layer's vertices and properties in place.
+
+    In place rather than delete-and-re-add, so that redrawing it (a filter
+    handle being dragged, a re-run link step) keeps the layer's identity,
+    its position in the layer list and whatever the user set in its layer
+    controls -- and so a widget holding on to the layer (the diffusion
+    panel) sees the same layer change, rather than one layer vanish and a
+    stranger appear.
+
+    `feat_df` carries `track_id`/`frame`/`y`/`x` plus any property columns
+    (e.g. `track_features_df`'s output). `Tracks.data`'s setter wipes the
+    features table, which drops `color_by` back to `track_id`, so the
+    coloring in force beforehand is put back once the properties are."""
+    previous_color_by = layer.color_by
+    data, properties = _tracks_layer_arrays(feat_df)
+    with warnings.catch_warnings():
+        # The setter's own "color_by not present, falling back" warning is
+        # exactly the reset this function undoes two lines later.
+        warnings.filterwarnings("ignore", message="Previous color_by key", category=UserWarning)
+        layer.data = data
+    layer.properties = properties
+    if previous_color_by in layer.properties_to_color_by:
+        layer.color_by = previous_color_by
+
+
+def set_points_layer_data(layer, points_df: pl.DataFrame) -> None:
+    """Replace an existing detections Points layer's positions and
+    features in place -- the `add_points_layer` counterpart of
+    `set_tracks_layer_data`, for the same reasons. Every point is shown
+    again afterwards; callers that filter set `layer.shown` next."""
+    layer.data = points_df.select("frame", "y", "x").to_numpy()
+    layer.features = {col: points_df[col].to_numpy() for col in points_df.columns}
+    layer.shown = True
+
+
+@dataclass
+class ImageDisplay:
+    """One image stack, loaded and ready to become a layer: everything
+    `show_image` needs that is slow to compute, gathered off the GUI thread
+    (`load_image_display`)."""
+
+    path: Path
+    image: np.ndarray
+    pixel_size_um: Optional[float]
+    dt_s: Optional[float]
+    contrast_limits: tuple[float, float]
+
+
+@dataclass
+class ResultDisplay:
+    """One saved bundle plus its source image, loaded and ready to show."""
+
+    bundle_dir: Path
+    image: ImageDisplay
+    points_df: pl.DataFrame
+    tracks_df: pl.DataFrame
+    manifest: dict
+    rois: list[dict]
+
+
+def load_image_display(image_path: str | Path, channel: int = 0, z_index: int = 0) -> ImageDisplay:
+    """Read a stack and its initial contrast. Touches no viewer, so it is
+    safe to run in a worker thread -- the read and the percentile are the
+    slow part of showing an image, and doing them on the GUI thread froze
+    the file list on every row change."""
+    image_path = Path(image_path)
+    image, pixel_size_um, dt_s = load_stack(image_path, channel=channel, z_index=z_index)
+    return ImageDisplay(
+        path=image_path,
+        image=image,
+        pixel_size_um=pixel_size_um,
+        dt_s=dt_s,
+        contrast_limits=percentile_contrast_limits(image),
     )
 
-    # Read before the clear: if this same image is already on screen, its
-    # (possibly hand-tuned) contrast comes with it instead of resetting.
-    carryover = image_display_carryover(viewer, image_path.stem)
+
+def load_result_display(bundle_dir: str | Path) -> ResultDisplay:
+    """Read a bundle's tables and its source image. Thread-safe, like
+    `load_image_display`."""
+    points_df, tracks_df, manifest, rois = load_experiment(bundle_dir)
+    params = manifest.get("params", {})
+    image = load_image_display(
+        manifest["source_image_path"],
+        channel=params.get("channel", 0),
+        z_index=params.get("z_index", 0),
+    )
+    return ResultDisplay(Path(bundle_dir), image, points_df, tracks_df, manifest, rois)
+
+
+def show_image(viewer, loaded: ImageDisplay):
+    """Clear `viewer` and show one image. If this same image is already on
+    screen, its (possibly hand-tuned) display settings carry over instead
+    of resetting -- read before the clear, since the clear is what removes
+    them."""
+    name = loaded.path.stem
+    display = dict(contrast_limits=loaded.contrast_limits)
+    display.update(image_display_carryover(viewer, name))
     viewer.layers.clear()
-    add_image_layer(viewer, image, image_path.stem, **carryover)
+    return add_image_layer(viewer, loaded.image, name, **display)
+
+
+def add_experiment_layers(viewer, experiment_dir: str | Path) -> None:
+    """Load a bundle and show it (`load_result_display` + `show_result`),
+    blocking -- for the standalone viewer, where there is no UI to keep
+    responsive."""
+    show_result(viewer, load_result_display(experiment_dir))
+
+
+def show_result(viewer, loaded: ResultDisplay) -> None:
+    """Clear `viewer` and add the image/points/tracks/ROI layers for one
+    loaded bundle -- any saved ROI (see `spt_pipeline.rois`) is added back
+    as a `"polygon"`-type Shapes layer under its original napari layer
+    name, so the region used for detection is visible again, not just the
+    results."""
+    show_image(viewer, loaded.image)
+    experiment_dir = loaded.bundle_dir
+    points_df, tracks_df, rois = loaded.points_df, loaded.tracks_df, loaded.rois
+    params = loaded.manifest.get("params", {})
 
     pixel_size_um = params.get("pixel_size_um") or 1.0
     dt_s = params.get("dt_s") or 1.0

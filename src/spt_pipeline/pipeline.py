@@ -304,10 +304,16 @@ def load_session(
     dt_s: Optional[float] = None,
     channel: int = 0,
     z_index: int = 0,
+    stack: Optional[tuple[np.ndarray, Optional[float], Optional[float]]] = None,
 ) -> PipelineSession:
     """Load a timelapse and start a fresh (un-calibrated, un-detected,
-    un-tracked) `PipelineSession`."""
-    im, file_pixel_size_um, file_dt_s = load_stack(image_path, channel=channel, z_index=z_index)
+    un-tracked) `PipelineSession`. `stack` is an already-read
+    `load_stack(image_path, channel, z_index)` result, so a caller that
+    has the image in memory (the UI, which loaded it to display it) does
+    not read it a second time."""
+    if stack is None:
+        stack = load_stack(image_path, channel=channel, z_index=z_index)
+    im, file_pixel_size_um, file_dt_s = stack
     pixel_size_um = pixel_size_um if pixel_size_um is not None else file_pixel_size_um
     dt_s = dt_s if dt_s is not None else file_dt_s
     if pixel_size_um is None or dt_s is None:
