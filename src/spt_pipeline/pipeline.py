@@ -71,6 +71,7 @@ from typing import Callable, Optional
 import numpy as np
 import polars as pl
 import spotsolve
+import spotsolve_rs
 from spotsolve import loctable, tracking
 
 from spt_pipeline.io_formats import load_stack
@@ -102,11 +103,24 @@ DEFAULT_CAMERA_KWARGS = dict(
 # landing outside `band` is an out-of-band reject (too narrow, too wide, or
 # too close to an edge) rather than a detection, which is how out-of-focus
 # and non-PSF-shaped junk is kept out of the table. `k_max` caps how many
-# emitters one box may be fitted with jointly. `threshold` overrides the
-# seed cut FIND derives from the frame; `None` (recommended) derives it.
+# emitters one box may be fitted with jointly.
+#
+# Two cuts on the same LoG z-statistic (sd of its noise), which fail in
+# opposite directions and so are set separately. `seed_threshold` decides
+# which peaks in the frame get a box searched around them: loose costs only
+# time, since a seed still has to pay the 10-nat test to become a detection,
+# while light never seeded is never fitted; `None` (recommended) derives it
+# from the frame size. `birth_threshold` is how strong a leftover residual
+# peak inside a box must be before another emitter is tried there: loose
+# costs precision (a slightly wrong fit's leftover light around a bright
+# spot can pass as a false neighbour) and time. It is a calibrated constant,
+# not frame-derived, so it is written out here rather than left as `None`,
+# and the manifest records the number actually used. Raise it toward 4 for
+# speed; lower it toward 2.5 on faint, sparse data.
 DEFAULT_DETECT_KWARGS = dict(
     k_max=spotsolve.K_MAX,
-    threshold=None,
+    seed_threshold=None,
+    birth_threshold=float(spotsolve_rs.BOX_BIRTH_Z),
     slack=spotsolve.SLACK,
     band=spotsolve.BAND,
 )

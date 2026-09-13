@@ -406,8 +406,8 @@ class _DetectTab(QWidget):
 
     Core: `sigma` with its preview loop (see this module's docstring --
     this is what replaced the Calibration tab), `k_max` (most emitters one
-    box may be fitted with jointly -- the crowding ceiling), the seed
-    threshold, the aggregate cut, a frame range and a "restrict to ROI"
+    box may be fitted with jointly -- the crowding ceiling), the seed and
+    birth thresholds, the aggregate cut, a frame range and a "restrict to ROI"
     checkbox. Expert: `slack` and `band`, the width ranges a fit may take
     and be reported at, both as multiples of `sigma` and echoed in px.
 
@@ -510,25 +510,40 @@ class _DetectTab(QWidget):
             tooltip="Most emitters one box may be fitted with jointly. The\n"
             "crowding ceiling: raise it for very dense fields, at some cost.",
         )
-        self.threshold = _dspin(
-            0.0, 0.0, 1e9, 1.0, decimals=3,
-            tooltip="Override FIND's seed cut. Leave 'derive from frame' checked\n"
-            "unless you have a reason -- the derived value adapts per frame.",
+        # Two cuts on the same LoG z-statistic, failing in opposite
+        # directions (see `DEFAULT_DETECT_KWARGS`): the seed cut decides
+        # what gets searched and is derived per frame by default; the birth
+        # cut decides what gets tried inside a box and is a constant.
+        self.seed_threshold = _dspin(
+            4.0, 0.0, 1e9, 0.1, decimals=2,
+            tooltip="Which peaks in the frame get a box searched around them, in sd\n"
+            "of the LoG filter's noise. Loose costs only time -- a seed still has\n"
+            "to pass the 10-nat test to become a detection -- while too strict\n"
+            "loses light that is never fitted. Leave 'derive from frame' checked\n"
+            "unless you have a reason.",
         )
-        self.derive_threshold = QCheckBox("derive from frame")
-        self.derive_threshold.setToolTip(
-            "Let the detector derive the seed threshold from each frame\n"
-            "(spotsolve's threshold=None). Recommended."
+        self.derive_seed_threshold = QCheckBox("derive from frame")
+        self.derive_seed_threshold.setToolTip(
+            "Let the detector derive the seed cut from the frame size\n"
+            "(spotsolve's seed_threshold=None). Recommended."
         )
-        self.derive_threshold.setChecked(d["threshold"] is None)
-        if d["threshold"] is not None:
-            self.threshold.setValue(d["threshold"])
-        self.derive_threshold.toggled.connect(self._on_derive_threshold_toggled)
-        self._on_derive_threshold_toggled(self.derive_threshold.isChecked())
-        threshold_row = QHBoxLayout()
-        threshold_row.setContentsMargins(0, 0, 0, 0)
-        threshold_row.addWidget(self.threshold)
-        threshold_row.addWidget(self.derive_threshold)
+        self.derive_seed_threshold.setChecked(d["seed_threshold"] is None)
+        if d["seed_threshold"] is not None:
+            self.seed_threshold.setValue(d["seed_threshold"])
+        self.derive_seed_threshold.toggled.connect(self._on_derive_seed_threshold_toggled)
+        self._on_derive_seed_threshold_toggled(self.derive_seed_threshold.isChecked())
+        seed_threshold_row = QHBoxLayout()
+        seed_threshold_row.setContentsMargins(0, 0, 0, 0)
+        seed_threshold_row.addWidget(self.seed_threshold)
+        seed_threshold_row.addWidget(self.derive_seed_threshold)
+
+        self.birth_threshold = _dspin(
+            d["birth_threshold"], 0.0, 1e9, 0.1, decimals=2,
+            tooltip="How strong a leftover residual peak inside a box must be before\n"
+            "another emitter is tried there, in sd of the LoG filter's noise.\n"
+            "Loose costs precision (false neighbours around bright spots) and\n"
+            "time. Raise toward 4 for speed; lower toward 2.5 on faint, sparse data.",
+        )
 
         # Over-bright cut, relative to each frame's own median detection --
         # relative so that one number survives bleaching and illumination
@@ -545,7 +560,8 @@ class _DetectTab(QWidget):
         core_form = QFormLayout()
         core_form.setContentsMargins(0, 0, 0, 0)
         core_form.addRow("k_max", self.k_max)
-        core_form.addRow("threshold", threshold_row)
+        core_form.addRow("seed threshold", seed_threshold_row)
+        core_form.addRow("birth threshold", self.birth_threshold)
         core_form.addRow("aggregate ratio", self.agg_ratio)
 
         # What gets analyzed, not how -- kept in core (not expert) since
@@ -760,8 +776,8 @@ class _DetectTab(QWidget):
 
     # -- detect -----------------------------------------------------------
 
-    def _on_derive_threshold_toggled(self, checked: bool) -> None:
-        self.threshold.setEnabled(not checked)
+    def _on_derive_seed_threshold_toggled(self, checked: bool) -> None:
+        self.seed_threshold.setEnabled(not checked)
 
     def _on_no_band_toggled(self, checked: bool) -> None:
         self.band_lo.setEnabled(not checked)
@@ -878,7 +894,10 @@ class _DetectTab(QWidget):
     def get_detect_kwargs(self) -> dict:
         return dict(
             k_max=self.k_max.value(),
-            threshold=None if self.derive_threshold.isChecked() else self.threshold.value(),
+            seed_threshold=(
+                None if self.derive_seed_threshold.isChecked() else self.seed_threshold.value()
+            ),
+            birth_threshold=self.birth_threshold.value(),
             slack=(self.slack_lo.value(), self.slack_hi.value()),
             band=None if self.no_band.isChecked() else (self.band_lo.value(), self.band_hi.value()),
         )
