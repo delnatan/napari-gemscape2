@@ -88,13 +88,24 @@ pixels get analyzed, not how -- kept in its core section since these are
 exactly what make "explore one image incrementally" (this widget's whole
 point, vs. blindly running a batch job) practical: a frame-range pair
 (`get_frame_range`) and a "restrict to ROI" checkbox
-(`get_use_roi_mask`), plus a "Draw ROI…" button (`newRoiRequested`) that
-just asks for a fresh Shapes layer to draw on -- this widget stays
-viewer-agnostic (no napari `Viewer` reference), so `ExperimentListWidget`
-(which owns the viewer) is responsible both for adding that layer
-(persistent/2D, transparent fill, polygon-lasso tool active -- see
-`_on_new_roi_requested`) and, once the ROI checkbox is checked, for
-finding the active Shapes layer and turning it into the boolean mask
+(`get_use_roi_mask`), plus a Shapes-layer dropdown (`get_roi_layer_name`)
+and a "Draw ROI…" button (`newRoiRequested`) that just asks for a fresh
+Shapes layer to draw on.
+
+The dropdown is what makes several ROIs on screen at once workable: draw
+as many Shapes layers as you like (rename them in napari's layer list --
+the name shown here follows, and it's the name the ROI is saved under,
+see `spt_pipeline.rois`), then pick which one this run is restricted to.
+It replaced "whichever Shapes layer happens to be active", where the
+targeted region silently changed whenever the layer selection did -- and
+where a second ROI could only be used by clicking the right layer first.
+
+This widget stays viewer-agnostic (no napari `Viewer` reference), so
+`ExperimentListWidget` (which owns the viewer) is responsible for adding
+that layer (persistent/2D, transparent fill, polygon-lasso tool active --
+see `_on_new_roi_requested`), for keeping the dropdown's contents in sync
+with the viewer's Shapes layers (`set_roi_choices`), and, once the ROI
+checkbox is checked, for turning the named layer into the boolean mask
 array `spotsolve`'s `roi` argument expects.
 """
 
@@ -107,6 +118,7 @@ import spotsolve
 from qtpy.QtCore import Qt, Signal
 from qtpy.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFormLayout,
     QHBoxLayout,
@@ -407,6 +419,7 @@ class _DetectTab(QWidget):
     runRequested = Signal()
     cancelRequested = Signal()
     newRoiRequested = Signal()
+    roiLayerChanged = Signal()
     filtersChanged = Signal()
 
     def __init__(self) -> None:
@@ -557,24 +570,40 @@ class _DetectTab(QWidget):
         frame_row.addWidget(self.frame_end)
         frame_row.addStretch()
 
-        self.use_roi_mask = QCheckBox("Restrict to ROI (active Shapes layer)")
+        self.use_roi_mask = QCheckBox("Restrict to ROI")
         self.use_roi_mask.setToolTip(
-            "Only place emitters inside the shape(s) on the viewer's currently\n"
-            "active Shapes layer (spotsolve's roi argument). Draw a Shapes layer\n"
-            "in napari first."
+            "Only place emitters inside the shape(s) on the Shapes layer picked\n"
+            "in the dropdown (spotsolve's roi argument). Draw one with the button\n"
+            "next to it, or in napari, first."
         )
+        # Which Shapes layer, chosen by name rather than by whatever
+        # happens to be selected in napari's layer list -- see this
+        # module's docstring. Kept in sync by `set_roi_choices`; the entry
+        # text is the live layer name, so renaming a layer in napari
+        # renames it here (and that name is what the ROI is saved under).
+        self.roi_layer = QComboBox()
+        self.roi_layer.setToolTip(
+            "Which Shapes layer to use as the ROI. Draw several and rename them\n"
+            "in napari's layer list to keep more than one region around; only the\n"
+            "one selected here restricts the run."
+        )
+        self.roi_layer.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.roi_layer.currentTextChanged.connect(self.roiLayerChanged)
         self.new_roi_button = QPushButton("Draw ROI…")
         self.new_roi_button.setToolTip(
             "Add a new Shapes layer (transparent fill, polygon-lasso tool active)\n"
             "for drawing the ROI -- 2D so it stays visible on every frame instead\n"
-            "of only the one it was drawn on."
+            "of only the one it was drawn on. Each click adds another, so several\n"
+            "regions can be kept side by side and picked between."
         )
         self.new_roi_button.clicked.connect(self.newRoiRequested.emit)
         roi_row = QHBoxLayout()
         roi_row.setContentsMargins(0, 0, 0, 0)
         roi_row.addWidget(self.use_roi_mask)
+        roi_row.addWidget(self.roi_layer, 1)
         roi_row.addWidget(self.new_roi_button)
-        roi_row.addStretch()
+        self._sync_roi_row()
+        self.use_roi_mask.toggled.connect(self._sync_roi_row)
 
         # `slack` is the width range a fit may take; `band` the narrower
         # range actually reported as a detection. Both are multiples of
@@ -803,6 +832,43 @@ class _DetectTab(QWidget):
     def get_use_roi_mask(self) -> bool:
         return self.use_roi_mask.isChecked()
 
+    def get_roi_layer_name(self) -> Optional[str]:
+        """Name of the Shapes layer the ROI checkbox targets, or None if
+        the viewer has no Shapes layer to target."""
+        name = self.roi_layer.currentText()
+        return name or None
+
+    def set_roi_choices(self, names: list[str], preferred: Optional[str] = None) -> None:
+        """Replace the dropdown's entries with the viewer's current Shapes
+        layer names, selecting `preferred` (the caller's own record of
+        which *layer* is targeted, which is how a rename keeps its
+        selection instead of jumping elsewhere), else the current text if
+        it survived, else the last entry -- the newest layer, since
+        `ExperimentListWidget` passes them in layer-list order.
+
+        Signals are blocked across the rebuild so this can't be mistaken
+        for the user picking something: `roiLayerChanged` is meant to fire
+        only when they actually change the target."""
+        current = self.roi_layer.currentText()
+        blocked = self.roi_layer.blockSignals(True)
+        self.roi_layer.clear()
+        self.roi_layer.addItems(names)
+        for candidate in (preferred, current):
+            if candidate in names:
+                self.roi_layer.setCurrentText(candidate)
+                break
+        else:
+            if names:
+                self.roi_layer.setCurrentIndex(len(names) - 1)
+        self.roi_layer.blockSignals(blocked)
+        self._sync_roi_row()
+
+    def _sync_roi_row(self) -> None:
+        """Grey the dropdown out unless the ROI checkbox is on and there
+        is something to pick, so an empty/irrelevant picker doesn't read
+        as a setting that is doing something."""
+        self.roi_layer.setEnabled(self.use_roi_mask.isChecked() and self.roi_layer.count() > 0)
+
     def get_agg_ratio(self) -> float:
         return self.agg_ratio.value()
 
@@ -974,6 +1040,7 @@ class PipelineParamsWidget(QWidget):
     trackRequested = Signal()
     saveRequested = Signal()
     newRoiRequested = Signal()
+    roiLayerChanged = Signal()
     pointFiltersChanged = Signal()
     trackFiltersChanged = Signal()
 
@@ -986,6 +1053,7 @@ class PipelineParamsWidget(QWidget):
         self._detect.runRequested.connect(self.detectRequested)
         self._detect.cancelRequested.connect(self.detectCancelRequested)
         self._detect.newRoiRequested.connect(self.newRoiRequested)
+        self._detect.roiLayerChanged.connect(self.roiLayerChanged)
         self._detect.filtersChanged.connect(self.pointFiltersChanged)
         self._tracking.runRequested.connect(self.trackRequested)
         self._tracking.saveRequested.connect(self.saveRequested)
@@ -1058,6 +1126,12 @@ class PipelineParamsWidget(QWidget):
 
     def get_use_roi_mask(self) -> bool:
         return self._detect.get_use_roi_mask()
+
+    def get_roi_layer_name(self) -> Optional[str]:
+        return self._detect.get_roi_layer_name()
+
+    def set_roi_choices(self, names: list[str], preferred: Optional[str] = None) -> None:
+        self._detect.set_roi_choices(names, preferred)
 
     def set_preview_result(self, summary: Optional[dict], level: str = "neutral") -> None:
         self._detect.set_preview_result(summary, level)

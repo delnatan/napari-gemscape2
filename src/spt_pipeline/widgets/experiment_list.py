@@ -18,10 +18,15 @@ Detect tab's PSF-width preview loop and frame-range/ROI scope controls)
 lives in
 `widgets/params_panel.py::PipelineParamsWidget`, which stays viewer-
 agnostic; this module is what actually resolves the ROI checkbox into a
-boolean mask array, by reading the active napari Shapes layer
-(`_build_roi_mask`). This widget always runs `run_detect_step` with a
-`progress_callback` (for the live frame-count/cancel UI), which is what
-actually puts it on `run_detect_step`'s frame-by-frame path -- not the
+boolean mask array, by reading the Shapes layer named in that panel's ROI
+dropdown (`_build_roi_mask`). Several ROIs can be on screen at once --
+"Draw ROI…" adds another Shapes layer each time and `_on_roi_layers_
+changed` keeps the dropdown in step with the viewer (renames included),
+so which region a run covers is a deliberate pick rather than a
+side-effect of which layer was last clicked.
+
+This widget always runs `run_detect_step` with a `progress_callback`
+(for the live frame-count/cancel UI), which is what actually puts it on `run_detect_step`'s frame-by-frame path -- not the
 mask itself, which `find_spots_stack_df` accepts directly (see
 `pipeline.run_detect_step`'s docstring).
 
@@ -379,6 +384,12 @@ class ExperimentListWidget(QWidget):
         # `currentItemChanged` re-entry would run the "leaving this row"
         # cleanup against the row we're refusing to leave.
         self._reverting_selection = False
+        # The Shapes layer the ROI dropdown currently targets, held as the
+        # layer itself rather than its name: renaming a layer is the
+        # intended way to label one of several ROIs, and a name-keyed
+        # record would lose track of the target at exactly that moment
+        # (see `_on_roi_layers_changed`).
+        self._roi_target: Optional[Shapes] = None
         self.setAcceptDrops(True)
 
         header = QLabel(_ExperimentListView.KEYBINDINGS)
@@ -409,6 +420,17 @@ class ExperimentListWidget(QWidget):
         self.params_panel.trackRequested.connect(self._run_track_step)
         self.params_panel.saveRequested.connect(self._save_experiment)
         self.params_panel.newRoiRequested.connect(self._on_new_roi_requested)
+        # Keep the Detect tab's ROI dropdown showing the viewer's Shapes
+        # layers. Adding/removing/reordering layers is caught on the layer
+        # list itself; a *rename* is an event on the layer, so
+        # `_on_roi_layers_changed` (re)connects to each Shapes layer as it
+        # goes -- napari's emitters ignore a duplicate connect, so this
+        # can run as often as it likes.
+        self.viewer.layers.events.inserted.connect(self._on_roi_layers_changed)
+        self.viewer.layers.events.removed.connect(self._on_roi_layers_changed)
+        self.viewer.layers.events.reordered.connect(self._on_roi_layers_changed)
+        self.params_panel.roiLayerChanged.connect(self._on_roi_layer_selected)
+        self._on_roi_layers_changed()
         self.params_panel.pointFiltersChanged.connect(self._on_point_filters_changed)
         self.params_panel.trackFiltersChanged.connect(self._on_track_filters_changed)
 
@@ -712,6 +734,36 @@ class ExperimentListWidget(QWidget):
         self._session_item = item
         return session
 
+    def _roi_layers(self) -> list[Shapes]:
+        """Every Shapes layer in the viewer, in layer-list order -- the
+        candidate ROIs for the Detect tab's dropdown."""
+        return [layer for layer in self.viewer.layers if isinstance(layer, Shapes)]
+
+    def _on_roi_layer_selected(self) -> None:
+        """Remember which layer the dropdown now names, so a later rename
+        of it can be followed (`_on_roi_layers_changed`)."""
+        name = self.params_panel.get_roi_layer_name()
+        layer = self.viewer.layers[name] if name and name in self.viewer.layers else None
+        self._roi_target = layer if isinstance(layer, Shapes) else None
+
+    def _on_roi_layers_changed(self, event=None) -> None:
+        """Push the current Shapes layer names into the ROI dropdown, and
+        make sure a rename of any of them lands here too (each layer's own
+        `events.name`, since the layer list only reports add/remove/
+        reorder). Renaming is the intended way to tell several ROIs apart
+        -- the name is also what the region is saved under (see
+        `spt_pipeline.rois`) -- so the dropdown follows the *layer*
+        (`self._roi_target`) across a rename rather than losing it when
+        the name it was listed under disappears."""
+        layers = self._roi_layers()
+        for layer in layers:
+            layer.events.name.connect(self._on_roi_layers_changed)
+        if not any(layer is self._roi_target for layer in layers):
+            self._roi_target = None
+        preferred = self._roi_target.name if self._roi_target is not None else None
+        self.params_panel.set_roi_choices([layer.name for layer in layers], preferred)
+        self._on_roi_layer_selected()
+
     def _on_new_roi_requested(self) -> None:
         """Add an empty Shapes layer for drawing the ROI, ready to draw on
         immediately: 2D (`ndim=2`, fewer dims than an nD image stack) so a
@@ -720,29 +772,54 @@ class ExperimentListWidget(QWidget):
         `rois.roi_to_shapes_kwargs` uses when an ROI round-trips through
         disk -- transparent fill so it doesn't occlude the image/points
         underneath, and the polygon-lasso tool selected as the active mode
-        so the user can start drawing right away."""
+        so the user can start drawing right away.
+
+        Each click adds *another* layer ("roi 1", "roi 2", ...) rather
+        than reusing one, so several regions can be kept side by side and
+        picked between in the dropdown; the fresh one becomes the
+        dropdown's selection (`set_roi_choices` falls back to the last
+        entry, and this is the layer that was just appended)."""
+        existing = {layer.name for layer in self.viewer.layers}
+        n = 1
+        while f"roi {n}" in existing:
+            n += 1
         layer = self.viewer.add_shapes(
             ndim=2,
-            name="roi",
+            name=f"roi {n}",
             face_color="transparent",
             edge_color="yellow",
         )
         self.viewer.layers.selection.active = layer
         layer.mode = "add_polygon_lasso"
+        # The insert event already refreshed the dropdown (keeping
+        # whatever was targeted before); point it at the layer the user
+        # just asked for instead -- they're about to draw on it.
+        self._roi_target = layer
+        self._on_roi_layers_changed()
 
     def _build_roi_mask(self, shape: tuple[int, int]) -> tuple[np.ndarray, dict]:
-        """Boolean `(H, W)` mask from the viewer's currently active Shapes
-        layer -- the union of every shape drawn on it -- plus that layer's
-        polygon ROI record (`spt_pipeline.rois.shapes_layer_to_roi`), meant to be
-        stashed on `session.roi` so `_on_track_finished` can persist it
-        alongside the run's results (see `experiment.write_experiment`).
-        Raises if there isn't an active Shapes layer, or it has nothing
-        drawn on it yet."""
-        active = self.viewer.layers.selection.active
-        if not isinstance(active, Shapes) or len(active.data) == 0:
-            raise ValueError("no active Shapes layer with a shape drawn -- select/draw one as the ROI")
-        mask = np.any(active.to_masks(shape), axis=0)
-        return mask, shapes_layer_to_roi(active)
+        """Boolean `(H, W)` mask from the Shapes layer named in the Detect
+        tab's ROI dropdown -- the union of every shape drawn on it -- plus
+        that layer's polygon ROI record
+        (`spt_pipeline.rois.shapes_layer_to_roi`), meant to be stashed on
+        `session.roi` so `_save_experiment` can persist it alongside the
+        run's results (see `experiment.write_experiment`).
+
+        Targeted by name rather than by which layer happens to be selected
+        in napari, so clicking around the layer list (or drawing a second
+        region for reference) can't quietly change which pixels a run
+        covers. Raises if the named layer is gone or has nothing drawn on
+        it yet."""
+        name = self.params_panel.get_roi_layer_name()
+        if name is None:
+            raise ValueError('no ROI layer to use — press "Draw ROI…" and draw a region first')
+        layer = self.viewer.layers[name] if name in self.viewer.layers else None
+        if not isinstance(layer, Shapes):
+            raise ValueError(f"ROI layer {name!r} is gone — pick another one or draw a new one")
+        if len(layer.data) == 0:
+            raise ValueError(f"nothing drawn on ROI layer {name!r} yet")
+        mask = np.any(layer.to_masks(shape), axis=0)
+        return mask, shapes_layer_to_roi(layer)
 
     def _start_step_worker(
         self, worker, on_finished, indeterminate: bool = False, on_error: Optional[Callable] = None
