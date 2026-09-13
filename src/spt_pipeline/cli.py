@@ -12,7 +12,7 @@ from pathlib import Path
 
 import typer
 
-from spt_pipeline.experiment import build_manifest, git_sha, repo_root_of, write_experiment
+from spt_pipeline.results import build_manifest, git_sha, repo_root_of, write_result
 from spt_pipeline.pipeline import DetectTrackParams, run_detect_track
 
 app = typer.Typer(no_args_is_help=True)
@@ -25,16 +25,16 @@ def detect_track(
     """Run detect+track over every image listed in CONFIG.
 
     Config format:
-        experiments_root = "experiments"
+        results_root = "results"
         [params]
         sigma_init = 1.3
 
         [[inputs]]
         path = "data/beads_timelapse_dense.tif"
-        experiment_id = "beads_dense"   # optional, defaults to the stem
+        result_id = "beads_dense"   # optional, defaults to the stem
     """
     cfg = tomllib.loads(config.read_text())
-    experiments_root = Path(cfg.get("experiments_root", "experiments"))
+    results_root = Path(cfg.get("results_root", "results"))
     params = DetectTrackParams(**cfg.get("params", {}))
 
     import spotsolve
@@ -47,9 +47,9 @@ def detect_track(
 
     for entry in cfg["inputs"]:
         image_path = Path(entry["path"])
-        experiment_id = entry.get("experiment_id", image_path.stem)
+        result_id = entry.get("result_id", image_path.stem)
 
-        typer.echo(f"[{experiment_id}] {image_path}")
+        typer.echo(f"[{result_id}] {image_path}")
         points_df, tracks_df, manifest_extra = run_detect_track(
             image_path,
             pixel_size_um=entry.get("pixel_size_um"),
@@ -57,25 +57,25 @@ def detect_track(
             params=params,
         )
         manifest = build_manifest(
-            experiment_id=experiment_id,
+            result_id=result_id,
             source_image_path=image_path,
             params=manifest_extra,
             repo_shas=repo_shas,
         )
-        experiment_dir = experiments_root / experiment_id
-        write_experiment(experiment_dir, points_df, tracks_df, manifest)
+        result_dir = results_root / result_id
+        write_result(result_dir, points_df, tracks_df, manifest)
         typer.echo(
-            f"  -> {experiment_dir}  "
+            f"  -> {result_dir}  "
             f"({manifest_extra['n_points']} points, {manifest_extra['n_tracks']} tracks)"
         )
 
 
 @app.command("view")
-def view(experiment_dir: Path) -> None:
-    """Launch napari and load ONE experiment bundle's layers."""
+def view(result_dir: Path) -> None:
+    """Launch napari and load ONE results bundle's layers."""
     from spt_pipeline.viewer import launch_viewer
 
-    launch_viewer(experiment_dir)
+    launch_viewer(result_dir)
 
 
 def main() -> None:

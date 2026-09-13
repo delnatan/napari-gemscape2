@@ -113,7 +113,7 @@ from qtpy.QtWidgets import (
 )
 
 from spt_pipeline.diffusion import tracks_to_diffusionkit_df
-from spt_pipeline.experiment import load_diffusion_results, write_diffusion_results
+from spt_pipeline.results import load_diffusion_results, write_diffusion_results
 from spt_pipeline.joint_plot import numeric_columns, plot_property_joint
 from spt_pipeline.pipeline import filter_mask
 from spt_pipeline.viewer import set_tracks_layer_data
@@ -1225,7 +1225,7 @@ class DiffusionAnalysisWidget(QWidget):
         super().__init__()
         self.viewer = napari_viewer
 
-        self._experiment_dir: Optional[Path] = None
+        self._result_dir: Optional[Path] = None
         self.pixel_size_um = 1.0
         self.dt_s = 1.0
         self._diffkit_tracks: Optional[pl.DataFrame] = None
@@ -1504,7 +1504,7 @@ class DiffusionAnalysisWidget(QWidget):
     def _clear_loaded_state(self) -> None:
         self._restore_previous_tracks_layer_if_synced()
         self._detach_mouse_callback()
-        self._experiment_dir = None
+        self._result_dir = None
         self._tracks_layer = None
         self._diffkit_tracks = None
         self._tracks_df_px = None
@@ -1561,8 +1561,8 @@ class DiffusionAnalysisWidget(QWidget):
         base table and the layer's units/bundle metadata. Leaves every fit
         result alone -- callers decide whether those still apply."""
         self._tracks_df_px = track_points_df
-        raw_experiment_dir = layer.metadata.get("experiment_dir")
-        self._experiment_dir = Path(raw_experiment_dir) if raw_experiment_dir else None
+        raw_result_dir = layer.metadata.get("result_dir")
+        self._result_dir = Path(raw_result_dir) if raw_result_dir else None
         self.pixel_size_um = layer.metadata.get("pixel_size_um") or 1.0
         self.dt_s = layer.metadata.get("dt_s") or 1.0
         self._diffkit_tracks = tracks_to_diffusionkit_df(track_points_df, self.pixel_size_um, self.dt_s)
@@ -1575,11 +1575,11 @@ class DiffusionAnalysisWidget(QWidget):
         layer = self._tracks_layer
         if layer is None:
             return
-        if self._experiment_dir is not None:
-            self._source_label.setText(f"'{layer.name}' -> {self._experiment_dir}")
+        if self._result_dir is not None:
+            self._source_label.setText(f"'{layer.name}' -> {self._result_dir}")
         else:
             self._source_label.setText(
-                f"'{layer.name}' (no known experiment bundle -- results can't be saved)"
+                f"'{layer.name}' (no known results bundle -- results can't be saved)"
             )
 
     def _load_from_layer(self, layer: Tracks) -> None:
@@ -1625,7 +1625,7 @@ class DiffusionAnalysisWidget(QWidget):
         layer.events.properties.connect(self._on_tracks_layer_event)
 
         saved_per_track, saved_summary = (
-            load_diffusion_results(self._experiment_dir) if self._experiment_dir is not None else (None, None)
+            load_diffusion_results(self._result_dir) if self._result_dir is not None else (None, None)
         )
         n_saved = saved_per_track.height if saved_per_track is not None else 0
         if saved_summary is not None:
@@ -1668,7 +1668,7 @@ class DiffusionAnalysisWidget(QWidget):
             or self._anisotropy_full_df is not None
             or bool(self._track_fit_rows)
         )
-        self._save_button.setEnabled(has_results and self._experiment_dir is not None)
+        self._save_button.setEnabled(has_results and self._result_dir is not None)
 
     # -- track table + selection --
 
@@ -1935,7 +1935,7 @@ class DiffusionAnalysisWidget(QWidget):
     # -- persistence --
 
     def _save_results(self) -> None:
-        if self._experiment_dir is None:
+        if self._result_dir is None:
             return
         tables = []
         if self._classical_full_df is not None:
@@ -1970,5 +1970,5 @@ class DiffusionAnalysisWidget(QWidget):
                 "anomalous_r_squared": fit.ensemble_anomalous_fit.r_squared,
             }
 
-        write_diffusion_results(self._experiment_dir, per_track_df, summary)
-        self._classical.report_saved(f"saved {per_track_df.height} fit(s) to {self._experiment_dir}")
+        write_diffusion_results(self._result_dir, per_track_df, summary)
+        self._classical.report_saved(f"saved {per_track_df.height} fit(s) to {self._result_dir}")

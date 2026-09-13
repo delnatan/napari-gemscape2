@@ -1,7 +1,7 @@
-"""Load an experiment bundle's image + points + tracks as napari layers.
+"""Load a results bundle's image + points + tracks as napari layers.
 
 Also the single place that decides how each of those layers *looks*.
-Both this module's `add_experiment_layers` and the interactive stepwise
+Both this module's `add_result_layers` and the interactive stepwise
 path (`widgets/experiment_list.py`) build the same three kinds of layer,
 and the stepwise path swaps its "(preview)" layers for final ones when a
 bundle is saved -- so any styling that lives at only one of those call
@@ -21,7 +21,7 @@ from typing import Optional
 import numpy as np
 import polars as pl
 
-from spt_pipeline.experiment import load_experiment
+from spt_pipeline.results import load_result
 from spt_pipeline.pipeline import load_stack, track_features_df
 from spt_pipeline.rois import roi_to_shapes_kwargs
 
@@ -156,7 +156,7 @@ def add_tracks_layer(
     se_y/se_x, bg, fit_sigma, ...) straight off this one layer, already
     aligned with track_id, instead of a separate "points" layer lookup
     (which has no track_id -- it's the pre-linking detections table, see
-    experiment.py)."""
+    results.py)."""
     if name in viewer.layers:
         del viewer.layers[name]
     if tracks_df is None or tracks_df.height == 0 or "track_id" not in tracks_df.columns:
@@ -264,7 +264,7 @@ def load_image_display(image_path: str | Path, channel: int = 0, z_index: int = 
 def load_result_display(bundle_dir: str | Path) -> ResultDisplay:
     """Read a bundle's tables and its source image. Thread-safe, like
     `load_image_display`."""
-    points_df, tracks_df, manifest, rois = load_experiment(bundle_dir)
+    points_df, tracks_df, manifest, rois = load_result(bundle_dir)
     params = manifest.get("params", {})
     image = load_image_display(
         manifest["source_image_path"],
@@ -286,11 +286,11 @@ def show_image(viewer, loaded: ImageDisplay):
     return add_image_layer(viewer, loaded.image, name, **display)
 
 
-def add_experiment_layers(viewer, experiment_dir: str | Path) -> None:
+def add_result_layers(viewer, result_dir: str | Path) -> None:
     """Load a bundle and show it (`load_result_display` + `show_result`),
     blocking -- for the standalone viewer, where there is no UI to keep
     responsive."""
-    show_result(viewer, load_result_display(experiment_dir))
+    show_result(viewer, load_result_display(result_dir))
 
 
 def show_result(viewer, loaded: ResultDisplay) -> None:
@@ -300,22 +300,22 @@ def show_result(viewer, loaded: ResultDisplay) -> None:
     name, so the region used for detection is visible again, not just the
     results."""
     show_image(viewer, loaded.image)
-    experiment_dir = loaded.bundle_dir
+    result_dir = loaded.bundle_dir
     points_df, tracks_df, rois = loaded.points_df, loaded.tracks_df, loaded.rois
     params = loaded.manifest.get("params", {})
 
     pixel_size_um = params.get("pixel_size_um") or 1.0
     dt_s = params.get("dt_s") or 1.0
-    # pixel_size_um/dt_s/experiment_dir ride along as layer metadata on both
+    # pixel_size_um/dt_s/result_dir ride along as layer metadata on both
     # the "points" and "tracks" layers so a widget reading either one (see
     # widgets/diffusion_panel.py, which reads the "tracks" layer) can
     # convert its data straight to physical units and write results back
-    # to the right bundle -- no separate "load an experiment" step of its
+    # to the right bundle -- no separate "load a result" step of its
     # own.
     layer_metadata = {
         "pixel_size_um": pixel_size_um,
         "dt_s": dt_s,
-        "experiment_dir": str(Path(experiment_dir).resolve()),
+        "result_dir": str(Path(result_dir).resolve()),
     }
 
     add_points_layer(viewer, points_df, "points", layer_metadata)
@@ -325,12 +325,12 @@ def show_result(viewer, loaded: ResultDisplay) -> None:
         viewer.add_shapes(**roi_to_shapes_kwargs(roi), edge_color="yellow")
 
 
-def launch_viewer(experiment_dir: str | Path):
+def launch_viewer(result_dir: str | Path):
     """Standalone entry point (`spt view <dir>`) -- opens a fresh napari
     window with one bundle's layers loaded, blocking until it's closed."""
     import napari
 
     viewer = napari.Viewer()
-    add_experiment_layers(viewer, experiment_dir)
+    add_result_layers(viewer, result_dir)
     napari.run()
     return viewer

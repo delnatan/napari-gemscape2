@@ -286,7 +286,7 @@ class PipelineSession:
     # whatever napari Shapes layer backed run_detect_step's `mask`, if any
     # -- set by the widget (not pipeline.py itself, which stays napari-
     # agnostic), carried through to session_manifest_extra's caller so
-    # write_experiment can persist it alongside points/tracks.
+    # write_result can persist it alongside points/tracks.
     roi: Optional[list[dict]] = None
 
     tracks_df: Optional[pl.DataFrame] = None
@@ -933,7 +933,7 @@ def run_track_step(
 def session_manifest_extra(session: PipelineSession) -> dict:
     """Assemble the `manifest.json` `params` payload from a session that's
     been through all three stages -- meant to be passed as
-    `experiment.build_manifest`'s `params`."""
+    `results.build_manifest`'s `params`."""
     ts = session.track_summary or {}
     cs = session.calib_summary or {}
     return {
@@ -1029,7 +1029,7 @@ def run_detect_track(
     calibration/track).
 
     Returns (points_df, tracks_df, manifest_extra) -- `manifest_extra` is
-    meant to be passed as `experiment.build_manifest`'s `params`.
+    meant to be passed as `results.build_manifest`'s `params`.
     """
     params = params or DetectTrackParams()
     session = load_session(image_path, pixel_size_um=pixel_size_um, dt_s=dt_s, channel=channel, z_index=z_index)

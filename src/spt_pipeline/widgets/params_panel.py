@@ -8,7 +8,7 @@ TrackMate use for spot detection:
              [Run detect], then histogram filters on what it found)
     Track:   Link -> Filter -> Save
              (linking knobs, [Run tracking], histogram filters on the
-             tracks it linked, then [Save experiment])
+             tracks it linked, then [Save results])
 
 Each arrow there is a page, not a scroll: within a tab the steps are a
 `_StepPager` -- one step visible at a time, `‹`/`›` to leaf between them,
@@ -981,7 +981,7 @@ class _TrackingTab(QWidget):
         )
         self.filters.filtersChanged.connect(self.filtersChanged)
 
-        self.save_button = QPushButton("Save experiment")
+        self.save_button = QPushButton("Save results")
         self.save_button.setEnabled(False)
         self.save_button.setToolTip(
             "Write the bundle: points.parquet (every detection, unfiltered),\n"

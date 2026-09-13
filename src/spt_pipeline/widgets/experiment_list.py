@@ -55,8 +55,8 @@ through the same `self._worker` slot (only one run -- batch or stepwise
   `_on_selection_changed`) -- it's scoped to "the image currently being
   worked on", not persisted across items.
 
-  Stepwise runs write **nothing** until "Save experiment" is pressed
-  (`_save_experiment`). The filter histograms on both tabs are the reason:
+  Stepwise runs write **nothing** until "Save results" is pressed
+  (`_save_result`). The filter histograms on both tabs are the reason:
   the cuts they set are chosen by looking at a finished stage's output, so
   committing the bundle the instant linking returned would mean saving
   before the decision that shapes it had been made. Batch runs still write
@@ -112,14 +112,14 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from spt_pipeline.experiment import (
+from spt_pipeline.results import (
     build_manifest,
-    experiment_dir_for,
+    result_dir_for,
     git_sha,
-    has_experiment,
-    load_experiment,
+    has_result,
+    load_manifest,
     repo_root_of,
-    write_experiment,
+    write_result,
 )
 from spt_pipeline.io_formats import SUPPORTED_SUFFIXES as SUPPORTED_FORMATS
 from spt_pipeline.pipeline import (
@@ -184,7 +184,7 @@ STATUS_COLORS = {
 @dataclass
 class ExperimentEntry:
     image_path: Path
-    experiment_dir: Path
+    result_dir: Path
     status: Status = Status.UNTOUCHED
     n_tracks: Optional[int] = None
     error: Optional[str] = None
@@ -285,7 +285,7 @@ class _ExperimentListView(QListWidget):
         self.setDropIndicatorShown(True)
         self.setItemDelegate(ExperimentItemDelegate(self))
         self.folder_path: Optional[Path] = None
-        self.experiments_root: Optional[Path] = None
+        self.results_root: Optional[Path] = None
         # Set by the owning ExperimentListWidget so a folder reload can be
         # refused while a run is in flight (see load_folder) -- a fresh
         # QListWidgetItem per row would otherwise silently detach the
@@ -314,7 +314,7 @@ class _ExperimentListView(QListWidget):
             return
         if key == Qt.Key.Key_F5:
             if self.folder_path is not None:
-                self.load_folder(self.folder_path, self.experiments_root)
+                self.load_folder(self.folder_path, self.results_root)
             return
         super().keyPressEvent(event)
 
@@ -339,9 +339,9 @@ class _ExperimentListView(QListWidget):
     def dropEvent(self, event) -> None:
         folder = _dropped_folder(event)
         if folder is not None:
-            self.load_folder(folder, self.experiments_root)
+            self.load_folder(folder, self.results_root)
 
-    def load_folder(self, folder_path: Path, experiments_root: Optional[Path] = None) -> None:
+    def load_folder(self, folder_path: Path, results_root: Optional[Path] = None) -> None:
         if self.is_busy():
             self.on_busy_blocked()
             return
@@ -349,7 +349,7 @@ class _ExperimentListView(QListWidget):
             return
         self.clear()
         self.folder_path = Path(folder_path)
-        self.experiments_root = experiments_root or (self.folder_path / "experiments")
+        self.results_root = results_root or (self.folder_path / "results")
 
         for file_path in natsorted(self.folder_path.iterdir()):
             if file_path.name.startswith("."):
@@ -357,15 +357,12 @@ class _ExperimentListView(QListWidget):
             if file_path.suffix.lower() not in SUPPORTED_FORMATS:
                 continue
 
-            experiment_dir = experiment_dir_for(self.experiments_root, file_path)
-            entry = ExperimentEntry(image_path=file_path, experiment_dir=experiment_dir)
+            result_dir = result_dir_for(self.results_root, file_path)
+            entry = ExperimentEntry(image_path=file_path, result_dir=result_dir)
             item = ExperimentItem(entry)
 
-            if has_experiment(experiment_dir):
-                _, tracks_df, manifest, _ = load_experiment(experiment_dir)
-                n_tracks = manifest.get("params", {}).get("n_tracks")
-                if n_tracks is None and tracks_df.height:
-                    n_tracks = tracks_df["track_id"].n_unique()
+            if has_result(result_dir):
+                n_tracks = load_manifest(result_dir)["params"]["n_tracks"]
                 item.set_status(Status.COMPLETE, n_tracks=n_tracks)
 
             self.addItem(item)
@@ -471,7 +468,7 @@ class ExperimentListWidget(QWidget):
         self.params_panel.detectRequested.connect(self._run_detect_step)
         self.params_panel.detectCancelRequested.connect(self._cancel_active_run)
         self.params_panel.trackRequested.connect(self._run_track_step)
-        self.params_panel.saveRequested.connect(self._save_experiment)
+        self.params_panel.saveRequested.connect(self._save_result)
         self.params_panel.newRoiRequested.connect(self._on_new_roi_requested)
         # Keep the Detect tab's ROI dropdown showing the viewer's Shapes
         # layers. Adding/removing/reordering layers is caught on the layer
@@ -644,7 +641,7 @@ class ExperimentListWidget(QWidget):
         box.setWindowTitle("Unsaved results")
         box.setText(f"{item.entry.image_path.name} has results that haven't been saved.")
         box.setInformativeText(
-            "Save writes its experiment bundle first; Discard drops them."
+            "Save writes its results bundle first; Discard drops them."
             if savable
             else "It hasn't been linked yet, so there is nothing to save — leaving drops it."
         )
@@ -658,7 +655,7 @@ class ExperimentListWidget(QWidget):
         if clicked is discard:
             return True
         if save is not None and clicked is save:
-            return self._save_experiment(item)
+            return self._save_result(item)
         return False
 
     def _confirm_reload(self) -> bool:
@@ -689,7 +686,7 @@ class ExperimentListWidget(QWidget):
         entry = item.entry
         self._loading_text = f"loading {entry.image_path.name}…"
         self.progress_label.setText(self._loading_text)
-        worker = _load_item_worker(entry.image_path, entry.experiment_dir)
+        worker = _load_item_worker(entry.image_path, entry.result_dir)
         worker.returned.connect(
             lambda loaded, item=item, g=generation: self._on_item_loaded(item, g, loaded)
         )
@@ -841,12 +838,12 @@ class ExperimentListWidget(QWidget):
             "spt_pipeline": git_sha(repo_root_of(spt_pipeline)),
         }
         manifest = build_manifest(
-            experiment_id=entry.experiment_dir.name,
+            result_id=entry.result_dir.name,
             source_image_path=entry.image_path,
             params=manifest_extra,
             repo_shas=repo_shas,
         )
-        write_experiment(entry.experiment_dir, points_df, tracks_df, manifest)
+        write_result(entry.result_dir, points_df, tracks_df, manifest)
         item.set_status(Status.COMPLETE, n_tracks=manifest_extra["n_tracks"])
         self.list_view.viewport().update()
 
@@ -973,8 +970,8 @@ class ExperimentListWidget(QWidget):
         tab's ROI dropdown -- the union of every shape drawn on it -- plus
         that layer's polygon ROI record
         (`spt_pipeline.rois.shapes_layer_to_roi`), meant to be stashed on
-        `session.roi` so `_save_experiment` can persist it alongside the
-        run's results (see `experiment.write_experiment`).
+        `session.roi` so `_save_result` can persist it alongside the
+        run's results (see `experiment.write_result`).
 
         Targeted by name rather than by which layer happens to be selected
         in napari, so clicking around the layer list (or drawing a second
@@ -1296,7 +1293,7 @@ class ExperimentListWidget(QWidget):
 
         # Feed the Track tab's histograms one row per track, then draw the
         # layer through whatever cuts survive. Nothing is written yet --
-        # `_save_experiment` is the finalize step now, so the filters can
+        # `_save_result` is the finalize step now, so the filters can
         # be tuned against the linked result before it's committed.
         self._track_cache = None
         self.params_panel.set_track_filter_source(self._track_tables()[0])
@@ -1356,7 +1353,7 @@ class ExperimentListWidget(QWidget):
             self.params_panel.set_save_status("filters changed — save to apply", level="caution")
 
     def _session_layer_metadata(self) -> dict:
-        """The same `pixel_size_um`/`dt_s`/`experiment_dir` metadata
+        """The same `pixel_size_um`/`dt_s`/`result_dir` metadata
         `viewer.show_result` puts on a saved bundle's layers, for the
         in-memory session's layers -- so a widget reading either (e.g.
         widgets/diffusion_panel.py) works the same on a preview as on a
@@ -1365,7 +1362,7 @@ class ExperimentListWidget(QWidget):
         return {
             "pixel_size_um": session.pixel_size_um if session is not None else 1.0,
             "dt_s": session.dt_s if session is not None else 1.0,
-            "experiment_dir": str(self._session_item.entry.experiment_dir.resolve())
+            "result_dir": str(self._session_item.entry.result_dir.resolve())
             if self._session_item is not None
             else None,
         }
@@ -1454,7 +1451,7 @@ class ExperimentListWidget(QWidget):
 
     # -- Finalize (explicit save) --
 
-    def _save_experiment(self, item: Optional[ExperimentItem] = None) -> bool:
+    def _save_result(self, item: Optional[ExperimentItem] = None) -> bool:
         """Write the bundle for the stepwise session of `item` (default: the
         current row): every detection in points.parquet, the tracks that
         pass the Track tab's cuts in tracks.parquet, and both filter specs
@@ -1498,14 +1495,14 @@ class ExperimentListWidget(QWidget):
         # getting the filtered one, so correct it before it's written.
         manifest_params["n_tracks"] = tracks_df["track_id"].n_unique()
         manifest = build_manifest(
-            experiment_id=entry.experiment_dir.name,
+            result_id=entry.result_dir.name,
             source_image_path=entry.image_path,
             params=manifest_params,
             repo_shas=repo_shas,
         )
         try:
-            write_experiment(
-                entry.experiment_dir, session.points_df, tracks_df, manifest, rois=session.roi
+            write_result(
+                entry.result_dir, session.points_df, tracks_df, manifest, rois=session.roi
             )
         except Exception as exc:
             self.params_panel.set_save_status(f"error: {exc}", level="error")
@@ -1516,7 +1513,7 @@ class ExperimentListWidget(QWidget):
         item.entry.has_unsaved_session = False
         self.list_view.viewport().update()
         self.params_panel.set_save_status(
-            f"saved {n_tracks} tracks → {entry.experiment_dir.name}", level="ok"
+            f"saved {n_tracks} tracks → {entry.result_dir.name}", level="ok"
         )
 
         if self.list_view.currentItem() is item:
@@ -1609,11 +1606,11 @@ def _debounce_timer(parent: QObject, slot: Callable[[], None], msec: int = 40) -
 
 
 @thread_worker(start_thread=False)
-def _load_item_worker(image_path: Path, experiment_dir: Path):
+def _load_item_worker(image_path: Path, result_dir: Path):
     """A row's saved bundle if it has one, else its raw image -- read off
     the GUI thread, shown by `ExperimentListWidget._on_item_loaded`."""
-    if has_experiment(experiment_dir):
-        return load_result_display(experiment_dir)
+    if has_result(result_dir):
+        return load_result_display(result_dir)
     return load_image_display(image_path)
 
 

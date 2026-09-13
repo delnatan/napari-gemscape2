@@ -34,12 +34,12 @@ nearest-neighbor spacing. Read its verdict as an advisory: the closed forms are
 sample physics, but its thresholds were calibrated against the older LAP linker
 and are conservative for this one (see that module's docstring).
 
-## Reproducible experiment bundles
+## Reproducible results bundles
 
 Each processed acquisition is written as a directory bundle:
 
 ```
-experiments/<experiment_id>/
+results/<result_id>/
     points.parquet
     tracks.parquet
     manifest.json
@@ -70,7 +70,7 @@ distribution it applies to, the way Imaris and TrackMate do it — `flux > 1200`
 means nothing until you can see that the flux histogram is bimodal with a trough
 at 1200. Filters stack and AND together, and the layer in the viewer redraws as
 each handle moves, so a spot that fails a cut leaves the image while the cut is
-being made. Nothing is written to disk until *Save experiment*, so the cuts are
+being made. Nothing is written to disk until *Save results*, so the cuts are
 chosen against a finished stage's real output rather than guessed at beforehand.
 
 This is also how the PSF width is measured, which is why there is no calibration
@@ -113,7 +113,7 @@ spt detect-track config.toml
 ```
 
 ```toml
-experiments_root = "experiments"
+results_root = "results"
 
 [params]
 # Give `sigma` (px) to use a measured width directly — e.g. one settled on
@@ -133,13 +133,13 @@ track_filters = { track_length = [5.0, 1e9] }
 
 [[inputs]]
 path = "data/beads_timelapse_dense.tif"
-experiment_id = "beads_dense"   # optional, defaults to the stem
+result_id = "beads_dense"   # optional, defaults to the stem
 ```
 
 Interactive: open napari and use the "Experiment list" dock widget to browse a
 folder of raw images and work one image through **Detect** (camera, PSF width via
 Preview frame, detection knobs, then filters on what it found) and **Track**
-(link, then filters on the tracks), pressing *Save experiment* when the result is
+(link, then filters on the tracks), pressing *Save results* when the result is
 worth keeping. The "Diffusion analysis" widget then reads the tracks layer for
 MSD, Bayesian and per-track anisotropy fits, and offers the same histogram
 filters over per-track results — so a fitted `D` or `alpha` is filterable by the
