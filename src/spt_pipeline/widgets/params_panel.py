@@ -90,7 +90,10 @@ point, vs. blindly running a batch job) practical: a frame-range pair
 (`get_frame_range`) and a "restrict to ROI" checkbox
 (`get_use_roi_mask`), plus a Shapes-layer dropdown (`get_roi_layer_name`)
 and a "Draw ROI…" button (`newRoiRequested`) that just asks for a fresh
-Shapes layer to draw on.
+Shapes layer to draw on. A "cores" spinbox (`get_n_threads`) sits beside
+the frame range -- `localize_stack`'s `n_threads`, defaulted to every
+core (see `pipeline.run_detect_step`'s docstring for why this speeds up
+even the interactively-watched run, not just a headless batch).
 
 The dropdown is what makes several ROIs on screen at once workable: draw
 as many Shapes layers as you like (rename them in napari's layer list --
@@ -111,6 +114,7 @@ array `spotsolve`'s `roi` argument expects.
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import polars as pl
@@ -432,6 +436,24 @@ class _DetectTab(QWidget):
         frame_row.addWidget(self.frame_end)
         frame_row.addStretch()
 
+        # How many native threads `localize_stack` hands frames to (both
+        # the batch path and, chunked, the interactively-watched one --
+        # see `pipeline.run_detect_step`'s docstring). Capped at the
+        # machine's own core count; defaulting to it is what "use every
+        # core" means without a spinbox arrow-key marathon to get there.
+        cpu_count = os.cpu_count() or 1
+        self.n_threads = _ispin(
+            cpu_count, 1, cpu_count,
+            tooltip="Worker threads spotsolve's localize_stack hands frames to.\n"
+            "Defaults to every core on this machine. Lower it to leave some\n"
+            "cores free for other work while a long run is going.",
+        )
+        cores_row = QHBoxLayout()
+        cores_row.setContentsMargins(0, 0, 0, 0)
+        cores_row.addWidget(QLabel("cores"))
+        cores_row.addWidget(self.n_threads)
+        cores_row.addStretch()
+
         self.use_roi_mask = QCheckBox("Restrict to ROI")
         self.use_roi_mask.setToolTip(
             "Only place emitters inside the shape(s) on the Shapes layer picked\n"
@@ -541,6 +563,7 @@ class _DetectTab(QWidget):
         detect_layout.addLayout(core_form)
         detect_layout.addWidget(hline())
         detect_layout.addLayout(frame_row)
+        detect_layout.addLayout(cores_row)
         detect_layout.addLayout(roi_row)
         detect_layout.addWidget(_expert_section(expert_form))
         detect_layout.addWidget(hline())
@@ -690,6 +713,9 @@ class _DetectTab(QWidget):
         if start == 0 and end == 0:
             return None
         return (start, end)
+
+    def get_n_threads(self) -> int:
+        return self.n_threads.value()
 
     def get_use_roi_mask(self) -> bool:
         return self.use_roi_mask.isChecked()
@@ -948,6 +974,7 @@ class PipelineParamsWidget(QWidget):
             detect_kwargs=self._detect.get_detect_kwargs(),
             calibration_kwargs=dict(DEFAULT_CALIBRATION_KWARGS),
             frame_range=self._detect.get_frame_range(),
+            n_threads=self._detect.get_n_threads(),
             point_filters=self.get_point_filters(),
             track_filters=self.get_track_filters(),
         )
@@ -986,6 +1013,9 @@ class PipelineParamsWidget(QWidget):
 
     def get_frame_range(self) -> Optional[tuple[int, int]]:
         return self._detect.get_frame_range()
+
+    def get_n_threads(self) -> int:
+        return self._detect.get_n_threads()
 
     def get_use_roi_mask(self) -> bool:
         return self._detect.get_use_roi_mask()

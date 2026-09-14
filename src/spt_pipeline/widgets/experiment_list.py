@@ -26,9 +26,13 @@ so which region a run covers is a deliberate pick rather than a
 side-effect of which layer was last clicked.
 
 This widget always runs `run_detect_step` with a `progress_callback`
-(for the live frame-count/cancel UI), which is what actually puts it on `run_detect_step`'s frame-by-frame path -- not the
-mask itself, which `find_spots_stack_df` accepts directly (see
-`pipeline.run_detect_step`'s docstring).
+(for the live frame-count/cancel UI), which is what actually puts it on
+`run_detect_step`'s chunked path -- not the mask itself, which
+`find_spots_stack_df` accepts directly (see `pipeline.run_detect_step`'s
+docstring). The Detect tab's "cores" spinbox (`get_n_threads`) is the
+chunk's own `localize_stack` call's `n_threads`, so this path is still
+multi-core; only progress/cancel granularity, not parallelism, is traded
+away here.
 
 Drag-and-drop accepts a dropped folder anywhere on this dock widget (not
 just precisely on the list rows) -- both `_ExperimentListView` and the
@@ -1179,6 +1183,7 @@ class ExperimentListWidget(QWidget):
             mask,
             self._cancel_event,
             emitter,
+            self.params_panel.get_n_threads(),
         )
         self._start_step_worker(
             worker,
@@ -1666,6 +1671,7 @@ def _run_detect_worker(
     mask: Optional[np.ndarray],
     cancel_event: threading.Event,
     emitter: _ProgressEmitter,
+    n_threads: Optional[int] = None,
 ) -> PipelineSession:
     def progress_cb(done: int, total: int, stage: str) -> None:
         emitter.updated.emit(done, total, stage)
@@ -1680,6 +1686,7 @@ def _run_detect_worker(
         mask=mask,
         progress_callback=progress_cb,
         cancel_event=cancel_event,
+        n_threads=n_threads,
     )
 
 

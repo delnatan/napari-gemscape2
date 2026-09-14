@@ -63,6 +63,7 @@ Two things the interactive path does that the headless one doesn't:
 
 from __future__ import annotations
 
+import os
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -146,13 +147,13 @@ ProgressCallback = Callable[[int, int, str], None]
 class PipelineCancelled(Exception):
     """Raised at a `cancel_event` checkpoint (see `run_detect_step`/
     `run_track_step`/`run_calibration_step`'s `cancel_event` argument).
-    Cooperative cancellation only -- takes effect at the next frame
-    (detect, when a `progress_callback` puts it on the per-frame path) or
-    stage boundary, not instantly, since `calibrate_sigma`,
-    `localize_stack` and `link` are each one opaque Rust call with no
-    interruption point of their own. Propagates like any other exception
-    through `napari.qt.threading`'s `errored` signal; the widget is
-    responsible for telling this apart from a real error."""
+    Cooperative cancellation only -- takes effect at the next chunk
+    (detect, when a `progress_callback` puts it on the chunked
+    `localize_stack` path) or stage boundary, not instantly, since
+    `calibrate_sigma`, `localize_stack` and `link` are each one opaque
+    Rust call with no interruption point of their own. Propagates like any
+    other exception through `napari.qt.threading`'s `errored` signal; the
+    widget is responsible for telling this apart from a real error."""
 
 
 def _check_cancelled(cancel_event: Optional[threading.Event]) -> None:
@@ -234,6 +235,9 @@ class DetectTrackParams:
     camera_kwargs: dict = field(default_factory=lambda: dict(DEFAULT_CAMERA_KWARGS))
     detect_kwargs: dict = field(default_factory=lambda: dict(DEFAULT_DETECT_KWARGS))
     calibration_kwargs: dict = field(default_factory=lambda: dict(DEFAULT_CALIBRATION_KWARGS))
+    # Worker threads `localize_stack` hands frames to, in `run_detect_step`.
+    # None means every core (os.cpu_count()) -- spotsolve's own default.
+    n_threads: Optional[int] = None
     # (start, end) frame slice, Python-slice semantics; None, or end <= 0,
     # means through the real last frame (see _resolve_frame_range).
     # Not `mask` -- that's an interactive-only concept (built from a live
@@ -554,6 +558,7 @@ def run_detect_step(
     mask: Optional[np.ndarray] = None,
     progress_callback: Optional[ProgressCallback] = None,
     cancel_event: Optional[threading.Event] = None,
+    n_threads: Optional[int] = None,
 ) -> PipelineSession:
     """Localize every spot over `session.image[start:end]` (default: every
     frame) with `spotsolve`, and assemble the result into the standard
@@ -593,16 +598,17 @@ def run_detect_step(
     was junk" stays an auditable fact about the run rather than a silent
     deletion.
 
-    Frame-by-frame (reporting progress each frame, checking `cancel_event`
-    each frame) is used only when `progress_callback` is given -- the same
-    tradeoff an interactively-watched run has always made against the
-    faster rayon-parallel `localize_stack`, which has no per-frame
-    checkpoint of its own to report through. `mask` does not force that
-    path; `localize_stack` takes an `roi` directly.
+    Both paths run every frame through the rayon-parallel `localize_stack`
+    -- `n_threads` (default: every core, `os.cpu_count()`) is how many
+    native threads it hands frames to. They differ only in chunk size:
+    with no `progress_callback`, the whole range goes through in one call;
+    with one, the range is split into chunks of `n_threads` frames each --
+    small enough that progress and cancellation still land often, large
+    enough that every thread stays busy within a chunk.
 
     `cancel_event`, if given, is checked before this stage starts and --
-    on the `progress_callback` path only -- again before each frame, so a
-    cancellation lands within one frame rather than only between stages
+    on the `progress_callback` path only -- again before each chunk, so a
+    cancellation lands within one chunk rather than only between stages
     (see `PipelineCancelled`'s docstring).
     """
     _check_cancelled(cancel_event)
@@ -620,22 +626,27 @@ def run_detect_step(
     if end <= start:
         raise ValueError(f"empty frame_range: start={start} >= end={end}")
 
-    frame_indices = range(start, end)
-    n = len(frame_indices)
+    n = end - start
+    threads = int(n_threads or os.cpu_count() or 1)
 
     if progress_callback is not None:
         results = []
-        for done, i in enumerate(frame_indices, start=1):
+        i = start
+        while i < end:
             _check_cancelled(cancel_event)
-            results.append(
-                spotsolve.localize(
-                    session.image[i], sigma, roi=mask, images=False, **camera, **detect
+            j = min(i + threads, end)
+            results.extend(
+                spotsolve.localize_stack(
+                    session.image[i:j], sigma, roi=mask, images=False,
+                    n_threads=threads, **camera, **detect
                 )
             )
-            progress_callback(done, n, "finding spots")
+            progress_callback(len(results), n, "finding spots")
+            i = j
     else:
         results = spotsolve.localize_stack(
-            session.image[start:end], sigma, roi=mask, images=False, **camera, **detect
+            session.image[start:end], sigma, roi=mask, images=False,
+            n_threads=threads, **camera, **detect
         )
 
     # `frame_tables` is per-frame; stitch them with a running `loc_id0` so
@@ -1080,6 +1091,7 @@ def run_detect_track(
         frame_range=params.frame_range,
         progress_callback=detect_progress,
         cancel_event=cancel_event,
+        n_threads=params.n_threads,
     )
 
     def track_progress(done: int, total: int, stage: str) -> None:
