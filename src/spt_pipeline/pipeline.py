@@ -72,28 +72,18 @@ from typing import Callable, Optional
 import numpy as np
 import polars as pl
 import spotsolve
-import spotsolve_rs
 from spotsolve import loctable, tracking
 
 from spt_pipeline.io_formats import load_stack
 from spt_pipeline.tracking_diagnostics import check_resolvability
 
 # The camera's own calibration, forwarded to every `spotsolve.localize`/
-# `localize_stack`/`calibrate_sigma` call. These are properties of the
-# detector chip, not tuning knobs: `offset` (ADU) and `gain` (ADU per
-# photoelectron) convert the raw frame into the photoelectron counts the
-# Poisson likelihood is written in, and `read_noise` (electrons rms) is the
-# variance floor added to it.
-#
-# `gain=None` means "estimate it from each frame", which is what makes this
-# a usable default on an uncharacterized camera -- but a measured gain is
-# strictly better, since a per-frame estimate moves with the sample and
-# quietly rescales every flux in the movie with it. Measure it once and set
-# it here (or in the widget's Camera group) if you can.
+# `localize_stack`/`calibrate_sigma` call. `offset` (ADU) is subtracted
+# before fitting; everything else about the camera -- gain, read noise --
+# is measured from each frame's own noise (`spotsolve` no longer takes
+# either as an input), so `offset` is the only knob left here.
 DEFAULT_CAMERA_KWARGS = dict(
     offset=0.0,
-    gain=None,
-    read_noise=0.0,
 )
 
 # Forwarded to `spotsolve.localize`/`localize_stack` as **kwargs, mirroring
@@ -106,22 +96,16 @@ DEFAULT_CAMERA_KWARGS = dict(
 # and non-PSF-shaped junk is kept out of the table. `k_max` caps how many
 # emitters one box may be fitted with jointly.
 #
-# Two cuts on the same LoG z-statistic (sd of its noise), which fail in
-# opposite directions and so are set separately. `seed_threshold` decides
-# which peaks in the frame get a box searched around them: loose costs only
-# time, since a seed still has to pay the 10-nat test to become a detection,
-# while light never seeded is never fitted; `None` (recommended) derives it
-# from the frame size. `birth_threshold` is how strong a leftover residual
-# peak inside a box must be before another emitter is tried there: loose
-# costs precision (a slightly wrong fit's leftover light around a bright
-# spot can pass as a false neighbour) and time. It is a calibrated constant,
-# not frame-derived, so it is written out here rather than left as `None`,
-# and the manifest records the number actually used. Raise it toward 4 for
-# speed; lower it toward 2.5 on faint, sparse data.
+# One cut on the LoG z-statistic (sd of the frame's own noise), used both
+# for which peaks get a box searched around them and for whether a
+# leftover residual peak inside a box gets tried as another emitter --
+# `spotsolve` used to split these into a seed cut and a birth cut, but
+# measurement showed one number (`PEAK_Z`) does the same job. `None`
+# (recommended) uses that default; raise it for fewer false positives and
+# speed, lower it toward 2.5 for faint, sparse data.
 DEFAULT_DETECT_KWARGS = dict(
     k_max=spotsolve.K_MAX,
-    seed_threshold=None,
-    birth_threshold=float(spotsolve_rs.BOX_BIRTH_Z),
+    threshold=None,
     slack=spotsolve.SLACK,
     band=spotsolve.BAND,
 )
@@ -232,6 +216,12 @@ class DetectTrackParams:
     # flux-weighted compromise between whatever is inside it, so linking it
     # produces a trajectory of something that isn't a particle.
     drop_aggregates: bool = True
+    # Whether `spotsolve.tracking.link` also scores candidate links by
+    # brightness continuity (each detection's `flux`/`se_flux`), on top of
+    # position and CRLB. Off by default -- it's an extra cue for a crowded
+    # field where position alone leaves ambiguous assignments, not a
+    # correction to a broken default.
+    link_with_flux: bool = False
     camera_kwargs: dict = field(default_factory=lambda: dict(DEFAULT_CAMERA_KWARGS))
     detect_kwargs: dict = field(default_factory=lambda: dict(DEFAULT_DETECT_KWARGS))
     calibration_kwargs: dict = field(default_factory=lambda: dict(DEFAULT_CALIBRATION_KWARGS))
@@ -284,11 +274,10 @@ class PipelineSession:
 
     points_df: Optional[pl.DataFrame] = None
     # One row per frame (`loctable.FRAME_SCHEMA`): detection counts, the
-    # out-of-band reject breakdown, the aggregate flux share, and the gain
-    # each frame was fitted with. Kept on the session rather than folded
-    # into `points_df` because it's a fact about the frame, not about any
-    # one detection -- and it's what makes "why did this frame find
-    # nothing" answerable after the fact.
+    # out-of-band reject breakdown, and the aggregate flux share. Kept on
+    # the session rather than folded into `points_df` because it's a fact
+    # about the frame, not about any one detection -- and it's what makes
+    # "why did this frame find nothing" answerable after the fact.
     frames_df: Optional[pl.DataFrame] = None
     camera_kwargs_used: Optional[dict] = None
     detect_kwargs_used: Optional[dict] = None
@@ -305,6 +294,7 @@ class PipelineSession:
     track_summary: Optional[dict] = None
     link_params: Optional[tracking.LinkParams] = None
     drop_aggregates_used: Optional[bool] = None
+    link_with_flux_used: Optional[bool] = None
     min_track_length_used: Optional[int] = None
     point_filters_used: Optional[FilterSpec] = None
     track_filters_used: Optional[FilterSpec] = None
@@ -800,6 +790,7 @@ def run_track_step(
     session: PipelineSession,
     min_track_length: int = 2,
     drop_aggregates: bool = True,
+    link_with_flux: bool = False,
     point_filters: Optional[FilterSpec] = None,
     track_filters: Optional[FilterSpec] = None,
     progress_callback: Optional[ProgressCallback] = None,
@@ -830,6 +821,13 @@ def run_track_step(
     `loctable.filter_aggregates`. `session.points_df` is left whole either
     way -- the filter applies to what the linker sees, not to what was
     saved, so the aggregate share stays auditable in `frames_df`.
+
+    `link_with_flux` (default False) additionally scores each candidate
+    link by brightness continuity -- each detection's `flux`/`se_flux` --
+    on top of position and CRLB (`spotsolve.tracking.link`'s
+    `brightness=True`). An extra cue for a crowded field where position
+    alone leaves ambiguous assignments; off by default because it isn't a
+    correction to a broken default, just a second signal to opt into.
 
     `point_filters` is the same idea generalized to any per-detection
     column (`{column: (lo, hi)}` -- see `filter_mask`): the Detect tab's
@@ -887,7 +885,7 @@ def run_track_step(
 
     _check_cancelled(cancel_event)
     report(1, 2, "linking")
-    tracks_df = tracking.link(link_input, link_params)
+    tracks_df = tracking.link(link_input, link_params, brightness=link_with_flux)
     n_tracks_linked = tracks_df["track_id"].n_unique() if tracks_df.height else 0
     if min_track_length > 1:
         tracks_df = tracks_df.filter(pl.len().over("track_id") >= min_track_length)
@@ -923,6 +921,7 @@ def run_track_step(
     session.tracks_df = tracks_df
     session.link_params = link_params
     session.drop_aggregates_used = drop_aggregates
+    session.link_with_flux_used = link_with_flux
     session.min_track_length_used = min_track_length
     session.point_filters_used = dict(point_filters) if point_filters else None
     session.track_filters_used = dict(track_filters) if track_filters else None
@@ -973,6 +972,7 @@ def session_manifest_extra(session: PipelineSession) -> dict:
         "n_linked_steps": ts.get("n_linked_steps"),
         "min_track_length": session.min_track_length_used,
         "drop_aggregates": session.drop_aggregates_used,
+        "link_with_flux": session.link_with_flux_used,
         "agg_ratio": session.agg_ratio_used,
         "n_points_dropped_as_aggregate": ts.get("n_points_dropped_as_aggregate"),
         # What the histogram filters were set to, as plain
@@ -1101,6 +1101,7 @@ def run_detect_track(
         session,
         params.min_track_length,
         drop_aggregates=params.drop_aggregates,
+        link_with_flux=params.link_with_flux,
         point_filters=params.point_filters,
         track_filters=params.track_filters,
         progress_callback=track_progress,

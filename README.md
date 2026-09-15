@@ -122,9 +122,12 @@ results_root = "results"
 # folder of separate acquisitions wants.
 sigma_init = 1.3
 min_track_length = 2
-# Measure these once for your camera -- gain omitted means "estimate per
-# frame", which works but drifts with the sample.
-camera_kwargs = { offset = 100.0, gain = 2.0, read_noise = 2.0 }
+# `offset` is the only camera fact spotsolve needs -- noise is measured
+# from each frame directly.
+camera_kwargs = { offset = 100.0 }
+# Score candidate links by brightness continuity (flux/se_flux) as well as
+# position and CRLB -- an extra cue for a crowded field. Off by default.
+link_with_flux = false
 # The same QC cuts the UI's histogram filters produce, as {column = [lo, hi]}.
 # Applied to what the linker sees and to which tracks are kept -- never to
 # points.parquet, which holds every detection either way.
@@ -137,10 +140,10 @@ result_id = "beads_dense"   # optional, defaults to the stem
 ```
 
 Interactive: open napari and use the "Experiment list" dock widget to browse a
-folder of raw images and work one image through **Detect** (camera, PSF width via
+folder of raw images and work one image through **Detect** (PSF width via
 Preview frame, detection knobs, then filters on what it found) and **Track**
-(link, then filters on the tracks), pressing *Save results* when the result is
-worth keeping. The "Diffusion analysis" widget then reads the tracks layer for
+(link, optionally with flux as a second link cue, then filters on the
+tracks), pressing *Save results* when the result is worth keeping. The "Diffusion analysis" widget then reads the tracks layer for
 MSD, Bayesian and per-track anisotropy fits, and offers the same histogram
 filters over per-track results — so a fitted `D` or `alpha` is filterable by the
 same drag as any other feature.

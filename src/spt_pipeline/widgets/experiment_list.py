@@ -1071,7 +1071,7 @@ class ExperimentListWidget(QWidget):
         summary = session.preview_summary or {}
         n_fits = summary.get("n_fits", 0)
         # A preview that found nothing is a real answer (wrong sigma,
-        # wrong camera gain, blank frame) -- say so in red rather than
+        # wrong offset, blank frame) -- say so in red rather than
         # leaving an empty status that reads like it never ran.
         self.params_panel.set_preview_result(summary, level="error" if n_fits == 0 else "ok")
         self._add_preview_layer(session)
@@ -1263,6 +1263,7 @@ class ExperimentListWidget(QWidget):
             session,
             self.params_panel.get_min_track_length(),
             self.params_panel.get_drop_aggregates(),
+            self.params_panel.get_link_with_flux(),
             # The Detect tab's cuts decide what the linker sees -- applied
             # here rather than to `points_df`, which keeps every detection
             # (see run_track_step's docstring).
@@ -1695,6 +1696,7 @@ def _run_track_worker(
     session: PipelineSession,
     min_track_length: int,
     drop_aggregates: bool,
+    link_with_flux: bool,
     point_filters: dict,
     emitter: _ProgressEmitter,
 ) -> PipelineSession:
@@ -1705,6 +1707,7 @@ def _run_track_worker(
         session,
         min_track_length,
         drop_aggregates=drop_aggregates,
+        link_with_flux=link_with_flux,
         point_filters=point_filters,
         progress_callback=progress_cb,
     )

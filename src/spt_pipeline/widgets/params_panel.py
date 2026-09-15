@@ -3,8 +3,8 @@ two tabbed pages -- **Detect** and **Track** -- each of which is a small
 detect -> filter -> finalize flow of its own, the shape Imaris and
 TrackMate use for spot detection:
 
-    Detect:  Camera -> PSF width -> Detect -> Filter
-             (camera + PSF + detection knobs, [Preview frame] /
+    Detect:  PSF width -> Detect -> Filter
+             (offset + PSF + detection knobs, [Preview frame] /
              [Run detect], then histogram filters on what it found)
     Track:   Link -> Filter -> Save
              (linking knobs, [Run tracking], histogram filters on the
@@ -42,10 +42,12 @@ something you see rather than something a median averages away.
 where there is nobody to look; the "calibrate per file" checkbox next to
 `sigma` is what routes a multi-file batch run back to it.
 
-The camera group moved here with it. It was on the Calibration tab because
-"what is this camera" is a calibration question, but it is read by
-preview, detect and calibrate alike -- and with calibration no longer a
-tab of its own, the one tab that always needs it is this one.
+The camera fact that's left -- `offset` -- moved here with it: it's read
+by preview, detect and calibrate alike, and with calibration no longer a
+tab of its own, the one tab that always needs it is this one. `gain` and
+`read_noise` are gone entirely: `spotsolve` now measures noise from each
+frame rather than taking a camera calibration as input, so there is
+nothing left to expose for them.
 `PipelineParamsWidget.get_camera_kwargs` remains the single source of
 truth that `ExperimentListWidget` forwards to every stage.
 
@@ -171,80 +173,12 @@ def _run_row(button_text: str) -> tuple[QPushButton, QLabel, QHBoxLayout]:
     return button, status, row
 
 
-class _CameraFields(QWidget):
-    """The camera's own calibration: `offset` (ADU), `gain` (ADU per
-    photoelectron) and `read_noise` (electrons rms). Not tuning knobs --
-    these convert the raw frame into the photoelectron counts
-    `spotsolve`'s Poisson likelihood is written in, so they are facts
-    about the chip that every stage must agree on.
-
-    `gain` has an "estimate per frame" checkbox, checked by default,
-    because that's what makes the detector usable on an uncharacterized
-    camera. It is a fallback and not a preference: a per-frame estimate
-    moves with the sample, which quietly rescales every flux in the movie
-    along with it. Uncheck it and enter a measured gain when you have one
-    -- the tooltip says so, since nothing in the output makes an estimated
-    gain look different from a measured one."""
-
-    def __init__(self, defaults: dict) -> None:
-        super().__init__()
-        self.offset = double_spinbox(
-            defaults["offset"], 0.0, 1e6, 1.0, decimals=2,
-            tooltip="Camera offset / baseline, ADU -- subtracted before the\n"
-            "photoelectron conversion.",
-        )
-        self.read_noise = double_spinbox(
-            defaults["read_noise"], 0.0, 1e4, 0.1, decimals=3,
-            tooltip="Read noise, electrons rms -- the variance floor added to\n"
-            "the Poisson term.",
-        )
-        self.gain = double_spinbox(
-            1.0, 1e-6, 1e6, 0.1, decimals=4,
-            tooltip="Gain, ADU per photoelectron. Prefer a measured value:\n"
-            "a per-frame estimate drifts with the sample and rescales every\n"
-            "reported flux with it.",
-        )
-        self.estimate_gain = QCheckBox("estimate per frame")
-        self.estimate_gain.setToolTip(
-            "Estimate gain from each frame instead of using a fixed value.\n"
-            "Usable default on an uncharacterized camera, but a measured gain\n"
-            "is strictly better -- see the gain field's tooltip."
-        )
-        self.estimate_gain.setChecked(defaults["gain"] is None)
-        if defaults["gain"] is not None:
-            self.gain.setValue(defaults["gain"])
-        self.estimate_gain.toggled.connect(self._on_estimate_gain_toggled)
-        self._on_estimate_gain_toggled(self.estimate_gain.isChecked())
-
-        gain_row = QHBoxLayout()
-        gain_row.setContentsMargins(0, 0, 0, 0)
-        gain_row.addWidget(self.gain)
-        gain_row.addWidget(self.estimate_gain)
-
-        form = QFormLayout()
-        form.setContentsMargins(4, 4, 4, 4)
-        form.addRow("offset (ADU)", self.offset)
-        form.addRow("gain (ADU/e-)", gain_row)
-        form.addRow("read noise (e- rms)", self.read_noise)
-        self.setLayout(form)
-
-    def _on_estimate_gain_toggled(self, checked: bool) -> None:
-        self.gain.setEnabled(not checked)
-
-    def get_kwargs(self) -> dict:
-        return dict(
-            offset=self.offset.value(),
-            gain=None if self.estimate_gain.isChecked() else self.gain.value(),
-            read_noise=self.read_noise.value(),
-        )
-
-
 class _DetectTab(QWidget):
-    """Four pages -- Camera, PSF width, Detect, Filter -- leafed through
-    with the `qtkit.StepPager` header: the camera, the PSF width, the
-    `spotsolve.localize` knobs plus scope and the two actions that produce
-    something to look at (preview one frame / run the range), then a
-    filter stack over what they found.
+    """Three pages -- PSF width, Detect, Filter -- leafed through with the
+    `qtkit.StepPager` header: the PSF width, the `spotsolve.localize`
+    knobs plus scope and the two actions that produce something to look at
+    (preview one frame / run the range), then a filter stack over what
+    they found.
 
     One consequence of paging worth knowing: the preview loop's two
     halves now sit on neighbouring pages -- "Use" on PSF width, the
@@ -256,12 +190,15 @@ class _DetectTab(QWidget):
     the whole reason this is a preview loop rather than
     `calibrate_sigma`.
 
-    Core: `sigma` with its preview loop (see this module's docstring --
-    this is what replaced the Calibration tab), `k_max` (most emitters one
-    box may be fitted with jointly -- the crowding ceiling), the seed and
-    birth thresholds, the aggregate cut, a frame range and a "restrict to ROI"
-    checkbox. Expert: `slack` and `band`, the width ranges a fit may take
-    and be reported at, both as multiples of `sigma` and echoed in px.
+    Core: `offset` (the one camera fact `spotsolve` still takes -- gain and
+    read noise are measured from each frame now), `sigma` with its preview
+    loop (see this module's docstring -- this is what replaced the
+    Calibration tab), `k_max` (most emitters one box may be fitted with
+    jointly -- the crowding ceiling), the LoG `threshold` (one cut, used
+    both for seeding a box and for trying another emitter inside one), the
+    aggregate cut, a frame range and a "restrict to ROI" checkbox. Expert:
+    `slack` and `band`, the width ranges a fit may take and be reported
+    at, both as multiples of `sigma` and echoed in px.
 
     There is no sparsity weight, iteration budget or refinement schedule
     to set: the search's accept/reject rule is a fixed deviance
@@ -278,7 +215,12 @@ class _DetectTab(QWidget):
         super().__init__()
         self._running = False
         self._measured_sigma: Optional[float] = None
-        self._camera = _CameraFields(DEFAULT_CAMERA_KWARGS)
+        self.offset = double_spinbox(
+            DEFAULT_CAMERA_KWARGS["offset"], 0.0, 1e6, 1.0, decimals=2,
+            tooltip="Camera offset / baseline, ADU -- subtracted before fitting.\n"
+            "The only camera fact spotsolve needs: noise is measured from\n"
+            "each frame, not from a gain/read-noise calibration.",
+        )
         d = DEFAULT_DETECT_KWARGS
         slack_lo, slack_hi = d["slack"]
         band_lo, band_hi = d["band"]
@@ -360,40 +302,32 @@ class _DetectTab(QWidget):
             tooltip="Most emitters one box may be fitted with jointly. The\n"
             "crowding ceiling: raise it for very dense fields, at some cost.",
         )
-        # Two cuts on the same LoG z-statistic, failing in opposite
-        # directions (see `DEFAULT_DETECT_KWARGS`): the seed cut decides
-        # what gets searched and is derived per frame by default; the birth
-        # cut decides what gets tried inside a box and is a constant.
-        self.seed_threshold = double_spinbox(
-            4.0, 0.0, 1e9, 0.1, decimals=2,
-            tooltip="Which peaks in the frame get a box searched around them, in sd\n"
-            "of the LoG filter's noise. Loose costs only time -- a seed still has\n"
-            "to pass the 10-nat test to become a detection -- while too strict\n"
-            "loses light that is never fitted. Leave 'derive from frame' checked\n"
-            "unless you have a reason.",
+        # One cut on the LoG z-statistic, used both for which peaks get a
+        # box searched around them and for whether a leftover residual
+        # peak inside a box gets tried as another emitter (see
+        # `DEFAULT_DETECT_KWARGS`) -- spotsolve used to split these into a
+        # seed cut and a birth cut, but one number does the same job.
+        self.threshold = double_spinbox(
+            spotsolve.PEAK_Z, 0.0, 1e9, 0.1, decimals=2,
+            tooltip="The LoG cut, in sd of the frame's own noise, for both getting a\n"
+            "box searched and for trying another emitter inside one. Raise it\n"
+            "for fewer false positives and speed; lower it toward 2.5 on faint,\n"
+            "sparse data. Leave 'use recommended' checked unless you have a reason.",
         )
-        self.derive_seed_threshold = QCheckBox("derive from frame")
-        self.derive_seed_threshold.setToolTip(
-            "Let the detector derive the seed cut from the frame size\n"
-            "(spotsolve's seed_threshold=None). Recommended."
+        self.derive_threshold = QCheckBox("use recommended")
+        self.derive_threshold.setToolTip(
+            "Let the detector use its own default cut, spotsolve's PEAK_Z\n"
+            "(threshold=None). Recommended."
         )
-        self.derive_seed_threshold.setChecked(d["seed_threshold"] is None)
-        if d["seed_threshold"] is not None:
-            self.seed_threshold.setValue(d["seed_threshold"])
-        self.derive_seed_threshold.toggled.connect(self._on_derive_seed_threshold_toggled)
-        self._on_derive_seed_threshold_toggled(self.derive_seed_threshold.isChecked())
-        seed_threshold_row = QHBoxLayout()
-        seed_threshold_row.setContentsMargins(0, 0, 0, 0)
-        seed_threshold_row.addWidget(self.seed_threshold)
-        seed_threshold_row.addWidget(self.derive_seed_threshold)
-
-        self.birth_threshold = double_spinbox(
-            d["birth_threshold"], 0.0, 1e9, 0.1, decimals=2,
-            tooltip="How strong a leftover residual peak inside a box must be before\n"
-            "another emitter is tried there, in sd of the LoG filter's noise.\n"
-            "Loose costs precision (false neighbours around bright spots) and\n"
-            "time. Raise toward 4 for speed; lower toward 2.5 on faint, sparse data.",
-        )
+        self.derive_threshold.setChecked(d["threshold"] is None)
+        if d["threshold"] is not None:
+            self.threshold.setValue(d["threshold"])
+        self.derive_threshold.toggled.connect(self._on_derive_threshold_toggled)
+        self._on_derive_threshold_toggled(self.derive_threshold.isChecked())
+        threshold_row = QHBoxLayout()
+        threshold_row.setContentsMargins(0, 0, 0, 0)
+        threshold_row.addWidget(self.threshold)
+        threshold_row.addWidget(self.derive_threshold)
 
         # Over-bright cut, relative to each frame's own median detection --
         # relative so that one number survives bleaching and illumination
@@ -409,9 +343,9 @@ class _DetectTab(QWidget):
 
         core_form = QFormLayout()
         core_form.setContentsMargins(0, 0, 0, 0)
+        core_form.addRow("offset (ADU)", self.offset)
         core_form.addRow("k_max", self.k_max)
-        core_form.addRow("seed threshold", seed_threshold_row)
-        core_form.addRow("birth threshold", self.birth_threshold)
+        core_form.addRow("threshold", threshold_row)
         core_form.addRow("aggregate ratio", self.agg_ratio)
 
         # What gets analyzed, not how -- kept in core (not expert) since
@@ -570,7 +504,6 @@ class _DetectTab(QWidget):
         detect_layout.addLayout(run_row)
 
         self.pager = StepPager()
-        self.pager.add_page("Camera", self._camera)
         self.pager.add_page("PSF width", psf_body)
         self.pager.add_page("Detect", detect_body)
         self.pager.add_page("Filter", self.filters)
@@ -645,8 +578,8 @@ class _DetectTab(QWidget):
 
     # -- detect -----------------------------------------------------------
 
-    def _on_derive_seed_threshold_toggled(self, checked: bool) -> None:
-        self.seed_threshold.setEnabled(not checked)
+    def _on_derive_threshold_toggled(self, checked: bool) -> None:
+        self.threshold.setEnabled(not checked)
 
     def _on_no_band_toggled(self, checked: bool) -> None:
         self.band_lo.setEnabled(not checked)
@@ -761,15 +694,12 @@ class _DetectTab(QWidget):
         return self.agg_ratio.value()
 
     def get_camera_kwargs(self) -> dict:
-        return self._camera.get_kwargs()
+        return dict(offset=self.offset.value())
 
     def get_detect_kwargs(self) -> dict:
         return dict(
             k_max=self.k_max.value(),
-            seed_threshold=(
-                None if self.derive_seed_threshold.isChecked() else self.seed_threshold.value()
-            ),
-            birth_threshold=self.birth_threshold.value(),
+            threshold=None if self.derive_threshold.isChecked() else self.threshold.value(),
             slack=(self.slack_lo.value(), self.slack_hi.value()),
             band=None if self.no_band.isChecked() else (self.band_lo.value(), self.band_hi.value()),
         )
@@ -787,6 +717,12 @@ class _TrackingTab(QWidget):
     each detection's own `se_y`/`se_x`. So there is no gate, no search
     radius and no cost weighting to set here -- only what to feed it and
     what to keep afterwards.
+
+    `link_with_flux` is the one optional extra: it adds each detection's
+    `flux`/`se_flux` as a second scoring cue (brightness continuity),
+    alongside position and CRLB. Off by default -- position/CRLB alone is
+    the well-tested path; flux helps most in a crowded field where two
+    candidates sit at nearly the same distance but different brightness.
 
     `min_track_length` filters the final `tracks_df` (see
     `pipeline.run_track_step`) -- default 2 drops bare singletons (a
@@ -825,6 +761,13 @@ class _TrackingTab(QWidget):
             "emitter, and its position is a flux-weighted compromise between\n"
             "whatever is inside it. points.parquet keeps them either way."
         )
+        self.link_with_flux = QCheckBox("use flux as a link cue")
+        self.link_with_flux.setToolTip(
+            "Also score candidate links by brightness continuity (each\n"
+            "detection's flux/se_flux), alongside position and CRLB. Off by\n"
+            "default -- an extra cue for a crowded field where two candidates\n"
+            "sit at nearly the same distance but different brightness."
+        )
         form = QFormLayout()
         form.setContentsMargins(0, 0, 0, 0)
         form.addRow("min track length", self.min_track_length)
@@ -838,6 +781,7 @@ class _TrackingTab(QWidget):
         link_layout.setSpacing(2)
         link_layout.addLayout(form)
         link_layout.addWidget(self.drop_aggregates)
+        link_layout.addWidget(self.link_with_flux)
         link_layout.addWidget(
             note_label(
                 "No gate to set: linking parameters are measured from the movie. "
@@ -909,6 +853,9 @@ class _TrackingTab(QWidget):
     def get_drop_aggregates(self) -> bool:
         return self.drop_aggregates.isChecked()
 
+    def get_link_with_flux(self) -> bool:
+        return self.link_with_flux.isChecked()
+
 
 class PipelineParamsWidget(QWidget):
     """Tabbed `DetectTrackParams` form -- Detect / Track, each a
@@ -970,6 +917,7 @@ class PipelineParamsWidget(QWidget):
             min_track_length=self._tracking.get_min_track_length(),
             agg_ratio=self._detect.get_agg_ratio(),
             drop_aggregates=self._tracking.get_drop_aggregates(),
+            link_with_flux=self._tracking.get_link_with_flux(),
             camera_kwargs=self._detect.get_camera_kwargs(),
             detect_kwargs=self._detect.get_detect_kwargs(),
             calibration_kwargs=dict(DEFAULT_CALIBRATION_KWARGS),
@@ -1001,8 +949,8 @@ class PipelineParamsWidget(QWidget):
         return self._detect.get_preview_frame_index()
 
     def get_camera_kwargs(self) -> dict:
-        """The one source of truth for `offset`/`gain`/`read_noise`, shared
-        by preview, detect and (headless) calibration."""
+        """The one source of truth for `offset`, shared by preview, detect
+        and (headless) calibration."""
         return self._detect.get_camera_kwargs()
 
     def get_detect_kwargs(self) -> dict:
@@ -1048,6 +996,9 @@ class PipelineParamsWidget(QWidget):
 
     def get_drop_aggregates(self) -> bool:
         return self._tracking.get_drop_aggregates()
+
+    def get_link_with_flux(self) -> bool:
+        return self._tracking.get_link_with_flux()
 
     def set_track_status(self, text: str, level: str = "neutral") -> None:
         self._tracking.set_status(text, level)
