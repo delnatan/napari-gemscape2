@@ -111,11 +111,20 @@ DEFAULT_CAMERA_KWARGS = dict(
 # measurement showed one number (`PEAK_Z`) does the same job. `None`
 # (recommended) uses that default; raise it for fewer false positives and
 # speed, lower it toward 2.5 for faint, sparse data.
+#
+# `selection`/`count_penalty` pick the per-box emitter-count rule:
+# "fixed" (default) is the existing greedy 10-nat cost, unaffected by
+# `count_penalty=0.0` -- i.e. today's behavior, unchanged. "bic" compares
+# background-only and multi-emitter fits with an experimental
+# BIC-inspired score instead; see spotsolve's docs/COUNT_SELECTION.md
+# before trusting a `count_penalty` value against real data.
 DEFAULT_DETECT_KWARGS = dict(
     k_max=spotsolve.K_MAX,
     threshold=None,
     slack=spotsolve.SLACK,
     band=spotsolve.BAND,
+    selection="fixed",
+    count_penalty=0.0,
 )
 
 # Forwarded to `spotsolve.localize_aguet`/`localize_aguet_stack` as **kwargs

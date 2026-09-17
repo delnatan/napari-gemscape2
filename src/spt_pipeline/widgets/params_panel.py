@@ -404,6 +404,41 @@ class _DetectTab(QWidget):
         threshold_row.addWidget(self.threshold)
         threshold_row.addWidget(self.derive_threshold)
 
+        # spotsolve's per-emitter-count rule: "fixed" keeps the existing
+        # greedy 10-nat cost (count_penalty=0 leaves that behavior exactly
+        # as it was); "bic" compares background-only and multi-emitter fits
+        # with an experimental BIC-inspired score instead (spotsolve's
+        # docs/COUNT_SELECTION.md). Multi-emitter only -- Aguet fits one
+        # screened candidate at a time, so there is no count to select.
+        self.selection = QComboBox()
+        self.selection.addItem("Fixed (default)", "fixed")
+        self.selection.addItem("BIC (experimental)", "bic")
+        self.selection.setToolTip(
+            "How the detector decides how many emitters one box holds.\n\n"
+            "Fixed: the existing greedy 10-nat rule.\n"
+            "BIC (experimental): compares background-only and multi-emitter\n"
+            "fits by an information-criterion-style score instead of a fixed\n"
+            "cost. Not calibrated evidence or a false-positive rate -- slower,\n"
+            "and still being evaluated on faint/blurred data."
+        )
+        self.selection.currentIndexChanged.connect(self._on_selection_changed)
+        self.count_penalty = double_spinbox(
+            0.0, 0.0, 1e6, 0.5, decimals=2,
+            tooltip="Extra cost per emitter added to the count rule above --\n"
+            "must be finite and non-negative. Higher values favor fewer\n"
+            "emitters. Adds to the 10-nat cost in Fixed mode too (0 leaves\n"
+            "Fixed at its original behavior); the value that meets a given\n"
+            "false-positive budget in BIC mode is data-dependent -- see\n"
+            "spotsolve's docs/COUNT_SELECTION.md before trusting one number.",
+        )
+        self._selection_row = selection_row = QHBoxLayout()
+        selection_row.setContentsMargins(0, 0, 0, 0)
+        selection_row.addWidget(self.selection)
+        selection_row.addWidget(QLabel("penalty"))
+        selection_row.addWidget(self.count_penalty)
+        self._selection_note = note_label("")
+        self._on_selection_changed()
+
         # Aguet's one core tuning knob: the per-pixel LoG screening level
         # (not a frame-wide false discovery rate -- see spotsolve.aguet).
         # Plays the same "main cut" role `threshold` plays for the
@@ -589,6 +624,8 @@ class _DetectTab(QWidget):
         expert_form.addRow("band (× sigma)", band_row)
         expert_form.addRow("", self._band_note)
         expert_form.addRow("", self.no_band)
+        expert_form.addRow("count selection", selection_row)
+        expert_form.addRow("", self._selection_note)
         expert_form.addRow("boxsize (px)", self.boxsize)
         expert_form.addRow("max iterations", self.itermax)
         self._update_band_note()
@@ -713,6 +750,8 @@ class _DetectTab(QWidget):
         self.expert_form.setRowVisible(self._band_row, not sparse)
         self.expert_form.setRowVisible(self._band_note, not sparse)
         self.expert_form.setRowVisible(self.no_band, not sparse)
+        self.expert_form.setRowVisible(self._selection_row, not sparse)
+        self.expert_form.setRowVisible(self._selection_note, not sparse)
         self.expert_form.setRowVisible(self.boxsize, sparse)
         self.expert_form.setRowVisible(self.itermax, sparse)
         self._detector_note.setText(
@@ -729,6 +768,15 @@ class _DetectTab(QWidget):
         self.band_lo.setEnabled(not checked)
         self.band_hi.setEnabled(not checked)
         self._update_band_note()
+
+    def _on_selection_changed(self) -> None:
+        """BIC is still experimental (spotsolve's docs/COUNT_SELECTION.md)
+        -- say so right under the control, not only in its tooltip."""
+        self._selection_note.setText(
+            "Experimental: not calibrated evidence or a false-positive rate."
+            if self.selection.currentData() == "bic"
+            else ""
+        )
 
     def _on_run_button_clicked(self) -> None:
         if self._running:
@@ -852,6 +900,8 @@ class _DetectTab(QWidget):
             threshold=None if self.derive_threshold.isChecked() else self.threshold.value(),
             slack=(self.slack_lo.value(), self.slack_hi.value()),
             band=None if self.no_band.isChecked() else (self.band_lo.value(), self.band_hi.value()),
+            selection=self.selection.currentData(),
+            count_penalty=self.count_penalty.value(),
         )
 
 
