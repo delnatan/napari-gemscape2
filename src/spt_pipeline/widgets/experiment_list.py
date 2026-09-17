@@ -117,6 +117,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from spt_pipeline import units
 from spt_pipeline.results import (
     build_manifest,
     result_dir_for,
@@ -150,6 +151,7 @@ from spt_pipeline.viewer import (
     add_image_layer,
     add_points_layer,
     add_tracks_layer,
+    layer_units_metadata,
     load_image_display,
     load_result_display,
     set_points_layer_data,
@@ -428,6 +430,11 @@ class ExperimentListWidget(QWidget):
         # rate a handle emits, and queuing one per event made dragging lag.
         self._points_redraw = _debounce_timer(self, self._update_points_layer)
         self._tracks_redraw = _debounce_timer(self, self._update_tracks_layer)
+        # A scale spinbox emits per arrow-click and per keystroke, and
+        # applying one re-aggregates every track metric and redraws the
+        # tracks layer -- so it lands once the typing stops, on a longer
+        # fuse than a filter drag (which is a gesture, not an edit).
+        self._scale_change = _debounce_timer(self, self._apply_image_scale_change, msec=300)
 
         # Showing a row's image (or bundle) runs in a worker, started after
         # a short pause in row changes so that arrowing down the list does
@@ -488,6 +495,7 @@ class ExperimentListWidget(QWidget):
         self._on_roi_layers_changed()
         self.params_panel.pointFiltersChanged.connect(self._on_point_filters_changed)
         self.params_panel.trackFiltersChanged.connect(self._on_track_filters_changed)
+        self.params_panel.imageScaleChanged.connect(self._on_image_scale_changed)
 
         self.progress_label = QLabel("")
         self.progress_label.setWordWrap(True)
@@ -612,6 +620,10 @@ class ExperimentListWidget(QWidget):
         self.params_panel.clear_filters()
         self.params_panel.set_point_filter_source(None)
         self.params_panel.set_track_filter_source(None)
+        # Blanked rather than left showing the row being left -- the load
+        # that will fill it in is debounced, and a stale pixel size on
+        # screen is worse than none.
+        self.params_panel.set_image_metadata(None)
         self.list_view.viewport().update()
 
         # Blank the viewer now rather than when the load lands: until then
@@ -630,6 +642,7 @@ class ExperimentListWidget(QWidget):
         self._tracks_layer = None
         self._points_redraw.stop()
         self._tracks_redraw.stop()
+        self._scale_change.stop()
 
     def _confirm_leave_session(self) -> bool:
         """Whether it is fine to drop the current session: True straight
@@ -715,6 +728,10 @@ class ExperimentListWidget(QWidget):
         image = loaded.image if isinstance(loaded, ResultDisplay) else loaded
         self._loaded = (item, image)
         self.params_panel.set_frame_bounds(image.image.shape[0])
+        # What the file says about itself, shown on selection rather than
+        # only discovered when a run fails on it -- see
+        # `PipelineParamsWidget.set_image_metadata`.
+        self.params_panel.set_image_metadata(image.metadata)
         if isinstance(loaded, ResultDisplay):
             show_result(self.viewer, loaded)
             self._restore_filters_from_bundle(loaded)
@@ -810,7 +827,16 @@ class ExperimentListWidget(QWidget):
         emitter.updated.connect(self._on_progress)
 
         worker = _run_pipeline_worker(
-            entry.image_path, self.params_panel.get_params(), self._cancel_event, emitter
+            entry.image_path,
+            self.params_panel.get_params(),
+            self._cancel_event,
+            emitter,
+            # A batch run honors the same override as a stepwise one --
+            # a folder of acquisitions with no recorded pixel size is
+            # exactly the case the override exists for, and it would be
+            # odd for "Run selected" to be the one path that ignores it.
+            self.params_panel.get_pixel_size_um(),
+            self.params_panel.get_dt_s(),
         )
         worker.returned.connect(lambda result, item=item: self._on_run_finished(item, result))
         worker.errored.connect(lambda exc, item=item: self._on_run_error(item, exc))
@@ -896,15 +922,26 @@ class ExperimentListWidget(QWidget):
             # The row's load never landed, so its image isn't on screen.
             # Added under whatever is there (an ROI drawn meanwhile, say)
             # rather than clearing it away.
-            session = load_session(item.entry.image_path)
+            session = load_session(
+                item.entry.image_path,
+                pixel_size_um=self.params_panel.get_pixel_size_um(),
+                dt_s=self.params_panel.get_dt_s(),
+            )
             layer = add_image_layer(self.viewer, session.image, item.entry.image_path.stem)
             self.viewer.layers.move(self.viewer.layers.index(layer), 0)
         else:
             session = load_session(
-                item.entry.image_path, stack=(loaded.image, loaded.pixel_size_um, loaded.dt_s)
+                item.entry.image_path,
+                pixel_size_um=self.params_panel.get_pixel_size_um(),
+                dt_s=self.params_panel.get_dt_s(),
+                stack=(loaded.image, loaded.metadata),
             )
         self._session = session
         self._session_item = item
+        # The session is what the stages actually run with, so the banner
+        # follows it: for a row whose bundle was on screen a moment ago,
+        # that swaps the manifest's recorded numbers back to the file's.
+        self.params_panel.set_image_metadata(session.metadata)
         return session
 
     def _roi_layers(self) -> list[Shapes]:
@@ -1294,9 +1331,12 @@ class ExperimentListWidget(QWidget):
         # linking is suspect, and neither number alone would show it.
         dropped = summary.get("n_points_dropped_by_filter") or 0
         filtered = f"  ({dropped} points cut by filters)" if dropped else ""
+        # Units from `spt_pipeline.units` rather than spelled out here, so
+        # this line, the diffusion panel's fit summaries and every plot
+        # axis say µm²/s the same way.
         self.params_panel.set_track_status(
-            f"{n_tracks} tracks  D~{summary.get('D_est_um2_s', 0.0):.4f} um^2/s "
-            f"(linker fit {summary.get('D_link_um2_s', 0.0):.4f}, "
+            f"{n_tracks} tracks  D ≈ {units.fmt(summary.get('D_est_um2_s'), 'D_est_um2_s')} "
+            f"(linker fit {units.fmt(summary.get('D_link_um2_s'), 'D_link_um2_s')}, "
             f"immobile {summary.get('immobile_fraction', 0.0):.0%}){filtered}\n{message}",
             level=level,
         )
@@ -1356,6 +1396,64 @@ class ExperimentListWidget(QWidget):
             )
             self.params_panel.set_save_enabled(False)
 
+    def _on_image_scale_changed(self) -> None:
+        """The override changed -- apply it once the edit settles."""
+        self._scale_change.start()
+
+    def _apply_image_scale_change(self) -> None:
+        """The pixel size / frame interval override changed.
+
+        For the next run there is nothing to do -- `_ensure_session` and
+        the batch worker both read the panel when they start. What needs
+        handling is a session already holding results, since those were
+        computed at the old scale: `points_df`'s `t`/`y_um`/`se_*_um`
+        columns were derived by `loctable` at detect time and the track
+        summary's D/density/crowding at link time. Linking itself is
+        unaffected (it works in pixels), so the tracks are still the same
+        tracks -- but the bundle would be internally inconsistent if saved
+        now, which is why this re-scales what it cheaply can, says what it
+        can't, and blocks the save until a re-run.
+        """
+        self._scale_change.stop()
+        session = self._session
+        if session is None:
+            return
+        pixel_size_um, dt_s = self.params_panel.get_effective_image_scale()
+        if pixel_size_um is None or dt_s is None:
+            return
+        if (pixel_size_um, dt_s) == (session.pixel_size_um, session.dt_s):
+            return
+        session.pixel_size_um = pixel_size_um
+        session.dt_s = dt_s
+
+        # Layer metadata first: the diffusion panel reads its conversion
+        # factors from there, and it is reading the layers right now.
+        metadata = self._session_layer_metadata()
+        for layer in (self._live(self._points_layer), self._live(self._tracks_layer)):
+            if layer is not None:
+                layer.metadata.update(metadata)
+
+        if session.tracks_df is not None:
+            # Per-track metrics (`mean_step_um`, `duration_s`) are derived
+            # from the scale, so they and the histograms over them are
+            # recomputed -- a cut on "mean step < 0.2 um" has to mean the
+            # new µm.
+            self._track_cache = None
+            self.params_panel.set_track_filter_source(self._track_tables()[0])
+            self._update_tracks_layer(new_data=True)
+        if session.points_df is not None:
+            self._mark_unsaved()
+            self.params_panel.set_save_enabled(False)
+            self.params_panel.set_detect_status(
+                "scale changed — re-run detect so the saved table's µm and s columns match",
+                level="caution",
+            )
+            if session.tracks_df is not None:
+                self.params_panel.set_track_status(
+                    "scale changed — re-run detect and tracking to update D and the crowding check",
+                    level="caution",
+                )
+
     def _on_track_filters_changed(self) -> None:
         self._tracks_redraw.start()
         if self._session is not None and self._session.tracks_df is not None:
@@ -1369,13 +1467,11 @@ class ExperimentListWidget(QWidget):
         widgets/diffusion_panel.py) works the same on a preview as on a
         loaded bundle."""
         session = self._session
-        return {
-            "pixel_size_um": session.pixel_size_um if session is not None else 1.0,
-            "dt_s": session.dt_s if session is not None else 1.0,
-            "result_dir": str(self._session_item.entry.result_dir.resolve())
-            if self._session_item is not None
-            else None,
-        }
+        return layer_units_metadata(
+            session.pixel_size_um if session is not None else None,
+            session.dt_s if session is not None else None,
+            self._session_item.entry.result_dir if self._session_item is not None else None,
+        )
 
     def _update_points_layer(self, new_data: bool = False) -> None:
         """Show only the detections that pass the Detect tab's cuts --
@@ -1579,6 +1675,18 @@ class ExperimentListWidget(QWidget):
         params = loaded.manifest.get("params", {}) or {}
         pixel_size_um = params.get("pixel_size_um") or 1.0
         dt_s = params.get("dt_s") or 1.0
+        # The bundle's own recorded conversion factors, which are what its
+        # tables are in -- not necessarily what the file would parse as
+        # today (a re-saved bundle may have been run with an override, and
+        # a reader fix can change what the file yields). Showing the
+        # manifest's values while a saved bundle is on screen keeps the
+        # banner describing the data actually displayed.
+        self.params_panel.set_image_metadata(
+            None,
+            source="bundle",
+            pixel_size_um=params.get("pixel_size_um"),
+            dt_s=params.get("dt_s"),
+        )
 
         self.params_panel.set_point_filter_source(points_df if points_df.height else None)
         metrics = (
@@ -1634,12 +1742,19 @@ def _run_pipeline_worker(
     params: DetectTrackParams,
     cancel_event: threading.Event,
     emitter: _ProgressEmitter,
+    pixel_size_um: Optional[float] = None,
+    dt_s: Optional[float] = None,
 ):
     def progress_cb(done: int, total: int, stage: str) -> None:
         emitter.updated.emit(done, total, stage)
 
     return run_detect_track(
-        image_path, params=params, progress_callback=progress_cb, cancel_event=cancel_event
+        image_path,
+        pixel_size_um=pixel_size_um,
+        dt_s=dt_s,
+        params=params,
+        progress_callback=progress_cb,
+        cancel_event=cancel_event,
     )
 
 

@@ -91,6 +91,64 @@ multiples of the initial guess and not absolute pixels, so changing `sigma` move
 both windows with it — the Detect tab prints the resulting px window underneath
 them for that reason.
 
+## Units, and where they come from
+
+Two numbers turn this pipeline's pixels and frames into physics: the pixel size
+and the frame interval. Everything physical is those two multiplied through —
+`x_um`, `duration_s`, `mean_step_um`, every fitted `D` and `K` — so both are read
+off the image file's own metadata and **shown, with their provenance, before
+anything runs**: the line above the Detect/Track tabs says e.g.
+`from file: 500 frames · 0.1083 µm/px · 0.0302 s/frame`, and its tooltip says
+which metadata field each came from. A headless run prints the same line
+(`spt detect-track`), and `manifest.json` records it (`pixel_size_um_source`,
+`dt_s_source`, `metadata_notes`), so a bundle says not just what pixel size it
+used but where that came from.
+
+A reader refuses to guess rather than defaulting quietly, because a wrong
+calibration produces a table that looks completely normal:
+
+- A TIFF's `XResolution` is "pixels per unit" and the tag itself never says
+  microns. The unit comes from ImageJ's own `unit` field or from
+  `ResolutionUnit` (inch/cm only), or from the OME header when there is one,
+  which is preferred since it states a unit per axis. With no usable unit there
+  is **no pixel size** — an inch-calibrated file used to read as microns, i.e.
+  every physical column out by 25400×.
+- An `.ims` with no recorded extents yields a voxel size of 1/width from
+  ImarisReader's defaults — plausible-looking and not a calibration. That now
+  reads as missing (`ImarisReader.voxel_size_known`).
+- An `.nd2`'s exactly-1×1 µm voxel is that reader's placeholder, so it reads as
+  missing too.
+- A recorded-but-zero frame interval reads as missing rather than dividing into
+  `D` later, and non-square pixels or irregular frame timing (measured from
+  per-frame timestamps) are flagged as notes rather than averaged away silently.
+
+`pipeline.load_session` then raises naming what is missing and what the file did
+say, instead of failing downstream — and the interactive panel turns that line
+red before a button is pressed.
+
+**Overriding it.** The same line folds open into "Image metadata": where each
+value came from, and two boxes to supply your own when the file is silent or
+wrong. It unfolds itself when a value is missing, since that is the one moment
+it is the next thing to use; otherwise it stays out of the way. The override is
+sticky across images — a folder is usually one session — and never silent about
+it: while in force the line reads `overridden: … — file says …` in amber, and
+the bundle records `pixel_size_um_source: "given explicitly (file said: …)"`.
+Both the stepwise buttons and "Run selected" honor it, as does a config's
+`pixel_size_um`/`dt_s` per `[[inputs]]` entry for headless runs.
+
+Changing the scale after a detect or link run re-derives what it cheaply can
+(per-track metrics, the layers' units) and blocks *Save* until you re-run —
+`points.parquet`'s `t`/`y_um`/`se_*_um` columns are derived at detect time, so a
+bundle saved across a scale change would be internally inconsistent.
+
+In results, `spt_pipeline.units` is the single source of truth for what each
+column is measured in: it labels the tracks-pane headers (`D_classical [µm²/s]`,
+`se_x_max [px]`, `se_x_um_max [µm]`), the filter rows' tooltips, the spatial
+map's color scale, every fit readout, and every plot axis — the last in the same
+mathtext style diffusionkit's own figures use, so a joint plot and an MSD plot
+label the same quantity the same way. A column whose unit isn't registered is
+shown bare rather than guessed at.
+
 ## Setup
 
 The project has its own `uv`-managed virtual environment in `.venv`. `spotsolve`

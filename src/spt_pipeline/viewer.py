@@ -9,6 +9,13 @@ sites shows up as the display changing under the user at save time. The
 `add_image_layer`/`add_points_layer`/`add_tracks_layer` helpers here are
 what both sides call, so a preview layer and its final counterpart are
 pixel-for-pixel the same but for the name.
+
+Layer *coordinates* are pixels throughout -- no `scale=` is set on any
+layer, so points and tracks land on the image they were detected in.
+The physical units live in the layers' `metadata` instead
+(`layer_units_metadata`), which is what a downstream widget converts with
+and, just as importantly, what tells it whether there was a real
+calibration to convert by.
 """
 
 from __future__ import annotations
@@ -21,6 +28,7 @@ from typing import Optional
 import numpy as np
 import polars as pl
 
+from spt_pipeline.io_formats import StackMetadata
 from spt_pipeline.results import load_result
 from spt_pipeline.pipeline import load_stack, track_features_df
 from spt_pipeline.rois import roi_to_shapes_kwargs
@@ -74,6 +82,47 @@ DETECTED_POINTS_STYLE = dict(
 # napari's layer controls for an Image layer without changing what the
 # data is.
 IMAGE_DISPLAY_PROPERTIES = ("colormap", "contrast_limits", "gamma")
+
+
+def layer_units_metadata(
+    pixel_size_um: Optional[float], dt_s: Optional[float], result_dir=None
+) -> dict:
+    """The `metadata=` dict every points/tracks layer this app adds
+    carries: the two conversion factors, whether they are real, and which
+    bundle the layer belongs to.
+
+    `pixel_size_um`/`dt_s` ride along so a widget reading either layer
+    (see `widgets/diffusion_panel.py`, which reads the "tracks" layer) can
+    convert its pixel-space data straight to physical units and write
+    results back to the right bundle -- no separate "load a result" step
+    of its own.
+
+    `units_known` is the part that matters for honesty: a layer whose
+    source never recorded a pixel size still needs *some* factor for the
+    conversion to run at all, and 1.0 is the only neutral choice -- but
+    the resulting columns are then pixels and frames wearing `_um` and
+    `_s` names. The flag is how a reader can say so out loud instead of
+    presenting px²/frame as µm²/s (see
+    `DiffusionAnalysisWidget._update_source_label`).
+    """
+    known = _positive_or_none(pixel_size_um) is not None and _positive_or_none(dt_s) is not None
+    return {
+        "pixel_size_um": _positive_or_none(pixel_size_um) or 1.0,
+        "dt_s": _positive_or_none(dt_s) or 1.0,
+        "units_known": known,
+        "result_dir": str(Path(result_dir).resolve()) if result_dir is not None else None,
+    }
+
+
+def _positive_or_none(value) -> Optional[float]:
+    """A conversion factor only counts if it is a finite positive number:
+    a manifest/layer carrying 0.0 or None for one is carrying no value,
+    and multiplying by it would be worse than admitting that."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if np.isfinite(number) and number > 0 else None
 
 
 def percentile_contrast_limits(image, percentiles=IMAGE_PERCENTILES) -> tuple[float, float]:
@@ -228,9 +277,16 @@ class ImageDisplay:
 
     path: Path
     image: np.ndarray
-    pixel_size_um: Optional[float]
-    dt_s: Optional[float]
+    metadata: StackMetadata
     contrast_limits: tuple[float, float]
+
+    @property
+    def pixel_size_um(self) -> Optional[float]:
+        return self.metadata.pixel_size_um
+
+    @property
+    def dt_s(self) -> Optional[float]:
+        return self.metadata.dt_s
 
 
 @dataclass
@@ -251,12 +307,11 @@ def load_image_display(image_path: str | Path, channel: int = 0, z_index: int = 
     slow part of showing an image, and doing them on the GUI thread froze
     the file list on every row change."""
     image_path = Path(image_path)
-    image, pixel_size_um, dt_s = load_stack(image_path, channel=channel, z_index=z_index)
+    image, metadata = load_stack(image_path, channel=channel, z_index=z_index)
     return ImageDisplay(
         path=image_path,
         image=image,
-        pixel_size_um=pixel_size_um,
-        dt_s=dt_s,
+        metadata=metadata,
         contrast_limits=percentile_contrast_limits(image),
     )
 
@@ -304,19 +359,11 @@ def show_result(viewer, loaded: ResultDisplay) -> None:
     points_df, tracks_df, rois = loaded.points_df, loaded.tracks_df, loaded.rois
     params = loaded.manifest.get("params", {})
 
-    pixel_size_um = params.get("pixel_size_um") or 1.0
-    dt_s = params.get("dt_s") or 1.0
-    # pixel_size_um/dt_s/result_dir ride along as layer metadata on both
-    # the "points" and "tracks" layers so a widget reading either one (see
-    # widgets/diffusion_panel.py, which reads the "tracks" layer) can
-    # convert its data straight to physical units and write results back
-    # to the right bundle -- no separate "load a result" step of its
-    # own.
-    layer_metadata = {
-        "pixel_size_um": pixel_size_um,
-        "dt_s": dt_s,
-        "result_dir": str(Path(result_dir).resolve()),
-    }
+    layer_metadata = layer_units_metadata(
+        params.get("pixel_size_um"), params.get("dt_s"), result_dir
+    )
+    pixel_size_um = layer_metadata["pixel_size_um"]
+    dt_s = layer_metadata["dt_s"]
 
     add_points_layer(viewer, points_df, "points", layer_metadata)
     add_tracks_layer(viewer, tracks_df, pixel_size_um, dt_s, "tracks", layer_metadata)

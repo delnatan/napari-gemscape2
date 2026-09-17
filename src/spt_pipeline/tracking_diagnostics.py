@@ -41,6 +41,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from spt_pipeline import units
+
 
 def rms_step_um(D_um2_s: float, dt_s: float) -> float:
     """2D root-mean-square displacement per frame interval, from the
@@ -111,8 +113,8 @@ def check_resolvability(D_um2_s: float, dt_s: float, density_um2: float) -> dict
         verdict = "unresolvable"
         message = (
             f"crowding ratio {ratio:.2f} >= {RATIO_UNRESOLVABLE}: the step "
-            f"({step:.3f} um) is comparable to or larger than the mean "
-            f"nearest-neighbor spacing ({spacing:.3f} um) -- frame-to-frame "
+            f"({step:.3f} {units.UM}) is comparable to or larger than the mean "
+            f"nearest-neighbor spacing ({spacing:.3f} {units.UM}) -- frame-to-frame "
             "identity is expected to be frequently ambiguous. Increase frame "
             f"rate (lower dt) and/or lower labeling density. {_LINKER_CAVEAT}"
         )
@@ -120,16 +122,16 @@ def check_resolvability(D_um2_s: float, dt_s: float, density_um2: float) -> dict
         verdict = "caution"
         message = (
             f"crowding ratio {ratio:.2f} in [{RATIO_CAUTION}, "
-            f"{RATIO_UNRESOLVABLE}): the step ({step:.3f} um) is a non-trivial "
-            f"fraction of the mean nearest-neighbor spacing ({spacing:.3f} um) "
+            f"{RATIO_UNRESOLVABLE}): the step ({step:.3f} {units.UM}) is a non-trivial "
+            f"fraction of the mean nearest-neighbor spacing ({spacing:.3f} {units.UM}) "
             f"-- some identity swaps expected in crowded regions. {_LINKER_CAVEAT}"
         )
     else:
         verdict = "ok"
         message = (
             f"crowding ratio {ratio:.2f} < {RATIO_CAUTION}: the step "
-            f"({step:.3f} um) is small relative to the mean nearest-neighbor "
-            f"spacing ({spacing:.3f} um) -- crowding is not expected to be the "
+            f"({step:.3f} {units.UM}) is small relative to the mean nearest-neighbor "
+            f"spacing ({spacing:.3f} {units.UM}) -- crowding is not expected to be the "
             "limiting factor."
         )
 

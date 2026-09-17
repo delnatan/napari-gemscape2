@@ -82,7 +82,7 @@ import polars as pl
 import spotsolve
 from spotsolve import loctable, tracking
 
-from spt_pipeline.io_formats import load_stack
+from spt_pipeline.io_formats import StackMetadata, load_stack
 from spt_pipeline.tracking_diagnostics import check_resolvability
 
 # The camera's own calibration, forwarded to every `spotsolve.localize`/
@@ -295,6 +295,12 @@ class PipelineSession:
     dt_s: float
     channel: int = 0
     z_index: int = 0
+    # What the file itself said (`io_formats.StackMetadata`), kept beside
+    # the two numbers actually in force: `pixel_size_um`/`dt_s` above may
+    # be a caller's explicit override, and the difference between "read
+    # from the file" and "supplied by hand" is exactly what the UI shows
+    # and `session_manifest_extra` records.
+    metadata: Optional[StackMetadata] = None
 
     sigma: Optional[float] = None
     calib_summary: Optional[dict] = None
@@ -349,22 +355,34 @@ def load_session(
     dt_s: Optional[float] = None,
     channel: int = 0,
     z_index: int = 0,
-    stack: Optional[tuple[np.ndarray, Optional[float], Optional[float]]] = None,
+    stack: Optional[tuple[np.ndarray, StackMetadata]] = None,
 ) -> PipelineSession:
     """Load a timelapse and start a fresh (un-calibrated, un-detected,
     un-tracked) `PipelineSession`. `stack` is an already-read
     `load_stack(image_path, channel, z_index)` result, so a caller that
     has the image in memory (the UI, which loaded it to display it) does
-    not read it a second time."""
+    not read it a second time.
+
+    Raises if the file records no pixel size / frame interval and none was
+    passed: every physical column downstream is those two numbers
+    multiplied through, so there is no safe default to fall back on. The
+    message names which one is missing and what the file did say about
+    it (`StackMetadata.detail`), since "this .tif has no calibration" is
+    a fixable problem and "pixel_size_um/dt_s not found" was not."""
     if stack is None:
         stack = load_stack(image_path, channel=channel, z_index=z_index)
-    im, file_pixel_size_um, file_dt_s = stack
-    pixel_size_um = pixel_size_um if pixel_size_um is not None else file_pixel_size_um
-    dt_s = dt_s if dt_s is not None else file_dt_s
+    im, metadata = stack
+    pixel_size_um = pixel_size_um if pixel_size_um is not None else metadata.pixel_size_um
+    dt_s = dt_s if dt_s is not None else metadata.dt_s
     if pixel_size_um is None or dt_s is None:
+        missing = " and ".join(
+            name
+            for name, value in (("pixel size", pixel_size_um), ("frame interval", dt_s))
+            if value is None
+        )
         raise ValueError(
-            f"{image_path}: pixel_size_um/dt_s not found in file metadata "
-            "and not given explicitly"
+            f"{Path(image_path).name}: no {missing} available — not in the file's own "
+            f"metadata, and not given explicitly.\n{metadata.detail()}"
         )
     return PipelineSession(
         image_path=Path(image_path),
@@ -373,6 +391,7 @@ def load_session(
         dt_s=dt_s,
         channel=channel,
         z_index=z_index,
+        metadata=metadata,
     )
 
 
@@ -1040,6 +1059,13 @@ def session_manifest_extra(session: PipelineSession) -> dict:
     return {
         "pixel_size_um": session.pixel_size_um,
         "dt_s": session.dt_s,
+        # Where those two came from, and anything the reader flagged about
+        # them (non-square pixels, irregular frame timing, an
+        # unconvertible unit) -- see `io_formats.StackMetadata`. The
+        # values alone don't say whether they were read off the file or
+        # supplied by hand, and every physical column in this bundle is
+        # them multiplied through.
+        **_metadata_provenance(session),
         "channel": session.channel,
         "z_index": session.z_index,
         "sigma_px": session.sigma,
@@ -1081,6 +1107,26 @@ def session_manifest_extra(session: PipelineSession) -> dict:
         "frame_range": list(session.frame_range_used) if session.frame_range_used is not None else None,
         "spotsolve_version": spotsolve.__version__,
     }
+
+
+def _metadata_provenance(session: PipelineSession) -> dict:
+    """`StackMetadata.as_manifest_dict()` for this session's image, with
+    each of the two required values marked as coming from the file or
+    from an explicit override (the values themselves are recorded
+    separately, by `session_manifest_extra`). Empty-ish but present for a
+    session built without metadata, so the manifest's shape doesn't
+    depend on which path produced it."""
+    metadata = session.metadata
+    if metadata is None:
+        return {"pixel_size_um_source": "unrecorded", "dt_s_source": "unrecorded"}
+    provenance = metadata.as_manifest_dict()
+    if metadata.pixel_size_um is None or metadata.pixel_size_um != session.pixel_size_um:
+        provenance["pixel_size_um_source"] = (
+            f"given explicitly (file said: {provenance['pixel_size_um_source']})"
+        )
+    if metadata.dt_s is None or metadata.dt_s != session.dt_s:
+        provenance["dt_s_source"] = f"given explicitly (file said: {provenance['dt_s_source']})"
+    return provenance
 
 
 def _jsonable_filters(filters: Optional[FilterSpec]) -> Optional[dict]:

@@ -5,6 +5,15 @@ column and always draws an alpha=1 Brownian reference line -- both specific
 to that one comparison. This generalizes it to arbitrary columns/labels/log
 scaling so any two trajectory properties (classical vs Bayesian D, alpha,
 r2, track length, anisotropy epsilon, ...) can be compared the same way.
+
+Axis labels default to `spt_pipeline.units.mpl_label(column)` rather than
+to the raw column name: since the axes here are picked at runtime from
+whatever the tracks pane holds, a plot could otherwise put
+`radius_of_gyration_um` (µm) against `se_x_max` (px) with nothing on
+either axis saying which is which. The labels come out in the same
+mathtext style as diffusionkit's own figures -- "$D$ ($\\mu$m$^2$/s)" --
+so a joint plot and an MSD plot from the same session look like they came
+from one program.
 """
 
 from __future__ import annotations
@@ -14,6 +23,8 @@ import pandas as pd
 import polars as pl
 import seaborn as sns
 from matplotlib.figure import Figure
+
+from spt_pipeline import units
 
 
 def plot_property_joint(
@@ -59,10 +70,15 @@ def plot_property_joint(
     g.ax_marg_x.hist(pdf["x"], bins=30, color="steelblue", edgecolor="white")
     g.ax_marg_y.hist(pdf["y"], bins=30, color="steelblue", edgecolor="white", orientation="horizontal")
 
-    xlabel = x_label or x_col
-    ylabel = y_label or y_col
-    g.ax_joint.set_xlabel(f"log10({xlabel})" if log_x else xlabel)
-    g.ax_joint.set_ylabel(f"log10({ylabel})" if log_y else ylabel)
+    # A log axis keeps its quantity's unit -- it is the unit the log was
+    # taken of, and dropping it (the old "log10(D_map_um2_s)") leaves the
+    # reader to guess whether a -1 is a small D or a large one in other
+    # units. `units.mpl_log_label` writes it the way diffusionkit's own
+    # log-D axes do.
+    xlabel = x_label or (units.mpl_log_label(x_col) if log_x else units.mpl_label(x_col))
+    ylabel = y_label or (units.mpl_log_label(y_col) if log_y else units.mpl_label(y_col))
+    g.ax_joint.set_xlabel(xlabel)
+    g.ax_joint.set_ylabel(ylabel)
 
     subtitle = f"{title or f'{ylabel} vs {xlabel}'} (r={r:.2f}, n={len(x)}"
     if n_dropped:

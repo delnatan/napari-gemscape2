@@ -12,6 +12,7 @@ from pathlib import Path
 
 import typer
 
+from spt_pipeline import units
 from spt_pipeline.results import build_manifest, git_sha, repo_root_of, write_result
 from spt_pipeline.pipeline import DetectTrackParams, run_detect_track
 
@@ -64,6 +65,20 @@ def detect_track(
         )
         result_dir = results_root / result_id
         write_result(result_dir, points_df, tracks_df, manifest)
+        # The two numbers every physical column in this bundle was
+        # computed with, and where they came from -- the headless
+        # counterpart of the metadata line the napari widget shows (see
+        # `widgets/params_panel.PipelineParamsWidget.set_image_metadata`).
+        # An unattended run is exactly where a wrong pixel size goes
+        # unnoticed, so it goes in the log next to the counts.
+        typer.echo(
+            f"  {units.fmt(manifest_extra['pixel_size_um'], 'pixel_size_um')} "
+            f"({manifest_extra.get('pixel_size_um_source')}) · "
+            f"{units.fmt(manifest_extra['dt_s'], 'dt_s')} "
+            f"({manifest_extra.get('dt_s_source')})"
+        )
+        for note in manifest_extra.get("metadata_notes") or ():
+            typer.echo(f"  ! {note}")
         typer.echo(
             f"  -> {result_dir}  "
             f"({manifest_extra['n_points']} points, {manifest_extra['n_tracks']} tracks)"

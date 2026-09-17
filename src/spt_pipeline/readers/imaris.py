@@ -18,7 +18,10 @@ class ImarisReader:
         filepath (str): Path to the .ims file.
         dtype (np.dtype): Data type of the image.
         shape (tuple): Dimensions (Time, Channels, Z, Y, X).
-        voxel_size (tuple): (Z, Y, X) voxel size in microns.
+        voxel_size (tuple): (Z, Y, X) voxel size, in `length_unit` (usually microns).
+        voxel_size_known (bool): whether the file really recorded the extents
+            `voxel_size` is derived from, as opposed to it being a default.
+        length_unit (str | None): unit the extents are recorded in, if the file says.
         timestamps (list): List of datetime objects for each time point.
         channels_info (list): List of dicts containing metadata (Name, Wavelengths, Exposure).
         resolution_levels (int): Number of resolution levels available.
@@ -34,6 +37,16 @@ class ImarisReader:
 
         # Initialize containers
         self.voxel_size = (1.0, 1.0, 1.0)
+        # Whether `voxel_size` was computed from extents actually present
+        # in the file, as opposed to the (0.0, 1.0) defaults below -- see
+        # `_parse_metadata`. False means "no calibration", which a caller
+        # cannot otherwise tell from the plausible-looking 1/width voxel
+        # size those defaults produce (spt_pipeline.io_formats._load_ims).
+        self.voxel_size_known = False
+        # The unit the extents (and so `voxel_size`) are in, as recorded
+        # in DataSetInfo/Image's "Unit" attribute. Usually "um"; None when
+        # the file doesn't say.
+        self.length_unit = None
         self.timestamps = []
         self.channels_info = []
 
@@ -240,6 +253,18 @@ class ImarisReader:
         vox_y = (max_y - min_y) / self.size_y if self.size_y > 0 else 1.0
         vox_z = (max_z - min_z) / self.size_z if self.size_z > 0 else 1.0
         self.voxel_size = (vox_z, vox_y, vox_x)
+
+        # The lateral extents are what a pixel size is derived from, so
+        # "known" means those four were really in the file: with any of
+        # them absent the defaults above give a voxel size of 1/width,
+        # which looks like a calibration and isn't.
+        lateral = [
+            self._get_val(img_info, key, float)
+            for key in ("ExtMin0", "ExtMin1", "ExtMax0", "ExtMax1")
+        ]
+        self.voxel_size_known = all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in lateral)
+        unit = self._get_val(img_info, "Unit", str)
+        self.length_unit = unit.strip() if isinstance(unit, str) and unit.strip() else None
 
         # --- Timestamps ---
         time_info = info_group.get("TimeInfo")

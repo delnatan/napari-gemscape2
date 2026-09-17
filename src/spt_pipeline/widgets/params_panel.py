@@ -51,6 +51,16 @@ nothing left to expose for them.
 `PipelineParamsWidget.get_camera_kwargs` remains the single source of
 truth that `ExperimentListWidget` forwards to every stage.
 
+Above both tabs sits `_ImageInfoPanel`: a one-line readout of the
+*image's own* metadata -- frame count, pixel size, frame interval -- over
+a folded section holding where each value came from and two spinboxes
+that override them. It is outside the tabs because those two numbers are
+not a parameter of either stage: they are read off the file and
+multiplied through everything both stages produce, and until this panel
+existed they were applied without ever being shown. A missing one turns
+the line red and unfolds the section, since `pipeline.load_session` will
+refuse to run without it and the box to fix it is right there.
+
 A note on units, since two different ones are in play: `sigma` is in
 **pixels**, while `slack` and `band` are **multiples of whatever sigma the
 search is running at** -- `spotsolve` reports `sigma_ratio = fit_sigma /
@@ -144,6 +154,8 @@ from qtpy.QtWidgets import (
 )
 from qtkit import CollapsibleSection, StepPager, double_spinbox, hline, note_label, style_status_label, wrapping_label
 
+from spt_pipeline import units
+from spt_pipeline.io_formats import StackMetadata
 from spt_pipeline.pipeline import (
     DEFAULT_CALIBRATION_KWARGS,
     DEFAULT_CAMERA_KWARGS,
@@ -162,6 +174,24 @@ def _ispin(value: int, minimum: int, maximum: int, tooltip: str) -> QSpinBox:
     box.setValue(value)
     box.setToolTip(tooltip)
     return box
+
+
+def _allow_wrapped_height(label: QLabel) -> QLabel:
+    """Let a `qtkit.wrapping_label` claim the height its wrapped text
+    actually needs.
+
+    `wrapping_label` gives the label an `Ignored` horizontal policy so a
+    long line can never widen the dock -- but a word-wrapped `QLabel`
+    still reports its *unwrapped* single-line height as its size hint, so
+    in a tight column the second and third wrapped lines are simply
+    clipped. Turning on `heightForWidth` makes the layout ask how tall the
+    text is at the width it was given, which is the whole point of
+    wrapping it. Worth it only for the labels that genuinely run to
+    several lines -- a file's metadata provenance, here."""
+    policy = label.sizePolicy()
+    policy.setHeightForWidth(True)
+    label.setSizePolicy(policy)
+    return label
 
 
 def _expert_section(form: QFormLayout) -> CollapsibleSection:
@@ -404,9 +434,13 @@ class _DetectTab(QWidget):
         core_form.addRow("", self._detector_note)
         core_form.addRow("offset (ADU)", self.offset)
         core_form.addRow("k_max", self.k_max)
-        core_form.addRow("threshold", threshold_row)
-        core_form.addRow("significance", self.significance)
-        core_form.addRow("aggregate ratio", self.agg_ratio)
+        # Row labels carry the unit the same way "offset (ADU)" and
+        # "sigma (px)" do: these three are a z-score, a p-value and a
+        # multiple of the frame's median flux, which is exactly the kind
+        # of thing a bare number invites getting wrong.
+        core_form.addRow("threshold (× noise sd)", threshold_row)
+        core_form.addRow("significance (p)", self.significance)
+        core_form.addRow("aggregate ratio (× median flux)", self.agg_ratio)
 
         # What gets analyzed, not how -- kept in core (not expert) since
         # these are exactly the knobs that let one image be explored
@@ -551,8 +585,8 @@ class _DetectTab(QWidget):
         self._band_note = note_label("")
         self.expert_form = expert_form = QFormLayout()
         expert_form.setContentsMargins(0, 0, 0, 0)
-        expert_form.addRow("slack (x sigma)", slack_row)
-        expert_form.addRow("band (x sigma)", band_row)
+        expert_form.addRow("slack (× sigma)", slack_row)
+        expert_form.addRow("band (× sigma)", band_row)
         expert_form.addRow("", self._band_note)
         expert_form.addRow("", self.no_band)
         expert_form.addRow("boxsize (px)", self.boxsize)
@@ -631,7 +665,9 @@ class _DetectTab(QWidget):
             self.set_preview_status("", level)
             return
         median = summary.get("fit_sigma_median")
-        self.use_measured_button.setText(f"Use {median:.3f}" if median is not None else "Use")
+        self.use_measured_button.setText(
+            f"Use {median:.3f} px" if median is not None else "Use"
+        )
         parts = [f"{summary.get('n_fits', 0)} fits"]
         if median is not None:
             mad = summary.get("fit_sigma_mad")
@@ -819,6 +855,288 @@ class _DetectTab(QWidget):
         )
 
 
+class _ImageInfoPanel(QWidget):
+    """The image's own physical metadata: what the file says, and what to
+    use instead when the file is wrong or silent.
+
+    Two rows above the stage tabs, because these are not a parameter of
+    either stage -- they are the scale everything both stages produce is
+    expressed in:
+
+      - a one-line summary that is always visible (frame count, pixel
+        size, frame interval, each with its unit), coloured neutral /
+        amber / red so a file with no calibration is obvious before a
+        button is pressed rather than as a `ValueError` after one;
+      - a folded "Image metadata" section holding the provenance (which
+        metadata field each value was read from, plus whatever the reader
+        flagged) and the two override spinboxes.
+
+    Folded by default, because the overwhelmingly common case is a file
+    that records both correctly and a user who never needs to think about
+    it. It unfolds **itself** exactly when it is needed: when the file is
+    missing one of the two, which is the one moment the panel is the next
+    thing to interact with.
+
+    The override is deliberately sticky across images: a folder is usually
+    one acquisition session, so a pixel size typed for the first file is
+    almost always right for its neighbours, and re-typing it per file
+    would be its own source of error. It can never be silent about that,
+    though -- while it is on, the summary line says `overridden` in amber
+    and names what the file itself said, and `manifest.json` records the
+    value as `given explicitly (file said: ...)`.
+    """
+
+    changed = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._metadata: Optional[StackMetadata] = None
+        self._file_pixel_size_um: Optional[float] = None
+        self._file_dt_s: Optional[float] = None
+        # Where the values being displayed came from ("file", or "bundle"
+        # for a saved result's recorded ones), kept so every line this
+        # panel writes names the same thing the values actually are.
+        self._source = "file"
+
+        self._summary = _allow_wrapped_height(wrapping_label(""))
+        style_status_label(self._summary)
+
+        self._detail = _allow_wrapped_height(note_label(""))
+
+        self._override = QCheckBox("use these values instead of the file's")
+        self._override.setToolTip(
+            "Analyze with the pixel size and frame interval below rather than\n"
+            "with what the file records -- for an acquisition whose metadata is\n"
+            "missing, or known to be wrong.\n\n"
+            "Stays on when you move to another image, since a folder is usually\n"
+            "one session; the line above says so while it is in force, and the\n"
+            "saved manifest records the value as given explicitly."
+        )
+        self._override.toggled.connect(self._on_override_toggled)
+
+        # Ranges wide enough for any light microscope: ~1 nm/px (a
+        # simulated or upsampled image) to 100 um/px, and 1 us to an hour
+        # per frame. Decimals are set for the small end, where the real
+        # values live -- a 108 nm pixel is 0.108, and rounding it to two
+        # decimals would be a 10% error in every physical column.
+        self._pixel_size = double_spinbox(
+            0.1, 0.0001, 100.0, 0.001, decimals=4, suffix=f" {units.UM}/px",
+            tooltip="Pixel size at the sample. Everything physical is this number\n"
+            "multiplied through: x_um, mean_step_um, and D as its square.",
+        )
+        self._dt = double_spinbox(
+            0.03, 0.0001, 3600.0, 0.001, decimals=4, suffix=" s/frame",
+            tooltip="Time between consecutive frames. Sets the MSD lag times, so D\n"
+            "is inversely proportional to it.",
+        )
+        for box in (self._pixel_size, self._dt):
+            box.valueChanged.connect(self._on_value_changed)
+
+        self._reset = QPushButton("Reset to file")
+        self._reset.setToolTip("Put both boxes back to what this file's own metadata says.")
+        self._reset.clicked.connect(self._reset_to_file)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.addRow("pixel size", self._pixel_size)
+        form.addRow("frame interval", self._dt)
+
+        body = QWidget()
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(2)
+        body_layout.addWidget(self._detail)
+        body_layout.addWidget(hline())
+        reset_row = QHBoxLayout()
+        reset_row.setContentsMargins(0, 0, 0, 0)
+        reset_row.addWidget(self._reset)
+        reset_row.addStretch()
+
+        body_layout.addWidget(self._override)
+        body_layout.addLayout(form)
+        body_layout.addLayout(reset_row)
+
+        self._section = CollapsibleSection("Image metadata", body, expanded=False)
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        layout.addWidget(self._summary)
+        layout.addWidget(self._section)
+        self.setLayout(layout)
+        self._sync_enabled()
+        self.set_metadata(None)
+
+    # -- what the file says ----------------------------------------------
+
+    def set_metadata(
+        self,
+        metadata: Optional[StackMetadata],
+        source: str = "file",
+        pixel_size_um: Optional[float] = None,
+        dt_s: Optional[float] = None,
+    ) -> None:
+        """Show the values for the image now being worked on.
+
+        `metadata` is a freshly-read file's (`io_formats.StackMetadata`).
+        `source="bundle"` with explicit `pixel_size_um`/`dt_s` instead
+        shows a saved bundle's recorded numbers -- which is what its
+        tables are actually in, whether they came from the file or from an
+        override at the time.
+        """
+        self._metadata = metadata
+        self._source = source
+        if metadata is not None:
+            self._file_pixel_size_um = metadata.pixel_size_um
+            self._file_dt_s = metadata.dt_s
+        else:
+            self._file_pixel_size_um = pixel_size_um
+            self._file_dt_s = dt_s
+        if not self._override.isChecked():
+            self._load_file_values()
+        self._refresh()
+
+    def _load_file_values(self) -> None:
+        """Park the spinboxes on the file's own values, so turning the
+        override on starts from what the file said rather than from
+        whatever was last typed for a different image."""
+        for box, value in ((self._pixel_size, self._file_pixel_size_um), (self._dt, self._file_dt_s)):
+            if value is None:
+                continue
+            blocked = box.blockSignals(True)
+            box.setValue(float(value))
+            box.blockSignals(blocked)
+
+    # -- the override -----------------------------------------------------
+
+    def pixel_size_um(self) -> Optional[float]:
+        """The pixel size to analyze with, or None to use the file's."""
+        return self._pixel_size.value() if self._override.isChecked() else None
+
+    def dt_s(self) -> Optional[float]:
+        return self._dt.value() if self._override.isChecked() else None
+
+    def is_overriding(self) -> bool:
+        return self._override.isChecked()
+
+    def _on_override_toggled(self, checked: bool) -> None:
+        if not checked:
+            self._load_file_values()
+        self._sync_enabled()
+        self._refresh()
+        self.changed.emit()
+
+    def _on_value_changed(self, _value: float) -> None:
+        if self._override.isChecked():
+            self._refresh()
+            self.changed.emit()
+
+    def _reset_to_file(self) -> None:
+        self._load_file_values()
+        self._refresh()
+        if self._override.isChecked():
+            self.changed.emit()
+
+    def _sync_enabled(self) -> None:
+        overriding = self._override.isChecked()
+        self._pixel_size.setEnabled(overriding)
+        self._dt.setEnabled(overriding)
+        self._reset.setEnabled(overriding and self._has_file_values())
+
+    def _has_file_values(self) -> bool:
+        return self._file_pixel_size_um is not None or self._file_dt_s is not None
+
+    # -- display ----------------------------------------------------------
+
+    def effective(self) -> tuple[Optional[float], Optional[float]]:
+        """`(pixel_size_um, dt_s)` that a run would actually use: the
+        override where it is in force, the file's otherwise, None where
+        neither has one."""
+        pixel = self.pixel_size_um()
+        dt = self.dt_s()
+        return (
+            pixel if pixel is not None else self._file_pixel_size_um,
+            dt if dt is not None else self._file_dt_s,
+        )
+
+    def _refresh(self) -> None:
+        if self._metadata is None and not self._has_file_values() and not self._override.isChecked():
+            self._summary.setText("no image loaded")
+            self._summary.setToolTip("")
+            self._detail.setText("")
+            style_status_label(self._summary)
+            self._section.set_title("Image metadata")
+            return
+
+        pixel, dt = self.effective()
+        frames = f"{self._metadata.n_frames} {units.FRAMES} · " if self._metadata is not None else ""
+        shown = " · ".join(
+            (
+                units.fmt_unit(pixel, units.UM + "/px") if pixel is not None else "pixel size ?",
+                units.fmt_unit(dt, "s/frame") if dt is not None else "frame interval ?",
+            )
+        )
+        missing = [
+            name for name, value in (("pixel size", pixel), ("frame interval", dt)) if value is None
+        ]
+        notes = self._metadata.notes if self._metadata is not None else ()
+
+        if self._override.isChecked():
+            prefix = "overridden: "
+            said = self._file_summary()
+            if said:
+                suffix = f" — {self._source} says {said}"
+            elif self._metadata is not None:
+                suffix = f" — {self._source} records neither"
+            else:
+                # Between images (the row's load is debounced) there is no
+                # file to compare against yet; claiming it records nothing
+                # would be a flash of something untrue.
+                suffix = ""
+            level = "caution"
+        else:
+            prefix = "from file: " if self._source == "file" else f"from saved {self._source}: "
+            suffix = ""
+            level = "neutral"
+        if missing:
+            suffix = f" — no {' or '.join(missing)}: set them below to run"
+            level = "error"
+        elif notes and not self._override.isChecked():
+            suffix = " — see the details below"
+            level = "caution"
+
+        style_status_label(self._summary, level)
+        self._summary.setText(f"{prefix}{frames}{shown}{suffix}")
+        if self._metadata is not None:
+            self._summary.setToolTip(self._metadata.detail())
+            self._detail.setText(self._metadata.provenance())
+        else:
+            self._summary.setToolTip("")
+            self._detail.setText(
+                f"Recorded in this {self._source}: {self._file_summary() or 'nothing'}."
+            )
+        self._section.set_title(
+            "Image metadata — overridden" if self._override.isChecked() else "Image metadata"
+        )
+        # Unfold itself only to ask for something it needs: a file missing
+        # a value cannot be analyzed until one is typed here, so the panel
+        # opens on that and on nothing else. It is never folded back
+        # automatically -- that would fight whoever opened it.
+        if missing and not self._section.is_expanded():
+            self._section.set_expanded(True)
+
+    def _file_summary(self) -> str:
+        parts = [
+            units.fmt_unit(value, unit)
+            for value, unit in (
+                (self._file_pixel_size_um, units.UM + "/px"),
+                (self._file_dt_s, "s/frame"),
+            )
+            if value is not None
+        ]
+        return " · ".join(parts)
+
+
 class _TrackingTab(QWidget):
     """Three pages -- Link, Filter, Save: what little the linker leaves to
     the caller, then a filter stack over the tracks it produced, then the
@@ -864,8 +1182,10 @@ class _TrackingTab(QWidget):
         super().__init__()
         self.min_track_length = _ispin(
             2, 1, 10_000,
-            tooltip="Drop tracks shorter than this (frames) from the final result.\n"
-            "1 = keep everything, including singletons.",
+            tooltip="Drop tracks with fewer localizations than this from the final\n"
+            "result. Counted in POINTS, not seconds: linking is frame-to-frame,\n"
+            "so an n-point track spans n-1 intervals and its duration_s is\n"
+            "(n-1) x dt. 1 = keep everything, including singletons.",
         )
         self.drop_aggregates = QCheckBox("exclude flagged aggregates from linking")
         self.drop_aggregates.setChecked(True)
@@ -884,7 +1204,7 @@ class _TrackingTab(QWidget):
         )
         form = QFormLayout()
         form.setContentsMargins(0, 0, 0, 0)
-        form.addRow("min track length", self.min_track_length)
+        form.addRow("min track length (points)", self.min_track_length)
 
         self.run_button, self.status_label, run_row = _run_row("Run tracking")
         self.run_button.clicked.connect(self.runRequested.emit)
@@ -993,6 +1313,11 @@ class PipelineParamsWidget(QWidget):
     roiLayerChanged = Signal()
     pointFiltersChanged = Signal()
     trackFiltersChanged = Signal()
+    # The pixel size / frame interval override was turned on, off or
+    # retyped. Everything physical already computed for the current image
+    # was computed at the old scale, so the host has work to do -- see
+    # `ExperimentListWidget._on_image_scale_changed`.
+    imageScaleChanged = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -1013,10 +1338,55 @@ class PipelineParamsWidget(QWidget):
         self._tabs.addTab(self._detect, "Detect")
         self._tabs.addTab(self._tracking, "Track")
 
+        # Above the tabs, not inside either one: the pixel size and frame
+        # interval are not a detection or a linking setting, they are the
+        # two facts every physical number on both tabs (and every `_um`
+        # column in the saved bundle) is derived from. They were previously
+        # read out of the file and applied without ever being shown, so a
+        # wrong or absent calibration only surfaced as an odd D. See
+        # `_ImageInfoPanel`, which also owns the override for a file whose
+        # metadata is missing or wrong.
+        self._image_info = _ImageInfoPanel()
+        self._image_info.changed.connect(self.imageScaleChanged)
+
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        layout.addWidget(self._image_info)
         layout.addWidget(self._tabs)
         self.setLayout(layout)
+
+    def set_image_metadata(
+        self,
+        metadata: Optional[StackMetadata],
+        source: str = "file",
+        pixel_size_um: Optional[float] = None,
+        dt_s: Optional[float] = None,
+    ) -> None:
+        """Show what the image now being worked on says about itself --
+        see `_ImageInfoPanel.set_metadata`."""
+        self._image_info.set_metadata(metadata, source, pixel_size_um, dt_s)
+
+    def get_pixel_size_um(self) -> Optional[float]:
+        """The pixel size a run should use, or None to take the file's.
+
+        `ExperimentListWidget` passes both this and `get_dt_s` to
+        `pipeline.load_session`/`run_detect_track`, whose own arguments
+        have always accepted an explicit value -- until now only the
+        headless config could supply one."""
+        return self._image_info.pixel_size_um()
+
+    def get_dt_s(self) -> Optional[float]:
+        return self._image_info.dt_s()
+
+    def is_overriding_image_scale(self) -> bool:
+        return self._image_info.is_overriding()
+
+    def get_effective_image_scale(self) -> tuple[Optional[float], Optional[float]]:
+        """`(pixel_size_um, dt_s)` a run would actually use: the override
+        where it is in force, otherwise what the current image's file
+        recorded. Either is None when neither has one."""
+        return self._image_info.effective()
 
     def get_params(self) -> DetectTrackParams:
         """Batch (`run_detect_track`) params. `sigma` is left None when

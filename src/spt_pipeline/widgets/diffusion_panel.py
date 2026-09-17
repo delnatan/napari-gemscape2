@@ -80,6 +80,22 @@ Track/spatial-map positions used for viewer overlays are kept in
 and Tracks layer), separate from the *physical-unit* table
 (`self._diffkit_tracks`) handed to diffusionkit -- conflating the two
 would misplace every overlay relative to the image.
+
+Both unit systems are therefore on screen at once, which is why nothing
+here shows a bare number:
+
+  - the tracks pane's headers carry each column's unit
+    (`_UnitHeaderModel` over `spt_pipeline.units`), since `se_x_max` (px)
+    and `se_x_um_max` (µm) are adjacent columns of the same quantity;
+  - each fit readout formats through `units.fmt`, including the per-track
+    Bayesian fit, whose parameters are a D, a K, an alpha and a
+    localization sigma with four different units (`_PARAM_COLUMNS`);
+  - the spatial map gets a written color scale (`_map_scale_label`), a
+    napari Points layer colored by a feature having no legend of its own;
+  - and the two conversion factors everything above depends on --
+    `pixel_size_um`, `dt_s`, read off the Tracks layer's metadata -- are
+    shown next to the layer name, including the case where the layer
+    carries none and they are placeholders (see `_update_source_label`).
 """
 
 from __future__ import annotations
@@ -127,6 +143,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from spt_pipeline import units
 from spt_pipeline.diffusion import tracks_to_diffusionkit_df
 from spt_pipeline.results import load_diffusion_results, write_diffusion_results
 from spt_pipeline.joint_plot import numeric_columns, plot_property_joint
@@ -249,6 +266,47 @@ def _run_anisotropy_worker(
     )
 
 
+class _UnitHeaderModel(ColumnTableModel):
+    """`qtkit.ColumnTableModel` with the units in the header.
+
+    The tracks pane's table is where this pipeline's two unit systems
+    meet: `se_x_max` is in pixels, `se_x_um_max` and
+    `radius_of_gyration_um` in µm, `flux_mean` in camera counts,
+    `D_map_um2_s` in µm²/s -- 40-odd columns whose unit is a naming
+    convention at best (`_um`) and absent at worst (`flux`, `se_x`,
+    `fit_sigma`). So each header shows `spt_pipeline.units.header` (the
+    name with its unit bracketed, the unit stated once) and each header's
+    tooltip the exact column name, which is what the value is stored and
+    filtered under.
+
+    Headers are resolved for the table as a whole (`units.headers`), not
+    column by column, so a pair like `se_x_max`/`se_x_um_max` doesn't come
+    out as the same word twice.
+
+    Only the header is relabelled: `column_names`/`row_dict`/`find_row`
+    and every caller that reaches for `track_id` still see the real
+    names."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        self._headers: dict[str, str] = {}
+        super().__init__(*args, **kwargs)
+
+    def set_columns(self, columns) -> None:
+        self._headers = units.headers(columns)
+        super().set_columns(columns)
+
+    def headerData(self, section: int, orientation, role: int = Qt.ItemDataRole.DisplayRole):  # noqa: N802
+        if orientation == Qt.Orientation.Horizontal:
+            names = self.column_names()
+            if 0 <= section < len(names):
+                name = names[section]
+                if role == Qt.ItemDataRole.DisplayRole:
+                    return self._headers.get(name, units.header(name))
+                if role == Qt.ItemDataRole.ToolTipRole:
+                    return units.tooltip(name)
+        return super().headerData(section, orientation, role)
+
+
 class _ProgressRelay(QObject):
     """Carries diffusionkit's `progress(done, total)` callback -- which it
     calls from the worker thread -- back to the GUI thread. The relay lives
@@ -261,7 +319,9 @@ class _ProgressRelay(QObject):
 # Per-vertex columns that are position, identity, or already per-track --
 # nothing to summarize. `track_length` is taken from the diffusionkit table
 # instead (guaranteed present there), and y/x become the centroid.
-_QC_SKIP_COLUMNS = frozenset({"track_id", "frame", "y", "x", "track_length"})
+# `loc_id` is a detection's serial number: its min/mean/max are three
+# columns of pure noise in a table that already runs past fifty.
+_QC_SKIP_COLUMNS = frozenset({"track_id", "loc_id", "frame", "y", "x", "track_length"})
 
 # How each genuinely per-point column is collapsed to one number per track.
 # min/max are what actually replaced the old per-point "Data Explorer": its
@@ -382,6 +442,21 @@ def _normalize_map_table(table: pl.DataFrame, model: str) -> pl.DataFrame:
     )
 
 
+# diffusionkit's per-track parameter names mapped to the column names
+# `spt_pipeline.units` knows their units by. Only `sigma` actually needs
+# the indirection, and it needs it badly: in a `TrackFit` it is the fitted
+# LOCALIZATION error in µm (diffusionkit's own bulk table calls it
+# `sigma_median_um`), while the same bare name in spotsolve's localization
+# table is the PSF width in pixels. One name, two units, two orders of
+# magnitude apart.
+_PARAM_COLUMNS = {
+    "D": "D_um2_s",
+    "K": "K_um2_s_alpha",
+    "alpha": "alpha",
+    "sigma": "sigma_loc_um",
+}
+
+
 def _track_fit_row(fit: "dk_bayes.TrackFit") -> dict:
     """One ad-hoc single-track fit (`method` "map" or "nuts"), normalized
     the same way as `_normalize_map_table` so both land in the same
@@ -401,7 +476,13 @@ def _track_fit_row(fit: "dk_bayes.TrackFit") -> dict:
 
 
 def _format_summary(summary: dict) -> str:
-    return "\n".join(f"{key} = {value}" for key, value in summary.items())
+    """A saved `diffusion_summary.json` as lines of "key = value unit".
+
+    The keys are already unit-suffixed (`normal_D_um2_s`), which is how
+    the file stays readable on its own; `units.fmt` restates the unit
+    where it can, so a loaded summary reads like a freshly-computed one
+    rather than like raw JSON."""
+    return "\n".join(f"{key} = {units.fmt(value, key)}" for key, value in summary.items())
 
 
 _ANISOTROPY_DISPLAY_COLUMNS = [
@@ -493,7 +574,10 @@ class _TracksPane(QWidget):
         self._min_track_length = QSpinBox()
         self._min_track_length.setRange(1, 10_000)
         self._min_track_length.setValue(1)
-        self._min_track_length.setToolTip("Hide tracks shorter than this (1 = show everything).")
+        self._min_track_length.setToolTip(
+            "Hide tracks with fewer localizations than this — counted in POINTS, "
+            "not seconds (an n-point track spans (n-1) × dt). 1 = show everything."
+        )
         self._min_track_length.valueChanged.connect(lambda _v: self.host.on_filters_changed())
 
         self._sync_display_checkbox = QCheckBox("sync viewer")
@@ -542,7 +626,7 @@ class _TracksPane(QWidget):
         self._joint_plot_control.plotRequested.connect(self._show_joint_plot)
         self._plot_section = CollapsibleSection("Joint plot", self._joint_plot_control, expanded=False)
 
-        self._model = ColumnTableModel()
+        self._model = _UnitHeaderModel()
         # Can carry 40+ columns after three fits (hence fixed-width
         # columns), and is the one thing here that should soak up spare
         # height while giving all of it back on demand.
@@ -659,7 +743,10 @@ class _TracksPane(QWidget):
             )
             style_status_label(self._count_label, "caution")
             return
-        figure = plot_property_joint(df, x_col, y_col, log_x=log_x, log_y=log_y, title="Tracks")
+        # No `title=`: `plot_property_joint` then titles the panel with
+        # both axes' own labels (quantity + unit), which says more than
+        # "Tracks" does when the axes are picked at runtime.
+        figure = plot_property_joint(df, x_col, y_col, log_x=log_x, log_y=log_y)
         if self._joint_plot_window is None:
             self._joint_plot_window = PlotWindow("Tracks: joint plot", parent=self)
         self._joint_plot_window.show_figure(figure)
@@ -757,11 +844,12 @@ class _ClassicalTab(QWidget):
         normal = fit.ensemble_normal_fit
         anomalous = fit.ensemble_anomalous_fit
         self._summary.setText(
-            f"D = {normal.D_um2_s:.4g} um^2/s (R^2={normal.r_squared:.3f})\n"
-            f"alpha = {anomalous.alpha:.3f}, "
-            f"K = {anomalous.K_um2_s_alpha:.4g} um^2/s^alpha "
-            f"(R^2={anomalous.r_squared:.3f})\n"
-            f"mean localization offset = {fit.mean_localization_offset_um2:.4g} um^2"
+            f"D = {units.fmt(normal.D_um2_s, 'D_um2_s')} (R² = {normal.r_squared:.3f})\n"
+            f"α = {anomalous.alpha:.3f}, "
+            f"K = {units.fmt(anomalous.K_um2_s_alpha, 'K_um2_s_alpha')} "
+            f"(R² = {anomalous.r_squared:.3f})\n"
+            "mean localization offset = "
+            f"{units.fmt(fit.mean_localization_offset_um2, 'mean_localization_offset_um2')}"
         )
 
         figure = dk_analysis_viz.plot_ensemble_fit(fit.ensemble, normal, anomalous)
@@ -816,6 +904,12 @@ class _BayesianTab(QWidget):
         color_form.setContentsMargins(0, 0, 0, 0)
         color_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         color_form.addRow("color map by", self._color_by_picker)
+        # What the map's colors mean, in words and in a unit: the picker
+        # above it names a column and the histogram below sets the color
+        # range, but neither said what the numbers on that range are --
+        # so a viridis field of dots carried no scale at all. Updated by
+        # `_on_color_by_changed`/`refresh_color_by_choices`.
+        self._map_scale_label = status_label("")
         self._map_histogram = HistogramRangeWidget()
         self._map_histogram.setEnabled(False)
         self._map_histogram.rangeChanged.connect(self._on_map_range_changed)
@@ -844,6 +938,7 @@ class _BayesianTab(QWidget):
         map_layout.addWidget(self._map_button)
         map_layout.addWidget(self._map_status)
         map_layout.addLayout(color_form)
+        map_layout.addWidget(self._map_scale_label)
         map_layout.addWidget(self._map_histogram)
 
         track_body = QWidget()
@@ -888,6 +983,7 @@ class _BayesianTab(QWidget):
         self._color_by_picker.blockSignals(False)
         self._color_by_picker.setEnabled(False)
         self._map_histogram.setEnabled(False)
+        self._map_scale_label.setText("")
 
     def _run_map(self) -> None:
         tracks = self.host.diffkit_tracks_for_fit()
@@ -925,6 +1021,26 @@ class _BayesianTab(QWidget):
 
     def _on_map_range_changed(self, vmin: float, vmax: float) -> None:
         self.host.set_map_contrast_limits(vmin, vmax)
+        self._update_map_scale_label(vmin, vmax)
+
+    def _update_map_scale_label(
+        self, vmin: Optional[float] = None, vmax: Optional[float] = None
+    ) -> None:
+        """State what the map's color ramp is showing and over what range,
+        in that quantity's own unit -- the legend a napari Points layer
+        colored by a feature doesn't come with."""
+        column = self._color_by_picker.currentText()
+        if not column:
+            self._map_scale_label.setText("")
+            return
+        if vmin is None or vmax is None:
+            vmin, vmax = self._map_histogram.range()
+        unit = units.unit_of(column)
+        self._map_scale_label.setText(
+            f"map color: {units.header(column)}   "
+            f"{vmin:.4g} → {vmax:.4g}{' ' + unit if unit else ''}"
+        )
+        self._map_scale_label.setToolTip(units.tooltip(column))
 
     def on_spatial_source_registered(self, preferred_color_by: Optional[str] = None) -> None:
         """Called by the host whenever *any* tab (this one's own MAP fit,
@@ -970,6 +1086,7 @@ class _BayesianTab(QWidget):
             self._map_histogram.set_range(float(lo), float(hi))
             self.host.set_map_contrast_limits(float(lo), float(hi))
         self._map_histogram.blockSignals(False)
+        self._update_map_scale_label()
 
     def _run_track_fit(self) -> None:
         track_id = self.host.selected_track_id
@@ -1002,9 +1119,16 @@ class _BayesianTab(QWidget):
         self._track_status.setText(f"track {fit.track_id} fit (n={fit.track_length})")
         style_status_label(self._track_status, "ok")
 
+        # Parameter names come from diffusionkit ("D", "K", "alpha",
+        # "sigma"), and each carries a different unit -- which this
+        # readout used to leave off entirely, so a D and an alpha were
+        # printed identically. `_PARAM_COLUMNS` maps each to the column
+        # name `spt_pipeline.units` knows it by.
         lines = [f"track {fit.track_id}, model={fit.model}, method={fit.method}"]
         for name, value in fit.params.items():
-            lines.append(f"  {name} = {value:.4g}  [{fit.lo[name]:.4g}, {fit.hi[name]:.4g}]")
+            column = _PARAM_COLUMNS.get(name, name)
+            interval = f"[{fit.lo[name]:.4g}, {fit.hi[name]:.4g}]"
+            lines.append(f"  {name} = {units.fmt(value, column)}  {interval}")
         self._track_result_label.setText("\n".join(lines))
 
         if fit.method == "nuts":
@@ -1187,7 +1311,15 @@ class _AnisotropyTab(QWidget):
                 )
             )
         if "eps_median" in per_track.columns:
-            lines.append(f"median eps = {per_track['eps_median'].median():.3g}")
+            # eps is tanh(|h|) in diffusionkit's log-Euclidean
+            # coordinates, i.e. (D∥ − D⊥)/(D∥ + D⊥): a normalized
+            # difference in [0, 1), 0 being isotropic. Dimensionless, and
+            # said so, since every other number this widget reports does
+            # carry a unit and a bare figure would read as an oversight.
+            lines.append(
+                f"median ε = {per_track['eps_median'].median():.3g} "
+                "  (dimensionless: (D∥−D⊥)/(D∥+D⊥), 0 = isotropic)"
+            )
         return "\n".join(lines)
 
     def _on_error(self, exc: Exception) -> None:
@@ -1220,6 +1352,10 @@ class DiffusionAnalysisWidget(QWidget):
         self._result_dir: Optional[Path] = None
         self.pixel_size_um = 1.0
         self.dt_s = 1.0
+        # Whether the two above came from a real calibration or are the
+        # placeholders that let the conversion run at all -- set from the
+        # layer's metadata in `_adopt_track_table`.
+        self.units_known = False
         self._diffkit_tracks: Optional[pl.DataFrame] = None
         self._tracks_df_px: Optional[pl.DataFrame] = None
         self._base_track_df: Optional[pl.DataFrame] = None
@@ -1557,7 +1693,11 @@ class DiffusionAnalysisWidget(QWidget):
         self._spatial_sources = {}
         self._track_fit_rows = []
         self._current_track_id = None
+        self.pixel_size_um = 1.0
+        self.dt_s = 1.0
+        self.units_known = False
         self._source_label.setText("no Tracks layer in this viewer")
+        style_status_label(self._source_label)
         self._tracks_pane.reset()
         self._classical.reset()
         self._bayesian.reset()
@@ -1601,6 +1741,17 @@ class DiffusionAnalysisWidget(QWidget):
         self._result_dir = Path(raw_result_dir) if raw_result_dir else None
         self.pixel_size_um = layer.metadata.get("pixel_size_um") or 1.0
         self.dt_s = layer.metadata.get("dt_s") or 1.0
+        # Layers this app builds say whether those two are real
+        # (`viewer.layer_units_metadata`); a Tracks layer from anywhere
+        # else doesn't, and the 1.0s above are then placeholders rather
+        # than a calibration -- see `_update_source_label`.
+        self.units_known = bool(
+            layer.metadata.get(
+                "units_known",
+                layer.metadata.get("pixel_size_um") is not None
+                and layer.metadata.get("dt_s") is not None,
+            )
+        )
         self._diffkit_tracks = tracks_to_diffusionkit_df(track_points_df, self.pixel_size_um, self.dt_s)
         self._base_track_df, self._qc_columns = _base_track_table(
             self._diffkit_tracks, track_points_df
@@ -1608,15 +1759,39 @@ class DiffusionAnalysisWidget(QWidget):
         self._update_source_label()
 
     def _update_source_label(self) -> None:
+        """Name the loaded layer, its bundle, and -- the part that is not
+        cosmetic -- the two conversion factors every physical column in
+        this widget is computed with.
+
+        `tracks_to_diffusionkit_df` multiplies pixel positions by
+        `pixel_size_um` and frame indices by `dt_s`, so every `_um`/`_s`
+        column here, and every D and K fitted from them, is those two
+        numbers. A layer that carries neither still gets 1.0 for both
+        (see `viewer.layer_units_metadata`) because the conversion has to
+        run on something -- and then `D_map_um2_s` is really px²/frame
+        under a µm²/s name. That case gets said out loud rather than
+        rendered identically to a calibrated one."""
         layer = self._tracks_layer
         if layer is None:
             return
-        if self._result_dir is not None:
-            self._source_label.setText(f"'{layer.name}' -> {self._result_dir}")
+        where = (
+            f"→ {self._result_dir}"
+            if self._result_dir is not None
+            else "(no known results bundle — results can't be saved)"
+        )
+        scale = (
+            f"{units.fmt_unit(self.pixel_size_um, units.UM + '/px')} · "
+            f"{units.fmt_unit(self.dt_s, 's/frame')}"
+        )
+        if self.units_known:
+            self._source_label.setText(f"'{layer.name}' {where}\n{scale}")
+            style_status_label(self._source_label, "neutral")
         else:
             self._source_label.setText(
-                f"'{layer.name}' (no known results bundle -- results can't be saved)"
+                f"'{layer.name}' {where}\nno pixel size / frame interval on this layer — "
+                "every µm and s column below is really px and frames"
             )
+            style_status_label(self._source_label, "caution")
 
     def _load_from_layer(self, layer: Tracks) -> None:
         track_points_df = self._layer_track_table(layer)
