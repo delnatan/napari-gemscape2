@@ -2017,7 +2017,7 @@ wheels = [
 [[package]]
 name = "qtkit"
 version = "0.1.0"
-source = { git = "https://github.com/delnatan/qtkit.git?branch=main#8962d857ef1e10ef34778a763bd89927888ae34b" }
+source = { git = "https://github.com/delnatan/qtkit.git?branch=main#c92460934582e6c69bf2e11f021d9bf6492928f3" }
 dependencies = [
     { name = "numpy" },
     { name = "qtpy" },

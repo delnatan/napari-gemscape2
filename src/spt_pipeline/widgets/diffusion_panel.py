@@ -900,10 +900,18 @@ class _BayesianTab(QWidget):
         self._color_by_picker = QComboBox()
         self._color_by_picker.setEnabled(False)
         self._color_by_picker.currentTextChanged.connect(self._on_color_by_changed)
+        # D spans orders of magnitude across a field of tracks, so a linear
+        # histogram is one tall spike at the low end -- log bins are what
+        # make the rest of the distribution visible enough to drag a handle
+        # into.
+        self._map_log_scale_check = QCheckBox("log scale")
+        self._map_log_scale_check.setEnabled(False)
+        self._map_log_scale_check.toggled.connect(self._on_map_log_scale_toggled)
         color_form = QFormLayout()
         color_form.setContentsMargins(0, 0, 0, 0)
         color_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         color_form.addRow("color map by", self._color_by_picker)
+        color_form.addRow("", self._map_log_scale_check)
         # What the map's colors mean, in words and in a unit: the picker
         # above it names a column and the histogram below sets the color
         # range, but neither said what the numbers on that range are --
@@ -983,6 +991,7 @@ class _BayesianTab(QWidget):
         self._color_by_picker.blockSignals(False)
         self._color_by_picker.setEnabled(False)
         self._map_histogram.setEnabled(False)
+        self._map_log_scale_check.setEnabled(False)
         self._map_scale_label.setText("")
 
     def _run_map(self) -> None:
@@ -1020,6 +1029,16 @@ class _BayesianTab(QWidget):
         self._refresh_map_histogram(reset_range=True)
 
     def _on_map_range_changed(self, vmin: float, vmax: float) -> None:
+        self.host.set_map_contrast_limits(vmin, vmax)
+        self._update_map_scale_label(vmin, vmax)
+
+    def _on_map_log_scale_toggled(self, enabled: bool) -> None:
+        """Re-bin the map histogram on a log10 axis. `set_log_scale` is
+        silent and may clamp the range off zero/negative values, so the
+        host's contrast limits are re-synced from it explicitly -- unlike
+        a drag, nothing else would tell them the range moved."""
+        self._map_histogram.set_log_scale(enabled)
+        vmin, vmax = self._map_histogram.range()
         self.host.set_map_contrast_limits(vmin, vmax)
         self._update_map_scale_label(vmin, vmax)
 
@@ -1064,6 +1083,7 @@ class _BayesianTab(QWidget):
         enabled = bool(columns)
         self._color_by_picker.setEnabled(enabled)
         self._map_histogram.setEnabled(enabled)
+        self._map_log_scale_check.setEnabled(enabled)
         if enabled:
             self.host.set_map_color_by(self._color_by_picker.currentText())
 

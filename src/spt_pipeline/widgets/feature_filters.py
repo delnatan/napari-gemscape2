@@ -28,6 +28,7 @@ from typing import Optional, Sequence
 
 import polars as pl
 from qtkit import FilterPanel, columns_of
+from qtpy.QtWidgets import QCheckBox
 
 from spt_pipeline import units
 
@@ -49,25 +50,42 @@ class FeatureFilterPanel(FilterPanel):
     readout: pass the per-track table (one row per track) when filtering
     tracks, so "412 of 1893 tracks pass" means what it says.
 
-    Adds one thing to the base panel: each row's histogram carries a
+    Adds two things to the base panel: each row's histogram carries a
     tooltip saying what its column is measured in
     (`spt_pipeline.units.tooltip`). A row's column picker shows the bare
     column name -- that is the base widget's, and the name is the one the
     cut is recorded under in `manifest.json`, so it should stay literal --
     but the tracks table offers `se_x_max` (px) and `se_x_um_max` (µm)
     side by side, and dragging a handle to "0.03" means two different
-    things depending on which one is in front of you."""
+    things depending on which one is in front of you.
+
+    It also adds a single "Log-scale histograms" checkbox that applies to
+    every row: flux, `D`, and other QC columns commonly span orders of
+    magnitude, where a linear histogram is one spike at the low end and a
+    handle can't be dragged onto the rest of the distribution."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self._log_scale = False
+        self._log_scale_check = QCheckBox("Log-scale histograms")
+        self._log_scale_check.toggled.connect(self._on_log_scale_toggled)
+        # Index 2: after the rows stack and the add/clear buttons, before
+        # the "N of M pass" summary -- see `qtkit.filters.FilterPanel`.
+        self.layout().insertWidget(2, self._log_scale_check)
         # Rows are created by the base class (the "+ Add filter" button,
-        # `set_filters`), so the tooltips are refreshed from the one
-        # signal every one of those paths ends in.
+        # `set_filters`), so the tooltip and log-scale refresh run off the
+        # one signal every one of those paths ends in.
         self.filtersChanged.connect(self._refresh_unit_tooltips)
+
+    def _on_log_scale_toggled(self, enabled: bool) -> None:
+        self._log_scale = enabled
+        for row in self.rows():
+            row.histogram.set_log_scale(enabled)
 
     def _refresh_unit_tooltips(self) -> None:
         for row in self.rows():
             row.histogram.setToolTip(units.tooltip(row.column()))
+            row.histogram.set_log_scale(self._log_scale)
 
     def set_source(self, df: Optional[pl.DataFrame], columns: Optional[Sequence[str]] = None) -> None:
         """Point every row at a (re-computed) table, keeping the cuts already
