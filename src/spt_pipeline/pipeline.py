@@ -20,10 +20,18 @@ schema.
 Two things the previous sfwloc-based pipeline did are gone because
 `spotsolve` makes them unnecessary rather than because they were dropped:
 
-  - There is one detector, not a choice of three. The model-selection
-    search handles a crowded field and a sparse one by the same rule, so
-    there is no dense/sparse/DAOPHOT algorithm to pick and no per-algorithm
-    solver-kwargs dict to keep in sync.
+  - There is one *default* detector, not a per-acquisition choice of
+    three. `spotsolve.localize`/`localize_stack` (multi-emitter, the
+    default `DetectTrackParams.detector`) fits each box jointly and
+    decides how many emitters it holds by Bayesian model selection --
+    the same rule handles a crowded field and a sparse one, so there is
+    no dense/sparse/DAOPHOT algorithm to hand-pick per file. `spotsolve`
+    now also ships `localize_aguet`/`localize_aguet_stack`
+    (`detector="aguet"`): independent single-emitter fits behind a LoG
+    screen, with no multi-emitter search and no width-band rejection --
+    the spotfitlm-compatible baseline for genuinely sparse fields, kept
+    on as an option rather than the default because the joint fit's
+    model selection is the more general rule when in doubt.
   - Linking takes no gate. `spotsolve.tracking.fit_link_params` measures
     the step-size distribution, detection continuity and CRLB inflation
     from the movie itself, so the old bootstrap-link -> estimate-D ->
@@ -108,6 +116,22 @@ DEFAULT_DETECT_KWARGS = dict(
     threshold=None,
     slack=spotsolve.SLACK,
     band=spotsolve.BAND,
+)
+
+# Forwarded to `spotsolve.localize_aguet`/`localize_aguet_stack` as **kwargs
+# when `DetectTrackParams.detector == "aguet"`, mirroring their own defaults
+# (`spotsolve.aguet`). None of `DEFAULT_DETECT_KWARGS`' keys apply here --
+# Aguet fits one emitter per LoG-screened candidate independently rather
+# than searching a box jointly, so there is no `k_max` (nothing to search
+# jointly for), no `slack`/`band` (every screened fit is reported; there is
+# no width-based accept/reject) and no `threshold` (the screening cut is
+# `significance`, a per-pixel level rather than a z-score). `boxsize` is the
+# odd fit-crop size around each candidate and `itermax` its optimizer's
+# iteration budget -- both rarely need changing.
+DEFAULT_SPARSE_KWARGS = dict(
+    significance=0.05,
+    boxsize=9,
+    itermax=50,
 )
 
 # Forwarded to `spotsolve.calibrate_sigma` as **kwargs, mirroring its own
@@ -222,11 +246,26 @@ class DetectTrackParams:
     # field where position alone leaves ambiguous assignments, not a
     # correction to a broken default.
     link_with_flux: bool = False
+    # Which spotsolve detector `run_detect_step` runs: "multi_emitter"
+    # (default -- `spotsolve.localize`/`localize_stack`, joint fit + Bayesian
+    # model selection) or "aguet" (`localize_aguet`/`localize_aguet_stack`,
+    # the independent-fit sparse baseline). Only the production detect step
+    # honors this -- `run_calibration_step`/`run_preview_frame` always
+    # measure sigma with the multi-emitter detector regardless, since a PSF
+    # width is a physical fact about the optics, not a property of which
+    # detector will run on it.
+    detector: str = "multi_emitter"
     camera_kwargs: dict = field(default_factory=lambda: dict(DEFAULT_CAMERA_KWARGS))
-    detect_kwargs: dict = field(default_factory=lambda: dict(DEFAULT_DETECT_KWARGS))
+    # None picks `DEFAULT_DETECT_KWARGS` or `DEFAULT_SPARSE_KWARGS` to match
+    # `detector` (see `run_detect_step`) -- left as None rather than always
+    # defaulting to the multi-emitter dict, which would silently hand
+    # `localize_aguet_stack` keyword arguments (`k_max`, `slack`, `band`) it
+    # doesn't accept.
+    detect_kwargs: Optional[dict] = None
     calibration_kwargs: dict = field(default_factory=lambda: dict(DEFAULT_CALIBRATION_KWARGS))
-    # Worker threads `localize_stack` hands frames to, in `run_detect_step`.
-    # None means every core (os.cpu_count()) -- spotsolve's own default.
+    # Worker threads the chosen `detector`'s stack function hands frames to,
+    # in `run_detect_step`. None means every core (os.cpu_count()) --
+    # spotsolve's own default for either detector.
     n_threads: Optional[int] = None
     # (start, end) frame slice, Python-slice semantics; None, or end <= 0,
     # means through the real last frame (see _resolve_frame_range).
@@ -277,10 +316,14 @@ class PipelineSession:
     # out-of-band reject breakdown, and the aggregate flux share. Kept on
     # the session rather than folded into `points_df` because it's a fact
     # about the frame, not about any one detection -- and it's what makes
-    # "why did this frame find nothing" answerable after the fact.
+    # "why did this frame find nothing" answerable after the fact. Its
+    # `n_too_narrow`/`n_too_wide`/`n_edge` columns are always 0 when
+    # `detector_used == "aguet"`: that detector has no width-band rejection
+    # to count (see `run_detect_step`).
     frames_df: Optional[pl.DataFrame] = None
     camera_kwargs_used: Optional[dict] = None
     detect_kwargs_used: Optional[dict] = None
+    detector_used: Optional[str] = None
     agg_ratio_used: Optional[float] = None
     frame_range_used: Optional[tuple[int, int]] = None
     # Polygon ROI record(s) (see spt_pipeline.rois.shapes_layer_to_roi) for
@@ -346,6 +389,11 @@ def run_calibration_step(
     (default: the first frame), via `spotsolve.calibrate_sigma`. Sets
     `session.sigma`/`session.calib_summary` in place (and returns
     `session`, for chaining).
+
+    Always uses the multi-emitter detector (`calibrate_sigma` is hardcoded
+    to it), regardless of `DetectTrackParams.detector` -- a PSF width is a
+    physical fact about the optics, not a property of which detector will
+    later run the production detect step against it.
 
     `frame_index` matters when the default frame isn't a good calibration
     reference -- e.g. sparser or better-focused elsewhere in the stack.
@@ -443,13 +491,16 @@ def run_preview_frame(
     agg_ratio: Optional[float] = None,
     mask: Optional[np.ndarray] = None,
     cancel_event: Optional[threading.Event] = None,
+    detector: str = "multi_emitter",
 ) -> PipelineSession:
-    """Localize ONE frame at `sigma` with the reporting band OFF, so every
-    fit lands in the table -- including the ones a real detect run would
-    bin as out-of-band. Sets `session.preview_points_df` /
-    `session.preview_summary` / `session.preview_frame_used` in place (and
-    returns `session`, for chaining). Never touches `points_df`: a preview
-    is something to look at, not a result to link or save.
+    """Localize ONE frame at `sigma` with `detector` ("multi_emitter", the
+    default, or "aguet"), so every fit lands in the table -- including, for
+    the multi-emitter detector, the ones a real detect run would bin as
+    out-of-band (its reporting band is forced off here). Sets
+    `session.preview_points_df` / `session.preview_summary` /
+    `session.preview_frame_used` in place (and returns `session`, for
+    chaining). Never touches `points_df`: a preview is something to look
+    at, not a result to link or save.
 
     This is what makes `calibrate_sigma` unnecessary interactively. That
     function's loop was: localize the frame with the band off, take the
@@ -464,33 +515,44 @@ def run_preview_frame(
     tight CI around it. `run_calibration_step` is still there for the
     headless path, where there is nobody to look.
 
-    `summary` also carries `n_in_band` against the CURRENT `detect_kwargs`
-    band -- how many of these fits a real run at this sigma would actually
-    report -- since that, not the raw fit count, is what a detect run
-    yields. `accepted` is the same question per row (see
-    `calibration_accepted`), meant for the preview layer's border color.
+    For `detector="multi_emitter"`, `summary` also carries `n_in_band`
+    against the CURRENT `detect_kwargs` band -- how many of these fits a
+    real run at this sigma would actually report -- since that, not the
+    raw fit count, is what a detect run yields. `accepted` is the same
+    question per row (see `calibration_accepted`), meant for the preview
+    layer's border color. `detector="aguet"` has no band to gate against
+    (every LoG-screened fit it makes is already a reported detection), so
+    every row previews as accepted and `n_in_band` is omitted; `n_failed`
+    (from the fit's own `info["failures"]`) is reported instead.
 
     `cancel_event` is only checked before the call: one frame is one
     opaque Rust call (see `PipelineCancelled`).
     """
     _check_cancelled(cancel_event)
     camera = dict(camera_kwargs) if camera_kwargs is not None else dict(DEFAULT_CAMERA_KWARGS)
-    detect = dict(detect_kwargs) if detect_kwargs is not None else dict(DEFAULT_DETECT_KWARGS)
     t = session.image.shape[0]
     frame_index = max(0, min(frame_index, t - 1))
+    frame = session.image[frame_index]
 
-    # `band=None` regardless of what the Detect tab has set: the whole
-    # point of a preview is to show the fits the band would have removed,
-    # so the band can be chosen against them. `slack` (the range a fit may
-    # TAKE, as opposed to be reported at) is honored -- it bounds the
-    # optimizer, so overriding it would preview a different fit.
-    preview_kwargs = dict(detect)
-    band = preview_kwargs.pop("band", None)
-    preview_kwargs["band"] = None
+    n_failed = None
+    if detector == "aguet":
+        detect = dict(detect_kwargs) if detect_kwargs is not None else dict(DEFAULT_SPARSE_KWARGS)
+        band = None
+        result = spotsolve.localize_aguet(frame, sigma, roi=mask, images=False, **camera, **detect)
+        n_failed = len(result.info.get("failures", ()))
+    else:
+        detect = dict(detect_kwargs) if detect_kwargs is not None else dict(DEFAULT_DETECT_KWARGS)
+        # `band=None` regardless of what the Detect tab has set: the whole
+        # point of a preview is to show the fits the band would have
+        # removed, so the band can be chosen against them. `slack` (the
+        # range a fit may TAKE, as opposed to be reported at) is honored --
+        # it bounds the optimizer, so overriding it would preview a
+        # different fit.
+        preview_kwargs = dict(detect)
+        band = preview_kwargs.pop("band", None)
+        preview_kwargs["band"] = None
+        result = spotsolve.localize(frame, sigma, roi=mask, images=False, **camera, **preview_kwargs)
 
-    result = spotsolve.localize(
-        session.image[frame_index], sigma, roi=mask, images=False, **camera, **preview_kwargs
-    )
     points_df, frame_row, _aggs = loctable.frame_tables(
         result,
         frame=frame_index,
@@ -510,8 +572,10 @@ def run_preview_frame(
     session.preview_frame_used = frame_index
     session.preview_summary = {
         "sigma_used": sigma,
+        "detector": detector,
         "n_fits": points_df.height,
-        "n_in_band": int(accepted.sum()) if points_df.height else 0,
+        "n_in_band": int(accepted.sum()) if points_df.height and band is not None else None,
+        "n_failed": n_failed,
         "n_flagged": int(points_df["is_aggregate"].sum()) if points_df.height else 0,
         # The median of THIS frame's fitted widths -- one round of what
         # `calibrate_sigma` iterates. Preview again at it to do the next.
@@ -549,10 +613,22 @@ def run_detect_step(
     progress_callback: Optional[ProgressCallback] = None,
     cancel_event: Optional[threading.Event] = None,
     n_threads: Optional[int] = None,
+    detector: str = "multi_emitter",
 ) -> PipelineSession:
     """Localize every spot over `session.image[start:end]` (default: every
     frame) with `spotsolve`, and assemble the result into the standard
     localization table.
+
+    `detector` picks which spotsolve function does the work: the default
+    "multi_emitter" (`spotsolve.localize_stack`, joint per-box fit with
+    Bayesian model selection) or "aguet" (`spotsolve.localize_aguet_stack`,
+    independent single-emitter fits behind a LoG screen -- the sparse
+    baseline). `detect_kwargs` must match whichever is chosen (`None` picks
+    `DEFAULT_DETECT_KWARGS`/`DEFAULT_SPARSE_KWARGS` accordingly) -- the two
+    detectors take disjoint keyword arguments, so a dict built for one
+    raises a `TypeError` if forwarded to the other. `session.frames_df`'s
+    `n_too_narrow`/`n_too_wide`/`n_edge` columns are always 0 for
+    `detector="aguet"`: it has no width-band rejection to count.
 
     Sets `session.points_df` (one row per detection,
     `loctable.LOCALIZATION_SCHEMA`) and `session.frames_df` (one row per
@@ -564,8 +640,9 @@ def run_detect_step(
     calibration entirely. If omitted, falls back to `session.sigma` from a
     prior `run_calibration_step` call -- raises if neither is available.
     Note this is the width the search runs AT; each emitter still gets its
-    own fitted width (`fit_sigma`), and how far that may stray before the
-    fit stops being reported is `detect_kwargs`' `slack`/`band`.
+    own fitted width (`fit_sigma`), and -- for `detector="multi_emitter"`
+    only -- how far that may stray before the fit stops being reported is
+    `detect_kwargs`' `slack`/`band`.
 
     `frame_range`, if given, is a `(start, end)` pair (Python-slice
     semantics: `end` exclusive) restricting which frames are processed --
@@ -588,13 +665,14 @@ def run_detect_step(
     was junk" stays an auditable fact about the run rather than a silent
     deletion.
 
-    Both paths run every frame through the rayon-parallel `localize_stack`
-    -- `n_threads` (default: every core, `os.cpu_count()`) is how many
-    native threads it hands frames to. They differ only in chunk size:
-    with no `progress_callback`, the whole range goes through in one call;
-    with one, the range is split into chunks of `n_threads` frames each --
-    small enough that progress and cancellation still land often, large
-    enough that every thread stays busy within a chunk.
+    Both paths run every frame through whichever rayon-parallel stack
+    function `detector` selects -- `n_threads` (default: every core,
+    `os.cpu_count()`) is how many native threads it hands frames to. They
+    differ only in chunk size: with no `progress_callback`, the whole range
+    goes through in one call; with one, the range is split into chunks of
+    `n_threads` frames each -- small enough that progress and cancellation
+    still land often, large enough that every thread stays busy within a
+    chunk.
 
     `cancel_event`, if given, is checked before this stage starts and --
     on the `progress_callback` path only -- again before each chunk, so a
@@ -610,7 +688,11 @@ def run_detect_step(
         sigma = session.sigma
 
     camera = dict(camera_kwargs) if camera_kwargs is not None else dict(DEFAULT_CAMERA_KWARGS)
-    detect = dict(detect_kwargs) if detect_kwargs is not None else dict(DEFAULT_DETECT_KWARGS)
+    localize_stack_fn = spotsolve.localize_aguet_stack if detector == "aguet" else spotsolve.localize_stack
+    if detect_kwargs is not None:
+        detect = dict(detect_kwargs)
+    else:
+        detect = dict(DEFAULT_SPARSE_KWARGS if detector == "aguet" else DEFAULT_DETECT_KWARGS)
 
     start, end = _resolve_frame_range(frame_range, session.image.shape[0])
     if end <= start:
@@ -626,7 +708,7 @@ def run_detect_step(
             _check_cancelled(cancel_event)
             j = min(i + threads, end)
             results.extend(
-                spotsolve.localize_stack(
+                localize_stack_fn(
                     session.image[i:j], sigma, roi=mask, images=False,
                     n_threads=threads, **camera, **detect
                 )
@@ -634,7 +716,7 @@ def run_detect_step(
             progress_callback(len(results), n, "finding spots")
             i = j
     else:
-        results = spotsolve.localize_stack(
+        results = localize_stack_fn(
             session.image[start:end], sigma, roi=mask, images=False,
             n_threads=threads, **camera, **detect
         )
@@ -663,6 +745,7 @@ def run_detect_step(
     session.frames_df = loctable.concat(frame_parts)
     session.camera_kwargs_used = camera
     session.detect_kwargs_used = detect
+    session.detector_used = detector
     session.agg_ratio_used = agg_ratio
     session.frame_range_used = (start, end)
     return session
@@ -991,6 +1074,7 @@ def session_manifest_extra(session: PipelineSession) -> dict:
         "n_points": session.points_df.height if session.points_df is not None else 0,
         "n_tracks": session.tracks_df["track_id"].n_unique() if session.tracks_df is not None and session.tracks_df.height else 0,
         "camera_kwargs": session.camera_kwargs_used,
+        "detector": session.detector_used,
         "detect_kwargs": _jsonable_detect_kwargs(session.detect_kwargs_used),
         "calibration_kwargs": session.calibration_kwargs_used,
         "calibration_frame": session.calibration_frame_used,
@@ -1092,6 +1176,7 @@ def run_detect_track(
         progress_callback=detect_progress,
         cancel_event=cancel_event,
         n_threads=params.n_threads,
+        detector=params.detector,
     )
 
     def track_progress(done: int, total: int, stage: str) -> None:

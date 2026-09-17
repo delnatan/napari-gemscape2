@@ -1055,6 +1055,7 @@ class ExperimentListWidget(QWidget):
             self.params_panel.get_detect_kwargs(),
             self.params_panel.get_agg_ratio(),
             mask,
+            self.params_panel.get_detector(),
         )
         self._start_step_worker(
             worker, lambda s, item=item: self._on_preview_finished(item, s), indeterminate=True
@@ -1094,9 +1095,10 @@ class ExperimentListWidget(QWidget):
         `accepted` (green border) is whether a detect run at this sigma
         would report the spot at all, or reject it as out-of-band (see
         `pipeline.calibration_accepted`); gray-bordered points are the
-        out-of-band fits, which the preview includes precisely because it
-        runs with the band off. That is what makes the band choosable:
-        both populations are on the image at once.
+        out-of-band fits, which the preview includes precisely because the
+        multi-emitter detector runs with the band off. That is what makes
+        the band choosable: both populations are on the image at once. The
+        Aguet detector has no band -- every point previews green.
 
         Faces are transparent (border color only) so the boxes outline
         each fit without occluding the underlying image."""
@@ -1184,6 +1186,7 @@ class ExperimentListWidget(QWidget):
             self._cancel_event,
             emitter,
             self.params_panel.get_n_threads(),
+            self.params_panel.get_detector(),
         )
         self._start_step_worker(
             worker,
@@ -1649,6 +1652,7 @@ def _run_preview_worker(
     detect_kwargs: dict,
     agg_ratio: float,
     mask: Optional[np.ndarray],
+    detector: str = "multi_emitter",
 ) -> PipelineSession:
     return run_preview_frame(
         session,
@@ -1658,6 +1662,7 @@ def _run_preview_worker(
         detect_kwargs=detect_kwargs,
         agg_ratio=agg_ratio,
         mask=mask,
+        detector=detector,
     )
 
 
@@ -1673,6 +1678,7 @@ def _run_detect_worker(
     cancel_event: threading.Event,
     emitter: _ProgressEmitter,
     n_threads: Optional[int] = None,
+    detector: str = "multi_emitter",
 ) -> PipelineSession:
     def progress_cb(done: int, total: int, stage: str) -> None:
         emitter.updated.emit(done, total, stage)
@@ -1688,6 +1694,7 @@ def _run_detect_worker(
         progress_callback=progress_cb,
         cancel_event=cancel_event,
         n_threads=n_threads,
+        detector=detector,
     )
 
 

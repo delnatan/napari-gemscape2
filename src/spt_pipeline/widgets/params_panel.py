@@ -68,12 +68,20 @@ rather than to the whole form.
 
 Why this form is so much smaller than the sfwloc-era one it replaces: that
 pipeline offered three detectors, each with its own ~20-key solver-kwargs
-dict, and a linker with a hand-tuned bootstrap gate. `spotsolve` has one
-detector whose decision rule is fixed (an emitter exists iff it lowers the
-box's Poisson deviance by a set number of nats) and a linker with no dials
-at all, so what's left to expose is genuinely the camera, the PSF width,
-and the reporting band -- physical facts about the instrument rather than
-solver tuning. A knob that isn't here is not hidden; it doesn't exist.
+dict, and a linker with a hand-tuned bootstrap gate. `spotsolve`'s default
+detector has a fixed decision rule (an emitter exists iff it lowers the
+box's Poisson deviance by a set number of nats) and the linker has no dials
+at all, so what's left to expose there is genuinely the camera, the PSF
+width, and the reporting band -- physical facts about the instrument rather
+than solver tuning. A knob that isn't here is not hidden; it doesn't exist.
+
+`spotsolve` now also ships a second detector, Aguet -- LoG-screened
+candidates fitted one at a time, with no multi-emitter search and no
+width-band rejection (the spotfitlm-compatible sparse baseline). The
+"detector" dropdown at the top of the Detect tab's core section picks
+between them; the knobs beneath it swap to match (`k_max`/`threshold`/
+`slack`/`band` for the default, `significance`/`boxsize`/`itermax` for
+Aguet) rather than showing both detectors' settings at once.
 
 Each tab owns its stage's "Run" button and a one-line status label, wired
 to `PipelineParamsWidget`'s `previewRequested`/`detectRequested`/
@@ -140,6 +148,7 @@ from spt_pipeline.pipeline import (
     DEFAULT_CALIBRATION_KWARGS,
     DEFAULT_CAMERA_KWARGS,
     DEFAULT_DETECT_KWARGS,
+    DEFAULT_SPARSE_KWARGS,
     TRACK_METRIC_COLUMNS,
     DetectTrackParams,
     FilterSpec,
@@ -175,8 +184,8 @@ def _run_row(button_text: str) -> tuple[QPushButton, QLabel, QHBoxLayout]:
 
 class _DetectTab(QWidget):
     """Three pages -- PSF width, Detect, Filter -- leafed through with the
-    `qtkit.StepPager` header: the PSF width, the `spotsolve.localize`
-    knobs plus scope and the two actions that produce something to look at
+    `qtkit.StepPager` header: the PSF width, the detector choice and its
+    knobs plus scope, and the two actions that produce something to look at
     (preview one frame / run the range), then a filter stack over what
     they found.
 
@@ -193,16 +202,28 @@ class _DetectTab(QWidget):
     Core: `offset` (the one camera fact `spotsolve` still takes -- gain and
     read noise are measured from each frame now), `sigma` with its preview
     loop (see this module's docstring -- this is what replaced the
-    Calibration tab), `k_max` (most emitters one box may be fitted with
-    jointly -- the crowding ceiling), the LoG `threshold` (one cut, used
-    both for seeding a box and for trying another emitter inside one), the
-    aggregate cut, a frame range and a "restrict to ROI" checkbox. Expert:
-    `slack` and `band`, the width ranges a fit may take and be reported
-    at, both as multiples of `sigma` and echoed in px.
+    Calibration tab), the `detector` dropdown, that detector's own knobs, the
+    aggregate cut, a frame range and a "restrict to ROI" checkbox.
 
-    There is no sparsity weight, iteration budget or refinement schedule
-    to set: the search's accept/reject rule is a fixed deviance
-    improvement, and it runs to its own convergence."""
+    Two detectors, two knob sets, never both on screen at once -- the
+    dropdown's choice sets which rows `_on_detector_changed` shows:
+
+      - `multi_emitter` (default, `spotsolve.localize`/`localize_stack`):
+        `k_max` (most emitters one box may be fitted with jointly -- the
+        crowding ceiling) and the LoG `threshold` (one cut, used both for
+        seeding a box and for trying another emitter inside one) in core;
+        `slack`/`band` (expert) -- the width ranges a fit may take and be
+        reported at, both as multiples of `sigma` and echoed in px. There is
+        no sparsity weight, iteration budget or refinement schedule to set:
+        the search's accept/reject rule is a fixed deviance improvement, and
+        it runs to its own convergence.
+      - `aguet` (`spotsolve.localize_aguet`/`localize_aguet_stack`, the
+        spotfitlm-compatible sparse baseline): `significance` (the LoG
+        screening cut, a per-pixel level rather than a z-score) in core;
+        `boxsize`/`itermax` (expert) -- the fit-crop size and this
+        detector's own iteration budget. No `k_max` (fits are independent,
+        never joint) and no `slack`/`band` (every screened fit is reported;
+        there is no width-based reject to gate on)."""
 
     previewRequested = Signal()
     runRequested = Signal()
@@ -222,8 +243,30 @@ class _DetectTab(QWidget):
             "each frame, not from a gain/read-noise calibration.",
         )
         d = DEFAULT_DETECT_KWARGS
+        s = DEFAULT_SPARSE_KWARGS
         slack_lo, slack_hi = d["slack"]
         band_lo, band_hi = d["band"]
+
+        # --- detector choice --------------------------------------------
+        # Which spotsolve function `get_detect_kwargs`/pipeline.run_detect_
+        # step actually calls. Switching it swaps the rows below between
+        # this detector's own knobs (`_on_detector_changed`) -- the two take
+        # disjoint keyword arguments, so showing both at once would just
+        # invite setting one that the current choice ignores.
+        self.detector = QComboBox()
+        self.detector.addItem("Multi-emitter (default)", "multi_emitter")
+        self.detector.addItem("Sparse (Aguet)", "aguet")
+        self.detector.setToolTip(
+            "Multi-emitter (default): fits each box jointly, deciding how many\n"
+            "emitters it holds by Bayesian model selection -- one rule for both\n"
+            "crowded and sparse fields.\n\n"
+            "Sparse (Aguet): the spotfitlm-compatible baseline. LoG-screens\n"
+            "candidates, then fits each one independently -- no multi-emitter\n"
+            "search, no width-band rejection (every screened fit is reported).\n"
+            "For genuinely sparse fields where the joint search is unneeded."
+        )
+        self.detector.currentIndexChanged.connect(self._on_detector_changed)
+        self._detector_note = note_label("")
 
         # --- PSF width, and the preview loop that measures it ----------
         self.sigma = double_spinbox(
@@ -260,10 +303,12 @@ class _DetectTab(QWidget):
         )
         self.preview_button = QPushButton("Preview frame")
         self.preview_button.setToolTip(
-            "Localize this one frame at the current sigma with the reporting\n"
-            "band OFF, so every fit shows up -- including the ones a real run\n"
-            "would bin as out-of-band. Nothing is saved and points from a\n"
-            "previous Run detect are left alone."
+            "Localize this one frame at the current sigma with the chosen\n"
+            "detector below. For the multi-emitter detector its reporting band\n"
+            "is forced off, so every fit shows up -- including the ones a real\n"
+            "run would bin as out-of-band; Aguet has no band, so this changes\n"
+            "nothing for it. Nothing is saved and points from a previous Run\n"
+            "detect are left alone."
         )
         self.preview_button.clicked.connect(self.previewRequested.emit)
         self.use_measured_button = QPushButton("Use")
@@ -324,16 +369,28 @@ class _DetectTab(QWidget):
             self.threshold.setValue(d["threshold"])
         self.derive_threshold.toggled.connect(self._on_derive_threshold_toggled)
         self._on_derive_threshold_toggled(self.derive_threshold.isChecked())
-        threshold_row = QHBoxLayout()
+        self._threshold_row = threshold_row = QHBoxLayout()
         threshold_row.setContentsMargins(0, 0, 0, 0)
         threshold_row.addWidget(self.threshold)
         threshold_row.addWidget(self.derive_threshold)
+
+        # Aguet's one core tuning knob: the per-pixel LoG screening level
+        # (not a frame-wide false discovery rate -- see spotsolve.aguet).
+        # Plays the same "main cut" role `threshold` plays for the
+        # multi-emitter detector, so it sits in the same row position.
+        self.significance = double_spinbox(
+            s["significance"], 1e-6, 0.5, 0.01, decimals=4,
+            tooltip="Per-pixel screening significance for the Aguet baseline --\n"
+            "lower is stricter (fewer candidates screened in). This is NOT a\n"
+            "frame-wide false discovery rate. Raise it toward 0.1-0.2 on faint,\n"
+            "sparse data; lower it for fewer false positives.",
+        )
 
         # Over-bright cut, relative to each frame's own median detection --
         # relative so that one number survives bleaching and illumination
         # drift over a long movie. Detections above it are flagged, not
         # deleted (see pipeline.run_detect_step); the Track tab decides
-        # whether linking sees them.
+        # whether linking sees them. Shared by both detectors.
         self.agg_ratio = double_spinbox(
             spotsolve.AGG_AMP_RATIO, 1.0, 1e6, 1.0, decimals=2,
             tooltip="Flag a detection as an aggregate when its flux exceeds this\n"
@@ -341,11 +398,14 @@ class _DetectTab(QWidget):
             "the Track tab decides whether linking sees them.",
         )
 
-        core_form = QFormLayout()
+        self.core_form = core_form = QFormLayout()
         core_form.setContentsMargins(0, 0, 0, 0)
+        core_form.addRow("detector", self.detector)
+        core_form.addRow("", self._detector_note)
         core_form.addRow("offset (ADU)", self.offset)
         core_form.addRow("k_max", self.k_max)
         core_form.addRow("threshold", threshold_row)
+        core_form.addRow("significance", self.significance)
         core_form.addRow("aggregate ratio", self.agg_ratio)
 
         # What gets analyzed, not how -- kept in core (not expert) since
@@ -370,7 +430,8 @@ class _DetectTab(QWidget):
         frame_row.addWidget(self.frame_end)
         frame_row.addStretch()
 
-        # How many native threads `localize_stack` hands frames to (both
+        # How many native threads the chosen detector's stack function
+        # (`localize_stack` or `localize_aguet_stack`) hands frames to (both
         # the batch path and, chunked, the interactively-watched one --
         # see `pipeline.run_detect_step`'s docstring). Capped at the
         # machine's own core count; defaulting to it is what "use every
@@ -378,7 +439,7 @@ class _DetectTab(QWidget):
         cpu_count = os.cpu_count() or 1
         self.n_threads = _ispin(
             cpu_count, 1, cpu_count,
-            tooltip="Worker threads spotsolve's localize_stack hands frames to.\n"
+            tooltip="Worker threads the detector's stack function hands frames to.\n"
             "Defaults to every core on this machine. Lower it to leave some\n"
             "cores free for other work while a long run is going.",
         )
@@ -460,25 +521,44 @@ class _DetectTab(QWidget):
         )
         self.no_band.toggled.connect(self._on_no_band_toggled)
 
-        slack_row = QHBoxLayout()
+        self._slack_row = slack_row = QHBoxLayout()
         slack_row.setContentsMargins(0, 0, 0, 0)
         slack_row.addWidget(self.slack_lo)
         slack_row.addWidget(QLabel("to"))
         slack_row.addWidget(self.slack_hi)
-        band_row = QHBoxLayout()
+        self._band_row = band_row = QHBoxLayout()
         band_row.setContentsMargins(0, 0, 0, 0)
         band_row.addWidget(self.band_lo)
         band_row.addWidget(QLabel("to"))
         band_row.addWidget(self.band_hi)
 
+        # Aguet's own expert knobs: the odd fit-crop size and this
+        # detector's optimizer iteration budget. Both rarely need changing
+        # -- there's no per-emitter search to bound the way slack/band
+        # bound the multi-emitter fit.
+        self.boxsize = _ispin(
+            s["boxsize"], 3, 99,
+            tooltip="Odd fit-crop size, px, around each screened candidate.\n"
+            "Oversized boxes yield no fits. Leave at the default unless\n"
+            "spots sit close enough to overlap the crop.",
+        )
+        self.itermax = _ispin(
+            s["itermax"], 1, 10_000,
+            tooltip="Max optimizer iterations per candidate fit. Rarely needs\n"
+            "changing.",
+        )
+
         self._band_note = note_label("")
-        expert_form = QFormLayout()
+        self.expert_form = expert_form = QFormLayout()
         expert_form.setContentsMargins(0, 0, 0, 0)
         expert_form.addRow("slack (x sigma)", slack_row)
         expert_form.addRow("band (x sigma)", band_row)
         expert_form.addRow("", self._band_note)
         expert_form.addRow("", self.no_band)
+        expert_form.addRow("boxsize (px)", self.boxsize)
+        expert_form.addRow("max iterations", self.itermax)
         self._update_band_note()
+        self._on_detector_changed()
 
         self.run_button, self.status_label, run_row = _run_row("Run detect")
         self.run_button.clicked.connect(self._on_run_button_clicked)
@@ -559,6 +639,8 @@ class _DetectTab(QWidget):
             parts.append(f"median fit_sigma {median:.3f}{spread} px")
         if summary.get("band") is not None:
             parts.append(f"{summary.get('n_in_band', 0)} in band")
+        if summary.get("n_failed"):
+            parts.append(f"{summary['n_failed']} failed fits")
         if summary.get("n_flagged"):
             parts.append(f"{summary['n_flagged']} aggregate")
         self.set_preview_status("  ·  ".join(parts), level)
@@ -577,6 +659,32 @@ class _DetectTab(QWidget):
         return self._preview_frame.value()
 
     # -- detect -----------------------------------------------------------
+
+    def get_detector(self) -> str:
+        return self.detector.currentData()
+
+    def _on_detector_changed(self) -> None:
+        """Swap the core/expert rows to match the chosen detector -- see
+        this class's docstring for which knobs belong to which. Both
+        detectors' widgets exist the whole time (their values persist
+        across a switch); only visibility changes, via `QFormLayout.
+        setRowVisible` on whichever field object the row was built with."""
+        sparse = self.get_detector() == "aguet"
+        self.core_form.setRowVisible(self.k_max, not sparse)
+        self.core_form.setRowVisible(self._threshold_row, not sparse)
+        self.core_form.setRowVisible(self.significance, sparse)
+        self.expert_form.setRowVisible(self._slack_row, not sparse)
+        self.expert_form.setRowVisible(self._band_row, not sparse)
+        self.expert_form.setRowVisible(self._band_note, not sparse)
+        self.expert_form.setRowVisible(self.no_band, not sparse)
+        self.expert_form.setRowVisible(self.boxsize, sparse)
+        self.expert_form.setRowVisible(self.itermax, sparse)
+        self._detector_note.setText(
+            "No width-band rejection: every screened fit is reported, so\n"
+            "frames_df's too_narrow/too_wide/edge counts stay 0."
+            if sparse
+            else ""
+        )
 
     def _on_derive_threshold_toggled(self, checked: bool) -> None:
         self.threshold.setEnabled(not checked)
@@ -697,6 +805,12 @@ class _DetectTab(QWidget):
         return dict(offset=self.offset.value())
 
     def get_detect_kwargs(self) -> dict:
+        if self.get_detector() == "aguet":
+            return dict(
+                significance=self.significance.value(),
+                boxsize=self.boxsize.value(),
+                itermax=self.itermax.value(),
+            )
         return dict(
             k_max=self.k_max.value(),
             threshold=None if self.derive_threshold.isChecked() else self.threshold.value(),
@@ -918,6 +1032,7 @@ class PipelineParamsWidget(QWidget):
             agg_ratio=self._detect.get_agg_ratio(),
             drop_aggregates=self._tracking.get_drop_aggregates(),
             link_with_flux=self._tracking.get_link_with_flux(),
+            detector=self._detect.get_detector(),
             camera_kwargs=self._detect.get_camera_kwargs(),
             detect_kwargs=self._detect.get_detect_kwargs(),
             calibration_kwargs=dict(DEFAULT_CALIBRATION_KWARGS),
@@ -955,6 +1070,9 @@ class PipelineParamsWidget(QWidget):
 
     def get_detect_kwargs(self) -> dict:
         return self._detect.get_detect_kwargs()
+
+    def get_detector(self) -> str:
+        return self._detect.get_detector()
 
     def get_agg_ratio(self) -> float:
         return self._detect.get_agg_ratio()
