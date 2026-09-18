@@ -45,45 +45,42 @@ just precisely on the list rows) -- both `_ExperimentListView` and the
 outer `ExperimentListWidget` implement it, since the list no longer fills
 the whole panel now that the params form sits below it.
 
-Two ways to run the pipeline on the *current* selection, both threaded
-through the same `self._worker` slot (only one run -- batch or stepwise
--- active at a time):
-- **Batch** ("Run selected" button / `Shift+R` key, possibly multi-select):
-  always the full calibrate->detect->track pipeline
-  (`pipeline.run_detect_track`). Only `Status.UNTOUCHED`/`Status.ERROR`
-  items run by default -- `COMPLETE`/`SKIP` are excluded so this can't
-  silently overwrite finished work; press `U` to unmark a `COMPLETE` item
-  first if a deliberate re-run is wanted. The same button doubles as
-  Cancel while a run is active (`_cancel_active_run`) -- cooperative, see
-  `pipeline.PipelineCancelled`'s docstring for what that actually
-  guarantees per stage.
-- **Stepwise** (the params-panel tabs' own buttons, single current item
-  only): preview, detect and track run independently against a
-  `pipeline.PipelineSession` held in `self._session`, so changing one
-  stage's knobs and re-running it doesn't force redoing the earlier
-  stages. The session resets on selection change (see
-  `_on_selection_changed`) -- it's scoped to "the image currently being
-  worked on", not persisted across items.
+The pipeline runs one image at a time, on the current row, from the
+params-panel tabs' own buttons. Preview, detect and track run
+independently, in the background through one `self._worker` slot, against
+a `pipeline.PipelineSession` held in `self._session`, so changing one
+stage's knobs and re-running it doesn't force redoing the earlier stages.
+The session resets on selection change (see `_on_selection_changed`) --
+it's scoped to "the image currently being worked on", not persisted across
+items. Detect can be cancelled from its own button (`_cancel_active_run`)
+-- cooperatively, see `pipeline.PipelineCancelled`'s docstring for what
+that actually guarantees per stage.
 
-  Stepwise runs write **nothing** until "Save results" is pressed
-  (`_save_result`). The filter histograms on both tabs are the reason:
-  the cuts they set are chosen by looking at a finished stage's output, so
-  committing the bundle the instant linking returned would mean saving
-  before the decision that shapes it had been made. Batch runs still write
-  on completion -- nobody is dragging a handle during one. `has_unsaved_
-  session` on the list row is what marks the gap in between.
+There is deliberately no multi-file "run everything" here: an unattended
+run can't use the filter histograms, and a second, hands-off path through
+the same widget blurred what a saved bundle meant. Running a folder
+headlessly is the `spt detect-track` CLI's job (`pipeline.run_detect_track`);
+pooling results across experiments is a script's job, over the saved
+bundles.
 
-  Filters also drive the viewer live: `_update_points_layer` and
-  `_update_tracks_layer` redraw the "points (preview)"/"tracks (preview)"
-  layers through the current cuts on every handle move, so a spot that
-  fails a cut leaves the image as the cut is made. That immediacy is the
-  point of keeping the histogram next to the viewer instead of in a
-  report. Saving then hands those same layers their final names
-  (`_promote_preview_layers`) without touching the image layer or the ROI
-  layers, so the view doesn't reset out from under the user at the moment
-  the work is committed. Every layer here is built by
-  `viewer.py`'s `add_image_layer`/`add_points_layer`/`add_tracks_layer`,
-  which is what makes preview and final look identical.
+Runs write **nothing** until "Save results" is pressed
+(`_save_result`). The filter histograms on both tabs are the reason:
+the cuts they set are chosen by looking at a finished stage's output, so
+committing the bundle the instant linking returned would mean saving
+before the decision that shapes it had been made. `has_unsaved_session`
+on the list row is what marks the gap in between.
+
+Filters also drive the viewer live: `_update_points_layer` and
+`_update_tracks_layer` redraw the "points (preview)"/"tracks (preview)"
+layers through the current cuts on every handle move, so a spot that
+fails a cut leaves the image as the cut is made. That immediacy is the
+point of keeping the histogram next to the viewer instead of in a
+report. Saving then hands those same layers their final names
+(`_promote_preview_layers`) without touching the image layer or the ROI
+layers, so the view doesn't reset out from under the user at the moment
+the work is committed. Every layer here is built by
+`viewer.py`'s `add_image_layer`/`add_points_layer`/`add_tracks_layer`,
+which is what makes preview and final look identical.
 """
 
 from __future__ import annotations
@@ -105,7 +102,6 @@ from qtpy.QtGui import QColor, QFontMetrics, QPainter, QPen
 from qtpy.QtWidgets import (
     QAbstractItemView,
     QFileDialog,
-    QHBoxLayout,
     QLabel,
     QListWidget,
     QFrame,
@@ -136,7 +132,6 @@ from spt_pipeline.results import (
 )
 from spt_pipeline.io_formats import SUPPORTED_SUFFIXES as SUPPORTED_FORMATS
 from spt_pipeline.pipeline import (
-    DetectTrackParams,
     PipelineCancelled,
     PipelineSession,
     apply_filters,
@@ -144,7 +139,6 @@ from spt_pipeline.pipeline import (
     filter_mask,
     load_session,
     run_detect_step,
-    run_detect_track,
     run_preview_frame,
     run_track_step,
     session_from_bundle,
@@ -181,18 +175,14 @@ def _dropped_folder(event) -> Optional[Path]:
 
 class Status(str, Enum):
     UNTOUCHED = "untouched"
-    RUNNING = "running"
     COMPLETE = "complete"
     SKIP = "skip"
-    ERROR = "error"
 
 
 STATUS_COLORS = {
     Status.UNTOUCHED: QColor("#9a9a9a"),
-    Status.RUNNING: QColor("#3b82f6"),
     Status.COMPLETE: QColor("#22c55e"),
     Status.SKIP: QColor("#5a5a5a"),
-    Status.ERROR: QColor("#ef4444"),
 }
 
 
@@ -202,7 +192,6 @@ class ExperimentEntry:
     result_dir: Path
     status: Status = Status.UNTOUCHED
     n_tracks: Optional[int] = None
-    error: Optional[str] = None
     # True while this item's session holds results (a detect or link run,
     # or filters moved since the last save) that aren't in its bundle --
     # painted as an amber ring by ExperimentItemDelegate. Leaving the item
@@ -224,7 +213,7 @@ class ExperimentItem(QListWidgetItem):
 
 
 class ExperimentItemDelegate(QStyledItemDelegate):
-    """Paints a status dot + filename (+ track count/error once known)."""
+    """Paints a status dot + filename (+ track count once known)."""
 
     DOT_DIAMETER = 8
     PADDING = 8
@@ -262,12 +251,10 @@ class ExperimentItemDelegate(QStyledItemDelegate):
         label = entry.image_path.name
         if entry.status is Status.COMPLETE and entry.n_tracks is not None:
             label += f"   ({entry.n_tracks} tracks)"
-        elif entry.status is Status.ERROR and entry.error:
-            label += f"   — {entry.error}"
         painter.setPen(text_color)
         # Plain drawText into a rect this narrow just hard-clips a long
-        # filename/error mid-character with no visual cue there's more --
-        # elide it instead (full path/error is still available via the
+        # filename mid-character with no visual cue there's more --
+        # elide it instead (full path is still available via the
         # item's tooltip, set in `ExperimentItem.__init__`).
         metrics = QFontMetrics(painter.font())
         elided = metrics.elidedText(label, Qt.TextElideMode.ElideRight, text_rect.width())
@@ -282,13 +269,11 @@ class _ExperimentListView(QListWidget):
     """The list itself: folder scanning + keybindings. Composed inside
     `ExperimentListWidget`, which owns the run/progress machinery."""
 
-    runRequested = Signal(list)  # list[ExperimentItem]
-
-    KEYBINDINGS = "Enter: load · Shift+R: run · X: skip · U: unmark · F5: rescan"
+    KEYBINDINGS = "Enter: load · X: skip · U: unmark · F5: rescan"
 
     def __init__(self) -> None:
         super().__init__()
-        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
         # QAbstractItemView delivers drag/drop events to its internal
@@ -314,9 +299,6 @@ class _ExperimentListView(QListWidget):
 
     def keyPressEvent(self, event) -> None:
         key = event.key()
-        if key == Qt.Key.Key_R and (event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
-            self.runRequested.emit(self.selectedItems())
-            return
         if key in (Qt.Key.Key_X, Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             for item in self.selectedItems():
                 item.set_status(Status.SKIP)
@@ -391,7 +373,7 @@ class _ProgressEmitter(QObject):
 
 
 class ExperimentListWidget(QWidget):
-    """Dock widget: folder-scan list + Run button/progress bar."""
+    """Dock widget: folder-scan list + params tabs + progress bar."""
 
     def __init__(self, napari_viewer) -> None:
         super().__init__()
@@ -400,15 +382,11 @@ class ExperimentListWidget(QWidget):
         self._cancel_event: Optional[threading.Event] = None
         self._session: Optional[PipelineSession] = None
         self._session_item: Optional[ExperimentItem] = None
-        # True while a stepwise Calibrate/Detect/Track worker (as opposed to
-        # a batch run) is active against `self._session_item` -- guards
-        # `_on_selection_changed` so clicking a different row mid-run can't
-        # rug the viewer layers out from under it (Finding: napari's layer
-        # list going blank on a mid-detect selection change). Batch runs
-        # don't set this (they go through `_run_next` directly, not
-        # `_start_step_worker`) since they don't hold layers hostage the
-        # same way -- `_on_run_finished`/`_on_run_error` already only touch
-        # the viewer when the finishing item is still the current one.
+        # True while a Preview/Detect/Track worker is active against
+        # `self._session_item` -- guards `_on_selection_changed` so clicking
+        # a different row mid-run can't rug the viewer layers out from under
+        # it (Finding: napari's layer list going blank on a mid-detect
+        # selection change).
         self._step_running = False
         # Re-entrancy guard for the `setCurrentItem` call `_on_selection_changed`
         # makes to revert a blocked switch -- without it, that call's own
@@ -468,8 +446,6 @@ class ExperimentListWidget(QWidget):
 
         self.list_view = _ExperimentListView()
         self.list_view.currentItemChanged.connect(self._on_selection_changed)
-        self.list_view.itemSelectionChanged.connect(self._update_run_button_label)
-        self.list_view.runRequested.connect(self._run_items)
         self.list_view.is_busy = lambda: self._worker is not None
         self.list_view.on_busy_blocked = lambda: self.progress_label.setText(
             "a run is in progress — finishing before loading a new folder"
@@ -478,12 +454,6 @@ class ExperimentListWidget(QWidget):
 
         open_button = QPushButton("Open folder…")
         open_button.clicked.connect(self._open_folder_dialog)
-        self.run_button = QPushButton("Run selected")
-        self.run_button.clicked.connect(self._on_run_button_clicked)
-
-        button_row = QHBoxLayout()
-        button_row.addWidget(open_button)
-        button_row.addWidget(self.run_button)
 
         self.params_panel = PipelineParamsWidget()
         self.params_panel.previewRequested.connect(self._run_preview_step)
@@ -574,10 +544,9 @@ class ExperimentListWidget(QWidget):
 
         layout = QVBoxLayout()
         layout.addWidget(header)
-        layout.addLayout(button_row)
+        layout.addWidget(open_button)
         layout.addWidget(splitter)
         self.setLayout(layout)
-        self._update_run_button_label()
 
     def _open_folder_dialog(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Select folder of timelapses")
@@ -737,7 +706,7 @@ class ExperimentListWidget(QWidget):
         return generation == self._load_generation and self.list_view.currentItem() is item
 
     def _clear_loading_text(self) -> None:
-        # Only our own message: a batch run shares this label.
+        # Only our own message: a step run shares this label.
         if self.progress_label.text() == self._loading_text:
             self.progress_label.setText("")
 
@@ -816,106 +785,12 @@ class ExperimentListWidget(QWidget):
             return
         self.progress_label.setText(f"could not load {item.entry.image_path.name}: {exc}")
 
-    def _update_run_button_label(self) -> None:
-        """Reflects what a click on `run_button` would actually do, given
-        the current selection -- kept a no-op while a run is active, since
-        `_run_next`/`_cancel_active_run` own the label in that state."""
-        if self._worker is not None:
-            return
-        items = self.list_view.selectedItems()
-        runnable = [item for item in items if item.entry.status in (Status.UNTOUCHED, Status.ERROR)]
-        n_complete = sum(1 for item in items if item.entry.status is Status.COMPLETE)
-        if not items:
-            self.run_button.setText("Run selected")
-        elif n_complete:
-            self.run_button.setText(f"Run selected ({len(runnable)}, {n_complete} complete)")
-        else:
-            self.run_button.setText(f"Run selected ({len(runnable)})")
-        self.run_button.setEnabled(True)
-
-    def _on_run_button_clicked(self) -> None:
-        if self._worker is not None:
-            self._cancel_active_run()
-        else:
-            self._run_items(self.list_view.selectedItems())
-
     def _cancel_active_run(self) -> None:
-        """Requests cancellation of whatever's currently running (batch or
-        stepwise Detect) -- cooperative only, see `PipelineCancelled`'s
-        docstring for how promptly this actually takes effect per stage.
-        Also drops any remaining queued batch items so they don't start."""
+        """Requests cancellation of the running Detect step -- cooperative
+        only, see `PipelineCancelled`'s docstring for how promptly this
+        actually takes effect per stage."""
         if self._cancel_event is not None:
             self._cancel_event.set()
-        self._run_queue = []
-        self.run_button.setText("Cancelling…")
-        self.run_button.setEnabled(False)
-
-    def _run_items(self, items: list[ExperimentItem]) -> None:
-        if self._worker is not None:
-            return
-        runnable = [item for item in items if item.entry.status in (Status.UNTOUCHED, Status.ERROR)]
-        n_complete = sum(1 for item in items if item.entry.status is Status.COMPLETE)
-        n_skip = sum(1 for item in items if item.entry.status is Status.SKIP)
-        if not runnable:
-            if n_complete or n_skip:
-                self.progress_label.setText(
-                    f"nothing to run -- {n_complete} already complete, {n_skip} skipped "
-                    "(press U to unmark and re-run)"
-                )
-            return
-        if n_complete or n_skip:
-            self.progress_label.setText(
-                f"running {len(runnable)}, skipping {n_complete} complete + {n_skip} skipped"
-            )
-        self._run_queue = runnable
-        self._cancel_event = threading.Event()
-        self._run_next()
-
-    def _run_next(self) -> None:
-        if not self._run_queue:
-            self._worker = None
-            self._cancel_event = None
-            self.progress_bar.setVisible(False)
-            self.progress_label.setText("")
-            self._update_run_button_label()
-            return
-
-        item = self._run_queue.pop(0)
-        entry = item.entry
-        item.set_status(Status.RUNNING)
-        self.list_view.viewport().update()
-
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setValue(0)
-        self.progress_label.setText(f"Running: {entry.image_path.name}")
-        # Filename already shown in `progress_label` above -- a QPushButton
-        # can't wrap its text, so embedding an unbounded filename here would
-        # force the button (and the row/dock around it) wider for as long
-        # as this run's name stays the longest one seen, the same class of
-        # bug `progress_label`'s own word-wrap fix addresses.
-        self.run_button.setText("Cancel")
-        self.run_button.setEnabled(True)
-
-        emitter = _ProgressEmitter()
-        emitter.updated.connect(self._on_progress)
-
-        worker = _run_pipeline_worker(
-            entry.image_path,
-            self.params_panel.get_params(),
-            self._cancel_event,
-            emitter,
-            # A batch run honors the same override as a stepwise one --
-            # a folder of acquisitions with no recorded pixel size is
-            # exactly the case the override exists for, and it would be
-            # odd for "Run selected" to be the one path that ignores it.
-            self.params_panel.get_pixel_size_um(),
-            self.params_panel.get_dt_s(),
-            self.params_panel.get_exposure_s(),
-        )
-        worker.returned.connect(lambda result, item=item: self._on_run_finished(item, result))
-        worker.errored.connect(lambda exc, item=item: self._on_run_error(item, exc))
-        self._worker = worker
-        worker.start()
 
     def _on_progress(self, done: int, total: int, stage: str) -> None:
         if total:
@@ -930,52 +805,6 @@ class ExperimentListWidget(QWidget):
             self.progress_label.setText(f"{stage} -- {done}/{total}")
         else:
             self.progress_label.setText(stage)
-
-    def _on_run_finished(self, item: ExperimentItem, result) -> None:
-        points_df, tracks_df, manifest_extra = result
-        entry = item.entry
-
-        import spotsolve
-        import spt_pipeline
-
-        repo_shas = {
-            "spotsolve": git_sha(repo_root_of(spotsolve)),
-            "spt_pipeline": git_sha(repo_root_of(spt_pipeline)),
-        }
-        manifest = build_manifest(
-            result_id=entry.result_dir.name,
-            source_image_path=entry.image_path,
-            params=manifest_extra,
-            repo_shas=repo_shas,
-        )
-        write_result(entry.result_dir, points_df, tracks_df, manifest)
-        item.set_status(Status.COMPLETE, n_tracks=manifest_extra["n_tracks"])
-        self.list_view.viewport().update()
-
-        if self.list_view.currentItem() is item and self._session_item is not item:
-            self._request_item_load(item)
-
-        self._worker = None
-        self._cancel_event = None
-        self._run_next()
-
-    def _on_run_error(self, item: ExperimentItem, exc: Exception) -> None:
-        cancelled = isinstance(exc, PipelineCancelled)
-        if cancelled:
-            # Not a real error -- back to untouched so it's safe (and
-            # obviously re-runnable) rather than parked in Status.ERROR.
-            item.set_status(Status.UNTOUCHED)
-        else:
-            item.set_status(Status.ERROR, error=str(exc))
-        self.list_view.viewport().update()
-        self._worker = None
-        self._cancel_event = None
-        # _run_next()'s empty-queue branch clears progress_label -- set the
-        # "cancelled" message after, so it's the one left showing instead of
-        # being immediately overwritten by that cleanup.
-        self._run_next()
-        if cancelled:
-            self.progress_label.setText("cancelled")
 
     # -- Stepwise Calibrate / Detect / Track (current selection only) --
 
@@ -1545,8 +1374,8 @@ class ExperimentListWidget(QWidget):
     def _apply_image_scale_change(self) -> None:
         """The pixel size / frame interval / exposure override changed.
 
-        For the next run there is nothing to do -- `_ensure_session` and
-        the batch worker both read the panel when they start. What needs
+        For the next run there is nothing to do -- `_ensure_session`
+        reads the panel when it starts. What needs
         handling is a session already holding results, since those were
         computed at the old scale: `points_df`'s `t`/`y_um`/`se_*_um`
         columns were derived by `loctable` at detect time and the track
@@ -1980,30 +1809,6 @@ def _load_item_worker(image_path: Path, result_dir: Path):
     if has_result(result_dir):
         return load_result_display(result_dir)
     return load_image_display(image_path)
-
-
-@thread_worker(start_thread=False)
-def _run_pipeline_worker(
-    image_path: Path,
-    params: DetectTrackParams,
-    cancel_event: threading.Event,
-    emitter: _ProgressEmitter,
-    pixel_size_um: Optional[float] = None,
-    dt_s: Optional[float] = None,
-    exposure_s: Optional[float] = None,
-):
-    def progress_cb(done: int, total: int, stage: str) -> None:
-        emitter.updated.emit(done, total, stage)
-
-    return run_detect_track(
-        image_path,
-        pixel_size_um=pixel_size_um,
-        dt_s=dt_s,
-        exposure_s=exposure_s,
-        params=params,
-        progress_callback=progress_cb,
-        cancel_event=cancel_event,
-    )
 
 
 @thread_worker(start_thread=False)

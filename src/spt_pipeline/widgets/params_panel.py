@@ -38,9 +38,8 @@ preview at the current sigma, look at the `fit_sigma` histogram, click
 three rounds and the distribution is on screen throughout, so a bimodal or
 ragged `fit_sigma` -- two focal planes, junk being fitted as signal -- is
 something you see rather than something a median averages away.
-`pipeline.run_calibration_step` is still there for the headless path,
-where there is nobody to look; the "calibrate per file" checkbox next to
-`sigma` is what routes a multi-file batch run back to it.
+`pipeline.run_calibration_step` is still there for the headless CLI,
+where there is nobody to look.
 
 The camera fact that's left -- `offset` -- moved here with it: it's read
 by preview, detect and calibrate alike, and with calibration no longer a
@@ -163,12 +162,10 @@ from qtkit import CollapsibleSection, StepPager, double_spinbox, hline, note_lab
 from spt_pipeline import units
 from spt_pipeline.io_formats import StackMetadata
 from spt_pipeline.pipeline import (
-    DEFAULT_CALIBRATION_KWARGS,
     DEFAULT_CAMERA_KWARGS,
     DEFAULT_DETECT_KWARGS,
     DEFAULT_SPARSE_KWARGS,
     TRACK_METRIC_COLUMNS,
-    DetectTrackParams,
     FilterSpec,
 )
 from spt_pipeline.widgets.feature_filters import FeatureFilterPanel
@@ -350,22 +347,6 @@ class _DetectTab(QWidget):
             "the whole of what calibrate_sigma used to do out of sight.",
         )
         self.sigma.valueChanged.connect(self._update_band_note)
-        self.calibrate_per_file = QCheckBox("calibrate per file")
-        self.calibrate_per_file.setChecked(True)
-        self.calibrate_per_file.setToolTip(
-            "Batch runs only (the experiment list's \"Run selected\"): measure\n"
-            "sigma separately for each file with spotsolve.calibrate_sigma,\n"
-            "taking the value on the left as that fit's starting guess.\n"
-            "On by default -- a folder of acquisitions need not share one\n"
-            "focus, and nobody is watching a batch run's histograms.\n\n"
-            "Preview and Run detect below always use the value on the left\n"
-            "exactly as entered, checked or not."
-        )
-        sigma_row = QHBoxLayout()
-        sigma_row.setContentsMargins(0, 0, 0, 0)
-        sigma_row.addWidget(self.sigma)
-        sigma_row.addWidget(self.calibrate_per_file)
-
         self._preview_frame = _ispin(
             0, 0, 1_000_000,
             tooltip="Stack frame (0-based) to preview. Frame 0 isn't always the\n"
@@ -401,7 +382,7 @@ class _DetectTab(QWidget):
 
         psf_form = _compact_form(QFormLayout())
         psf_form.setContentsMargins(0, 0, 0, 0)
-        psf_form.addRow("sigma (px)", sigma_row)
+        psf_form.addRow("sigma (px)", self.sigma)
 
         psf_body = QWidget()
         psf_layout = QVBoxLayout(psf_body)
@@ -541,7 +522,7 @@ class _DetectTab(QWidget):
 
         # How many native threads the chosen detector's stack function
         # (`localize_stack` or `localize_aguet_stack`) hands frames to (both
-        # the batch path and, chunked, the interactively-watched one --
+        # the headless CLI and, chunked, the interactively-watched run --
         # see `pipeline.run_detect_step`'s docstring). Capped at the
         # machine's own core count; defaulting to it is what "use every
         # core" means without a spinbox arrow-key marathon to get there.
@@ -800,9 +781,6 @@ class _DetectTab(QWidget):
     def get_sigma(self) -> float:
         return self.sigma.value()
 
-    def get_calibrate_per_file(self) -> bool:
-        return self.calibrate_per_file.isChecked()
-
     def get_preview_frame_index(self) -> int:
         return self._preview_frame.value()
 
@@ -861,9 +839,8 @@ class _DetectTab(QWidget):
 
     def set_running(self, running: bool) -> None:
         """Repurposes the run button into a Cancel button for the duration
-        of a run, mirroring the batch Run/Cancel toggle on the experiment
-        list's own run button -- see `ExperimentListWidget._cancel_active_run`
-        for what cancelling actually does (cooperative, not instant). Deliberately
+        of a run -- see `ExperimentListWidget._cancel_active_run` for what
+        cancelling actually does (cooperative, not instant). Deliberately
         doesn't embed the running file's name in the button text: a QPushButton
         can't wrap, so an unbounded filename here would force the button --
         and the row/dock around it -- wider, same as the bug fixed on
@@ -911,8 +888,8 @@ class _DetectTab(QWidget):
         """`(start, end)`, or `None` for "whole stack" (both spinboxes at
         their default 0). `end` is passed through as entered -- including
         its `0`/"last" sentinel value -- rather than resolved here against
-        `self._max_frames`, which may not be set yet (e.g. a queued batch
-        item whose image nothing has loaded on this widget). Resolving
+        `self._max_frames`, which may not be set yet (e.g. a run started
+        before the row's image finished loading on this widget). Resolving
         `end <= 0` into the real last frame is `pipeline._resolve_frame_
         range`'s job: it always has the actual stack length in hand."""
         start = self.frame_start.value()
@@ -1537,8 +1514,6 @@ class _TrackingTab(QWidget):
 class PipelineParamsWidget(QWidget):
     """Tabbed `DetectTrackParams` form -- Detect / Track, each a
     detect -> filter -> finalize flow (see this module's docstring).
-    `get_params()` reads both tabs' current state back into a fresh
-    `DetectTrackParams`, for the batch/multi-select "Run" action.
 
     For the stepwise per-tab buttons: `previewRequested`/`detectRequested`/
     `trackRequested`/`saveRequested` fire on click; `set_preview_result`/
@@ -1623,7 +1598,7 @@ class PipelineParamsWidget(QWidget):
         """The pixel size a run should use, or None to take the file's.
 
         `ExperimentListWidget` passes both this and `get_dt_s` to
-        `pipeline.load_session`/`run_detect_track`, whose own arguments
+        `pipeline.load_session`, whose own arguments
         have always accepted an explicit value -- until now only the
         headless config could supply one."""
         return self._image_info.pixel_size_um()
@@ -1633,7 +1608,7 @@ class PipelineParamsWidget(QWidget):
 
     def get_exposure_s(self) -> Optional[float]:
         """The exposure to record, or None to take the file's -- passed to
-        `load_session`/`run_detect_track` beside `get_dt_s`."""
+        `load_session` beside `get_dt_s`."""
         return self._image_info.exposure_s()
 
     def get_effective_exposure_s(self) -> Optional[float]:
@@ -1647,30 +1622,6 @@ class PipelineParamsWidget(QWidget):
         where it is in force, otherwise what the current image's file
         recorded. Either is None when neither has one."""
         return self._image_info.effective()
-
-    def get_params(self) -> DetectTrackParams:
-        """Batch (`run_detect_track`) params. `sigma` is left None when
-        "calibrate per file" is checked, which is what routes a multi-file
-        run back through `run_calibration_step` with the tab's sigma as
-        each fit's starting guess -- see `_DetectTab.calibrate_per_file`."""
-        per_file = self._detect.get_calibrate_per_file()
-        return DetectTrackParams(
-            sigma=None if per_file else self._detect.get_sigma(),
-            sigma_init=self._detect.get_sigma(),
-            calibration_frame_index=self._detect.get_preview_frame_index(),
-            min_track_length=self._tracking.get_min_track_length(),
-            agg_ratio=self._detect.get_agg_ratio(),
-            drop_aggregates=self._tracking.get_drop_aggregates(),
-            link_with_flux=self._tracking.get_link_with_flux(),
-            detector=self._detect.get_detector(),
-            camera_kwargs=self._detect.get_camera_kwargs(),
-            detect_kwargs=self._detect.get_detect_kwargs(),
-            calibration_kwargs=dict(DEFAULT_CALIBRATION_KWARGS),
-            frame_range=self._detect.get_frame_range(),
-            n_threads=self._detect.get_n_threads(),
-            point_filters=self.get_point_filters(),
-            track_filters=self.get_track_filters(),
-        )
 
     def show_tab(self, name: str, step: Optional[str] = None) -> None:
         """Bring one stage's tab -- and optionally one step page within it

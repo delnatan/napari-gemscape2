@@ -145,7 +145,7 @@ it is the next thing to use; otherwise it stays out of the way. The override is
 sticky across images — a folder is usually one session — and never silent about
 it: while in force the line reads `overridden: … — file says …` in amber, and
 the bundle records `pixel_size_um_source: "given explicitly (file said: …)"`.
-Both the stepwise buttons and "Run selected" honor it, as does a config's
+The widget's buttons honor it, as does a config's
 `pixel_size_um`/`dt_s` per `[[inputs]]` entry for headless runs.
 
 Changing the scale after a detect or link run re-derives what it cheaply can
@@ -232,3 +232,8 @@ the classical per-track Brownian MLE (`D` plus a calibrated non-Brownian score
 labelled comparison), Bayesian and per-track anisotropy fits, and offers the same histogram
 filters over per-track results — so a fitted `D` or `alpha` is filterable by the
 same drag as any other feature.
+
+The widgets work on one image at a time, on purpose. To process a whole folder
+without looking at each one, use `spt detect-track`. To compare experiments,
+read the saved bundles (`tracks.parquet`, `manifest.json`) into a script and
+pool them there.

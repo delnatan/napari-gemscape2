@@ -47,9 +47,8 @@ per-tab "Preview frame" / "Run detect" / "Run tracking" buttons (each
 stage builds on whatever the session already has: `run_detect_step` uses
 `session.sigma` from a prior calibration if the caller doesn't pass one
 explicitly; `run_track_step` needs `session.points_df` from a prior
-detect). `run_detect_track` composes them in one call for the headless CLI
-and the widget's batch/multi-select "Run" action, where stepwise control
-isn't needed.
+detect). `run_detect_track` composes them in one call for the headless CLI,
+where stepwise control isn't needed.
 
 Two things the interactive path does that the headless one doesn't:
 
@@ -1411,9 +1410,8 @@ def run_detect_track(
 ) -> tuple[pl.DataFrame, pl.DataFrame, dict]:
     """Run the full calibrate+detect+track pipeline on one timelapse in
     one call, composing `load_session`/`run_calibration_step`/
-    `run_detect_step`/`run_track_step` -- for the headless CLI and the
-    widget's batch/multi-select Run action. See this module's docstring
-    for the stepwise alternative.
+    `run_detect_step`/`run_track_step` -- for the headless CLI. See this
+    module's docstring for the stepwise alternative the widget uses.
 
     `image_path` can be .tif/.tiff, .nd2, or .ims (see `io_formats.load_stack`).
     `channel`/`z_index` pick which plane to track for files with more than

@@ -166,7 +166,7 @@ def image_display_carryover(viewer, name: str) -> dict:
     viewer currently has one, as kwargs for `add_image_layer`.
 
     Reloading a bundle re-adds the same image under the same name (a save
-    or a batch run finishing on the row that's already displayed), and
+    on the row that's already displayed), and
     re-deriving the contrast there would throw away a stretch the user
     hand-tuned -- for no reason, since it's the same pixels. Empty dict
     when there's no such layer, i.e. a genuinely new image, which then
