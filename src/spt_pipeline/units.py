@@ -33,7 +33,7 @@ with a per-track aggregate suffix (`_min`/`_mean`/`_max`, added by
 `widgets/diffusion_panel._qc_aggregate_table`) stripped, then a
 unit-bearing name suffix (`_um2_s`, `_um`, `_s`, `_rad`, ...), then a
 statistic suffix (`_median`/`_lo`/`_hi`/`_stderr`) or a fit-variant suffix
-(`_map`/`_classical`/`_track_fit`) stripped, and finally the unitless and
+(`_map`/`_mle`/`_msd`/`_track_fit`) stripped, and finally the unitless and
 pixel-space registries below.
 """
 
@@ -141,6 +141,26 @@ _EXACT: dict[str, Optional[str]] = {
     "r_squared": None,
     "log_bf10": None,
     "evidence": None,
+    # diffusionkit's Brownian displacement MLE (`classic.analyze_tracks`,
+    # `model == "brownian_mle"`). `z_nonbrownian` is a signed score,
+    # ~N(0,1) under Brownian motion + the provided localization noise;
+    # the p-values and likelihoods are pure numbers too.
+    "z_nonbrownian": None,
+    "z_nonbrownian_asymptotic": None,
+    "p_nonbrownian": None,
+    "p_motion": None,
+    "lr_motion": None,
+    "log_likelihood": None,
+    "alpha_1step": None,
+    "alpha_1step_se": None,
+    "n_boot": None,
+    "n_boot_valid": None,
+    # diffusionkit's count of observations actually used for a track --
+    # the same quantity as `track_length`.
+    "n_frames": POINTS,
+    "status": None,
+    "mle_status": None,
+    "message": None,
     "track_id": None,
     "loc_id": None,
     "model": None,
@@ -179,6 +199,8 @@ _STATISTIC_SUFFIXES = (
     "_classical",
     "_classical_anom",
     "_track_fit",
+    "_mle",
+    "_msd",
     "_est",
     "_link",
     "_arith_mean",
@@ -197,6 +219,7 @@ _MPL_TOKENS = {
     "psi": r"$\psi$",
     "sigma": r"$\sigma$",
     "tau": r"$\tau$",
+    "z": r"$z$",
     "r2": r"$R^2$",
 }
 

@@ -18,12 +18,18 @@ Detect tab's PSF-width preview loop and frame-range/ROI scope controls)
 lives in
 `widgets/params_panel.py::PipelineParamsWidget`, which stays viewer-
 agnostic; this module is what actually resolves the ROI checkbox into a
-boolean mask array, by reading the Shapes layer named in that panel's ROI
-dropdown (`_build_roi_mask`). Several ROIs can be on screen at once --
-"Draw ROI…" adds another Shapes layer each time and `_on_roi_layers_
-changed` keeps the dropdown in step with the viewer (renames included),
-so which region a run covers is a deliberate pick rather than a
-side-effect of which layer was last clicked.
+boolean mask array and a label image, by reading the Shapes layers
+checked in that panel's ROI list (`_build_roi_labels`). Several ROIs can
+be on screen at once -- "Draw ROI…" adds another Shapes layer each time
+and `_on_roi_layers_changed` keeps the list in step with the viewer
+(renames included), so which regions a run covers is a deliberate pick
+rather than a side-effect of which layer was last clicked. Each checked
+layer is one region: detections are labeled with it
+(`rois.label_points`) and tracking links each region on its own.
+
+A row with a saved bundle is also a live session as soon as it's shown
+(`_adopt_bundle_session`): its detections can be linked, and its tracks
+re-filtered and re-saved, without re-running detect.
 
 This widget always runs `run_detect_step` with a `progress_callback`
 (for the live frame-count/cancel UI), which is what actually puts it on
@@ -125,6 +131,7 @@ from spt_pipeline.results import (
     has_result,
     load_manifest,
     repo_root_of,
+    write_detection_result,
     write_result,
 )
 from spt_pipeline.io_formats import SUPPORTED_SUFFIXES as SUPPORTED_FORMATS
@@ -140,11 +147,12 @@ from spt_pipeline.pipeline import (
     run_detect_track,
     run_preview_frame,
     run_track_step,
+    session_from_bundle,
     session_manifest_extra,
     track_features_df,
     track_metrics_df,
 )
-from spt_pipeline.rois import shapes_layer_to_roi
+from spt_pipeline.rois import label_image, label_points, overlap_pixels, shapes_layer_to_roi
 from spt_pipeline.viewer import (
     ImageDisplay,
     ResultDisplay,
@@ -407,12 +415,14 @@ class ExperimentListWidget(QWidget):
         # `currentItemChanged` re-entry would run the "leaving this row"
         # cleanup against the row we're refusing to leave.
         self._reverting_selection = False
-        # The Shapes layer the ROI dropdown currently targets, held as the
-        # layer itself rather than its name: renaming a layer is the
-        # intended way to label one of several ROIs, and a name-keyed
-        # record would lose track of the target at exactly that moment
-        # (see `_on_roi_layers_changed`).
-        self._roi_target: Optional[Shapes] = None
+        # The Shapes layers the ROI list currently has checked, held as the
+        # layers themselves rather than their names: renaming a layer is
+        # the intended way to label one of several ROIs, and a name-keyed
+        # record would lose track of the targets at exactly that moment
+        # (see `_on_roi_layers_changed`). None until anything was ever
+        # checked, which is what lets the list pick a default then and
+        # only then.
+        self._roi_targets: Optional[list[Shapes]] = None
 
         # The session's own detections/tracks layers, held as layers rather
         # than looked up by name: a filter drag redraws them in place, Save
@@ -481,8 +491,9 @@ class ExperimentListWidget(QWidget):
         self.params_panel.detectCancelRequested.connect(self._cancel_active_run)
         self.params_panel.trackRequested.connect(self._run_track_step)
         self.params_panel.saveRequested.connect(self._save_result)
+        self.params_panel.saveDetectionsRequested.connect(self._save_detection_result)
         self.params_panel.newRoiRequested.connect(self._on_new_roi_requested)
-        # Keep the Detect tab's ROI dropdown showing the viewer's Shapes
+        # Keep the Detect tab's ROI list showing the viewer's Shapes
         # layers. Adding/removing/reordering layers is caught on the layer
         # list itself; a *rename* is an event on the layer, so
         # `_on_roi_layers_changed` (re)connects to each Shapes layer as it
@@ -613,6 +624,8 @@ class ExperimentListWidget(QWidget):
         self.params_panel.set_track_status("")
         self.params_panel.set_save_status("")
         self.params_panel.set_save_enabled(False)
+        self.params_panel.set_detect_save_status("")
+        self.params_panel.set_detect_save_enabled(False)
         # The histogram ranges belong to a table that's about to be
         # unloaded -- carrying them onto the next image would apply cuts
         # chosen against a different population, which is exactly the
@@ -653,7 +666,14 @@ class ExperimentListWidget(QWidget):
         item, session = self._session_item, self._session
         if item is None or session is None or not item.entry.has_unsaved_session:
             return True
-        savable = session.tracks_df is not None and session.tracks_df.height > 0
+        # Tracks, if any, always take Save down the full points+tracks path
+        # (`_save_result`); with points alone (tracking hasn't run, or has
+        # but wasn't kept), Save writes just the detections
+        # (`_save_detection_result`) -- either way there is something to
+        # save as soon as detect has run, which `has_unsaved_session` above
+        # already implies.
+        has_tracks = session.tracks_df is not None and session.tracks_df.height > 0
+        savable = has_tracks or session.points_df is not None
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
         box.setWindowTitle("Unsaved results")
@@ -661,7 +681,7 @@ class ExperimentListWidget(QWidget):
         box.setInformativeText(
             "Save writes its results bundle first; Discard drops them."
             if savable
-            else "It hasn't been linked yet, so there is nothing to save — leaving drops it."
+            else "Nothing has been detected yet, so there is nothing to save — leaving drops it."
         )
         save = box.addButton("Save", QMessageBox.ButtonRole.AcceptRole) if savable else None
         discard = box.addButton("Discard", QMessageBox.ButtonRole.DestructiveRole)
@@ -673,7 +693,7 @@ class ExperimentListWidget(QWidget):
         if clicked is discard:
             return True
         if save is not None and clicked is save:
-            return self._save_result(item)
+            return self._save_result(item) if has_tracks else self._save_detection_result(item)
         return False
 
     def _confirm_reload(self) -> bool:
@@ -735,8 +755,61 @@ class ExperimentListWidget(QWidget):
         if isinstance(loaded, ResultDisplay):
             show_result(self.viewer, loaded)
             self._restore_filters_from_bundle(loaded)
+            self._adopt_bundle_session(item, loaded)
         else:
             show_image(self.viewer, loaded)
+
+    def _adopt_bundle_session(self, item: ExperimentItem, loaded: ResultDisplay) -> None:
+        """Make a saved bundle on screen a live session, not just a
+        picture of one: its detections become `session.points_df`, so
+        Track links them straight away, and its tracks (if any) can be
+        re-filtered and re-saved -- without re-running detect, which is
+        what the Track button used to demand of a reopened bundle.
+
+        Runs after `_restore_filters_from_bundle`, whose filter updates
+        would otherwise read as edits to this session. The layers
+        `show_result` just added are adopted as the session's own, so
+        filter drags redraw them in place instead of adding a second copy,
+        and the bundle's saved ROIs become the checked ones again."""
+        image = loaded.image
+        try:
+            session = session_from_bundle(
+                image.path,
+                (image.image, image.metadata),
+                loaded.points_df,
+                loaded.tracks_df,
+                loaded.manifest,
+                loaded.rois,
+            )
+        except Exception as exc:
+            self.params_panel.set_detect_status(f"could not resume the saved bundle: {exc}", level="error")
+            return
+        self._session = session
+        self._session_item = item
+        item.entry.has_unsaved_session = False
+        self._track_cache = None
+        for attr, name in (("_points_layer", "points"), ("_tracks_layer", "tracks")):
+            layer = self.viewer.layers[name] if name in self.viewer.layers else None
+            setattr(self, attr, layer)
+        if loaded.rois:
+            self._check_roi_layers([roi["name"] for roi in loaded.rois])
+
+        n_points = session.points_df.height
+        self.params_panel.set_detect_status(
+            f"{n_points} points from the saved bundle — Track links them as they are"
+            + self._roi_count_text(session),
+            level="ok" if n_points else "error",
+        )
+        self.params_panel.set_detect_save_enabled(False)
+        self._update_points_layer()
+        if session.tracks_df is not None:
+            self.params_panel.set_save_enabled(True)
+            n_tracks = session.tracks_df["track_id"].n_unique()
+            self.params_panel.set_track_status(
+                f"{n_tracks} tracks from the saved bundle" + self._roi_track_text(session)
+            )
+        else:
+            self.params_panel.set_track_status("not linked yet — press Track to link the saved points")
 
     def _on_item_load_error(self, item: ExperimentItem, generation: int, exc: Exception) -> None:
         if not self._load_is_current(item, generation):
@@ -837,6 +910,7 @@ class ExperimentListWidget(QWidget):
             # odd for "Run selected" to be the one path that ignores it.
             self.params_panel.get_pixel_size_um(),
             self.params_panel.get_dt_s(),
+            self.params_panel.get_exposure_s(),
         )
         worker.returned.connect(lambda result, item=item: self._on_run_finished(item, result))
         worker.errored.connect(lambda exc, item=item: self._on_run_error(item, exc))
@@ -926,6 +1000,7 @@ class ExperimentListWidget(QWidget):
                 item.entry.image_path,
                 pixel_size_um=self.params_panel.get_pixel_size_um(),
                 dt_s=self.params_panel.get_dt_s(),
+                exposure_s=self.params_panel.get_exposure_s(),
             )
             layer = add_image_layer(self.viewer, session.image, item.entry.image_path.stem)
             self.viewer.layers.move(self.viewer.layers.index(layer), 0)
@@ -934,6 +1009,7 @@ class ExperimentListWidget(QWidget):
                 item.entry.image_path,
                 pixel_size_um=self.params_panel.get_pixel_size_um(),
                 dt_s=self.params_panel.get_dt_s(),
+                exposure_s=self.params_panel.get_exposure_s(),
                 stack=(loaded.image, loaded.metadata),
             )
         self._session = session
@@ -945,34 +1021,45 @@ class ExperimentListWidget(QWidget):
         return session
 
     def _roi_layers(self) -> list[Shapes]:
-        """Every Shapes layer in the viewer, in layer-list order -- the
-        candidate ROIs for the Detect tab's dropdown."""
-        return [layer for layer in self.viewer.layers if isinstance(layer, Shapes)]
+        """Every Shapes layer in the viewer, top of napari's layer list
+        first -- the candidate ROIs for the Detect tab's list, in the
+        order that also decides who wins an overlap
+        (`rois.label_image`), so what looks on top is on top."""
+        return [layer for layer in reversed(self.viewer.layers) if isinstance(layer, Shapes)]
 
     def _on_roi_layer_selected(self) -> None:
-        """Remember which layer the dropdown now names, so a later rename
-        of it can be followed (`_on_roi_layers_changed`)."""
-        name = self.params_panel.get_roi_layer_name()
-        layer = self.viewer.layers[name] if name and name in self.viewer.layers else None
-        self._roi_target = layer if isinstance(layer, Shapes) else None
+        """Remember which layers the list now has checked, so a later
+        rename of one can be followed (`_on_roi_layers_changed`)."""
+        names = set(self.params_panel.get_roi_layer_names())
+        self._roi_targets = [layer for layer in self._roi_layers() if layer.name in names]
 
     def _on_roi_layers_changed(self, event=None) -> None:
-        """Push the current Shapes layer names into the ROI dropdown, and
-        make sure a rename of any of them lands here too (each layer's own
+        """Push the current Shapes layer names into the ROI list, and make
+        sure a rename of any of them lands here too (each layer's own
         `events.name`, since the layer list only reports add/remove/
         reorder). Renaming is the intended way to tell several ROIs apart
-        -- the name is also what the region is saved under (see
-        `spt_pipeline.rois`) -- so the dropdown follows the *layer*
-        (`self._roi_target`) across a rename rather than losing it when
-        the name it was listed under disappears."""
+        -- the name is also what the region is saved under and what its
+        detections are labeled with (see `spt_pipeline.rois`) -- so the
+        list follows the *layers* (`self._roi_targets`) across a rename
+        rather than losing the check when the old name disappears."""
         layers = self._roi_layers()
         for layer in layers:
             layer.events.name.connect(self._on_roi_layers_changed)
-        if not any(layer is self._roi_target for layer in layers):
-            self._roi_target = None
-        preferred = self._roi_target.name if self._roi_target is not None else None
-        self.params_panel.set_roi_choices([layer.name for layer in layers], preferred)
+        checked = None
+        if self._roi_targets is not None:
+            self._roi_targets = [t for t in self._roi_targets if any(t is layer for layer in layers)]
+            checked = [t.name for t in self._roi_targets]
+        self.params_panel.set_roi_choices([layer.name for layer in layers], checked)
         self._on_roi_layer_selected()
+
+    def _check_roi_layers(self, names: list[str]) -> None:
+        """Make exactly `names` the checked ROIs (plus switch "Restrict to
+        ROI" on) -- how a reopened bundle's saved regions become the
+        active selection again, so re-tracking or re-detecting it covers
+        the same regions under the same labels."""
+        self._roi_targets = [layer for layer in self._roi_layers() if layer.name in set(names)]
+        self._on_roi_layers_changed()
+        self.params_panel.set_use_roi_mask(bool(self._roi_targets))
 
     def _on_new_roi_requested(self) -> None:
         """Add an empty Shapes layer for drawing the ROI, ready to draw on
@@ -985,10 +1072,9 @@ class ExperimentListWidget(QWidget):
         so the user can start drawing right away.
 
         Each click adds *another* layer ("roi 1", "roi 2", ...) rather
-        than reusing one, so several regions can be kept side by side and
-        picked between in the dropdown; the fresh one becomes the
-        dropdown's selection (`set_roi_choices` falls back to the last
-        entry, and this is the layer that was just appended)."""
+        than reusing one, so several regions can be kept side by side; the
+        fresh one is checked alongside whatever already was, since drawing
+        another region is almost always to run on it too."""
         existing = {layer.name for layer in self.viewer.layers}
         n = 1
         while f"roi {n}" in existing:
@@ -1001,35 +1087,40 @@ class ExperimentListWidget(QWidget):
         )
         self.viewer.layers.selection.active = layer
         layer.mode = "add_polygon_lasso"
-        # The insert event already refreshed the dropdown (keeping
-        # whatever was targeted before); point it at the layer the user
-        # just asked for instead -- they're about to draw on it.
-        self._roi_target = layer
+        # The insert event already refreshed the list (keeping whatever
+        # was checked before); add the layer the user just asked for --
+        # they're about to draw on it.
+        self._roi_targets = [*(self._roi_targets or []), layer]
         self._on_roi_layers_changed()
 
-    def _build_roi_mask(self, shape: tuple[int, int]) -> tuple[np.ndarray, dict]:
-        """Boolean `(H, W)` mask from the Shapes layer named in the Detect
-        tab's ROI dropdown -- the union of every shape drawn on it -- plus
-        that layer's polygon ROI record
-        (`spt_pipeline.rois.shapes_layer_to_roi`), meant to be stashed on
-        `session.roi` so `_save_result` can persist it alongside the
-        run's results (see `experiment.write_result`).
+    def _build_roi_labels(self, shape: tuple[int, int]) -> tuple[np.ndarray, np.ndarray, list[dict]]:
+        """`(mask, labels, rois)` for the Shapes layers checked in the
+        Detect tab's ROI list: each layer's polygon record
+        (`spt_pipeline.rois.shapes_layer_to_roi`, top of napari's list
+        first), the `(H, W)` label image they rasterize to
+        (`rois.label_image`, -1 outside every one), and its boolean union
+        -- the `roi` mask spotsolve is handed. The records go on
+        `session.roi` so `_save_result` can persist them, and the labels
+        stamp each detection with its region (`rois.label_points`).
 
         Targeted by name rather than by which layer happens to be selected
-        in napari, so clicking around the layer list (or drawing a second
+        in napari, so clicking around the layer list (or drawing another
         region for reference) can't quietly change which pixels a run
-        covers. Raises if the named layer is gone or has nothing drawn on
-        it yet."""
-        name = self.params_panel.get_roi_layer_name()
-        if name is None:
-            raise ValueError('no ROI layer to use — press "Draw ROI…" and draw a region first')
-        layer = self.viewer.layers[name] if name in self.viewer.layers else None
-        if not isinstance(layer, Shapes):
-            raise ValueError(f"ROI layer {name!r} is gone — pick another one or draw a new one")
-        if len(layer.data) == 0:
-            raise ValueError(f"nothing drawn on ROI layer {name!r} yet")
-        mask = np.any(layer.to_masks(shape), axis=0)
-        return mask, shapes_layer_to_roi(layer)
+        covers. Raises if nothing is checked, or a checked layer is gone or
+        has nothing drawn on it yet."""
+        names = self.params_panel.get_roi_layer_names()
+        if not names:
+            raise ValueError('no ROI checked — press "Draw ROI…" and draw a region, or check one')
+        records = []
+        for name in names:
+            layer = self.viewer.layers[name] if name in self.viewer.layers else None
+            if not isinstance(layer, Shapes):
+                raise ValueError(f"ROI layer {name!r} is gone — uncheck it or draw a new one")
+            if len(layer.data) == 0:
+                raise ValueError(f"nothing drawn on ROI layer {name!r} yet")
+            records.append(shapes_layer_to_roi(layer))
+        labels = label_image(records, shape)
+        return labels >= 0, labels, records
 
     def _start_step_worker(
         self, worker, on_finished, indeterminate: bool = False, on_error: Optional[Callable] = None
@@ -1076,7 +1167,7 @@ class ExperimentListWidget(QWidget):
         mask = None
         if self.params_panel.get_use_roi_mask():
             try:
-                mask, _roi = self._build_roi_mask(session.image.shape[1:])
+                mask, _labels, _rois = self._build_roi_labels(session.image.shape[1:])
             except Exception as exc:
                 self.params_panel.set_preview_status(f"error: {exc}", level="error")
                 return
@@ -1186,15 +1277,15 @@ class ExperimentListWidget(QWidget):
             return
         self.params_panel.set_frame_bounds(session.image.shape[0])
 
-        mask = None
+        mask = labels = None
         session.roi = None
         if self.params_panel.get_use_roi_mask():
             try:
-                mask, roi = self._build_roi_mask(session.image.shape[1:])
+                mask, labels, rois = self._build_roi_labels(session.image.shape[1:])
             except Exception as exc:
                 self.params_panel.set_detect_status(f"error: {exc}", level="error")
                 return
-            session.roi = [roi]
+            session.roi = rois
 
         # The Detect tab's sigma box, always -- not `session.sigma` from
         # some earlier run. It IS the setting now that the preview loop
@@ -1227,16 +1318,24 @@ class ExperimentListWidget(QWidget):
         )
         self._start_step_worker(
             worker,
-            lambda s, item=item: self._on_detect_finished(item, s),
+            lambda s, item=item, labels=labels: self._on_detect_finished(item, s, labels),
             on_error=lambda exc, item=item: self._on_detect_error(item, exc),
         )
 
-    def _on_detect_finished(self, item: ExperimentItem, session: PipelineSession) -> None:
+    def _on_detect_finished(
+        self, item: ExperimentItem, session: PipelineSession, labels: Optional[np.ndarray] = None
+    ) -> None:
         self.params_panel.set_detect_running(False)
         if self._session_item is not item:
             self._finish_step_worker()
             return
         self._session = session
+        if labels is not None and session.points_df is not None and session.roi:
+            # Every detection gets the region it fell in -- the label
+            # tracking splits on and the diffusion panel groups by.
+            session.points_df = label_points(
+                session.points_df, labels, [roi["name"] for roi in session.roi]
+            )
         item.entry.has_unsaved_session = True
         self.list_view.viewport().update()
         n_points = session.points_df.height if session.points_df is not None else 0
@@ -1260,7 +1359,8 @@ class ExperimentListWidget(QWidget):
             if parts:
                 extra = "  (" + ", ".join(parts) + ")"
         self.params_panel.set_detect_status(
-            f"{n_points} points across frames {start}-{end - 1}{extra}",
+            f"{n_points} points across frames {start}-{end - 1}{extra}"
+            + self._roi_count_text(session, labels),
             level="error" if n_points == 0 else "ok",
         )
 
@@ -1278,7 +1378,44 @@ class ExperimentListWidget(QWidget):
             del self.viewer.layers["preview spots"]
         self._update_points_layer(new_data=True)
         self.params_panel.set_save_enabled(False)
+        self.params_panel.set_detect_save_enabled(n_points > 0)
+        self.params_panel.set_detect_save_status("not saved yet" if n_points > 0 else "", level="caution")
         self._finish_step_worker()
+
+    @staticmethod
+    def _roi_count_text(session: PipelineSession, labels: Optional[np.ndarray] = None) -> str:
+        """Per-region detection counts for the Detect status line, for a
+        run over more than one ROI -- plus how many pixels the regions
+        share, since those went to the higher one without saying so."""
+        df = session.points_df
+        if not session.roi or len(session.roi) < 2 or df is None or "roi" not in df.columns:
+            return ""
+        counts = dict(df.group_by("roi").len().iter_rows())
+        text = "\n" + " · ".join(f"{roi['name']}: {counts.get(roi['name'], 0)}" for roi in session.roi)
+        if labels is not None:
+            shared = overlap_pixels(session.roi, labels.shape)
+            if shared:
+                text += f"  ({shared} px overlap → higher layer)"
+        return text
+
+    @staticmethod
+    def _roi_track_text(session: PipelineSession) -> str:
+        """One short line per ROI for the Track status -- each region was
+        linked with its own fitted parameters (`run_track_step`), so its
+        own D is the number worth reading, not only the pooled one."""
+        by_roi = (session.track_summary or {}).get("by_roi")
+        if not by_roi:
+            return ""
+        lines = []
+        for name, row in by_roi.items():
+            line = (
+                f"{name}: {row.get('n_tracks', 0)} tracks  "
+                f"D ≈ {units.fmt(row.get('D_est_um2_s'), 'D_est_um2_s')}"
+            )
+            if row.get("fell_back_to_pooled"):
+                line += " (too few points to fit alone — pooled link params)"
+            lines.append(line)
+        return "\n" + "\n".join(lines)
 
     def _on_detect_error(self, item: ExperimentItem, exc: Exception) -> None:
         self.params_panel.set_detect_running(False)
@@ -1292,8 +1429,12 @@ class ExperimentListWidget(QWidget):
         item = self.list_view.currentItem()
         if item is None:
             return
-        session = self._session if self._session_item is item else None
-        if session is None or session.points_df is None:
+        try:
+            session = self._ensure_session(item)
+        except Exception as exc:
+            self.params_panel.set_track_status(f"error: {exc}", level="error")
+            return
+        if session.points_df is None:
             self.params_panel.set_track_status("error: run detect first", level="error")
             return
         self.progress_label.setText(f"Linking: {item.entry.image_path.name}")
@@ -1337,7 +1478,8 @@ class ExperimentListWidget(QWidget):
         self.params_panel.set_track_status(
             f"{n_tracks} tracks  D ≈ {units.fmt(summary.get('D_est_um2_s'), 'D_est_um2_s')} "
             f"(linker fit {units.fmt(summary.get('D_link_um2_s'), 'D_link_um2_s')}, "
-            f"immobile {summary.get('immobile_fraction', 0.0):.0%}){filtered}\n{message}",
+            f"immobile {summary.get('immobile_fraction', 0.0):.0%}){filtered}"
+            f"{self._roi_track_text(session)}\n{message}",
             level=level,
         )
 
@@ -1401,7 +1543,7 @@ class ExperimentListWidget(QWidget):
         self._scale_change.start()
 
     def _apply_image_scale_change(self) -> None:
-        """The pixel size / frame interval override changed.
+        """The pixel size / frame interval / exposure override changed.
 
         For the next run there is nothing to do -- `_ensure_session` and
         the batch worker both read the panel when they start. What needs
@@ -1419,12 +1561,16 @@ class ExperimentListWidget(QWidget):
         if session is None:
             return
         pixel_size_um, dt_s = self.params_panel.get_effective_image_scale()
+        exposure_s = self.params_panel.get_effective_exposure_s()
         if pixel_size_um is None or dt_s is None:
             return
-        if (pixel_size_um, dt_s) == (session.pixel_size_um, session.dt_s):
+        scale_changed = (pixel_size_um, dt_s) != (session.pixel_size_um, session.dt_s)
+        exposure_changed = exposure_s != session.exposure_s
+        if not scale_changed and not exposure_changed:
             return
         session.pixel_size_um = pixel_size_um
         session.dt_s = dt_s
+        session.exposure_s = exposure_s
 
         # Layer metadata first: the diffusion panel reads its conversion
         # factors from there, and it is reading the layers right now.
@@ -1432,6 +1578,17 @@ class ExperimentListWidget(QWidget):
         for layer in (self._live(self._points_layer), self._live(self._tracks_layer)):
             if layer is not None:
                 layer.metadata.update(metadata)
+
+        if not scale_changed:
+            # Exposure alone: nothing computed here depends on it -- only
+            # the manifest records it, for the diffusion analysis -- so
+            # the results stand, and only the saved record is behind.
+            if session.points_df is not None:
+                self._mark_unsaved()
+                self.params_panel.set_save_status(
+                    "exposure changed — save to record it", level="caution"
+                )
+            return
 
         if session.tracks_df is not None:
             # Per-track metrics (`mean_step_um`, `duration_s`) are derived
@@ -1444,6 +1601,7 @@ class ExperimentListWidget(QWidget):
         if session.points_df is not None:
             self._mark_unsaved()
             self.params_panel.set_save_enabled(False)
+            self.params_panel.set_detect_save_enabled(False)
             self.params_panel.set_detect_status(
                 "scale changed — re-run detect so the saved table's µm and s columns match",
                 level="caution",
@@ -1467,11 +1625,16 @@ class ExperimentListWidget(QWidget):
         widgets/diffusion_panel.py) works the same on a preview as on a
         loaded bundle."""
         session = self._session
-        return layer_units_metadata(
+        metadata = layer_units_metadata(
             session.pixel_size_um if session is not None else None,
             session.dt_s if session is not None else None,
             self._session_item.entry.result_dir if self._session_item is not None else None,
+            session.exposure_s if session is not None else None,
         )
+        # What each `roi_index` on the layers' rows is called (see
+        # `spt_pipeline.rois.label_points`).
+        metadata["roi_names"] = [roi["name"] for roi in session.roi] if session and session.roi else []
+        return metadata
 
     def _update_points_layer(self, new_data: bool = False) -> None:
         """Show only the detections that pass the Detect tab's cuts --
@@ -1500,6 +1663,7 @@ class ExperimentListWidget(QWidget):
             )
             self._points_layer = layer
         elif new_data:
+            layer.metadata.update(self._session_layer_metadata())
             set_points_layer_data(layer, df)
             # A re-run after a save: this is a preview again until saved.
             layer.name = "points (preview)"
@@ -1540,6 +1704,10 @@ class ExperimentListWidget(QWidget):
                 self._session_layer_metadata(),
             )
             return
+        if new_data:
+            # Before the data: the diffusion panel re-reads the layer on a
+            # data change, and needs this run's ROI names when it does.
+            layer.metadata.update(self._session_layer_metadata())
         set_tracks_layer_data(layer, features)
         if new_data:
             layer.name = "tracks (preview)"
@@ -1621,12 +1789,77 @@ class ExperimentListWidget(QWidget):
         self.params_panel.set_save_status(
             f"saved {n_tracks} tracks → {entry.result_dir.name}", level="ok"
         )
+        # This bundle's points.parquet is now exactly what a "Save
+        # detections" would write anyway -- disabled so pressing it
+        # afterwards, unchanged, can't delete the tracks.parquet just
+        # written (`write_detection_result` always removes it).
+        self.params_panel.set_detect_save_enabled(False)
 
         if self.list_view.currentItem() is item:
             self._promote_preview_layers()
         return True
 
-    def _promote_preview_layers(self) -> None:
+    def _save_detection_result(self, item: Optional[ExperimentItem] = None) -> bool:
+        """Write points.parquet + manifest.json alone for the stepwise
+        session of `item` (default: the current row) -- the Detect tab's
+        own save, usable as soon as detect has run, independent of whether
+        tracking has too. Returns whether it was written.
+
+        Removes any tracks.parquet this bundle already had
+        (`results.write_detection_result`): those tracks were linked from
+        whatever points.parquet said before this call, and points.parquet
+        just changed under it. Use "Save results" (`_save_result`) once
+        tracking has been (re-)run to get a bundle with tracks in it
+        again."""
+        item = item if item is not None else self.list_view.currentItem()
+        session = self._session if (item is not None and self._session_item is item) else None
+        if session is None or session.points_df is None:
+            self.params_panel.set_detect_save_status(
+                "nothing to save — run detect first", level="error"
+            )
+            return False
+
+        session.point_filters_used = self.params_panel.get_point_filters() or None
+
+        entry = item.entry
+        import spotsolve
+        import spt_pipeline
+
+        repo_shas = {
+            "spotsolve": git_sha(repo_root_of(spotsolve)),
+            "spt_pipeline": git_sha(repo_root_of(spt_pipeline)),
+        }
+        manifest_params = session_manifest_extra(session)
+        # This save doesn't touch tracks (and removes any it previously
+        # had), so the manifest shouldn't claim a track count either.
+        manifest_params["n_tracks"] = None
+        manifest = build_manifest(
+            result_id=entry.result_dir.name,
+            source_image_path=entry.image_path,
+            params=manifest_params,
+            repo_shas=repo_shas,
+        )
+        try:
+            write_detection_result(entry.result_dir, session.points_df, manifest, rois=session.roi)
+        except Exception as exc:
+            self.params_panel.set_detect_save_status(f"error: {exc}", level="error")
+            return False
+
+        n_points = session.points_df.height
+        item.set_status(Status.COMPLETE, n_tracks=None)
+        # An unsaved link result, if any, is still unsaved -- only the
+        # detections just got written.
+        item.entry.has_unsaved_session = session.tracks_df is not None and session.tracks_df.height > 0
+        self.list_view.viewport().update()
+        self.params_panel.set_detect_save_status(
+            f"saved {n_points} detections → {entry.result_dir.name}", level="ok"
+        )
+
+        if self.list_view.currentItem() is item:
+            self._promote_preview_layers(tracks=False)
+        return True
+
+    def _promote_preview_layers(self, *, points: bool = True, tracks: bool = True) -> None:
         """Give the session's "(preview)" layers the final "points"/"tracks"
         names the saved bundle loads under.
 
@@ -1641,13 +1874,25 @@ class ExperimentListWidget(QWidget):
         A "points"/"tracks" pair from this row's previously saved bundle is
         superseded by the one just written, so it is removed. The ROI layers
         are left alone -- they were this run's input and are already on
-        screen."""
-        self._update_points_layer()
-        self._update_tracks_layer()
+        screen.
+
+        `points`/`tracks` pick which pair was actually just written --
+        `_save_detection_result` passes `tracks=False` so an unsaved (or
+        nonexistent) Tracks layer is left named "(preview)" rather than
+        promoted alongside detections it wasn't asked to save."""
+        if points:
+            self._update_points_layer()
+        if tracks:
+            self._update_tracks_layer()
         if "preview spots" in self.viewer.layers:
             del self.viewer.layers["preview spots"]
         metadata = self._session_layer_metadata()
-        for layer, final_name in ((self._points_layer, "points"), (self._tracks_layer, "tracks")):
+        pairs = []
+        if points:
+            pairs.append((self._points_layer, "points"))
+        if tracks:
+            pairs.append((self._tracks_layer, "tracks"))
+        for layer, final_name in pairs:
             layer = self._live(layer)
             if layer is None:
                 continue
@@ -1686,6 +1931,7 @@ class ExperimentListWidget(QWidget):
             source="bundle",
             pixel_size_um=params.get("pixel_size_um"),
             dt_s=params.get("dt_s"),
+            exposure_s=params.get("exposure_s"),
         )
 
         self.params_panel.set_point_filter_source(points_df if points_df.height else None)
@@ -1744,6 +1990,7 @@ def _run_pipeline_worker(
     emitter: _ProgressEmitter,
     pixel_size_um: Optional[float] = None,
     dt_s: Optional[float] = None,
+    exposure_s: Optional[float] = None,
 ):
     def progress_cb(done: int, total: int, stage: str) -> None:
         emitter.updated.emit(done, total, stage)
@@ -1752,6 +1999,7 @@ def _run_pipeline_worker(
         image_path,
         pixel_size_um=pixel_size_um,
         dt_s=dt_s,
+        exposure_s=exposure_s,
         params=params,
         progress_callback=progress_cb,
         cancel_event=cancel_event,

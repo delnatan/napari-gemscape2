@@ -4,7 +4,7 @@ Batch orchestration and napari visualization for single-particle tracking, conne
 
 - [`spotsolve`](https://github.com/delnatan/spotsolve) — multi-emitter 2D localization
   by Bayesian model selection, plus frame-to-frame linking. Runs in Rust.
-- [`diffusionkit`](https://github.com/delnatan/diffusionkit) — MSD and Bayesian diffusion analysis.
+- [`diffusionkit`](https://github.com/delnatan/diffusionkit) — classical (Brownian displacement MLE) and Bayesian diffusion analysis.
 
 ## Particle tracking in the dense regime
 
@@ -51,6 +51,18 @@ per detection, carrying `se_y`/`se_x` (per-detection CRLB), `flux`, `bg`,
 `fit_sigma`/`sigma_ratio` and the `is_aggregate` flag. `tracks.parquet` is that
 same table with a `track_id` column added, so every detector column survives
 linking and stays available for QC downstream.
+
+**Several ROIs** can be checked at once in the Detect tab — each Shapes layer is
+one region, named after the layer. Detections are then labeled with the region
+they fall in (`roi`/`roi_index` columns; where regions overlap, the one higher in
+napari's layer list wins), tracking links each region separately with its own
+fitted parameters (so no track crosses a boundary, and the manifest carries a
+`track_summary_by_roi`), and the Diffusion panel can filter to one ROI and
+reports the classical D/z summary per ROI.
+
+Reopening a row that already has a bundle resumes it: the saved points are the
+session's detections, so Track links them without re-running detect, and the
+saved ROIs come back checked.
 
 Nothing a QC decision rejects is deleted. Over-bright detections are **flagged**
 (`is_aggregate`), and the histogram filters described below are recorded as
@@ -141,8 +153,21 @@ Changing the scale after a detect or link run re-derives what it cheaply can
 `points.parquet`'s `t`/`y_um`/`se_*_um` columns are derived at detect time, so a
 bundle saved across a scale change would be internally inconsistent.
 
+**Exposure time.** A third number, the camera exposure, is read the same way
+(`.nd2` capture text, an Imaris `Channel` `ExposureTime` with a unit, OME
+`Plane ExposureTime`) and recorded in the manifest as `exposure_s` /
+`exposure_s_source`. Detection and linking never use it; the diffusion
+analysis does, because its MLE models the motion blur of a continuous
+exposure. It is **never defaulted to 0**: 0 means "instantaneous", and on
+real data that biases `D` by about −25% and the non-Brownian score by +0.3 to
++0.7. A file that doesn't record it (e.g. every Andor Fusion `.ims`) shows
+`exposure ?` in amber. You type it into "Image metadata" (the exposure box is
+not behind the override switch, so supplying it doesn't replace the file's
+pixel size or frame interval). The Diffusion panel's own exposure box is
+pre-filled from the layer, and it won't run until it has a value.
+
 In results, `spt_pipeline.units` is the single source of truth for what each
-column is measured in: it labels the tracks-pane headers (`D_classical [µm²/s]`,
+column is measured in: it labels the tracks-pane headers (`D_mle [µm²/s]`,
 `se_x_max [px]`, `se_x_um_max [µm]`), the filter rows' tooltips, the spatial
 map's color scale, every fit readout, and every plot axis — the last in the same
 mathtext style diffusionkit's own figures use, so a joint plot and an MSD plot
@@ -202,6 +227,8 @@ folder of raw images and work one image through **Detect** (PSF width via
 Preview frame, detection knobs, then filters on what it found) and **Track**
 (link, optionally with flux as a second link cue, then filters on the
 tracks), pressing *Save results* when the result is worth keeping. The "Diffusion analysis" widget then reads the tracks layer for
-MSD, Bayesian and per-track anisotropy fits, and offers the same histogram
+the classical per-track Brownian MLE (`D` plus a calibrated non-Brownian score
+`z`, read as a population: log D vs z, mean z ± SE; MSD fits only as a
+labelled comparison), Bayesian and per-track anisotropy fits, and offers the same histogram
 filters over per-track results — so a fitted `D` or `alpha` is filterable by the
 same drag as any other feature.

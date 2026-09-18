@@ -85,7 +85,10 @@ IMAGE_DISPLAY_PROPERTIES = ("colormap", "contrast_limits", "gamma")
 
 
 def layer_units_metadata(
-    pixel_size_um: Optional[float], dt_s: Optional[float], result_dir=None
+    pixel_size_um: Optional[float],
+    dt_s: Optional[float],
+    result_dir=None,
+    exposure_s: Optional[float] = None,
 ) -> dict:
     """The `metadata=` dict every points/tracks layer this app adds
     carries: the two conversion factors, whether they are real, and which
@@ -104,14 +107,29 @@ def layer_units_metadata(
     `_s` names. The flag is how a reader can say so out loud instead of
     presenting px²/frame as µm²/s (see
     `DiffusionAnalysisWidget._update_source_label`).
+
+    `exposure_s` has no placeholder: None stays None ("not known"), since
+    0 would be a real claim -- an instantaneous exposure -- that the
+    diffusion analysis would act on (see `io_formats`).
     """
     known = _positive_or_none(pixel_size_um) is not None and _positive_or_none(dt_s) is not None
     return {
         "pixel_size_um": _positive_or_none(pixel_size_um) or 1.0,
         "dt_s": _positive_or_none(dt_s) or 1.0,
         "units_known": known,
+        "exposure_s": _nonnegative_or_none(exposure_s),
         "result_dir": str(Path(result_dir).resolve()) if result_dir is not None else None,
     }
+
+
+def _nonnegative_or_none(value) -> Optional[float]:
+    """An exposure counts if it is finite and >= 0 -- zero is a real
+    (stroboscopic) exposure, unlike a zero pixel size."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if np.isfinite(number) and number >= 0 else None
 
 
 def _positive_or_none(value) -> Optional[float]:
@@ -220,15 +238,20 @@ def add_tracks_layer(
     )
 
 
-# The Tracks layer's own `data` columns; everything else on a track table
-# rides along as a per-vertex property.
+# The Tracks layer's own `data` columns; every other numeric column on a
+# track table rides along as a per-vertex property. Non-numeric ones (the
+# `roi` name, see `spt_pipeline.rois.label_points`) stay off: a Tracks
+# layer's properties feed its colormaps, and the ROI is carried there as
+# `roi_index` instead, named through the layer's `roi_names` metadata.
 _TRACK_DATA_COLUMNS = ("track_id", "frame", "y", "x")
 
 
 def _tracks_layer_arrays(feat_df: pl.DataFrame) -> tuple[np.ndarray, dict]:
     data = feat_df.select(*_TRACK_DATA_COLUMNS).to_numpy()
     properties = {
-        col: feat_df[col].to_numpy() for col in feat_df.columns if col not in _TRACK_DATA_COLUMNS
+        col: feat_df[col].to_numpy()
+        for col, dtype in zip(feat_df.columns, feat_df.dtypes)
+        if col not in _TRACK_DATA_COLUMNS and (dtype.is_numeric() or dtype == pl.Boolean)
     }
     return data, properties
 
@@ -360,15 +383,21 @@ def show_result(viewer, loaded: ResultDisplay) -> None:
     params = loaded.manifest.get("params", {})
 
     layer_metadata = layer_units_metadata(
-        params.get("pixel_size_um"), params.get("dt_s"), result_dir
+        params.get("pixel_size_um"), params.get("dt_s"), result_dir, params.get("exposure_s")
     )
     pixel_size_um = layer_metadata["pixel_size_um"]
     dt_s = layer_metadata["dt_s"]
+    # What each `roi_index` on the rows is called (`rois.label_points`).
+    layer_metadata["roi_names"] = [roi["name"] for roi in rois]
 
     add_points_layer(viewer, points_df, "points", layer_metadata)
     add_tracks_layer(viewer, tracks_df, pixel_size_um, dt_s, "tracks", layer_metadata)
 
-    for roi in rois:
+    # Last record first, so the first ends up on top of napari's layer
+    # list: `rois.json` is written in overlap-precedence order (first
+    # wins, see `rois.label_image`), and the layer list's top-first order
+    # is what the Detect tab reads that precedence back from.
+    for roi in reversed(rois):
         viewer.add_shapes(**roi_to_shapes_kwargs(roi), edge_color="yellow")
 
 

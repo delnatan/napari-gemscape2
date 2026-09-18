@@ -108,17 +108,19 @@ pixels get analyzed, not how -- kept in its core section since these are
 exactly what make "explore one image incrementally" (this widget's whole
 point, vs. blindly running a batch job) practical: a frame-range pair
 (`get_frame_range`) and a "restrict to ROI" checkbox
-(`get_use_roi_mask`), plus a Shapes-layer dropdown (`get_roi_layer_name`)
+(`get_use_roi_mask`), plus a checkable list of Shapes layers (`get_roi_layer_names`)
 and a "Draw ROI…" button (`newRoiRequested`) that just asks for a fresh
 Shapes layer to draw on. A "cores" spinbox (`get_n_threads`) sits beside
 the frame range -- `localize_stack`'s `n_threads`, defaulted to every
 core (see `pipeline.run_detect_step`'s docstring for why this speeds up
 even the interactively-watched run, not just a headless batch).
 
-The dropdown is what makes several ROIs on screen at once workable: draw
-as many Shapes layers as you like (rename them in napari's layer list --
-the name shown here follows, and it's the name the ROI is saved under,
-see `spt_pipeline.rois`), then pick which one this run is restricted to.
+The list is what makes several ROIs on screen at once workable: draw as
+many Shapes layers as you like (rename them in napari's layer list -- the
+name shown here follows, and it's the name the ROI is saved under and its
+detections are labeled with, see `spt_pipeline.rois`), then check which
+ones this run covers. Each checked layer is one region; with more than one
+checked, tracking links each region on its own (`pipeline.run_track_step`).
 It replaced "whichever Shapes layer happens to be active", where the
 targeted region silently changed whenever the layer selection did -- and
 where a second ROI could only be used by clicking the right layer first.
@@ -126,10 +128,11 @@ where a second ROI could only be used by clicking the right layer first.
 This widget stays viewer-agnostic (no napari `Viewer` reference), so
 `ExperimentListWidget` (which owns the viewer) is responsible for adding
 that layer (persistent/2D, transparent fill, polygon-lasso tool active --
-see `_on_new_roi_requested`), for keeping the dropdown's contents in sync
+see `_on_new_roi_requested`), for keeping the list's contents in sync
 with the viewer's Shapes layers (`set_roi_choices`), and, once the ROI
-checkbox is checked, for turning the named layer into the boolean mask
-array `spotsolve`'s `roi` argument expects.
+checkbox is checked, for turning the checked layers into the boolean mask
+array `spotsolve`'s `roi` argument expects and the labels each detection
+is stamped with.
 """
 
 from __future__ import annotations
@@ -139,13 +142,16 @@ from typing import Optional
 
 import polars as pl
 import spotsolve
-from qtpy.QtCore import Signal
+from qtpy.QtCore import Qt, Signal
 from qtpy.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFormLayout,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QPushButton,
     QSpinBox,
     QTabWidget,
@@ -168,11 +174,44 @@ from spt_pipeline.pipeline import (
 from spt_pipeline.widgets.feature_filters import FeatureFilterPanel
 
 
-def _ispin(value: int, minimum: int, maximum: int, tooltip: str) -> QSpinBox:
+# A dock this narrow has no room for a numeric field to claim more width
+# than its digits need -- QFormLayout's default AllNonFixedFieldsGrow
+# policy stretches every field to fill the row regardless, which is where
+# most of the wasted width actually comes from. `_compact_form` turns that
+# off; `_SPIN_WIDTH` caps each field at what its digits need so the label
+# column isn't squeezed into wrapping.
+_SPIN_WIDTH = 72
+_UNIT_SPIN_WIDTH = 108  # wide enough for a spinbox that also carries a unit suffix
+
+
+def _compact_form(form: QFormLayout) -> QFormLayout:
+    form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
+    form.setHorizontalSpacing(6)
+    form.setVerticalSpacing(2)
+    return form
+
+
+def _ispin(value: int, minimum: int, maximum: int, tooltip: str, width: int = _SPIN_WIDTH) -> QSpinBox:
     box = QSpinBox()
     box.setRange(minimum, maximum)
     box.setValue(value)
     box.setToolTip(tooltip)
+    box.setMaximumWidth(width)
+    return box
+
+
+def _dspin(
+    value: float,
+    minimum: float,
+    maximum: float,
+    step: float,
+    decimals: int,
+    tooltip: str = "",
+    suffix: str = "",
+    width: Optional[int] = None,
+) -> QDoubleSpinBox:
+    box = double_spinbox(value, minimum, maximum, step, decimals, tooltip=tooltip, suffix=suffix)
+    box.setMaximumWidth(width if width is not None else (_UNIT_SPIN_WIDTH if suffix else _SPIN_WIDTH))
     return box
 
 
@@ -261,12 +300,13 @@ class _DetectTab(QWidget):
     newRoiRequested = Signal()
     roiLayerChanged = Signal()
     filtersChanged = Signal()
+    saveRequested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
         self._running = False
         self._measured_sigma: Optional[float] = None
-        self.offset = double_spinbox(
+        self.offset = _dspin(
             DEFAULT_CAMERA_KWARGS["offset"], 0.0, 1e6, 1.0, decimals=2,
             tooltip="Camera offset / baseline, ADU -- subtracted before fitting.\n"
             "The only camera fact spotsolve needs: noise is measured from\n"
@@ -299,7 +339,7 @@ class _DetectTab(QWidget):
         self._detector_note = note_label("")
 
         # --- PSF width, and the preview loop that measures it ----------
-        self.sigma = double_spinbox(
+        self.sigma = _dspin(
             1.3, 0.3, 10.0, 0.1, decimals=3,
             tooltip="In-focus PSF sigma in PIXELS -- the width the search runs\n"
             "at. Each emitter still gets its own fitted width (fit_sigma);\n"
@@ -359,7 +399,7 @@ class _DetectTab(QWidget):
         self.preview_status = wrapping_label("")
         style_status_label(self.preview_status)
 
-        psf_form = QFormLayout()
+        psf_form = _compact_form(QFormLayout())
         psf_form.setContentsMargins(0, 0, 0, 0)
         psf_form.addRow("sigma (px)", sigma_row)
 
@@ -382,7 +422,7 @@ class _DetectTab(QWidget):
         # peak inside a box gets tried as another emitter (see
         # `DEFAULT_DETECT_KWARGS`) -- spotsolve used to split these into a
         # seed cut and a birth cut, but one number does the same job.
-        self.threshold = double_spinbox(
+        self.threshold = _dspin(
             spotsolve.PEAK_Z, 0.0, 1e9, 0.1, decimals=2,
             tooltip="The LoG cut, in sd of the frame's own noise, for both getting a\n"
             "box searched and for trying another emitter inside one. Raise it\n"
@@ -422,7 +462,7 @@ class _DetectTab(QWidget):
             "and still being evaluated on faint/blurred data."
         )
         self.selection.currentIndexChanged.connect(self._on_selection_changed)
-        self.count_penalty = double_spinbox(
+        self.count_penalty = _dspin(
             0.0, 0.0, 1e6, 0.5, decimals=2,
             tooltip="Extra cost per emitter added to the count rule above --\n"
             "must be finite and non-negative. Higher values favor fewer\n"
@@ -443,7 +483,7 @@ class _DetectTab(QWidget):
         # (not a frame-wide false discovery rate -- see spotsolve.aguet).
         # Plays the same "main cut" role `threshold` plays for the
         # multi-emitter detector, so it sits in the same row position.
-        self.significance = double_spinbox(
+        self.significance = _dspin(
             s["significance"], 1e-6, 0.5, 0.01, decimals=4,
             tooltip="Per-pixel screening significance for the Aguet baseline --\n"
             "lower is stricter (fewer candidates screened in). This is NOT a\n"
@@ -456,14 +496,14 @@ class _DetectTab(QWidget):
         # drift over a long movie. Detections above it are flagged, not
         # deleted (see pipeline.run_detect_step); the Track tab decides
         # whether linking sees them. Shared by both detectors.
-        self.agg_ratio = double_spinbox(
+        self.agg_ratio = _dspin(
             spotsolve.AGG_AMP_RATIO, 1.0, 1e6, 1.0, decimals=2,
             tooltip="Flag a detection as an aggregate when its flux exceeds this\n"
             "multiple of the frame's median detection. Flagged, never deleted --\n"
             "the Track tab decides whether linking sees them.",
         )
 
-        self.core_form = core_form = QFormLayout()
+        self.core_form = core_form = _compact_form(QFormLayout())
         core_form.setContentsMargins(0, 0, 0, 0)
         core_form.addRow("detector", self.detector)
         core_form.addRow("", self._detector_note)
@@ -520,36 +560,46 @@ class _DetectTab(QWidget):
 
         self.use_roi_mask = QCheckBox("Restrict to ROI")
         self.use_roi_mask.setToolTip(
-            "Only place emitters inside the shape(s) on the Shapes layer picked\n"
-            "in the dropdown (spotsolve's roi argument). Draw one with the button\n"
-            "next to it, or in napari, first."
+            "Only place emitters inside the Shapes layers checked in the list\n"
+            "below (spotsolve's roi argument). Draw one with the button next to\n"
+            "it, or in napari, first."
         )
-        # Which Shapes layer, chosen by name rather than by whatever
+        # Which Shapes layers, chosen by name rather than by whatever
         # happens to be selected in napari's layer list -- see this
-        # module's docstring. Kept in sync by `set_roi_choices`; the entry
-        # text is the live layer name, so renaming a layer in napari
-        # renames it here (and that name is what the ROI is saved under).
-        self.roi_layer = QComboBox()
-        self.roi_layer.setToolTip(
-            "Which Shapes layer to use as the ROI. Draw several and rename them\n"
-            "in napari's layer list to keep more than one region around; only the\n"
-            "one selected here restricts the run."
+        # module's docstring. Kept in sync by `set_roi_choices`; each entry
+        # is the live layer name, so renaming a layer in napari renames it
+        # here (and that name is what the ROI is saved under and what its
+        # detections are labeled with).
+        self.roi_layers = QListWidget()
+        self.roi_layers.setToolTip(
+            "Which Shapes layers to use as ROIs -- each checked layer is one\n"
+            "region, named after the layer. Detections are labeled with the\n"
+            "region they fall in (the 'roi' column), and with more than one\n"
+            "region checked, tracking links each region separately, so no\n"
+            "track crosses a boundary and each gets its own fitted D.\n"
+            "Where regions overlap, the one higher in this list (and in\n"
+            "napari's layer list) wins."
         )
-        self.roi_layer.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
-        self.roi_layer.currentTextChanged.connect(self.roiLayerChanged)
+        # Compact: a few rows is plenty, and this sits in a tall tab.
+        self.roi_layers.setMaximumHeight(4 * self.roi_layers.fontMetrics().height() + 12)
+        self.roi_layers.itemChanged.connect(lambda _item: self.roiLayerChanged.emit())
         self.new_roi_button = QPushButton("Draw ROI…")
         self.new_roi_button.setToolTip(
             "Add a new Shapes layer (transparent fill, polygon-lasso tool active)\n"
             "for drawing the ROI -- 2D so it stays visible on every frame instead\n"
             "of only the one it was drawn on. Each click adds another, so several\n"
-            "regions can be kept side by side and picked between."
+            "regions can be kept side by side and checked together."
         )
         self.new_roi_button.clicked.connect(self.newRoiRequested.emit)
-        roi_row = QHBoxLayout()
+        roi_top = QHBoxLayout()
+        roi_top.setContentsMargins(0, 0, 0, 0)
+        roi_top.addWidget(self.use_roi_mask)
+        roi_top.addStretch()
+        roi_top.addWidget(self.new_roi_button)
+        roi_row = QVBoxLayout()
         roi_row.setContentsMargins(0, 0, 0, 0)
-        roi_row.addWidget(self.use_roi_mask)
-        roi_row.addWidget(self.roi_layer, 1)
-        roi_row.addWidget(self.new_roi_button)
+        roi_row.addLayout(roi_top)
+        roi_row.addWidget(self.roi_layers)
         self._sync_roi_row()
         self.use_roi_mask.toggled.connect(self._sync_roi_row)
 
@@ -561,20 +611,20 @@ class _DetectTab(QWidget):
         # an out-of-band reject (too narrow / too wide / edge), which is how
         # out-of-focus and non-PSF-shaped junk stays out of the table;
         # `frames_df` counts them per frame.
-        self.slack_lo = double_spinbox(
+        self.slack_lo = _dspin(
             slack_lo, 0.1, 10.0, 0.05, decimals=3,
             tooltip="Narrowest width a fit may take, as a MULTIPLE OF SIGMA.",
         )
-        self.slack_hi = double_spinbox(
+        self.slack_hi = _dspin(
             slack_hi, 0.1, 20.0, 0.05, decimals=3,
             tooltip="Widest width a fit may take, as a MULTIPLE OF SIGMA.",
         )
-        self.band_lo = double_spinbox(
+        self.band_lo = _dspin(
             band_lo, 0.1, 10.0, 0.05, decimals=3,
             tooltip="Narrowest width reported as a detection, as a MULTIPLE OF\n"
             "SIGMA -- spotsolve tests it against sigma_ratio = fit_sigma/sigma.",
         )
-        self.band_hi = double_spinbox(
+        self.band_hi = _dspin(
             band_hi, 0.1, 20.0, 0.05, decimals=3,
             tooltip="Widest width reported as a detection, as a MULTIPLE OF\n"
             "SIGMA -- spotsolve tests it against sigma_ratio = fit_sigma/sigma.",
@@ -618,7 +668,7 @@ class _DetectTab(QWidget):
         )
 
         self._band_note = note_label("")
-        self.expert_form = expert_form = QFormLayout()
+        self.expert_form = expert_form = _compact_form(QFormLayout())
         expert_form.setContentsMargins(0, 0, 0, 0)
         expert_form.addRow("slack (× sigma)", slack_row)
         expert_form.addRow("band (× sigma)", band_row)
@@ -641,6 +691,30 @@ class _DetectTab(QWidget):
         )
         self.filters.filtersChanged.connect(self.filtersChanged)
 
+        # --- save (detections alone, independent of tracking) -----------
+        self.save_button = QPushButton("Save detections")
+        self.save_button.setEnabled(False)
+        self.save_button.setToolTip(
+            "Write points.parquet (every detection, unfiltered) and\n"
+            "manifest.json alone -- usable as soon as detect has run, before\n"
+            "tracking. Removes any tracks.parquet this bundle already had,\n"
+            "since it was linked from whatever points.parquet said before.\n\n"
+            "Nothing is written until you press this."
+        )
+        self.save_button.clicked.connect(self.saveRequested.emit)
+        self.save_status = wrapping_label("")
+        style_status_label(self.save_status)
+        save_row = QHBoxLayout()
+        save_row.setContentsMargins(0, 0, 0, 0)
+        save_row.addWidget(self.save_button)
+        save_row.addWidget(self.save_status, stretch=1)
+
+        save_body = QWidget()
+        save_layout = QVBoxLayout(save_body)
+        save_layout.setContentsMargins(0, 0, 0, 0)
+        save_layout.setSpacing(2)
+        save_layout.addLayout(save_row)
+
         detect_body = QWidget()
         detect_layout = QVBoxLayout(detect_body)
         detect_layout.setContentsMargins(0, 0, 0, 0)
@@ -658,6 +732,7 @@ class _DetectTab(QWidget):
         self.pager.add_page("PSF width", psf_body)
         self.pager.add_page("Detect", detect_body)
         self.pager.add_page("Filter", self.filters)
+        self.pager.add_page("Save", save_body)
 
         layout = QVBoxLayout()
         layout.setContentsMargins(4, 4, 4, 4)
@@ -815,6 +890,13 @@ class _DetectTab(QWidget):
         sight."""
         self.status_label.setText(f"{stage} -- {done}/{total}" if total else stage)
 
+    def set_save_status(self, text: str, level: str = "neutral") -> None:
+        style_status_label(self.save_status, level)
+        self.save_status.setText(text)
+
+    def set_save_enabled(self, enabled: bool) -> None:
+        self.save_button.setEnabled(enabled)
+
     def set_frame_bounds(self, n_frames: int) -> None:
         """Called once an image's frame count is known -- clamps the
         frame-range and preview-frame spinboxes' maxima without disturbing
@@ -845,42 +927,50 @@ class _DetectTab(QWidget):
     def get_use_roi_mask(self) -> bool:
         return self.use_roi_mask.isChecked()
 
-    def get_roi_layer_name(self) -> Optional[str]:
-        """Name of the Shapes layer the ROI checkbox targets, or None if
-        the viewer has no Shapes layer to target."""
-        name = self.roi_layer.currentText()
-        return name or None
+    def set_use_roi_mask(self, enabled: bool) -> None:
+        self.use_roi_mask.setChecked(enabled)
 
-    def set_roi_choices(self, names: list[str], preferred: Optional[str] = None) -> None:
-        """Replace the dropdown's entries with the viewer's current Shapes
-        layer names, selecting `preferred` (the caller's own record of
-        which *layer* is targeted, which is how a rename keeps its
-        selection instead of jumping elsewhere), else the current text if
-        it survived, else the last entry -- the newest layer, since
-        `ExperimentListWidget` passes them in layer-list order.
+    def get_roi_layer_names(self) -> list[str]:
+        """Names of the checked Shapes layers, in list order (napari's
+        layer list, top first -- which is also overlap precedence, see
+        `spt_pipeline.rois.label_image`). Empty if none is checked."""
+        return [
+            self.roi_layers.item(i).text()
+            for i in range(self.roi_layers.count())
+            if self.roi_layers.item(i).checkState() == Qt.CheckState.Checked
+        ]
+
+    def set_roi_choices(self, names: list[str], checked: Optional[list[str]] = None) -> None:
+        """Replace the list's entries with the viewer's current Shapes
+        layer names, checking `checked` (the caller's own record of which
+        *layers* are targeted, which is how a rename keeps its check
+        instead of dropping it). With no record (`checked=None`: nothing
+        was ever picked) it keeps whichever checked names survived, else
+        checks the first entry -- the top of napari's layer list, which is
+        the order `ExperimentListWidget` passes them in.
 
         Signals are blocked across the rebuild so this can't be mistaken
         for the user picking something: `roiLayerChanged` is meant to fire
-        only when they actually change the target."""
-        current = self.roi_layer.currentText()
-        blocked = self.roi_layer.blockSignals(True)
-        self.roi_layer.clear()
-        self.roi_layer.addItems(names)
-        for candidate in (preferred, current):
-            if candidate in names:
-                self.roi_layer.setCurrentText(candidate)
-                break
-        else:
-            if names:
-                self.roi_layer.setCurrentIndex(len(names) - 1)
-        self.roi_layer.blockSignals(blocked)
+        only when they actually change the targets."""
+        wanted = set(checked) if checked is not None else set(self.get_roi_layer_names())
+        wanted &= set(names)
+        if checked is None and not wanted and names:
+            wanted = {names[0]}
+        blocked = self.roi_layers.blockSignals(True)
+        self.roi_layers.clear()
+        for name in names:
+            item = QListWidgetItem(name)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if name in wanted else Qt.CheckState.Unchecked)
+            self.roi_layers.addItem(item)
+        self.roi_layers.blockSignals(blocked)
         self._sync_roi_row()
 
     def _sync_roi_row(self) -> None:
-        """Grey the dropdown out unless the ROI checkbox is on and there
-        is something to pick, so an empty/irrelevant picker doesn't read
-        as a setting that is doing something."""
-        self.roi_layer.setEnabled(self.use_roi_mask.isChecked() and self.roi_layer.count() > 0)
+        """Grey the list out unless the ROI checkbox is on and there is
+        something to pick, so an empty/irrelevant picker doesn't read as a
+        setting that is doing something."""
+        self.roi_layers.setEnabled(self.use_roi_mask.isChecked() and self.roi_layers.count() > 0)
 
     def get_agg_ratio(self) -> float:
         return self.agg_ratio.value()
@@ -934,15 +1024,36 @@ class _ImageInfoPanel(QWidget):
     though -- while it is on, the summary line says `overridden` in amber
     and names what the file itself said, and `manifest.json` records the
     value as `given explicitly (file said: ...)`.
+
+    The camera exposure sits beside them, with two differences. No stage
+    here needs it, so a file that doesn't record it (every Andor Fusion
+    .ims, for one) is amber, not red, and the section doesn't unfold for
+    it; the diffusion analysis does need it -- its blur model -- and reads
+    it off the layers (`viewer.layer_units_metadata`). And it is not
+    behind the override checkbox: that switch replaces the pixel size and
+    frame interval with the spinboxes' rounded values, which is the wrong
+    price for supplying a number the file simply lacks. Typing an exposure
+    is its own override, sticky across images like the other one, and
+    undone by "Reset to file". "Not set" is its own state below 0 rather
+    than 0 itself, since 0 is a real claim (an instantaneous exposure)
+    that would bias D and z if it were only a default.
     """
 
     changed = Signal()
+
+    # The exposure spinbox's "not set" value, shown as text: one step
+    # below the smallest real exposure (0).
+    _EXPOSURE_UNSET = -0.0001
 
     def __init__(self) -> None:
         super().__init__()
         self._metadata: Optional[StackMetadata] = None
         self._file_pixel_size_um: Optional[float] = None
         self._file_dt_s: Optional[float] = None
+        self._file_exposure_s: Optional[float] = None
+        # Whether the exposure box holds a value typed here (sticky, like
+        # the override) rather than the file's own.
+        self._exposure_typed = False
         # Where the values being displayed came from ("file", or "bundle"
         # for a saved result's recorded ones), kept so every line this
         # panel writes names the same thing the values actually are.
@@ -969,27 +1080,43 @@ class _ImageInfoPanel(QWidget):
         # per frame. Decimals are set for the small end, where the real
         # values live -- a 108 nm pixel is 0.108, and rounding it to two
         # decimals would be a 10% error in every physical column.
-        self._pixel_size = double_spinbox(
+        self._pixel_size = _dspin(
             0.1, 0.0001, 100.0, 0.001, decimals=4, suffix=f" {units.UM}/px",
             tooltip="Pixel size at the sample. Everything physical is this number\n"
             "multiplied through: x_um, mean_step_um, and D as its square.",
         )
-        self._dt = double_spinbox(
+        self._dt = _dspin(
             0.03, 0.0001, 3600.0, 0.001, decimals=4, suffix=" s/frame",
             tooltip="Time between consecutive frames. Sets the MSD lag times, so D\n"
             "is inversely proportional to it.",
         )
+        self._exposure = _dspin(
+            self._EXPOSURE_UNSET, self._EXPOSURE_UNSET, 3600.0, 0.001, decimals=4, suffix=" s",
+            tooltip="Camera exposure per frame -- how long the shutter is open, not\n"
+            "the frame interval (which also counts readout/dead time).\n\n"
+            "Only the diffusion analysis uses it: its MLE models the motion\n"
+            "blur of a continuous exposure. Leaving it at 0 when the camera\n"
+            "was really exposing for 20 ms biases D by about -25% and shifts\n"
+            "the non-Brownian score z by +0.3 to +0.7 -- so 'not set' is kept\n"
+            "distinct from 0, and the Diffusion panel asks for it.",
+        )
+        self._exposure.setSpecialValueText("not set")
+        self._exposure.valueChanged.connect(self._on_exposure_changed)
         for box in (self._pixel_size, self._dt):
             box.valueChanged.connect(self._on_value_changed)
 
         self._reset = QPushButton("Reset to file")
-        self._reset.setToolTip("Put both boxes back to what this file's own metadata says.")
+        self._reset.setToolTip("Put the boxes back to what this file's own metadata says.")
         self._reset.clicked.connect(self._reset_to_file)
 
-        form = QFormLayout()
+        form = _compact_form(QFormLayout())
         form.setContentsMargins(0, 0, 0, 0)
         form.addRow("pixel size", self._pixel_size)
         form.addRow("frame interval", self._dt)
+
+        exposure_form = _compact_form(QFormLayout())
+        exposure_form.setContentsMargins(0, 0, 0, 0)
+        exposure_form.addRow("exposure", self._exposure)
 
         body = QWidget()
         body_layout = QVBoxLayout(body)
@@ -1002,6 +1129,7 @@ class _ImageInfoPanel(QWidget):
         reset_row.addWidget(self._reset)
         reset_row.addStretch()
 
+        body_layout.addLayout(exposure_form)
         body_layout.addWidget(self._override)
         body_layout.addLayout(form)
         body_layout.addLayout(reset_row)
@@ -1025,6 +1153,7 @@ class _ImageInfoPanel(QWidget):
         source: str = "file",
         pixel_size_um: Optional[float] = None,
         dt_s: Optional[float] = None,
+        exposure_s: Optional[float] = None,
     ) -> None:
         """Show the values for the image now being worked on.
 
@@ -1039,9 +1168,11 @@ class _ImageInfoPanel(QWidget):
         if metadata is not None:
             self._file_pixel_size_um = metadata.pixel_size_um
             self._file_dt_s = metadata.dt_s
+            self._file_exposure_s = metadata.exposure_s
         else:
             self._file_pixel_size_um = pixel_size_um
             self._file_dt_s = dt_s
+            self._file_exposure_s = exposure_s
         if not self._override.isChecked():
             self._load_file_values()
         self._refresh()
@@ -1056,6 +1187,16 @@ class _ImageInfoPanel(QWidget):
             blocked = box.blockSignals(True)
             box.setValue(float(value))
             box.blockSignals(blocked)
+        # A typed exposure stays (see the class docstring); otherwise the
+        # box follows the file, and one the file doesn't record goes back
+        # to "not set" rather than to the last image's value.
+        if self._exposure_typed:
+            return
+        blocked = self._exposure.blockSignals(True)
+        self._exposure.setValue(
+            self._file_exposure_s if self._file_exposure_s is not None else self._EXPOSURE_UNSET
+        )
+        self._exposure.blockSignals(blocked)
 
     # -- the override -----------------------------------------------------
 
@@ -1065,6 +1206,10 @@ class _ImageInfoPanel(QWidget):
 
     def dt_s(self) -> Optional[float]:
         return self._dt.value() if self._override.isChecked() else None
+
+    def exposure_s(self) -> Optional[float]:
+        """The exposure typed here, or None to use the file's."""
+        return self._exposure.value() if self._exposure_typed else None
 
     def is_overriding(self) -> bool:
         return self._override.isChecked()
@@ -1081,20 +1226,37 @@ class _ImageInfoPanel(QWidget):
             self._refresh()
             self.changed.emit()
 
-    def _reset_to_file(self) -> None:
-        self._load_file_values()
+    def _on_exposure_changed(self, value: float) -> None:
+        # Back to "not set" is not a typed value -- it means "use the
+        # file's", which is what the box then shows again.
+        self._exposure_typed = value >= 0
+        if not self._exposure_typed:
+            self._load_file_values()
+        self._sync_enabled()
         self._refresh()
-        if self._override.isChecked():
+        self.changed.emit()
+
+    def _reset_to_file(self) -> None:
+        was_typed = self._exposure_typed
+        self._exposure_typed = False
+        self._load_file_values()
+        self._sync_enabled()
+        self._refresh()
+        if self._override.isChecked() or was_typed:
             self.changed.emit()
 
     def _sync_enabled(self) -> None:
         overriding = self._override.isChecked()
         self._pixel_size.setEnabled(overriding)
         self._dt.setEnabled(overriding)
-        self._reset.setEnabled(overriding and self._has_file_values())
+        self._reset.setEnabled((overriding and self._has_file_values()) or self._exposure_typed)
 
     def _has_file_values(self) -> bool:
-        return self._file_pixel_size_um is not None or self._file_dt_s is not None
+        return (
+            self._file_pixel_size_um is not None
+            or self._file_dt_s is not None
+            or self._file_exposure_s is not None
+        )
 
     # -- display ----------------------------------------------------------
 
@@ -1109,6 +1271,12 @@ class _ImageInfoPanel(QWidget):
             dt if dt is not None else self._file_dt_s,
         )
 
+    def effective_exposure_s(self) -> Optional[float]:
+        """The exposure a run would record: the override's when it is in
+        force and set, the file's otherwise, None where neither has one."""
+        exposure = self.exposure_s()
+        return exposure if exposure is not None else self._file_exposure_s
+
     def _refresh(self) -> None:
         if self._metadata is None and not self._has_file_values() and not self._override.isChecked():
             self._summary.setText("no image loaded")
@@ -1119,11 +1287,16 @@ class _ImageInfoPanel(QWidget):
             return
 
         pixel, dt = self.effective()
+        exposure = self.effective_exposure_s()
         frames = f"{self._metadata.n_frames} {units.FRAMES} · " if self._metadata is not None else ""
         shown = " · ".join(
             (
                 units.fmt_unit(pixel, units.UM + "/px") if pixel is not None else "pixel size ?",
                 units.fmt_unit(dt, "s/frame") if dt is not None else "frame interval ?",
+                f"exposure {units.fmt_unit(exposure, units.SECONDS)}"
+                + (" (entered)" if self._exposure_typed else "")
+                if exposure is not None
+                else "exposure ?",
             )
         )
         missing = [
@@ -1151,6 +1324,24 @@ class _ImageInfoPanel(QWidget):
         if missing:
             suffix = f" — no {' or '.join(missing)}: set them below to run"
             level = "error"
+        elif exposure is not None and dt is not None and exposure > dt:
+            suffix = " — exposure is longer than the frame interval; check both"
+            level = "error"
+        elif exposure is None:
+            # Not an error: detect and track don't need it. But the
+            # diffusion analysis will ask, so say so while it is cheap.
+            suffix = " — no exposure time: set it below before diffusion analysis"
+            level = "caution"
+        elif (
+            self._exposure_typed
+            and self._file_exposure_s is not None
+            and self._file_exposure_s != exposure
+        ):
+            suffix = (
+                f" — {self._source} says exposure "
+                f"{units.fmt_unit(self._file_exposure_s, units.SECONDS)}"
+            )
+            level = "caution"
         elif notes and not self._override.isChecked():
             suffix = " — see the details below"
             level = "caution"
@@ -1184,6 +1375,8 @@ class _ImageInfoPanel(QWidget):
             )
             if value is not None
         ]
+        if self._file_exposure_s is not None:
+            parts.append(f"exposure {units.fmt_unit(self._file_exposure_s, units.SECONDS)}")
         return " · ".join(parts)
 
 
@@ -1252,7 +1445,7 @@ class _TrackingTab(QWidget):
             "default -- an extra cue for a crowded field where two candidates\n"
             "sit at nearly the same distance but different brightness."
         )
-        form = QFormLayout()
+        form = _compact_form(QFormLayout())
         form.setContentsMargins(0, 0, 0, 0)
         form.addRow("min track length (points)", self.min_track_length)
 
@@ -1352,13 +1545,20 @@ class PipelineParamsWidget(QWidget):
     `set_detect_status`/`set_track_status`/`set_save_status` report each
     step's result back once `ExperimentListWidget` has run it.
     `pointFiltersChanged`/`trackFiltersChanged` fire whenever a histogram
-    handle moves, so the viewer overlay can follow the cut live."""
+    handle moves, so the viewer overlay can follow the cut live.
+
+    `saveRequested` is the Track tab's "Save results" (points + tracks
+    together); `saveDetectionsRequested` is the Detect tab's own "Save
+    detections" (points alone, no tracking required) -- two files, two
+    independent saves, since a linked track table only ever makes sense
+    once there are detections to have linked, not the other way round."""
 
     previewRequested = Signal()
     detectRequested = Signal()
     detectCancelRequested = Signal()
     trackRequested = Signal()
     saveRequested = Signal()
+    saveDetectionsRequested = Signal()
     newRoiRequested = Signal()
     roiLayerChanged = Signal()
     pointFiltersChanged = Signal()
@@ -1380,6 +1580,7 @@ class PipelineParamsWidget(QWidget):
         self._detect.newRoiRequested.connect(self.newRoiRequested)
         self._detect.roiLayerChanged.connect(self.roiLayerChanged)
         self._detect.filtersChanged.connect(self.pointFiltersChanged)
+        self._detect.saveRequested.connect(self.saveDetectionsRequested)
         self._tracking.runRequested.connect(self.trackRequested)
         self._tracking.saveRequested.connect(self.saveRequested)
         self._tracking.filtersChanged.connect(self.trackFiltersChanged)
@@ -1412,10 +1613,11 @@ class PipelineParamsWidget(QWidget):
         source: str = "file",
         pixel_size_um: Optional[float] = None,
         dt_s: Optional[float] = None,
+        exposure_s: Optional[float] = None,
     ) -> None:
         """Show what the image now being worked on says about itself --
         see `_ImageInfoPanel.set_metadata`."""
-        self._image_info.set_metadata(metadata, source, pixel_size_um, dt_s)
+        self._image_info.set_metadata(metadata, source, pixel_size_um, dt_s, exposure_s)
 
     def get_pixel_size_um(self) -> Optional[float]:
         """The pixel size a run should use, or None to take the file's.
@@ -1428,6 +1630,14 @@ class PipelineParamsWidget(QWidget):
 
     def get_dt_s(self) -> Optional[float]:
         return self._image_info.dt_s()
+
+    def get_exposure_s(self) -> Optional[float]:
+        """The exposure to record, or None to take the file's -- passed to
+        `load_session`/`run_detect_track` beside `get_dt_s`."""
+        return self._image_info.exposure_s()
+
+    def get_effective_exposure_s(self) -> Optional[float]:
+        return self._image_info.effective_exposure_s()
 
     def is_overriding_image_scale(self) -> bool:
         return self._image_info.is_overriding()
@@ -1506,11 +1716,14 @@ class PipelineParamsWidget(QWidget):
     def get_use_roi_mask(self) -> bool:
         return self._detect.get_use_roi_mask()
 
-    def get_roi_layer_name(self) -> Optional[str]:
-        return self._detect.get_roi_layer_name()
+    def set_use_roi_mask(self, enabled: bool) -> None:
+        self._detect.set_use_roi_mask(enabled)
 
-    def set_roi_choices(self, names: list[str], preferred: Optional[str] = None) -> None:
-        self._detect.set_roi_choices(names, preferred)
+    def get_roi_layer_names(self) -> list[str]:
+        return self._detect.get_roi_layer_names()
+
+    def set_roi_choices(self, names: list[str], checked: Optional[list[str]] = None) -> None:
+        self._detect.set_roi_choices(names, checked)
 
     def set_preview_result(self, summary: Optional[dict], level: str = "neutral") -> None:
         self._detect.set_preview_result(summary, level)
@@ -1526,6 +1739,12 @@ class PipelineParamsWidget(QWidget):
 
     def set_detect_running(self, running: bool) -> None:
         self._detect.set_running(running)
+
+    def set_detect_save_status(self, text: str, level: str = "neutral") -> None:
+        self._detect.set_save_status(text, level)
+
+    def set_detect_save_enabled(self, enabled: bool) -> None:
+        self._detect.set_save_enabled(enabled)
 
     # -- track stage ------------------------------------------------------
 

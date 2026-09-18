@@ -14,11 +14,22 @@ One ROI dict per napari Shapes layer: `{"name": <layer name>, "polygons":
 [[[y, x], ...], ...]}` -- multiple layers (e.g. differently-named regions
 drawn for reference vs. as the detect-step mask) round-trip as separate
 named Shapes layers, not merged into one.
+
+Several ROIs can also *label* a run rather than just bound it:
+`label_image` rasterizes a list of ROI records into one integer image
+(-1 outside all of them) and `label_points` stamps each detection with the
+ROI it fell in (`roi` by name, `roi_index` by position in the list, the
+same order `rois.json` is written in). Where ROIs overlap -- a nucleus
+drawn inside a cell, say -- the one listed first wins, so callers put the
+region that should win first (the widget orders them as napari's layer
+list shows them, top first).
 """
 
 from __future__ import annotations
 
 import numpy as np
+import polars as pl
+from skimage.draw import polygon as _fill_polygon
 
 ELLIPSE_N_VERTICES = 64
 
@@ -61,3 +72,59 @@ def roi_to_shapes_kwargs(roi: dict) -> dict:
         name=roi["name"],
         face_color="transparent",
     )
+
+
+def label_image(rois: list[dict], shape: tuple[int, int]) -> np.ndarray:
+    """`(H, W)` int16 image: the index into `rois` of the ROI covering each
+    pixel, -1 where none does. Every polygon of an ROI counts as that ROI
+    (a record is one Shapes layer, possibly several shapes). Overlaps go to
+    the ROI earliest in `rois`, which is why it is painted last."""
+    labels = np.full(shape, -1, dtype=np.int16)
+    for index in range(len(rois) - 1, -1, -1):
+        for poly in rois[index]["polygons"]:
+            verts = np.asarray(poly, dtype=float)
+            if verts.ndim != 2 or len(verts) < 3:
+                continue
+            rr, cc = _fill_polygon(verts[:, 0], verts[:, 1], shape=shape)
+            labels[rr, cc] = index
+    return labels
+
+
+def overlap_pixels(rois: list[dict], shape: tuple[int, int]) -> int:
+    """How many pixels more than one ROI covers -- reported next to a
+    labeled run, since those pixels silently went to the first-listed
+    ROI (see `label_image`)."""
+    counts = np.zeros(shape, dtype=np.int16)
+    for roi in rois:
+        covered = np.zeros(shape, dtype=bool)
+        for poly in roi["polygons"]:
+            verts = np.asarray(poly, dtype=float)
+            if verts.ndim != 2 or len(verts) < 3:
+                continue
+            rr, cc = _fill_polygon(verts[:, 0], verts[:, 1], shape=shape)
+            covered[rr, cc] = True
+        counts += covered
+    return int((counts > 1).sum())
+
+
+def label_points(points_df: pl.DataFrame, labels: np.ndarray, names: list[str]) -> pl.DataFrame:
+    """`points_df` plus `roi_index` (Int16, -1 outside every ROI) and `roi`
+    (the ROI's name, null outside), read off `labels` at each detection's
+    rounded `(y, x)`. Any existing `roi`/`roi_index` columns are replaced,
+    so re-labeling a loaded table is safe."""
+    points_df = points_df.drop([c for c in ("roi", "roi_index") if c in points_df.columns])
+    if points_df.height == 0:
+        return points_df.with_columns(
+            pl.lit(None, dtype=pl.Int16).alias("roi_index"), pl.lit(None, dtype=pl.Utf8).alias("roi")
+        )
+    h, w = labels.shape
+    yi = np.clip(np.rint(points_df["y"].to_numpy()).astype(np.int64), 0, h - 1)
+    xi = np.clip(np.rint(points_df["x"].to_numpy()).astype(np.int64), 0, w - 1)
+    index = labels[yi, xi].astype(np.int16)
+    name_lookup = np.array(list(names) + [None], dtype=object)
+    roi = name_lookup[np.where(index >= 0, index, len(names))]
+    return points_df.with_columns(
+        pl.Series("roi_index", index, dtype=pl.Int16),
+        pl.Series("roi", roi.tolist(), dtype=pl.Utf8),
+    )
+

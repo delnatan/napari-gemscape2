@@ -2,9 +2,16 @@
 
 A results bundle is a directory:
     <result_dir>/points.parquet
-    <result_dir>/tracks.parquet
+    <result_dir>/tracks.parquet  (optional -- only once tracking has been saved)
     <result_dir>/manifest.json
     <result_dir>/rois.json      (optional -- only if an ROI was used)
+
+Detection and tracking are two files, saved by two different actions
+(`write_result` for both, `write_detection_result` for points alone) -- a
+bundle can hold detections with no tracks yet, but never the reverse, since
+tracks are always linked from some points table. `load_result` reflects
+that: it returns an empty `tracks_df` rather than raising when
+`tracks.parquet` isn't there.
 
 The source image is referenced by path in the manifest, not copied.
 
@@ -99,13 +106,41 @@ def write_result(
         rois_path.unlink(missing_ok=True)
 
 
+def write_detection_result(
+    result_dir: str | Path,
+    points_df: pl.DataFrame,
+    manifest: dict,
+    rois: list[dict] | None = None,
+) -> None:
+    """The Detect stage's own save: `points.parquet` and `manifest.json`
+    (plus `rois.json`) alone, usable before tracking has run at all.
+
+    Removes a stale `tracks.parquet`: whatever tracks it held were linked
+    from a `points.parquet` that this call just replaced, so keeping it
+    would leave a tracks table on disk that no longer matches the points
+    beside it. Re-run tracking and `write_result` (the "Save results"
+    button) to get a bundle with tracks in it again."""
+    result_dir = Path(result_dir)
+    result_dir.mkdir(parents=True, exist_ok=True)
+    points_df.write_parquet(result_dir / POINTS_FILENAME)
+    (result_dir / MANIFEST_FILENAME).write_text(json.dumps(manifest, indent=2))
+    rois_path = result_dir / ROIS_FILENAME
+    if rois:
+        rois_path.write_text(json.dumps(rois, indent=2))
+    else:
+        rois_path.unlink(missing_ok=True)
+    (result_dir / TRACKS_FILENAME).unlink(missing_ok=True)
+
+
 def load_result(result_dir: str | Path) -> tuple[pl.DataFrame, pl.DataFrame, dict, list[dict]]:
     """Returns `(points_df, tracks_df, manifest, rois)` -- `rois` is `[]`
     for a bundle written before ROI persistence, or one that simply never
-    used one."""
+    used one; `tracks_df` is an empty `DataFrame` (rather than raising) for
+    a detections-only bundle written by `write_detection_result`."""
     result_dir = Path(result_dir)
     points_df = pl.read_parquet(result_dir / POINTS_FILENAME)
-    tracks_df = pl.read_parquet(result_dir / TRACKS_FILENAME)
+    tracks_path = result_dir / TRACKS_FILENAME
+    tracks_df = pl.read_parquet(tracks_path) if tracks_path.exists() else pl.DataFrame()
     manifest = json.loads((result_dir / MANIFEST_FILENAME).read_text())
     rois_path = result_dir / ROIS_FILENAME
     rois = json.loads(rois_path.read_text()) if rois_path.exists() else []

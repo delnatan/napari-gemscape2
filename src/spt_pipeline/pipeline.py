@@ -82,6 +82,7 @@ import polars as pl
 import spotsolve
 from spotsolve import loctable, tracking
 
+from spt_pipeline import rois as roi_tools
 from spt_pipeline.io_formats import StackMetadata, load_stack
 from spt_pipeline.tracking_diagnostics import check_resolvability
 
@@ -310,6 +311,10 @@ class PipelineSession:
     # from the file" and "supplied by hand" is exactly what the UI shows
     # and `session_manifest_extra` records.
     metadata: Optional[StackMetadata] = None
+    # Camera exposure, carried for the diffusion analysis's motion-blur
+    # model only -- no stage here reads it. None means "not known", which
+    # is different from 0 ("instantaneous"): see `io_formats`.
+    exposure_s: Optional[float] = None
 
     sigma: Optional[float] = None
     calib_summary: Optional[dict] = None
@@ -347,6 +352,12 @@ class PipelineSession:
     # agnostic), carried through to session_manifest_extra's caller so
     # write_result can persist it alongside points/tracks.
     roi: Optional[list[dict]] = None
+    # The saved manifest's `params`, when this session was rebuilt from a
+    # bundle (`session_from_bundle`) rather than run here -- what
+    # `session_manifest_extra` falls back on for anything the session
+    # never recomputed (the calibration CI, say), so a re-save of a
+    # reopened bundle doesn't erase its own provenance.
+    source_params: Optional[dict] = None
 
     tracks_df: Optional[pl.DataFrame] = None
     track_summary: Optional[dict] = None
@@ -365,6 +376,7 @@ def load_session(
     channel: int = 0,
     z_index: int = 0,
     stack: Optional[tuple[np.ndarray, StackMetadata]] = None,
+    exposure_s: Optional[float] = None,
 ) -> PipelineSession:
     """Load a timelapse and start a fresh (un-calibrated, un-detected,
     un-tracked) `PipelineSession`. `stack` is an already-read
@@ -377,7 +389,11 @@ def load_session(
     multiplied through, so there is no safe default to fall back on. The
     message names which one is missing and what the file did say about
     it (`StackMetadata.detail`), since "this .tif has no calibration" is
-    a fixable problem and "pixel_size_um/dt_s not found" was not."""
+    a fixable problem and "pixel_size_um/dt_s not found" was not.
+
+    `exposure_s` falls back to the file's the same way, but is never
+    required: a session with no known exposure can still be detected and
+    linked, and carries None for the diffusion analysis to ask about."""
     if stack is None:
         stack = load_stack(image_path, channel=channel, z_index=z_index)
     im, metadata = stack
@@ -401,6 +417,7 @@ def load_session(
         channel=channel,
         z_index=z_index,
         metadata=metadata,
+        exposure_s=exposure_s if exposure_s is not None else metadata.exposure_s,
     )
 
 
@@ -776,6 +793,9 @@ def run_detect_step(
     session.detector_used = detector
     session.agg_ratio_used = agg_ratio
     session.frame_range_used = (start, end)
+    # A fresh detection table supersedes whatever bundle this session was
+    # rebuilt from, so none of that bundle's recorded numbers still apply.
+    session.source_params = None
     return session
 
 
@@ -991,18 +1011,134 @@ def run_track_step(
             f"{n_after_aggregates} of them. Widen or clear them."
         )
 
+    roi_groups = _roi_groups(link_input)
     report(0, 2, "fitting link parameters")
+    # Fitted on everything even when linking per ROI: it is both the
+    # fallback for an ROI too sparse to fit on its own and the pooled
+    # numbers the top-level summary (and status line) report.
     link_params = tracking.fit_link_params(link_input)
 
     _check_cancelled(cancel_event)
     report(1, 2, "linking")
-    tracks_df = tracking.link(link_input, link_params, brightness=link_with_flux)
+    by_roi = None
+    if roi_groups is None:
+        tracks_df = tracking.link(link_input, link_params, brightness=link_with_flux)
+    else:
+        # One ROI at a time, each with its own fitted LinkParams: regions
+        # are separated because their D and density differ, and a pooled
+        # D prior would gate one region's steps by the other's. Linking
+        # separately is also what guarantees no track crosses a boundary.
+        roi_areas = _roi_areas_px(session)
+        pieces, by_roi, next_id = [], {}, 0
+        for index, name, group in roi_groups:
+            group_params, fell_back = link_params, True
+            if group.height >= MIN_POINTS_FOR_ROI_FIT:
+                try:
+                    group_params, fell_back = tracking.fit_link_params(group), False
+                except Exception:
+                    pass
+            linked = tracking.link(group, group_params, brightness=link_with_flux)
+            if linked.height:
+                linked = linked.with_columns(
+                    (pl.col("track_id").cast(pl.Int64) + next_id).alias("track_id")
+                )
+                next_id = int(linked["track_id"].max()) + 1
+            kept = linked
+            if min_track_length > 1 and kept.height:
+                kept = kept.filter(pl.len().over("track_id") >= min_track_length)
+            by_roi[name] = {
+                "roi_index": index,
+                "fell_back_to_pooled": fell_back,
+                **_link_summary(session, group, kept, group_params, roi_areas.get(index)),
+                "n_tracks": kept["track_id"].n_unique() if kept.height else 0,
+            }
+            pieces.append(linked)
+        tracks_df = pl.concat(pieces, how="vertical_relaxed") if pieces else link_input.head(0)
     n_tracks_linked = tracks_df["track_id"].n_unique() if tracks_df.height else 0
     if min_track_length > 1:
         tracks_df = tracks_df.filter(pl.len().over("track_id") >= min_track_length)
     tracks_df = apply_track_filters(tracks_df, track_filters, session.pixel_size_um, session.dt_s)
     report(2, 2, "done")
 
+    area_px = None
+    if roi_groups is not None or session.roi:
+        area_px = sum(_roi_areas_px(session).values()) or None
+    summary = _link_summary(session, link_input, tracks_df, link_params, area_px)
+
+    if session.source_params:
+        # Linking was just redone, so a reopened bundle's recorded link
+        # numbers and cuts no longer describe this session -- only its
+        # detect/calibration provenance still does.
+        session.source_params = {
+            key: value for key, value in session.source_params.items() if key not in _TRACK_KEYS
+        }
+    session.tracks_df = tracks_df
+    session.link_params = link_params
+    session.drop_aggregates_used = drop_aggregates
+    session.link_with_flux_used = link_with_flux
+    session.min_track_length_used = min_track_length
+    session.point_filters_used = dict(point_filters) if point_filters else None
+    session.track_filters_used = dict(track_filters) if track_filters else None
+    session.track_summary = {
+        **summary,
+        "n_points_linked": link_input.height,
+        "n_points_dropped_as_aggregate": points_df.height - n_after_aggregates,
+        "n_points_dropped_by_filter": n_after_aggregates - link_input.height,
+        "n_tracks_linked": n_tracks_linked,
+        "by_roi": by_roi,
+    }
+    return session
+
+
+# Below this many linkable detections an ROI's own `fit_link_params` is
+# not attempted: the mixture fit over nearest-neighbour distances needs a
+# population to fit, and a handful of points in a small region would give
+# a prior worse than the pooled one it falls back on.
+MIN_POINTS_FOR_ROI_FIT = 50
+
+
+def _roi_groups(link_input: pl.DataFrame) -> Optional[list[tuple[int, str, pl.DataFrame]]]:
+    """`[(roi_index, name, rows), ...]` when `link_input` is labeled with
+    more than one ROI (`rois.label_points`), else None -- one ROI or none
+    links as a single field, exactly as before ROIs could label. Rows
+    outside every ROI (`roi_index == -1`, possible only for a table
+    labeled after an unrestricted detect) form their own "(outside)"
+    group rather than being dropped."""
+    if "roi_index" not in link_input.columns:
+        return None
+    indices = sorted(i for i in link_input["roi_index"].unique().to_list() if i is not None)
+    if len(indices) < 2:
+        return None
+    groups = []
+    for index in indices:
+        rows = link_input.filter(pl.col("roi_index") == index)
+        name = rows["roi"][0] if "roi" in rows.columns and rows["roi"][0] is not None else "(outside)"
+        groups.append((index, name, rows))
+    return groups
+
+
+def _roi_areas_px(session: PipelineSession) -> dict[int, int]:
+    """Pixel area of each saved ROI, as `rois.label_image` assigns them
+    (overlaps counted once, to the ROI that wins them)."""
+    if not session.roi:
+        return {}
+    labels = roi_tools.label_image(session.roi, session.image.shape[1:])
+    values, counts = np.unique(labels[labels >= 0], return_counts=True)
+    return {int(v): int(c) for v, c in zip(values, counts)}
+
+
+def _link_summary(
+    session: PipelineSession,
+    link_input: pl.DataFrame,
+    tracks_df: pl.DataFrame,
+    link_params,
+    area_px: Optional[int] = None,
+) -> dict:
+    """The per-run linking numbers `track_summary` reports -- for the
+    whole field, or for one ROI's slice of it. `area_px` is the region
+    the detections could have come from: the ROI(s) when there are any,
+    else the full frame, so a density (and the crowding verdict built on
+    it) isn't diluted by area nothing could be detected in."""
     # The linker's own CRLB, pooled, as one localization precision in
     # physical units -- what `estimate_D_um2_s` subtracts off and what the
     # resolvability check reasons about. `se_inflate` is applied because it
@@ -1021,22 +1157,16 @@ def run_track_step(
     px2_per_frame_to_um2_s = session.pixel_size_um**2 / session.dt_s
     D_link = link_params.d_mean * px2_per_frame_to_um2_s
 
-    h, w = session.image.shape[1:]
-    active_area_um2 = (h * session.pixel_size_um) * (w * session.pixel_size_um)
+    if area_px is None:
+        h, w = session.image.shape[1:]
+        area_px = h * w
+    active_area_um2 = area_px * session.pixel_size_um**2
     mean_n_per_frame = (
         link_input.group_by("frame").len()["len"].mean() if link_input.height else 0.0
     )
     density_um2 = (mean_n_per_frame / active_area_um2) if mean_n_per_frame else 0.0
     resolvability = check_resolvability(D_est, session.dt_s, density_um2)
-
-    session.tracks_df = tracks_df
-    session.link_params = link_params
-    session.drop_aggregates_used = drop_aggregates
-    session.link_with_flux_used = link_with_flux
-    session.min_track_length_used = min_track_length
-    session.point_filters_used = dict(point_filters) if point_filters else None
-    session.track_filters_used = dict(track_filters) if track_filters else None
-    session.track_summary = {
+    return {
         "sigma_loc_um": sigma_loc_um,
         "D_est_um2_s": D_est,
         "n_linked_steps": n_links,
@@ -1047,16 +1177,11 @@ def run_track_step(
         "p_cont": link_params.p_cont,
         "lam_birth_per_px2": link_params.lam_birth,
         "se_inflate": link_params.se_inflate,
-        "n_points_linked": link_input.height,
-        "n_points_dropped_as_aggregate": points_df.height - n_after_aggregates,
-        "n_points_dropped_by_filter": n_after_aggregates - link_input.height,
-        "n_tracks_linked": n_tracks_linked,
         "density_um2": density_um2,
         "crowding_ratio": resolvability["ratio"],
         "resolvability_verdict": resolvability["verdict"],
         "resolvability_message": resolvability["message"],
     }
-    return session
 
 
 def session_manifest_extra(session: PipelineSession) -> dict:
@@ -1065,9 +1190,13 @@ def session_manifest_extra(session: PipelineSession) -> dict:
     `results.build_manifest`'s `params`."""
     ts = session.track_summary or {}
     cs = session.calib_summary or {}
-    return {
+    params = {
         "pixel_size_um": session.pixel_size_um,
         "dt_s": session.dt_s,
+        # Not used by any stage here; recorded so the diffusion analysis of
+        # this bundle can model motion blur without asking again. None when
+        # neither the file nor the user said.
+        "exposure_s": session.exposure_s,
         # Where those two came from, and anything the reader flagged about
         # them (non-square pixels, irregular frame timing, an
         # unconvertible unit) -- see `io_formats.StackMetadata`. The
@@ -1115,7 +1244,108 @@ def session_manifest_extra(session: PipelineSession) -> dict:
         "calibration_frame": session.calibration_frame_used,
         "frame_range": list(session.frame_range_used) if session.frame_range_used is not None else None,
         "spotsolve_version": spotsolve.__version__,
+        # Per-ROI linking numbers (`run_track_step` links each ROI on its
+        # own when the table is labeled with more than one) -- None for a
+        # single-field run.
+        "track_summary_by_roi": ts.get("by_roi"),
     }
+    # A session rebuilt from a saved bundle never recomputed what earlier
+    # stages recorded (the calibration's CI, say): keep the bundle's own
+    # value rather than overwrite it with None. Counts and versions are
+    # always the current session's.
+    for key, value in (session.source_params or {}).items():
+        if params.get(key) is None and key not in _NEVER_INHERITED:
+            params[key] = value
+    return params
+
+
+# Manifest keys `run_track_step` produces -- dropped from a rebuilt
+# session's `source_params` as soon as it links again.
+_TRACK_KEYS = frozenset({
+    "sigma_loc_um", "D_est_um2_s", "D_link_um2_s", "immobile_fraction", "p_cont",
+    "lam_birth_per_px2", "se_inflate", "n_linked_steps", "min_track_length",
+    "drop_aggregates", "link_with_flux", "n_points_dropped_as_aggregate",
+    "point_filters", "track_filters", "n_points_dropped_by_filter", "n_tracks_linked",
+    "density_um2", "crowding_ratio", "resolvability_verdict", "resolvability_message",
+    "track_summary_by_roi",
+})
+
+
+# Manifest keys that describe *this* write, never carried over from the
+# bundle a session was rebuilt from (`PipelineSession.source_params`).
+_NEVER_INHERITED = frozenset({"n_points", "n_tracks", "spotsolve_version"})
+
+
+def session_from_bundle(
+    image_path: str | Path,
+    stack: tuple[np.ndarray, StackMetadata],
+    points_df: pl.DataFrame,
+    tracks_df: Optional[pl.DataFrame],
+    manifest: dict,
+    rois: Optional[list[dict]] = None,
+) -> PipelineSession:
+    """A `PipelineSession` picking up where a saved bundle left off, so
+    its detections can be linked (or its tracks re-filtered and re-saved)
+    without re-running detect.
+
+    Built on the manifest's own `pixel_size_um`/`dt_s`/`exposure_s`, not
+    the file's or the UI's: `points.parquet`'s µm and s columns were
+    derived from those numbers, and linking against different ones would
+    leave the bundle internally inconsistent. Everything the manifest
+    records about how the detections were made is put back on the
+    `*_used` fields, and the whole `params` dict is kept as
+    `source_params` for `session_manifest_extra` to fall back on."""
+    params = dict(manifest.get("params", {}) or {})
+    image, metadata = stack
+
+    def filters(key: str) -> Optional[FilterSpec]:
+        spec = params.get(key)
+        return {col: tuple(bounds) for col, bounds in spec.items()} if spec else None
+
+    detect_kwargs = params.get("detect_kwargs")
+    if detect_kwargs is not None:
+        detect_kwargs = {
+            key: tuple(value) if key in ("slack", "band") and value is not None else value
+            for key, value in detect_kwargs.items()
+        }
+    frame_range = params.get("frame_range")
+    has_tracks = tracks_df is not None and tracks_df.height > 0 and "track_id" in tracks_df.columns
+    session = PipelineSession(
+        image_path=Path(image_path),
+        image=image,
+        pixel_size_um=params.get("pixel_size_um") or metadata.pixel_size_um,
+        dt_s=params.get("dt_s") or metadata.dt_s,
+        channel=params.get("channel", 0),
+        z_index=params.get("z_index", 0),
+        metadata=metadata,
+        exposure_s=params.get("exposure_s", metadata.exposure_s),
+        sigma=params.get("sigma_px"),
+        calibration_kwargs_used=params.get("calibration_kwargs"),
+        calibration_frame_used=params.get("calibration_frame"),
+        points_df=points_df,
+        camera_kwargs_used=params.get("camera_kwargs"),
+        detect_kwargs_used=detect_kwargs,
+        detector_used=params.get("detector"),
+        agg_ratio_used=params.get("agg_ratio"),
+        frame_range_used=tuple(frame_range) if frame_range is not None else None,
+        roi=list(rois) if rois else None,
+        source_params=params,
+        point_filters_used=filters("point_filters"),
+    )
+    if has_tracks:
+        session.tracks_df = tracks_df
+        session.min_track_length_used = params.get("min_track_length")
+        session.drop_aggregates_used = params.get("drop_aggregates")
+        session.link_with_flux_used = params.get("link_with_flux")
+        session.track_filters_used = filters("track_filters")
+        session.track_summary = {key: params.get(key) for key in _TRACK_KEYS}
+        session.track_summary["by_roi"] = params.get("track_summary_by_roi")
+    if session.pixel_size_um is None or session.dt_s is None:
+        raise ValueError(
+            f"{Path(image_path).name}: the saved bundle records no pixel size / frame "
+            "interval and the file has none either."
+        )
+    return session
 
 
 def _metadata_provenance(session: PipelineSession) -> dict:
@@ -1127,7 +1357,11 @@ def _metadata_provenance(session: PipelineSession) -> dict:
     depend on which path produced it."""
     metadata = session.metadata
     if metadata is None:
-        return {"pixel_size_um_source": "unrecorded", "dt_s_source": "unrecorded"}
+        return {
+            "pixel_size_um_source": "unrecorded",
+            "dt_s_source": "unrecorded",
+            "exposure_s_source": "unrecorded" if session.exposure_s is None else "given explicitly",
+        }
     provenance = metadata.as_manifest_dict()
     if metadata.pixel_size_um is None or metadata.pixel_size_um != session.pixel_size_um:
         provenance["pixel_size_um_source"] = (
@@ -1135,6 +1369,10 @@ def _metadata_provenance(session: PipelineSession) -> dict:
         )
     if metadata.dt_s is None or metadata.dt_s != session.dt_s:
         provenance["dt_s_source"] = f"given explicitly (file said: {provenance['dt_s_source']})"
+    if session.exposure_s is not None and metadata.exposure_s != session.exposure_s:
+        provenance["exposure_s_source"] = (
+            f"given explicitly (file said: {provenance['exposure_s_source']})"
+        )
     return provenance
 
 
@@ -1169,6 +1407,7 @@ def run_detect_track(
     params: Optional[DetectTrackParams] = None,
     progress_callback: Optional[ProgressCallback] = None,
     cancel_event: Optional[threading.Event] = None,
+    exposure_s: Optional[float] = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame, dict]:
     """Run the full calibrate+detect+track pipeline on one timelapse in
     one call, composing `load_session`/`run_calibration_step`/
@@ -1179,7 +1418,8 @@ def run_detect_track(
     `image_path` can be .tif/.tiff, .nd2, or .ims (see `io_formats.load_stack`).
     `channel`/`z_index` pick which plane to track for files with more than
     one (both default to 0). `pixel_size_um`/`dt_s` fall back to the
-    file's own metadata if not given explicitly.
+    file's own metadata if not given explicitly, and so does `exposure_s`
+    (recorded in the manifest for the diffusion analysis; never required).
 
     `cancel_event`, if given, is forwarded to each stage -- see
     `PipelineCancelled`'s docstring for what "cancelled" actually means per
@@ -1190,7 +1430,14 @@ def run_detect_track(
     meant to be passed as `results.build_manifest`'s `params`.
     """
     params = params or DetectTrackParams()
-    session = load_session(image_path, pixel_size_um=pixel_size_um, dt_s=dt_s, channel=channel, z_index=z_index)
+    session = load_session(
+        image_path,
+        pixel_size_um=pixel_size_um,
+        dt_s=dt_s,
+        channel=channel,
+        z_index=z_index,
+        exposure_s=exposure_s,
+    )
     start, end = _resolve_frame_range(params.frame_range, session.image.shape[0])
     n_frames = end - start
     total_steps = n_frames + 3

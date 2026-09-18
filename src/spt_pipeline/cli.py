@@ -56,6 +56,7 @@ def detect_track(
             pixel_size_um=entry.get("pixel_size_um"),
             dt_s=entry.get("dt_s"),
             params=params,
+            exposure_s=entry.get("exposure_s"),
         )
         manifest = build_manifest(
             result_id=result_id,
@@ -75,7 +76,9 @@ def detect_track(
             f"  {units.fmt(manifest_extra['pixel_size_um'], 'pixel_size_um')} "
             f"({manifest_extra.get('pixel_size_um_source')}) · "
             f"{units.fmt(manifest_extra['dt_s'], 'dt_s')} "
-            f"({manifest_extra.get('dt_s_source')})"
+            f"({manifest_extra.get('dt_s_source')}) · "
+            f"exposure {units.fmt(manifest_extra.get('exposure_s'), 'exposure_s')} "
+            f"({manifest_extra.get('exposure_s_source')})"
         )
         for note in manifest_extra.get("metadata_notes") or ():
             typer.echo(f"  ! {note}")

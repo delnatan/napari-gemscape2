@@ -17,6 +17,13 @@ record of *where it came from*, and any notes about how far the file's own
 metadata can be trusted. Either may be None, in which case the caller
 supplies it explicitly or raises (see `pipeline.load_session`).
 
+A third fact, the camera `exposure_s`, is read the same way but is not
+required to run: detection and linking never use it. The diffusion
+analysis does -- diffusionkit's displacement MLE models the motion blur
+of a continuous exposure, and treating a 20 ms exposure as instantaneous
+biases D by about -25% and the non-Brownian score by +0.3 to +0.7. So a
+missing exposure is None ("ask the user"), never 0 ("instantaneous").
+
 Provenance, not just values, because everything downstream silently
 adopts these two numbers: `x_um`, `duration_s`, `D_um2_s` and every
 physical column in a saved bundle is this pixel size and this frame
@@ -33,6 +40,7 @@ and what `manifest.json` records (`pipeline.session_manifest_extra`).
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -87,6 +95,28 @@ _ANISOTROPY_FRACTION = 0.01
 
 UNKNOWN = "not recorded in the file"
 
+# Time units an exposure is recorded in, in seconds. As with lengths, a
+# value whose unit isn't here -- or that has no unit at all -- is not
+# converted: a bare "20" is 20 ms from one acquisition program and 20 s
+# from nowhere, and guessing wrong is a 1000x error in the blur model.
+_TIME_UNITS_S = {
+    "s": 1.0,
+    "sec": 1.0,
+    "second": 1.0,
+    "seconds": 1.0,
+    "ms": 1e-3,
+    "msec": 1e-3,
+    "millisecond": 1e-3,
+    "milliseconds": 1e-3,
+    "us": 1e-6,
+    "µs": 1e-6,
+    "μs": 1e-6,
+    "microsecond": 1e-6,
+    "microseconds": 1e-6,
+}
+
+_VALUE_WITH_UNIT = re.compile(r"^\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*([^\d\s].*?)?\s*$")
+
 
 @dataclass(frozen=True)
 class StackMetadata:
@@ -113,6 +143,12 @@ class StackMetadata:
     # timestamps each frame (.nd2/.ims). None for a format that records
     # one nominal interval (.tif) -- "no spread measured", not "zero".
     dt_spread_s: Optional[float] = None
+    # Camera exposure per frame -- not required to detect or link, only
+    # by the diffusion analysis's blur model (see this module's
+    # docstring). None when the file doesn't say, in a unit this module
+    # can convert.
+    exposure_s: Optional[float] = None
+    exposure_source: str = UNKNOWN
     notes: tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -142,6 +178,11 @@ class StackMetadata:
             if self.dt_s is not None
             else "frame interval ?"
         )
+        parts.append(
+            f"exposure {units.fmt_unit(self.exposure_s, units.SECONDS)}"
+            if self.exposure_s is not None
+            else "exposure ?"
+        )
         if self.n_channels > 1:
             parts.append(f"channel {self.channel} of {self.n_channels}")
         if self.n_z > 1:
@@ -163,6 +204,7 @@ class StackMetadata:
             f"pixel size: {units.fmt_unit(self.pixel_size_um, units.UM + '/px')}"
             f"  ({self.pixel_size_source})",
             f"frame interval: {units.fmt_unit(self.dt_s, 's/frame')}  ({self.dt_source})",
+            f"exposure: {units.fmt_unit(self.exposure_s, units.SECONDS)}  ({self.exposure_source})",
         ]
         if self.dt_spread_s is not None:
             lines.append(
@@ -183,6 +225,7 @@ class StackMetadata:
             "pixel_size_um_source": self.pixel_size_source,
             "dt_s_source": self.dt_source,
             "dt_spread_s": self.dt_spread_s,
+            "exposure_s_source": self.exposure_source,
             "n_frames_in_file": self.n_frames,
             "n_channels_in_file": self.n_channels,
             "n_z_in_file": self.n_z,
@@ -215,6 +258,59 @@ def _to_um(value: Optional[float], unit: Optional[str]) -> tuple[Optional[float]
     if factor is None:
         return None, key
     return number * factor, key
+
+
+def _to_seconds(value, unit: Optional[str] = None) -> Optional[float]:
+    """A recorded time as seconds: `value` is a number with `unit`
+    beside it, or a string carrying both ("20 ms", "0.02s"). None for
+    anything without a unit `_TIME_UNITS_S` knows -- including a bare
+    number, whose unit is exactly what can't be assumed -- and for a
+    negative or non-finite value. Zero is kept: some acquisitions really
+    do record an instantaneous (stroboscopic) exposure."""
+    if isinstance(value, str) and unit is None:
+        match = _VALUE_WITH_UNIT.match(value)
+        if match is None:
+            return None
+        value, unit = match.group(1), match.group(2)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number < 0 or not unit:
+        return None
+    factor = _TIME_UNITS_S.get(str(unit).strip().lower())
+    return number * factor if factor is not None else None
+
+
+def _exposure_from_values(
+    recorded: list, where: str, notes: list[str]
+) -> tuple[Optional[float], str]:
+    """`(exposure_s, source)` from every exposure value one file records
+    for the plane in use -- a raw string or number each. One distinct
+    convertible value is the answer; several different ones (a multi-
+    channel acquisition whose channels can't be told apart in the text)
+    or an unconvertible one is noted and treated as missing, since the
+    blur model has to be told the real exposure, not a plausible one."""
+    if not recorded:
+        return None, UNKNOWN
+    converted = [_to_seconds(value) for value in recorded]
+    if any(value is None for value in converted):
+        bad = next(raw for raw, value in zip(recorded, converted) if value is None)
+        notes.append(
+            f"{where} records an exposure of {bad!r}, with no time unit this reader "
+            "knows — exposure treated as missing"
+        )
+        return None, UNKNOWN
+    distinct = sorted(set(converted))
+    if len(distinct) > 1:
+        notes.append(
+            f"{where} records different exposures ("
+            + ", ".join(units.fmt_unit(v, units.SECONDS) for v in distinct)
+            + ") and this reader can't tell which belongs to this channel — "
+            "exposure treated as missing"
+        )
+        return None, UNKNOWN
+    return distinct[0], where
 
 
 def _mean_pixel_size(
@@ -308,13 +404,16 @@ class _Calibration:
     dt_s: Optional[float] = None
     pixel_size_source: str = UNKNOWN
     dt_source: str = UNKNOWN
+    exposure_s: Optional[float] = None
+    exposure_source: str = UNKNOWN
     pixel_notes: list[str] = field(default_factory=list)
     dt_notes: list[str] = field(default_factory=list)
+    exposure_notes: list[str] = field(default_factory=list)
     general_notes: list[str] = field(default_factory=list)
 
     @property
     def notes(self) -> list[str]:
-        return [*self.general_notes, *self.pixel_notes, *self.dt_notes]
+        return [*self.general_notes, *self.pixel_notes, *self.dt_notes, *self.exposure_notes]
 
     def fill_from(self, other: "_Calibration") -> None:
         """Take whichever of the two facts this source is missing from
@@ -322,6 +421,12 @@ class _Calibration:
         only the notes that still describe an unanswered fact."""
         wanted_pixel = self.pixel_size_um is None
         wanted_dt = self.dt_s is None
+        wanted_exposure = self.exposure_s is None
+        if wanted_exposure and other.exposure_s is not None:
+            self.exposure_s = other.exposure_s
+            self.exposure_source = other.exposure_source
+        if wanted_exposure:
+            self.exposure_notes.extend(other.exposure_notes)
         if wanted_pixel and other.pixel_size_um is not None:
             self.pixel_size_um = other.pixel_size_um
             self.pixel_size_source = other.pixel_size_source
@@ -382,6 +487,18 @@ def _ome_calibration(tf) -> _Calibration:
             calibration.dt_notes.append(
                 f"OME TimeIncrementUnit={unit_name!r} not understood — frame interval ignored"
             )
+
+    # Per-plane, with its own unit attribute (OME's default is seconds).
+    # A single-channel stack is all this loader reads, so every plane's
+    # exposure should agree; `_exposure_from_values` says so if not.
+    recorded = [
+        f"{plane.get('ExposureTime')} {plane.get('ExposureTimeUnit', 's')}"
+        for plane in root.iter()
+        if plane.tag.rpartition("}")[2] == "Plane" and plane.get("ExposureTime") is not None
+    ]
+    calibration.exposure_s, calibration.exposure_source = _exposure_from_values(
+        recorded, "OME-TIFF Plane ExposureTime", calibration.exposure_notes
+    )
     return calibration
 
 
@@ -480,6 +597,8 @@ def _load_tiff(image_path: Path):
         dt_s=calibration.dt_s,
         pixel_size_source=calibration.pixel_size_source,
         dt_source=calibration.dt_source,
+        exposure_s=calibration.exposure_s,
+        exposure_source=calibration.exposure_source,
         notes=tuple(calibration.notes),
     )
     return im, metadata
@@ -540,6 +659,7 @@ def _load_nd2(image_path: Path, channel: int, z_index: int):
             pixel_source = "nd2 voxel_size()"
 
         dt_s, dt_spread_s, dt_source = _nd2_frame_interval_s(f, stack.shape[0], notes)
+        exposure_s, exposure_source = _nd2_exposure_s(f, notes)
         n_channels = int(f.sizes.get("C", 1))
         n_z = int(f.sizes.get("Z", 1))
 
@@ -555,9 +675,33 @@ def _load_nd2(image_path: Path, channel: int, z_index: int):
         n_channels=n_channels,
         n_z=n_z,
         dt_spread_s=dt_spread_s,
+        exposure_s=exposure_s,
+        exposure_source=exposure_source,
         notes=tuple(notes),
     )
     return stack, metadata
+
+
+_ND2_EXPOSURE = re.compile(r"Exposure:\s*([^\r\n,;]+)", re.IGNORECASE)
+
+
+def _nd2_exposure_s(nd2_file, notes: list[str]) -> tuple[Optional[float], str]:
+    """The camera exposure NIS-Elements writes into its capture text
+    ("Exposure: 20 ms"). The `capturing` block is read in preference to
+    `description`, which repeats it; a multi-channel file lists one line
+    per channel, and `_exposure_from_values` refuses to pick among
+    differing ones rather than guess which is this channel's."""
+    try:
+        text_info = nd2_file.text_info or {}
+    except Exception:
+        return None, UNKNOWN
+    for key in ("capturing", "description"):
+        recorded = _ND2_EXPOSURE.findall(str(text_info.get(key) or ""))
+        if recorded:
+            return _exposure_from_values(
+                [value.strip() for value in recorded], f"nd2 text_info '{key}' Exposure", notes
+            )
+    return None, UNKNOWN
 
 
 def _nd2_frame_interval_s(nd2_file, t_size: int, notes: list[str]):
@@ -645,6 +789,18 @@ def _load_ims(image_path: Path, channel: int, z_index: int):
             for ts in reader.timestamps
         ]
         dt_s, dt_spread_s = _interval_stats(times, notes, "Imaris timestamps")
+
+        # `ImarisReader` hands back the attribute as a float when it is a
+        # bare number and as the raw string when it carries a unit ("20
+        # ms"); only the latter can be converted. Imaris's own writer puts
+        # it on `Channel <i>`, but many writers (Andor Fusion among them)
+        # leave it out entirely.
+        recorded = (reader.channels_info[channel] or {}).get("exposure_time")
+        exposure_s, exposure_source = _exposure_from_values(
+            [] if recorded is None else [recorded],
+            f"Imaris Channel {channel} ExposureTime",
+            notes,
+        )
     finally:
         reader.close()
 
@@ -660,6 +816,8 @@ def _load_ims(image_path: Path, channel: int, z_index: int):
         n_channels=int(n_c),
         n_z=int(n_z),
         dt_spread_s=dt_spread_s,
+        exposure_s=exposure_s,
+        exposure_source=exposure_source,
         notes=tuple(notes),
     )
     return stack, metadata

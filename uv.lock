@@ -461,36 +461,42 @@ name = "diffusionkit"
 version = "0.1.0"
 source = { editable = "../diffusionkit" }
 dependencies = [
-    { name = "jax" },
-    { name = "matplotlib" },
     { name = "numpy" },
-    { name = "numpyro" },
-    { name = "pandas" },
     { name = "polars" },
     { name = "scipy" },
-    { name = "seaborn" },
-    { name = "tqdm" },
 ]
 
 [package.optional-dependencies]
 nested = [
+    { name = "jax" },
     { name = "jaxns" },
+    { name = "matplotlib" },
+    { name = "numpyro" },
+    { name = "pandas" },
+    { name = "seaborn" },
+    { name = "tqdm" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "jax" },
+    { name = "jax", marker = "extra == 'bayes'" },
+    { name = "jax", marker = "extra == 'nested'" },
     { name = "jaxns", marker = "extra == 'nested'", specifier = ">2.5" },
-    { name = "matplotlib" },
+    { name = "matplotlib", marker = "extra == 'nested'" },
+    { name = "matplotlib", marker = "extra == 'plots'" },
     { name = "numpy" },
-    { name = "numpyro" },
-    { name = "pandas" },
+    { name = "numpyro", marker = "extra == 'bayes'" },
+    { name = "numpyro", marker = "extra == 'nested'" },
+    { name = "pandas", marker = "extra == 'nested'" },
+    { name = "pandas", marker = "extra == 'plots'" },
     { name = "polars" },
     { name = "scipy" },
-    { name = "seaborn" },
-    { name = "tqdm" },
+    { name = "seaborn", marker = "extra == 'nested'" },
+    { name = "seaborn", marker = "extra == 'plots'" },
+    { name = "tqdm", marker = "extra == 'bayes'" },
+    { name = "tqdm", marker = "extra == 'nested'" },
 ]
-provides-extras = ["nested"]
+provides-extras = ["bayes", "plots", "nested"]
 
 [[package]]
 name = "dm-tree"
@@ -2017,7 +2023,7 @@ wheels = [
 [[package]]
 name = "qtkit"
 version = "0.1.0"
-source = { git = "https://github.com/delnatan/qtkit.git?branch=main#c92460934582e6c69bf2e11f021d9bf6492928f3" }
+source = { git = "https://github.com/delnatan/qtkit.git?branch=main#9aaf8c1dd258533eb283e762b03fe00ba2482136" }
 dependencies = [
     { name = "numpy" },
     { name = "qtpy" },
