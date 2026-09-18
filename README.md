@@ -231,9 +231,27 @@ the classical per-track Brownian MLE — by default just `D` (with its upper lim
 and `p_motion`) as a log-D histogram with median and IQR, about 2 s for ~500
 tracks; the calibrated non-Brownian score `z` (log D vs z, mean z ± SE) is an
 opt-in that costs ~15× more; MSD fits only as a labelled comparison. Saving
-writes `track_D.parquet`, one row per track (`track_id`, `roi`, `n_frames`,
-`mle_status`, `D_mle_um2_s`, `D_upper_mle_um2_s`, `p_motion`), the table to
-pool across experiments — plus Bayesian and per-track anisotropy fits, and offers the same histogram
+writes `tracks_summary.parquet`, one row per track — the table to read an
+experiment's tracks from and to pool across experiments (*Export CSV…* writes
+the same table as CSV). Every track is a row, filtered-out and unresolved ones
+included, with:
+
+- identity: `result_id` (the bundle), `track_id`, `roi`, and `passes_filters`
+  (the tracks pane's length and histogram cuts, recorded in
+  `diffusion_summary.json`);
+- size and position: `track_length`, `duration_s`, `mean_step_um`, mean
+  `x_um`/`y_um` (and px);
+- the classical fit: `mle_status`, `D_mle_um2_s`, `D_upper_mle_um2_s`,
+  `p_motion` (plus `z_nonbrownian`, `p_nonbrownian`, `alpha_1step` when z was
+  computed);
+- shape: `radius_of_gyration_um`, `net_displacement_um`, `straightness`,
+  `gyration_asymmetry`;
+- track quality, as the mean over the track's detections of each detector
+  column: `flux_mean`, `bg_mean`, `fit_sigma_mean`, `se_x_mean`/`se_y_mean`,
+  ... — in the detector's units (`fit_sigma`, `se_x` in px; the `_um` variants
+  in µm).
+
+The Diffusion panel also runs Bayesian and per-track anisotropy fits, and offers the same histogram
 filters over per-track results — so a fitted `D` or `alpha` is filterable by the
 same drag as any other feature.
 

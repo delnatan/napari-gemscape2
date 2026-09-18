@@ -90,25 +90,72 @@ def mle_track_table(fits: pl.DataFrame) -> pl.DataFrame:
     return mle_rows(fits).select(columns)
 
 
-def track_d_table(fits: pl.DataFrame, groups: Optional[pl.DataFrame] = None) -> pl.DataFrame:
-    """The per-track D table a results bundle carries for downstream
-    pooling (`results.TRACK_D_FILENAME`): `mle_track_table` plus
-    `n_frames` and, when `groups` (`track_id`, `group`) is given, the
-    `roi` each track was linked in. Every analysed track is a row --
-    `unresolved`/`excluded` ones included, with their status -- so a
-    script can apply its own rule rather than inherit a silent drop."""
-    table = mle_rows(fits).select("track_id", "n_frames").join(
-        mle_track_table(fits), on="track_id", how="left"
+# Per-point QC columns reach the tracks pane as `<col>_min/_mean/_max`
+# (`widgets/diffusion_panel._qc_aggregate_table`). The saved summary keeps
+# the mean only: it says what a track's detections were typically like,
+# at a third of the width.
+_QC_EXTREME_SUFFIXES = ("_min", "_max")
+
+
+def tracks_summary_table(
+    base: pl.DataFrame,
+    classical: Optional[pl.DataFrame],
+    *,
+    result_id: Optional[str],
+    pixel_size_um: float,
+    passing_ids: Optional[set],
+) -> pl.DataFrame:
+    """One row per track, for `results.TRACKS_SUMMARY_FILENAME`: the
+    primary table to read an experiment's tracks from, and to pool across
+    experiments.
+
+    `base` is the diffusion widget's per-track table (length, centroid in
+    px, shape from diffusionkit's `track_geometry`, `roi`, and per-point
+    detection QC aggregated per track); `classical` the classical run's
+    `mle_track_table`, or None before a run. Kept from `base`: every
+    column except the per-point min/max, so the detection quality of a
+    track reads as its mean `flux`, `bg`, `fit_sigma`, `se_x`/`se_y`, ...
+    Added: `result_id` (which experiment -- so pooling is a plain concat),
+    the centroid in µm, and `passes_filters` (the tracks pane's length
+    and histogram cuts; `passing_ids` None means no cut is set).
+
+    Every track is a row, including ones the MLE left `unresolved` or
+    `excluded`, and ones a filter rejects: the columns say which, so a
+    later script can apply the same rule or another without a re-run.
+    """
+    means = {c[: -len("_mean")] for c in base.columns if c.endswith("_mean")}
+    drop = [
+        c
+        for c in base.columns
+        if c.endswith(_QC_EXTREME_SUFFIXES) and c[: -len("_min")] in means
+    ]
+    table = base.drop(drop).with_columns(
+        (pl.col("x_px") * pixel_size_um).alias("x_um"),
+        (pl.col("y_px") * pixel_size_um).alias("y_um"),
+        pl.lit(result_id, dtype=pl.String).alias("result_id"),
+        (
+            pl.col("track_id").is_in(list(passing_ids))
+            if passing_ids is not None
+            else pl.lit(True)
+        ).alias("passes_filters"),
     )
-    if groups is not None:
+    if classical is not None:
         table = table.join(
-            groups.select(
-                pl.col("track_id").cast(table.schema["track_id"]), pl.col("group").alias("roi")
-            ),
+            classical.with_columns(pl.col("track_id").cast(table.schema["track_id"])),
             on="track_id",
             how="left",
-        ).select("track_id", "roi", pl.exclude("track_id", "roi"))
-    return table
+        )
+    lead = [
+        c
+        for c in (
+            "result_id", "track_id", "roi", "passes_filters", "track_length", "duration_s",
+            "mean_step_um", "x_um", "y_um", "x_px", "y_px",
+        )
+        if c in table.columns
+    ]
+    classical_cols = [c for c in (classical.columns if classical is not None else []) if c != "track_id"]
+    rest = [c for c in table.columns if c not in lead and c not in classical_cols]
+    return table.select(lead + classical_cols + rest).sort("track_id")
 
 
 def msd_track_table(fits: pl.DataFrame) -> pl.DataFrame:

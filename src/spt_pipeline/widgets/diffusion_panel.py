@@ -145,6 +145,7 @@ from qtkit.plot import AxisPicker, PlotWindow
 from qtpy.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -165,10 +166,14 @@ from spt_pipeline.diffusion import (
     msd_track_table,
     summarize_mle,
     summarize_mle_by_group,
-    track_d_table,
+    tracks_summary_table,
     tracks_to_diffusionkit_df,
 )
-from spt_pipeline.results import load_diffusion_results, write_diffusion_results
+from spt_pipeline.results import (
+    TRACKS_SUMMARY_FILENAME,
+    load_diffusion_results,
+    write_diffusion_results,
+)
 from spt_pipeline.joint_plot import (
     numeric_columns,
     plot_d_histogram,
@@ -1181,6 +1186,10 @@ class _ClassicalTab(QWidget):
         self._status.setText(text)
         style_status_label(self._status, "ok")
 
+    def report_error(self, text: str) -> None:
+        self._status.setText(text)
+        style_status_label(self._status, "error")
+
     def show_loaded_summary(self, text: str) -> None:
         self._summary.setText(text)
 
@@ -1966,7 +1975,15 @@ class DiffusionAnalysisWidget(QWidget):
         self._save_button.clicked.connect(self._save_results)
         self._save_button.setEnabled(False)
 
-        footer = flow_row(self._restrict_checkbox, self._save_button)
+        self._export_csv_button = QPushButton("Export CSV…")
+        self._export_csv_button.setToolTip(
+            "Write the per-track summary (the same table Save writes as\n"
+            f"{TRACKS_SUMMARY_FILENAME}) as CSV, for a spreadsheet or Prism."
+        )
+        self._export_csv_button.clicked.connect(self._export_tracks_csv)
+        self._export_csv_button.setEnabled(False)
+
+        footer = flow_row(self._restrict_checkbox, self._save_button, self._export_csv_button)
 
         self._progress_bar = QProgressBar()
         self._progress_bar.setTextVisible(True)
@@ -2246,6 +2263,7 @@ class DiffusionAnalysisWidget(QWidget):
         self._bayesian.reset()
         self._anisotropy.reset()
         self._save_button.setEnabled(False)
+        self._export_csv_button.setEnabled(False)
         self._clear_overlay_layers()
 
     @staticmethod
@@ -2472,6 +2490,7 @@ class DiffusionAnalysisWidget(QWidget):
             or bool(self._track_fit_rows)
         )
         self._save_button.setEnabled(has_results and self._result_dir is not None)
+        self._export_csv_button.setEnabled(self._base_track_df is not None)
 
     # -- track table + selection --
 
@@ -2780,6 +2799,67 @@ class DiffusionAnalysisWidget(QWidget):
 
     # -- persistence --
 
+    def _passing_track_ids(self) -> Optional[set]:
+        """Tracks passing the pane's length and histogram cuts -- the
+        quality filters, as opposed to its ROI picker, which is a view
+        (every row carries its `roi`). None when no cut is set."""
+        ids = None
+        min_len = self._tracks_pane.min_track_length()
+        if min_len > 1 and self._base_track_df is not None:
+            ids = set(
+                self._base_track_df.filter(pl.col("track_length") >= min_len)["track_id"].to_list()
+            )
+        cut = self._tracks_pane.filtered_track_ids()
+        if cut is not None:
+            ids = cut if ids is None else (ids & cut)
+        return ids
+
+    def _summary_filter_record(self) -> dict:
+        """What `passes_filters` in the saved summary means, for the JSON
+        beside it."""
+        return {
+            "min_track_length": self._tracks_pane.min_track_length(),
+            "ranges": {
+                column: [float(lo), float(hi)]
+                for column, (lo, hi) in (self._tracks_pane.filters.filters() or {}).items()
+            },
+        }
+
+    def tracks_summary(self) -> Optional[pl.DataFrame]:
+        """The per-track summary (`diffusion.tracks_summary_table`) for the
+        loaded layer and the current classical run, if any."""
+        if self._base_track_df is None:
+            return None
+        result_id = self._result_dir.name if self._result_dir is not None else None
+        if result_id is None and self._tracks_layer is not None:
+            result_id = self._tracks_layer.name
+        return tracks_summary_table(
+            self._base_track_df,
+            self._classical_df,
+            result_id=result_id,
+            pixel_size_um=self.pixel_size_um,
+            passing_ids=self._passing_track_ids(),
+        )
+
+    def _export_tracks_csv(self) -> None:
+        table = self.tracks_summary()
+        if table is None:
+            return
+        stem = Path(TRACKS_SUMMARY_FILENAME).stem
+        default_dir = self._result_dir if self._result_dir is not None else Path.home()
+        default_name = f"{table['result_id'][0]}_{stem}.csv" if table.height else f"{stem}.csv"
+        path, _filter = QFileDialog.getSaveFileName(
+            self, "Export per-track summary", str(default_dir / default_name), "CSV (*.csv)"
+        )
+        if not path:
+            return
+        try:
+            table.write_csv(path)
+        except OSError as exc:
+            self._classical.report_error(f"could not write {path}: {exc}")
+            return
+        self._classical.report_saved(f"exported {table.height} tracks to {path}")
+
     def _save_results(self) -> None:
         if self._result_dir is None:
             return
@@ -2856,8 +2936,9 @@ class DiffusionAnalysisWidget(QWidget):
             if self._classical.summary_by_roi:
                 summary["by_roi"] = self._classical.summary_by_roi
 
-        track_d = (
-            track_d_table(analysis.fits, self.track_rois()) if analysis is not None else None
+        summary["tracks_summary_filters"] = self._summary_filter_record()
+        write_diffusion_results(self._result_dir, per_track_df, summary, self.tracks_summary())
+        self._classical.report_saved(
+            f"saved {per_track_df.height} fit(s) and the per-track summary "
+            f"({TRACKS_SUMMARY_FILENAME}) to {self._result_dir}"
         )
-        write_diffusion_results(self._result_dir, per_track_df, summary, track_d)
-        self._classical.report_saved(f"saved {per_track_df.height} fit(s) to {self._result_dir}")

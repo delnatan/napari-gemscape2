@@ -41,10 +41,10 @@ MANIFEST_FILENAME = "manifest.json"
 ROIS_FILENAME = "rois.json"
 DIFFUSION_FITS_FILENAME = "diffusion_fits.parquet"
 DIFFUSION_SUMMARY_FILENAME = "diffusion_summary.json"
-# One row per analysed track: the Brownian MLE's D, its upper limit,
-# p_motion, status, n_frames and ROI -- the table to pool across
-# experiments (`diffusion.track_d_table`).
-TRACK_D_FILENAME = "track_D.parquet"
+# One row per track: identity, size, position, shape, mean detection QC
+# and the classical D -- the table to read an experiment's tracks from and
+# to pool across experiments (`diffusion.tracks_summary_table`).
+TRACKS_SUMMARY_FILENAME = "tracks_summary.parquet"
 
 
 def repo_root_of(module) -> Path:
@@ -155,31 +155,25 @@ def write_diffusion_results(
     result_dir: str | Path,
     per_track_df: pl.DataFrame,
     summary: dict,
-    track_d_df: pl.DataFrame | None = None,
+    tracks_summary_df: pl.DataFrame | None = None,
 ) -> None:
     """Diffusion-widget results, written like `rois.json`: an optional
     extra on top of the core points/tracks/manifest bundle, not every
     bundle has one. `per_track_df` holds one row per (track_id, method) --
-    the classic-MSD population fit's per-track table and any Bayesian
-    per-track fits the user has run, distinguished by a `method` column
-    (see `widgets/diffusion_panel.py`) -- so both live in one file.
-    `summary` holds the classic-MSD ensemble-level scalars (D/alpha fits,
-    localization offset).
+    the classical run's fits and any Bayesian per-track fits the user has
+    run, distinguished by a `method` column (see
+    `widgets/diffusion_panel.py`) -- so all of them live in one file.
+    `summary` holds the run settings and population-level scalars.
 
-    `track_d_df`, when given, is the flat per-track D table
-    (`TRACK_D_FILENAME`): the one to read when pooling experiments, since
-    `per_track_df` mixes every method's rows and columns. A save without
-    a classical run removes a stale one rather than leaving it to
-    disagree with the fits beside it."""
+    `tracks_summary_df`, when given, is the flat one-row-per-track table
+    (`TRACKS_SUMMARY_FILENAME`): the one to read, since `per_track_df`
+    mixes every method's rows and columns."""
     result_dir = Path(result_dir)
     result_dir.mkdir(parents=True, exist_ok=True)
     per_track_df.write_parquet(result_dir / DIFFUSION_FITS_FILENAME)
     (result_dir / DIFFUSION_SUMMARY_FILENAME).write_text(json.dumps(summary, indent=2))
-    track_d_path = result_dir / TRACK_D_FILENAME
-    if track_d_df is not None:
-        track_d_df.write_parquet(track_d_path)
-    else:
-        track_d_path.unlink(missing_ok=True)
+    if tracks_summary_df is not None:
+        tracks_summary_df.write_parquet(result_dir / TRACKS_SUMMARY_FILENAME)
 
 
 def load_diffusion_results(
