@@ -58,7 +58,7 @@ they fall in (`roi`/`roi_index` columns; where regions overlap, the one higher i
 napari's layer list wins), tracking links each region separately with its own
 fitted parameters (so no track crosses a boundary, and the manifest carries a
 `track_summary_by_roi`), and the Diffusion panel can filter to one ROI and
-reports the classical D/z summary per ROI.
+reports the classical D summary (and z, when computed) per ROI.
 
 Reopening a row that already has a bundle resumes it: the saved points are the
 session's detections, so Track links them without re-running detect, and the
@@ -93,8 +93,8 @@ step any more. **Preview frame** localizes one frame with the reporting band off
 a synthetic field: 1.100 → 1.4208 → 1.4197 against a true 1.45), with the
 distribution on screen throughout. A bimodal or ragged `fit_sigma` — two focal
 planes, junk being fitted as signal — becomes something you see rather than
-something a median averages away. `calibrate_sigma` is still what unattended batch
-runs use, where nobody is looking at a histogram.
+something a median averages away. `calibrate_sigma` is still what the headless
+`spt detect-track` uses, where nobody is looking at a histogram.
 
 One unit caveat, since two are in play: `sigma` is in **pixels**, while `slack`
 and `band` are **multiples of whatever sigma the search is running at**
@@ -227,9 +227,13 @@ folder of raw images and work one image through **Detect** (PSF width via
 Preview frame, detection knobs, then filters on what it found) and **Track**
 (link, optionally with flux as a second link cue, then filters on the
 tracks), pressing *Save results* when the result is worth keeping. The "Diffusion analysis" widget then reads the tracks layer for
-the classical per-track Brownian MLE (`D` plus a calibrated non-Brownian score
-`z`, read as a population: log D vs z, mean z ± SE; MSD fits only as a
-labelled comparison), Bayesian and per-track anisotropy fits, and offers the same histogram
+the classical per-track Brownian MLE — by default just `D` (with its upper limit
+and `p_motion`) as a log-D histogram with median and IQR, about 2 s for ~500
+tracks; the calibrated non-Brownian score `z` (log D vs z, mean z ± SE) is an
+opt-in that costs ~15× more; MSD fits only as a labelled comparison. Saving
+writes `track_D.parquet`, one row per track (`track_id`, `roi`, `n_frames`,
+`mle_status`, `D_mle_um2_s`, `D_upper_mle_um2_s`, `p_motion`), the table to
+pool across experiments — plus Bayesian and per-track anisotropy fits, and offers the same histogram
 filters over per-track results — so a fitted `D` or `alpha` is filterable by the
 same drag as any other feature.
 

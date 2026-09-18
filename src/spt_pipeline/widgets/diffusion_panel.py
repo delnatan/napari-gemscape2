@@ -165,10 +165,16 @@ from spt_pipeline.diffusion import (
     msd_track_table,
     summarize_mle,
     summarize_mle_by_group,
+    track_d_table,
     tracks_to_diffusionkit_df,
 )
 from spt_pipeline.results import load_diffusion_results, write_diffusion_results
-from spt_pipeline.joint_plot import numeric_columns, plot_d_z_joint, plot_property_joint
+from spt_pipeline.joint_plot import (
+    numeric_columns,
+    plot_d_histogram,
+    plot_d_z_joint,
+    plot_property_joint,
+)
 from spt_pipeline.pipeline import filter_mask
 from spt_pipeline.viewer import set_tracks_layer_data
 from spt_pipeline.widgets.feature_filters import FeatureFilterPanel
@@ -902,8 +908,9 @@ _Z_HELP = (
     "<b>D</b> is per track: the maximum-likelihood diffusion coefficient of its "
     "displacements, modelling the provided localization errors and the motion blur "
     "of the exposure. <b>unresolved</b> means D̂ = 0 &mdash; localization noise "
-    "explains all the motion &mdash; and gets an upper limit instead of a value."
-    "<br><br><b>z</b> is read across tracks, not per track. It is calibrated so "
+    "explains all the motion &mdash; and gets an upper limit instead of a value. "
+    "The histogram is of log D over resolved tracks; median and IQR are marked."
+    "<br><br><b>z</b> (optional) is read across tracks, not per track. It is calibrated so "
     "that it is ~N(0,1) for Brownian tracks of any length, noise or D. At ~5 frames "
     "a single track can't be called non-Brownian (even α = 0.5 is flagged only "
     "4&ndash;8% of the time), but a mean-z shift of 0.4&ndash;0.7 is plain across "
@@ -919,9 +926,15 @@ _Z_HELP = (
 
 class _ClassicalTab(QWidget):
     """diffusionkit's rebuilt classical analysis
-    (`classic.analyze_tracks`): the per-track Brownian displacement MLE,
-    reporting D and the calibrated non-Brownian score z, with the old
-    MSD fits available only as a labelled comparison.
+    (`classic.analyze_tracks`): the per-track Brownian displacement MLE.
+
+    Routine work is D: each track's maximum-likelihood D with its upper
+    limit, shown as a log-D histogram with the median and IQR. That costs
+    about 2 s for ~500 tracks. The calibrated non-Brownian score z is
+    opt-in ("non-Brownian score z"), because it is what the run's time
+    goes into -- a parametric bootstrap per track, ~15x the cost -- and
+    it changes nothing about D. The old MSD fits stay available only as a
+    labelled comparison.
 
     The one input here that is not already on the layer is the camera
     **exposure** -- separate from the frame interval, and the input the
@@ -946,6 +959,7 @@ class _ClassicalTab(QWidget):
         # one -- shown under the pooled summary and saved beside it.
         self._summary_by_roi: Optional[dict] = None
         self._plot_window: Optional[PlotWindow] = None
+        self._hist_window: Optional[PlotWindow] = None
         self._msd_plot_window: Optional[PlotWindow] = None
         # What the layer said, so the exposure note can say where the box's
         # value came from (and "reset" has something to go back to).
@@ -976,16 +990,24 @@ class _ClassicalTab(QWidget):
             "for short tracks, so there is no need to raise it for accuracy."
         )
 
+        # Off by default: D, its upper limit and p_motion come from the
+        # likelihood alone, and the bootstrap that calibrates z is nearly
+        # all of a run's cost.
+        self._compute_z = QCheckBox("non-Brownian score z")
+        self._compute_z.setToolTip(
+            "Also compute z, a per-track score calibrated to N(0,1) under\n"
+            "Brownian motion, read across tracks (mean z ± SE). It needs a\n"
+            "parametric bootstrap per track -- ~50 ms per track at 500 reps,\n"
+            "about 15x the cost of D alone -- and leaves D unchanged."
+        )
         self._n_boot = QSpinBox()
-        self._n_boot.setRange(0, 100_000)
+        self._n_boot.setRange(100, 100_000)
         self._n_boot.setSingleStep(100)
         self._n_boot.setValue(MLEOptions().n_boot)
-        self._n_boot.setToolTip(
-            "Parametric-bootstrap replicates per track that calibrate z to\n"
-            "N(0,1). The cost of the run is almost all here (~50 ms per track\n"
-            "at 500). 0 skips the bootstrap: z then falls back to its\n"
-            "uncalibrated asymptotic form, which is not N(0,1) for short tracks."
-        )
+        self._n_boot.setSuffix(" reps")
+        self._n_boot.setToolTip("Parametric-bootstrap replicates per track that calibrate z to N(0,1).")
+        self._n_boot.setEnabled(False)
+        self._compute_z.toggled.connect(self._n_boot.setEnabled)
 
         self._msd_comparison = QCheckBox("MSD comparison (D, α)")
         self._msd_comparison.setToolTip(
@@ -1002,27 +1024,30 @@ class _ClassicalTab(QWidget):
         form.addRow("exposure", self._exposure)
         form.addRow("", self._exposure_note)
         form.addRow("min points", self._min_frames)
-        form.addRow("bootstrap reps", self._n_boot)
+        form.addRow(flow_row(self._compute_z, self._n_boot))
 
-        self._run_button = QPushButton("Run Brownian MLE")
+        self._run_button = QPushButton("Run D (Brownian MLE)")
         self._run_button.clicked.connect(self._run)
         self._status = status_label("")
         self._summary = status_label("")
         self._summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
+        self._hist_button = QPushButton("D histogram")
+        self._hist_button.setToolTip("Reopen the log D histogram of the last run.")
+        self._hist_button.clicked.connect(self._show_histogram)
         self._plot_button = QPushButton("D vs z plot")
-        self._plot_button.setToolTip("Reopen the log D vs z population plot of the last run.")
+        self._plot_button.setToolTip("Reopen the log D vs z population plot (runs with z only).")
         self._plot_button.clicked.connect(self._show_plot)
         self._msd_plot_button = QPushButton("MSD comparison plot")
         self._msd_plot_button.setToolTip(
             "D vs α from the MSD fits (exposure treated as 0; no confidence intervals)."
         )
         self._msd_plot_button.clicked.connect(self._show_msd_plot)
-        plot_row = flow_row(self._plot_button, self._msd_plot_button)
+        plot_row = flow_row(self._hist_button, self._plot_button, self._msd_plot_button)
 
         help_text = note_label(_Z_HELP)
         help_text.setTextFormat(Qt.TextFormat.RichText)
-        self._help = CollapsibleSection("Reading D and z", help_text, expanded=False)
+        self._help = CollapsibleSection("Reading D (and z)", help_text, expanded=False)
 
         layout = QVBoxLayout()
         layout.setContentsMargins(6, 6, 6, 6)
@@ -1115,7 +1140,8 @@ class _ClassicalTab(QWidget):
         self._run_button.setEnabled(exposure is not None and self.host.has_tracks)
 
     def _refresh_plot_buttons(self) -> None:
-        self._plot_button.setEnabled(self._analysis is not None)
+        self._hist_button.setEnabled(self._analysis is not None)
+        self._plot_button.setEnabled(bool((self._summary_values or {}).get("n_z")))
         self._msd_plot_button.setEnabled(self._comparison is not None)
 
     def report_saved(self, text: str) -> None:
@@ -1137,7 +1163,7 @@ class _ClassicalTab(QWidget):
             self.host.dt_s,
             exposure,
             self._min_frames.value(),
-            self._n_boot.value(),
+            self._n_boot.value() if self._compute_z.isChecked() else 0,
             self._msd_comparison.isChecked(),
             self.host.progress_callback,
         )
@@ -1169,7 +1195,7 @@ class _ClassicalTab(QWidget):
 
         n_ok = summary.get("n_ok", 0)
         self._status.setText(f"{n_ok} of {summary['n_tracks']} tracks resolved motion")
-        style_status_label(self._status, "ok" if summary["n_z"] else "caution")
+        style_status_label(self._status, "ok" if summary["median_D_um2_s"] is not None else "caution")
         self._summary.setText(
             _format_mle_summary(summary, analysis) + _format_mle_by_roi(self._summary_by_roi)
         )
@@ -1178,13 +1204,27 @@ class _ClassicalTab(QWidget):
         if comparison is not None:
             display = display.join(msd_track_table(comparison.fits), on="track_id", how="left")
         self.host.set_classical_results(analysis, comparison, display)
+        if summary["median_D_um2_s"] is not None:
+            self._show_histogram()
         if summary["n_z"]:
             self._show_plot()
         if comparison is not None:
             self._show_msd_plot()
 
-    def _show_plot(self) -> None:
+    def _show_histogram(self) -> None:
         if self._analysis is None or self._summary_values is None:
+            return
+        figure = plot_d_histogram(
+            mle_rows(self._analysis.fits),
+            self._summary_values,
+            groups=self.host.track_rois() if self._summary_by_roi else None,
+        )
+        if self._hist_window is None:
+            self._hist_window = PlotWindow("Brownian MLE: D histogram", parent=self)
+        self._hist_window.show_figure(figure)
+
+    def _show_plot(self) -> None:
+        if self._analysis is None or not (self._summary_values or {}).get("n_z"):
             return
         figure = plot_d_z_joint(
             mle_rows(self._analysis.fits),
@@ -1264,7 +1304,10 @@ def _format_mle_summary(summary: dict, analysis: ClassicAnalysis) -> str:
             f"{summary['n_frames_min']:.0f} / {summary['n_frames_median']:.0f} / "
             f"{summary['n_frames_max']:.0f} {units.POINTS}"
         )
-    lines.append(f"median D = {units.fmt(summary.get('median_D_um2_s'), 'D_um2_s')} (resolved tracks)")
+    median = f"median D = {units.fmt(summary.get('median_D_um2_s'), 'D_um2_s')}"
+    if summary.get("q25_D_um2_s") is not None and summary.get("q75_D_um2_s") is not None:
+        median += f" (IQR {summary['q25_D_um2_s']:.3g}–{summary['q75_D_um2_s']:.3g})"
+    lines.append(median + ", resolved tracks")
     if summary.get("n_unresolved"):
         lines.append(
             f"{summary['n_unresolved']} unresolved (D̂ = 0): median upper limit "
@@ -1285,7 +1328,7 @@ def _format_mle_summary(summary: dict, analysis: ClassicAnalysis) -> str:
     lines.append(
         f"dt {units.fmt_unit(acquisition.dt_s, 's/frame')} · exposure "
         f"{units.fmt_unit(acquisition.exposure_s, units.SECONDS)} · "
-        f"{analysis.mle_options.n_boot} bootstrap reps"
+        + (f"z from {analysis.mle_options.n_boot} bootstrap reps" if analysis.mle_options.n_boot else "no z")
     )
     return "\n".join(lines)
 
@@ -2459,10 +2502,13 @@ class DiffusionAnalysisWidget(QWidget):
         numeric = [c for c, dtype in zip(display_df.columns, display_df.dtypes) if dtype.is_numeric()]
         self.register_spatial_source("classical_mle", display_df.select(numeric))
         self._rebuild_track_table()
+        with_z = "z_nonbrownian" in display_df.columns
         self._tracks_pane.set_plot_columns(
-            self._joined_track_df, prefer_x="D_mle_um2_s", prefer_y="z_nonbrownian"
+            self._joined_track_df,
+            prefer_x="D_mle_um2_s",
+            prefer_y="z_nonbrownian" if with_z else "track_length",
         )
-        self._bayesian.on_spatial_source_registered("z_nonbrownian")
+        self._bayesian.on_spatial_source_registered("D_mle_um2_s")
         self._update_save_enabled()
 
     def register_spatial_source(self, name: str, df: pl.DataFrame) -> None:
@@ -2594,16 +2640,17 @@ class DiffusionAnalysisWidget(QWidget):
         uncolored rather than pinning to one end of the colormap."""
         if self._classical_df is None:
             return df
+        present = [c for c in _TRACK_COLOR_COLUMNS[1:] if c in self._classical_df.columns]
         colors = self._classical_df.select(
             "track_id",
             pl.when(pl.col("D_mle_um2_s") > 0)
             .then(pl.col("D_mle_um2_s").log10())
             .otherwise(None)
             .alias("log10_D_mle"),
-            "z_nonbrownian",
+            *present,
         )
         return df.join(colors, on="track_id", how="left").with_columns(
-            pl.col(c).cast(pl.Float64).fill_null(float("nan")) for c in _TRACK_COLOR_COLUMNS
+            pl.col(c).cast(pl.Float64).fill_null(float("nan")) for c in ["log10_D_mle", *present]
         )
 
     def _set_tracks_layer_data(self, df: pl.DataFrame) -> None:
@@ -2774,5 +2821,8 @@ class DiffusionAnalysisWidget(QWidget):
             if self._classical.summary_by_roi:
                 summary["by_roi"] = self._classical.summary_by_roi
 
-        write_diffusion_results(self._result_dir, per_track_df, summary)
+        track_d = (
+            track_d_table(analysis.fits, self.track_rois()) if analysis is not None else None
+        )
+        write_diffusion_results(self._result_dir, per_track_df, summary, track_d)
         self._classical.report_saved(f"saved {per_track_df.height} fit(s) to {self._result_dir}")

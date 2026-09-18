@@ -211,3 +211,73 @@ def plot_d_z_joint(
     g.ax_marg_x.set_title("\n".join(lines), fontsize=9, loc="left")
     g.ax_marg_y.set_xlabel("density", fontsize=8)
     return g.figure
+
+
+def plot_d_histogram(
+    mle_rows: pl.DataFrame,
+    summary: dict,
+    title: str | None = None,
+    groups: pl.DataFrame | None = None,
+) -> Figure:
+    """The routine read of a Brownian MLE run: the per-track D
+    distribution as a histogram of log10 D.
+
+    Log bins because D spans decades across a field of tracks -- on a
+    linear axis it is one spike at the low end. The median and the
+    interquartile range (`summary`, from `diffusion.summarize_mle`) are
+    drawn on it and written in the title. `unresolved` tracks (D̂ = 0)
+    have no log D, so they can't be binned; the title counts them with
+    the median of their upper limits instead of letting them vanish.
+
+    `groups` (`track_id`, `group`), when it names more than one group --
+    the ROIs a run was split into -- draws one step histogram per group
+    on shared bins, so whether the regions' D distributions separate is
+    read off the same axes.
+    """
+    resolved = mle_rows.filter((pl.col("status") == "ok") & (pl.col("D_um2_s") > 0))
+    hue = None
+    if groups is not None:
+        resolved = resolved.join(groups.select("track_id", "group"), on="track_id", how="left")
+        if resolved["group"].drop_nulls().n_unique() > 1:
+            hue = "group"
+    x = np.log10(resolved["D_um2_s"].to_numpy().astype(float))
+
+    fig = Figure(figsize=(6.5, 4.2), layout="constrained")
+    ax = fig.add_subplot()
+    if len(x):
+        bins = np.histogram_bin_edges(x, bins="fd") if len(x) > 3 else 10
+        if not np.isscalar(bins) and len(bins) - 1 > 60:
+            bins = 60
+        if hue is None:
+            ax.hist(x, bins=bins, color="steelblue", edgecolor="white")
+        else:
+            pdf = pd.DataFrame({"x": x, "group": resolved["group"].fill_null("(none)").to_list()})
+            sns.histplot(data=pdf, x="x", hue="group", ax=ax, bins=bins, element="step", fill=False)
+            legend = ax.get_legend()
+            if legend is not None:
+                legend.set_title("ROI")
+    median = summary.get("median_D_um2_s")
+    q25, q75 = summary.get("q25_D_um2_s"), summary.get("q75_D_um2_s")
+    if q25 and q75:
+        ax.axvspan(np.log10(q25), np.log10(q75), color="0.2", alpha=0.12, lw=0, zorder=0)
+    if median:
+        ax.axvline(np.log10(median), color="0.2", lw=1.2)
+    ax.set_xlabel(units.mpl_log_label("D_um2_s") + " — Brownian MLE")
+    ax.set_ylabel("tracks")
+
+    lines = [title or r"Brownian MLE: per-track $D$"]
+    stats = f"n = {len(x)}"
+    if median is not None:
+        stats += f" · median D = {median:.3g} µm²/s"
+        if q25 is not None and q75 is not None:
+            stats += f" (IQR {q25:.3g}–{q75:.3g})"
+    lines.append(stats)
+    n_unresolved = summary.get("n_unresolved", 0)
+    if n_unresolved:
+        upper = summary.get("unresolved_D_upper_median_um2_s")
+        note = f"{n_unresolved} unresolved (D̂ = 0) not shown"
+        if upper is not None:
+            note += f"; median upper limit D < {upper:.3g} µm²/s"
+        lines.append(note)
+    ax.set_title("\n".join(lines), fontsize=9, loc="left")
+    return fig

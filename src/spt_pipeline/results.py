@@ -41,6 +41,10 @@ MANIFEST_FILENAME = "manifest.json"
 ROIS_FILENAME = "rois.json"
 DIFFUSION_FITS_FILENAME = "diffusion_fits.parquet"
 DIFFUSION_SUMMARY_FILENAME = "diffusion_summary.json"
+# One row per analysed track: the Brownian MLE's D, its upper limit,
+# p_motion, status, n_frames and ROI -- the table to pool across
+# experiments (`diffusion.track_d_table`).
+TRACK_D_FILENAME = "track_D.parquet"
 
 
 def repo_root_of(module) -> Path:
@@ -148,7 +152,10 @@ def load_result(result_dir: str | Path) -> tuple[pl.DataFrame, pl.DataFrame, dic
 
 
 def write_diffusion_results(
-    result_dir: str | Path, per_track_df: pl.DataFrame, summary: dict
+    result_dir: str | Path,
+    per_track_df: pl.DataFrame,
+    summary: dict,
+    track_d_df: pl.DataFrame | None = None,
 ) -> None:
     """Diffusion-widget results, written like `rois.json`: an optional
     extra on top of the core points/tracks/manifest bundle, not every
@@ -157,11 +164,22 @@ def write_diffusion_results(
     per-track fits the user has run, distinguished by a `method` column
     (see `widgets/diffusion_panel.py`) -- so both live in one file.
     `summary` holds the classic-MSD ensemble-level scalars (D/alpha fits,
-    localization offset)."""
+    localization offset).
+
+    `track_d_df`, when given, is the flat per-track D table
+    (`TRACK_D_FILENAME`): the one to read when pooling experiments, since
+    `per_track_df` mixes every method's rows and columns. A save without
+    a classical run removes a stale one rather than leaving it to
+    disagree with the fits beside it."""
     result_dir = Path(result_dir)
     result_dir.mkdir(parents=True, exist_ok=True)
     per_track_df.write_parquet(result_dir / DIFFUSION_FITS_FILENAME)
     (result_dir / DIFFUSION_SUMMARY_FILENAME).write_text(json.dumps(summary, indent=2))
+    track_d_path = result_dir / TRACK_D_FILENAME
+    if track_d_df is not None:
+        track_d_df.write_parquet(track_d_path)
+    else:
+        track_d_path.unlink(missing_ok=True)
 
 
 def load_diffusion_results(

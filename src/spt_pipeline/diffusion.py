@@ -62,21 +62,53 @@ def mle_rows(fits: pl.DataFrame) -> pl.DataFrame:
     return fits.filter(pl.col("model") == MLE_MODEL)
 
 
+def has_z(fits: pl.DataFrame) -> bool:
+    """Whether the run computed the calibrated non-Brownian score -- it
+    only exists when the bootstrap ran (`MLEOptions.n_boot > 0`)."""
+    return mle_rows(fits)["z_nonbrownian"].is_not_null().any()
+
+
 def mle_track_table(fits: pl.DataFrame) -> pl.DataFrame:
-    """One row per track: the MLE's D, its upper limit, and the
-    non-Brownian score, plus `mle_status` -- which matters more here than
-    for most fits, since `unresolved` (D̂ = 0: localization noise explains
-    all the motion) has a D of exactly 0 and no z, and is not a failure."""
-    return mle_rows(fits).select(
+    """One row per track: the MLE's D, its upper limit and `p_motion`,
+    plus `mle_status` -- which matters more here than for most fits,
+    since `unresolved` (D̂ = 0: localization noise explains all the
+    motion) has a D of exactly 0, and is not a failure.
+
+    The non-Brownian columns (`z_nonbrownian`, `p_nonbrownian`,
+    `alpha_1step`) are added only when the run computed z (`has_z`):
+    without the bootstrap, z is null and `alpha_1step` is an
+    uncalibrated read that routine D work has no use for."""
+    columns = [
         "track_id",
         pl.col("status").alias("mle_status"),
         pl.col("D_um2_s").alias("D_mle_um2_s"),
         pl.col("D_upper_um2_s").alias("D_upper_mle_um2_s"),
-        "z_nonbrownian",
-        "p_nonbrownian",
-        "alpha_1step",
         "p_motion",
+    ]
+    if has_z(fits):
+        columns += ["z_nonbrownian", "p_nonbrownian", "alpha_1step"]
+    return mle_rows(fits).select(columns)
+
+
+def track_d_table(fits: pl.DataFrame, groups: Optional[pl.DataFrame] = None) -> pl.DataFrame:
+    """The per-track D table a results bundle carries for downstream
+    pooling (`results.TRACK_D_FILENAME`): `mle_track_table` plus
+    `n_frames` and, when `groups` (`track_id`, `group`) is given, the
+    `roi` each track was linked in. Every analysed track is a row --
+    `unresolved`/`excluded` ones included, with their status -- so a
+    script can apply its own rule rather than inherit a silent drop."""
+    table = mle_rows(fits).select("track_id", "n_frames").join(
+        mle_track_table(fits), on="track_id", how="left"
     )
+    if groups is not None:
+        table = table.join(
+            groups.select(
+                pl.col("track_id").cast(table.schema["track_id"]), pl.col("group").alias("roi")
+            ),
+            on="track_id",
+            how="left",
+        ).select("track_id", "roi", pl.exclude("track_id", "roi"))
+    return table
 
 
 def msd_track_table(fits: pl.DataFrame) -> pl.DataFrame:
@@ -99,17 +131,19 @@ def msd_track_table(fits: pl.DataFrame) -> pl.DataFrame:
 def summarize_mle(fits: pl.DataFrame) -> dict:
     """The population-level read of the MLE rows of `fits`.
 
-    D is a per-track estimate; z is read here, across tracks. At ~5
+    D is the routine result: `median_D_um2_s` with its interquartile
+    range, over tracks that resolved motion. `unresolved` ones (D̂ = 0)
+    have no log D and would pull a median to 0, so they are counted
+    separately with the median of their upper limits instead ("D < x"),
+    rather than dropped.
+
+    The z keys (`n_z`, `mean_z`, ...) are filled only when the run
+    computed z (bootstrap on). z is read here, across tracks: at ~5
     frames one track's z can't classify it (a single α = 0.5 track is
     flagged only 4-8% of the time), but a mean-z shift of 0.4-0.7 is
     plain across ~100 tracks -- hence mean z with its standard error, the
     SD (≈1 if the noise model is calibrated), and the fraction beyond
     ±1.96 against the 5% expected by chance.
-
-    `median_D_um2_s` is over tracks that resolved motion; `unresolved`
-    ones (D̂ = 0) have no log D and would pull a median to 0, so they are
-    counted separately with the median of their upper limits instead
-    ("D < x"), rather than dropped.
 
     Every count is keyed by diffusionkit's own `status` (`n_ok`,
     `n_unresolved`, `n_excluded`, `n_invalid_input`, ...), so a track
@@ -118,19 +152,21 @@ def summarize_mle(fits: pl.DataFrame) -> dict:
     mle = mle_rows(fits)
     statuses = dict(mle.group_by("status").len().iter_rows())
     fitted = mle.filter(pl.col("status").is_in(["ok", "unresolved"]))
-    resolved = mle.filter(pl.col("z_nonbrownian").is_not_null() & (pl.col("D_um2_s") > 0))
+    resolved = mle.filter((pl.col("status") == "ok") & (pl.col("D_um2_s") > 0))
     unresolved = mle.filter(pl.col("status") == "unresolved")
-    z = resolved["z_nonbrownian"].to_numpy().astype(float)
+    z = resolved["z_nonbrownian"].drop_nulls().to_numpy().astype(float)
     n_z = len(z)
     sd_z = float(np.std(z, ddof=1)) if n_z > 1 else None
 
-    summary = {
+    return {
         "n_tracks": mle.height,
         **{f"n_{status}": int(count) for status, count in sorted(statuses.items())},
         "n_frames_min": _scalar(fitted["n_frames"].min()),
         "n_frames_median": _scalar(fitted["n_frames"].median()),
         "n_frames_max": _scalar(fitted["n_frames"].max()),
         "median_D_um2_s": _scalar(resolved["D_um2_s"].median()),
+        "q25_D_um2_s": _scalar(resolved["D_um2_s"].quantile(0.25)),
+        "q75_D_um2_s": _scalar(resolved["D_um2_s"].quantile(0.75)),
         "unresolved_D_upper_median_um2_s": _scalar(unresolved["D_upper_um2_s"].median()),
         "n_z": n_z,
         "mean_z": float(np.mean(z)) if n_z else None,
@@ -138,7 +174,6 @@ def summarize_mle(fits: pl.DataFrame) -> dict:
         "sd_z": sd_z,
         "frac_abs_z_gt_1_96": float(np.mean(np.abs(z) > Z_CRITICAL)) if n_z else None,
     }
-    return summary
 
 
 def summarize_mle_by_group(fits: pl.DataFrame, groups: pl.DataFrame) -> dict[str, dict]:
