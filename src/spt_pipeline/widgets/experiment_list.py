@@ -123,10 +123,9 @@ from spt_pipeline import units
 from spt_pipeline.results import (
     build_manifest,
     result_dir_for,
-    git_sha,
     has_result,
+    repo_shas,
     load_manifest,
-    repo_root_of,
     write_detection_result,
     write_result,
 )
@@ -162,6 +161,14 @@ from spt_pipeline.viewer import (
     show_result,
 )
 from spt_pipeline.widgets.params_panel import PipelineParamsWidget
+
+
+def _repo_shas() -> dict:
+    """Provenance for a bundle's manifest: the checkouts that produced it."""
+    import spotsolve
+    import spt_pipeline
+
+    return repo_shas(spotsolve, spt_pipeline)
 
 
 def _dropped_folder(event) -> Optional[Path]:
@@ -378,16 +385,15 @@ class ExperimentListWidget(QWidget):
     def __init__(self, napari_viewer) -> None:
         super().__init__()
         self.viewer = napari_viewer
+        # The one Preview/Detect/Track worker, while it runs against
+        # `self._session_item`. Also what guards `_on_selection_changed`,
+        # so clicking a different row mid-run can't rug the viewer layers
+        # out from under it (Finding: napari's layer list going blank on a
+        # mid-detect selection change).
         self._worker = None
         self._cancel_event: Optional[threading.Event] = None
         self._session: Optional[PipelineSession] = None
         self._session_item: Optional[ExperimentItem] = None
-        # True while a Preview/Detect/Track worker is active against
-        # `self._session_item` -- guards `_on_selection_changed` so clicking
-        # a different row mid-run can't rug the viewer layers out from under
-        # it (Finding: napari's layer list going blank on a mid-detect
-        # selection change).
-        self._step_running = False
         # Re-entrancy guard for the `setCurrentItem` call `_on_selection_changed`
         # makes to revert a blocked switch -- without it, that call's own
         # `currentItemChanged` re-entry would run the "leaving this row"
@@ -567,11 +573,11 @@ class ExperimentListWidget(QWidget):
     def _on_selection_changed(self, current: Optional[ExperimentItem], _previous) -> None:
         if current is None or self._reverting_selection:
             return
-        if self._step_running and self._session_item is not None and current is not self._session_item:
+        if self._worker is not None and self._session_item is not None and current is not self._session_item:
             # A calibrate/detect/track worker is still running against
             # `self._session_item` -- switching away would otherwise wipe
             # its viewer layers and orphan the worker's eventual result
-            # (see `_step_running`'s docstring). Snap the selection back
+            # (see `self._worker`'s comment). Snap the selection back
             # rather than let that happen.
             self._reverting_selection = True
             self.list_view.setCurrentItem(self._session_item)
@@ -821,26 +827,19 @@ class ExperimentListWidget(QWidget):
         self._load_timer.stop()
         self._clear_loading_text()
         loaded = self._loaded[1] if self._loaded is not None and self._loaded[0] is item else None
+        session = load_session(
+            item.entry.image_path,
+            pixel_size_um=self.params_panel.get_pixel_size_um(),
+            dt_s=self.params_panel.get_dt_s(),
+            exposure_s=self.params_panel.get_exposure_s(),
+            stack=(loaded.image, loaded.metadata) if loaded is not None else None,
+        )
         if loaded is None:
             # The row's load never landed, so its image isn't on screen.
             # Added under whatever is there (an ROI drawn meanwhile, say)
             # rather than clearing it away.
-            session = load_session(
-                item.entry.image_path,
-                pixel_size_um=self.params_panel.get_pixel_size_um(),
-                dt_s=self.params_panel.get_dt_s(),
-                exposure_s=self.params_panel.get_exposure_s(),
-            )
             layer = add_image_layer(self.viewer, session.image, item.entry.image_path.stem)
             self.viewer.layers.move(self.viewer.layers.index(layer), 0)
-        else:
-            session = load_session(
-                item.entry.image_path,
-                pixel_size_um=self.params_panel.get_pixel_size_um(),
-                dt_s=self.params_panel.get_dt_s(),
-                exposure_s=self.params_panel.get_exposure_s(),
-                stack=(loaded.image, loaded.metadata),
-            )
         self._session = session
         self._session_item = item
         # The session is what the stages actually run with, so the banner
@@ -956,7 +955,6 @@ class ExperimentListWidget(QWidget):
     ) -> None:
         if self._worker is not None:
             return
-        self._step_running = True
         self.progress_bar.setRange(0, 0 if indeterminate else 100)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
@@ -968,7 +966,6 @@ class ExperimentListWidget(QWidget):
     def _finish_step_worker(self) -> None:
         self._worker = None
         self._cancel_event = None
-        self._step_running = False
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setVisible(False)
         self.progress_label.setText("")
@@ -1586,13 +1583,6 @@ class ExperimentListWidget(QWidget):
         session.point_filters_used = self.params_panel.get_point_filters() or None
 
         entry = item.entry
-        import spotsolve
-        import spt_pipeline
-
-        repo_shas = {
-            "spotsolve": git_sha(repo_root_of(spotsolve)),
-            "spt_pipeline": git_sha(repo_root_of(spt_pipeline)),
-        }
         manifest_params = session_manifest_extra(session)
         # n_tracks comes off the session's unfiltered table; the bundle is
         # getting the filtered one, so correct it before it's written.
@@ -1601,7 +1591,7 @@ class ExperimentListWidget(QWidget):
             result_id=entry.result_dir.name,
             source_image_path=entry.image_path,
             params=manifest_params,
-            repo_shas=repo_shas,
+            repo_shas=_repo_shas(),
         )
         try:
             write_result(
@@ -1651,13 +1641,6 @@ class ExperimentListWidget(QWidget):
         session.point_filters_used = self.params_panel.get_point_filters() or None
 
         entry = item.entry
-        import spotsolve
-        import spt_pipeline
-
-        repo_shas = {
-            "spotsolve": git_sha(repo_root_of(spotsolve)),
-            "spt_pipeline": git_sha(repo_root_of(spt_pipeline)),
-        }
         manifest_params = session_manifest_extra(session)
         # This save doesn't touch tracks (and removes any it previously
         # had), so the manifest shouldn't claim a track count either.
@@ -1666,7 +1649,7 @@ class ExperimentListWidget(QWidget):
             result_id=entry.result_dir.name,
             source_image_path=entry.image_path,
             params=manifest_params,
-            repo_shas=repo_shas,
+            repo_shas=_repo_shas(),
         )
         try:
             write_detection_result(entry.result_dir, session.points_df, manifest, rois=session.roi)

@@ -13,7 +13,7 @@ from pathlib import Path
 import typer
 
 from spt_pipeline import units
-from spt_pipeline.results import build_manifest, git_sha, repo_root_of, write_result
+from spt_pipeline.results import build_manifest, repo_shas, write_result
 from spt_pipeline.pipeline import DetectTrackParams, run_detect_track
 
 app = typer.Typer(no_args_is_help=True)
@@ -41,10 +41,7 @@ def detect_track(
     import spotsolve
     import spt_pipeline
 
-    repo_shas = {
-        "spotsolve": git_sha(repo_root_of(spotsolve)),
-        "spt_pipeline": git_sha(repo_root_of(spt_pipeline)),
-    }
+    shas = repo_shas(spotsolve, spt_pipeline)
 
     for entry in cfg["inputs"]:
         image_path = Path(entry["path"])
@@ -62,7 +59,7 @@ def detect_track(
             result_id=result_id,
             source_image_path=image_path,
             params=manifest_extra,
-            repo_shas=repo_shas,
+            repo_shas=shas,
         )
         result_dir = results_root / result_id
         write_result(result_dir, points_df, tracks_df, manifest)

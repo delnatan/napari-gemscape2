@@ -248,6 +248,20 @@ def _run_row(button_text: str) -> tuple[QPushButton, QLabel, QHBoxLayout]:
     return button, status, row
 
 
+def _save_page(button_text: str, tooltip: str) -> tuple[QPushButton, QLabel, QWidget]:
+    """A stage's "Save" page: its save button (off until there is
+    something to save) and status label, as one page body."""
+    button, status, row = _run_row(button_text)
+    button.setEnabled(False)
+    button.setToolTip(tooltip)
+    body = QWidget()
+    layout = QVBoxLayout(body)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(2)
+    layout.addLayout(row)
+    return button, status, body
+
+
 class _DetectTab(QWidget):
     """Three pages -- PSF width, Detect, Filter -- leafed through with the
     `qtkit.StepPager` header: the PSF width, the detector choice and its
@@ -505,7 +519,6 @@ class _DetectTab(QWidget):
         # `ExperimentListWidget` once an image's frame count is known;
         # 0/0 means "process everything" (the common case, and the only
         # sane default before any image has been selected).
-        self._max_frames: Optional[int] = None
         self.frame_start = _ispin(0, 0, 1_000_000, tooltip="First frame to process (0-based).")
         self.frame_end = _ispin(
             0, 0, 1_000_000,
@@ -539,7 +552,7 @@ class _DetectTab(QWidget):
         cores_row.addWidget(self.n_threads)
         cores_row.addStretch()
 
-        self.use_roi_mask = QCheckBox("Restrict to ROI")
+        self.use_roi_mask = QCheckBox("restrict to ROI")
         self.use_roi_mask.setToolTip(
             "Only place emitters inside the Shapes layers checked in the list\n"
             "below (spotsolve's roi argument). Draw one with the button next to\n"
@@ -673,28 +686,15 @@ class _DetectTab(QWidget):
         self.filters.filtersChanged.connect(self.filtersChanged)
 
         # --- save (detections alone, independent of tracking) -----------
-        self.save_button = QPushButton("Save detections")
-        self.save_button.setEnabled(False)
-        self.save_button.setToolTip(
+        self.save_button, self.save_status, save_body = _save_page(
+            "Save detections",
             "Write points.parquet (every detection, unfiltered) and\n"
             "manifest.json alone -- usable as soon as detect has run, before\n"
             "tracking. Removes any tracks.parquet this bundle already had,\n"
             "since it was linked from whatever points.parquet said before.\n\n"
-            "Nothing is written until you press this."
+            "Nothing is written until you press this.",
         )
         self.save_button.clicked.connect(self.saveRequested.emit)
-        self.save_status = wrapping_label("")
-        style_status_label(self.save_status)
-        save_row = QHBoxLayout()
-        save_row.setContentsMargins(0, 0, 0, 0)
-        save_row.addWidget(self.save_button)
-        save_row.addWidget(self.save_status, stretch=1)
-
-        save_body = QWidget()
-        save_layout = QVBoxLayout(save_body)
-        save_layout.setContentsMargins(0, 0, 0, 0)
-        save_layout.setSpacing(2)
-        save_layout.addLayout(save_row)
 
         detect_body = QWidget()
         detect_layout = QVBoxLayout(detect_body)
@@ -879,7 +879,6 @@ class _DetectTab(QWidget):
         frame-range and preview-frame spinboxes' maxima without disturbing
         values the user already chose (Qt clamps the current value down
         automatically if it now exceeds the new maximum)."""
-        self._max_frames = n_frames
         self.frame_start.setMaximum(max(n_frames - 1, 0))
         self.frame_end.setMaximum(n_frames)
         self._preview_frame.setMaximum(max(n_frames - 1, 0))
@@ -887,9 +886,9 @@ class _DetectTab(QWidget):
     def get_frame_range(self) -> Optional[tuple[int, int]]:
         """`(start, end)`, or `None` for "whole stack" (both spinboxes at
         their default 0). `end` is passed through as entered -- including
-        its `0`/"last" sentinel value -- rather than resolved here against
-        `self._max_frames`, which may not be set yet (e.g. a run started
-        before the row's image finished loading on this widget). Resolving
+        its `0`/"last" sentinel value -- rather than resolved here, where
+        the frame count may not be known yet (a run started before the
+        row's image finished loading on this widget). Resolving
         `end <= 0` into the real last frame is `pipeline._resolve_frame_
         range`'s job: it always has the actual stack length in hand."""
         start = self.frame_start.value()
@@ -1188,9 +1187,6 @@ class _ImageInfoPanel(QWidget):
         """The exposure typed here, or None to use the file's."""
         return self._exposure.value() if self._exposure_typed else None
 
-    def is_overriding(self) -> bool:
-        return self._override.isChecked()
-
     def _on_override_toggled(self, checked: bool) -> None:
         if not checked:
             self._load_file_values()
@@ -1451,29 +1447,16 @@ class _TrackingTab(QWidget):
         )
         self.filters.filtersChanged.connect(self.filtersChanged)
 
-        self.save_button = QPushButton("Save results")
-        self.save_button.setEnabled(False)
-        self.save_button.setToolTip(
+        self.save_button, self.save_status, save_body = _save_page(
+            "Save results",
             "Write the bundle: points.parquet (every detection, unfiltered),\n"
             "tracks.parquet (the tracks that pass the filters above),\n"
             "manifest.json (what every stage ran with, including both filter\n"
             "specs) and rois.json if an ROI was used.\n\n"
             "Nothing is written until you press this -- adjust the filters and\n"
-            "press it again to rewrite the same bundle."
+            "press it again to rewrite the same bundle.",
         )
         self.save_button.clicked.connect(self.saveRequested.emit)
-        self.save_status = wrapping_label("")
-        style_status_label(self.save_status)
-        save_row = QHBoxLayout()
-        save_row.setContentsMargins(0, 0, 0, 0)
-        save_row.addWidget(self.save_button)
-        save_row.addWidget(self.save_status, stretch=1)
-
-        save_body = QWidget()
-        save_layout = QVBoxLayout(save_body)
-        save_layout.setContentsMargins(0, 0, 0, 0)
-        save_layout.setSpacing(2)
-        save_layout.addLayout(save_row)
 
         self.pager = StepPager()
         self.pager.add_page("Link", link_body)
@@ -1613,9 +1596,6 @@ class PipelineParamsWidget(QWidget):
 
     def get_effective_exposure_s(self) -> Optional[float]:
         return self._image_info.effective_exposure_s()
-
-    def is_overriding_image_scale(self) -> bool:
-        return self._image_info.is_overriding()
 
     def get_effective_image_scale(self) -> tuple[Optional[float], Optional[float]]:
         """`(pixel_size_um, dt_s)` a run would actually use: the override

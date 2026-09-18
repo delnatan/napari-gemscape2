@@ -62,6 +62,14 @@ def mle_rows(fits: pl.DataFrame) -> pl.DataFrame:
     return fits.filter(pl.col("model") == MLE_MODEL)
 
 
+def resolved_mle_rows(fits: pl.DataFrame) -> pl.DataFrame:
+    """The MLE rows that resolved motion (status `ok`, D̂ > 0) -- the
+    tracks a median D, a log-D histogram and a z are read over.
+    `unresolved` (D̂ = 0) and `excluded`/`invalid_input` rows are left out,
+    and are counted separately wherever this is used."""
+    return mle_rows(fits).filter((pl.col("status") == "ok") & (pl.col("D_um2_s") > 0))
+
+
 def has_z(fits: pl.DataFrame) -> bool:
     """Whether the run computed the calibrated non-Brownian score -- it
     only exists when the bootstrap ran (`MLEOptions.n_boot > 0`)."""
@@ -199,7 +207,7 @@ def summarize_mle(fits: pl.DataFrame) -> dict:
     mle = mle_rows(fits)
     statuses = dict(mle.group_by("status").len().iter_rows())
     fitted = mle.filter(pl.col("status").is_in(["ok", "unresolved"]))
-    resolved = mle.filter((pl.col("status") == "ok") & (pl.col("D_um2_s") > 0))
+    resolved = resolved_mle_rows(fits)
     unresolved = mle.filter(pl.col("status") == "unresolved")
     z = resolved["z_nonbrownian"].drop_nulls().to_numpy().astype(float)
     n_z = len(z)

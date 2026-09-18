@@ -59,7 +59,7 @@ class FeatureFilterPanel(FilterPanel):
     side by side, and dragging a handle to "0.03" means two different
     things depending on which one is in front of you.
 
-    It also adds a single "Log-scale histograms" checkbox that applies to
+    It also adds a single "log-scale histograms" checkbox that applies to
     every row: flux, `D`, and other QC columns commonly span orders of
     magnitude, where a linear histogram is one spike at the low end and a
     handle can't be dragged onto the rest of the distribution."""
@@ -67,7 +67,7 @@ class FeatureFilterPanel(FilterPanel):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._log_scale = False
-        self._log_scale_check = QCheckBox("Log-scale histograms")
+        self._log_scale_check = QCheckBox("log-scale histograms")
         self._log_scale_check.toggled.connect(self._on_log_scale_toggled)
         # Index 2: after the rows stack and the add/clear buttons, before
         # the "N of M pass" summary -- see `qtkit.filters.FilterPanel`.

@@ -47,17 +47,10 @@ DIFFUSION_SUMMARY_FILENAME = "diffusion_summary.json"
 TRACKS_SUMMARY_FILENAME = "tracks_summary.parquet"
 
 
-def repo_root_of(module) -> Path:
-    """A package's repo root, from its own `__file__` (`<repo>/src/
-    <package>/__init__.py`), for `git_sha` provenance -- works from any
-    caller regardless of that caller's own nesting depth, since it walks
-    up from the target package's `__file__`, not the caller's."""
-    return Path(module.__file__).resolve().parents[2]
-
-
 def git_sha(repo_path: str | Path) -> str | None:
-    """`git rev-parse HEAD` in `repo_path`, or None if unavailable (not a
-    git repo, git not installed, etc.) -- provenance is best-effort."""
+    """`git rev-parse HEAD` in `repo_path` (any directory inside the
+    repo), or None if unavailable (not a git repo, git not installed,
+    etc.) -- provenance is best-effort."""
     try:
         result = subprocess.run(
             ["git", "-C", str(repo_path), "rev-parse", "HEAD"],
@@ -68,6 +61,22 @@ def git_sha(repo_path: str | Path) -> str | None:
         return result.stdout.strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
         return None
+
+
+def repo_shas(*modules) -> dict[str, str | None]:
+    """`{package: git SHA}` for each module's source checkout, asked from
+    the package's own directory -- so it holds for a `src/` layout
+    (spotsolve, this package) and a flat one (diffusionkit) alike. None
+    for a package installed into site-packages, which has no checkout of
+    its own (and whose enclosing repo, if the venv sits in one, would be
+    the wrong answer)."""
+    shas = {}
+    for module in modules:
+        package_dir = Path(module.__file__).resolve().parent
+        shas[module.__name__] = (
+            None if "site-packages" in package_dir.parts else git_sha(package_dir)
+        )
+    return shas
 
 
 def build_manifest(

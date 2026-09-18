@@ -35,9 +35,11 @@ pointed at a selection you could not see.
   of their own).
 - **Classical** -- `diffusionkit.classic.analyze_tracks`: per track, the
   Brownian displacement MLE's D (with blur from the camera exposure
-  modelled) and its bootstrap-calibrated non-Brownian score z, read as a
-  population (log D vs z plot, mean z ± SE); the old MSD D/alpha fits only
-  behind an "MSD comparison" toggle. See `_ClassicalTab`.
+  modelled) and its upper limit, read as a log-D histogram; opt-in, the
+  bootstrap-calibrated non-Brownian score z (log D vs z, mean z ± SE); the
+  old MSD D/alpha fits only behind an "MSD comparison" toggle. See
+  `_ClassicalTab`. Saving writes the per-track summary table
+  (`diffusion.tracks_summary_table`) beside the fits.
 - **Bayesian** -- *Spatial MAP*: `diffusionkit.bayes.fit_population`
   batched over every eligible track, fast enough to run on the whole
   field of view; besides filling in tracks-pane columns, it also
@@ -172,6 +174,7 @@ from spt_pipeline.diffusion import (
 from spt_pipeline.results import (
     TRACKS_SUMMARY_FILENAME,
     load_diffusion_results,
+    repo_shas,
     write_diffusion_results,
 )
 from spt_pipeline.joint_plot import (
@@ -545,6 +548,16 @@ _PARAM_COLUMNS = {
 }
 
 
+def _analysis_repo_shas() -> dict:
+    """Provenance for saved diffusion results: the diffusionkit and
+    spt_pipeline checkouts that computed them (the bundle's manifest
+    already records what produced the tracks)."""
+    import diffusionkit
+    import spt_pipeline
+
+    return repo_shas(diffusionkit, spt_pipeline)
+
+
 def _label_corner_axes(figure, param_names: list[str]) -> None:
     """Put units on `dk_bayes_viz.plot_posterior_corner`'s axes.
 
@@ -604,7 +617,10 @@ def _format_summary(summary: dict) -> str:
     where it can, so a loaded summary reads like a freshly-computed one
     rather than like raw JSON."""
     lines = "\n".join(
-        f"{key} = {units.fmt(value, key)}" for key, value in summary.items() if key != "by_roi"
+        f"{key} = {units.fmt(value, key)}"
+        for key, value in summary.items()
+        # Nested records (by_roi, filters, provenance) aren't one number.
+        if not isinstance(value, dict)
     )
     return lines + _format_mle_by_roi(summary.get("by_roi"))
 
@@ -942,7 +958,7 @@ class _TracksPane(QWidget):
 # it, the two numbers genuinely disagree and the run is refused.
 _EXPOSURE_CLAMP_FRACTION = 0.01
 
-_Z_HELP = (
+_MLE_HELP = (
     "<b>D</b> is per track: the maximum-likelihood diffusion coefficient of its "
     "displacements, modelling the provided localization errors and the motion blur "
     "of the exposure. <b>unresolved</b> means D̂ = 0 &mdash; localization noise "
@@ -1061,7 +1077,7 @@ class _ClassicalTab(QWidget):
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         form.addRow("exposure", self._exposure)
         form.addRow("", self._exposure_note)
-        form.addRow("min points", self._min_frames)
+        form.addRow("min points for fit", self._min_frames)
         form.addRow(flow_row(self._compute_z, self._n_boot))
 
         self._run_button = QPushButton("Run D (Brownian MLE)")
@@ -1083,7 +1099,7 @@ class _ClassicalTab(QWidget):
         self._msd_plot_button.clicked.connect(self._show_msd_plot)
         plot_row = flow_row(self._hist_button, self._plot_button, self._msd_plot_button)
 
-        help_text = note_label(_Z_HELP)
+        help_text = note_label(_MLE_HELP)
         help_text.setTextFormat(Qt.TextFormat.RichText)
         self._help = CollapsibleSection("Reading D (and z)", help_text, expanded=False)
 
@@ -1198,7 +1214,7 @@ class _ClassicalTab(QWidget):
         exposure, _note, _level = self._exposure_for_run()
         if tracks is None or exposure is None:
             return
-        self._status.setText("running...")
+        self._status.setText("running…")
         style_status_label(self._status)
         worker = _run_classical_worker(
             tracks,
@@ -1215,7 +1231,6 @@ class _ClassicalTab(QWidget):
             self._on_error,
             [self._run_button],
             "Brownian MLE",
-            reports_progress=True,
         )
 
     def _on_finished(self, result: tuple[ClassicAnalysis, Optional[ClassicAnalysis]]) -> None:
@@ -1500,7 +1515,7 @@ class _BayesianTab(QWidget):
         if tracks is None:
             return
         model = self._model_picker.currentText()
-        self._map_status.setText("running...")
+        self._map_status.setText("running…")
         style_status_label(self._map_status)
         worker = _run_bulk_map_worker(tracks, self.host.dt_s, model, self.host.progress_callback)
         self.host.start_worker(
@@ -1509,7 +1524,6 @@ class _BayesianTab(QWidget):
             self._on_map_error,
             [self._map_button],
             f"MAP ({model})",
-            reports_progress=True,
         )
 
     def _on_map_finished(self, table: pl.DataFrame, model: str) -> None:
@@ -1733,13 +1747,13 @@ class _AnisotropyTab(QWidget):
         self._status = status_label("")
         self._summary = status_label("")
 
-        self._log_bf_button = QPushButton("Show log BF10 distribution")
+        self._log_bf_button = QPushButton("log BF10 distribution")
         self._log_bf_button.setEnabled(False)
         self._log_bf_button.clicked.connect(self._show_log_bf_plot)
-        self._eps_vs_bf_button = QPushButton("Show eps vs log BF10")
+        self._eps_vs_bf_button = QPushButton("ε vs log BF10")
         self._eps_vs_bf_button.setEnabled(False)
         self._eps_vs_bf_button.clicked.connect(self._show_eps_vs_bf_plot)
-        self._eps_forest_button = QPushButton("Show eps forest (top tracks)")
+        self._eps_forest_button = QPushButton("ε forest (top tracks)")
         self._eps_forest_button.setEnabled(False)
         self._eps_forest_button.clicked.connect(self._show_eps_forest_plot)
 
@@ -1781,7 +1795,7 @@ class _AnisotropyTab(QWidget):
         tracks = self.host.diffkit_tracks_for_fit()
         if tracks is None:
             return
-        self._status.setText("running... (nested sampling per track, can take a while)")
+        self._status.setText("running… (nested sampling per track, can take a while)")
         style_status_label(self._status)
         worker = _run_anisotropy_worker(
             tracks, self.host.dt_s, self._min_track_length.value(), self.host.progress_callback
@@ -1792,7 +1806,6 @@ class _AnisotropyTab(QWidget):
             self._on_error,
             [self._run_button],
             "anisotropy",
-            reports_progress=True,
         )
 
     def _on_finished(self, per_track: pl.DataFrame) -> None:
@@ -1971,7 +1984,15 @@ class DiffusionAnalysisWidget(QWidget):
             "passing the filters above, instead of on all of them."
         )
 
-        self._save_button = QPushButton("Save results")
+        # Not "Save results": that is the experiment list's button, which
+        # writes the tracks themselves -- this one writes the analysis of
+        # them into the same bundle.
+        self._save_button = QPushButton("Save analysis")
+        self._save_button.setToolTip(
+            "Write the fits (diffusion_fits.parquet), the run settings and\n"
+            f"population summary (diffusion_summary.json) and the per-track\n"
+            f"summary ({TRACKS_SUMMARY_FILENAME}) into this layer's bundle."
+        )
         self._save_button.clicked.connect(self._save_results)
         self._save_button.setEnabled(False)
 
@@ -2048,19 +2069,11 @@ class DiffusionAnalysisWidget(QWidget):
         source". This is both what the table displays
         (`_rebuild_track_table`) and what a fit run optionally restricts to
         (`diffkit_tracks_for_fit`)."""
-        ids = None
-        min_len = self._tracks_pane.min_track_length()
-        if min_len > 1 and self._base_track_df is not None:
-            ids = set(
-                self._base_track_df.filter(pl.col("track_length") >= min_len)["track_id"].to_list()
-            )
+        ids = self._passing_track_ids()
         roi = self._tracks_pane.selected_roi()
         if roi is not None and self._base_track_df is not None and "roi" in self._base_track_df.columns:
             roi_ids = set(self._base_track_df.filter(pl.col("roi") == roi)["track_id"].to_list())
             ids = roi_ids if ids is None else (ids & roi_ids)
-        track_ids = self._tracks_pane.filtered_track_ids()
-        if track_ids is not None:
-            ids = track_ids if ids is None else (ids & track_ids)
         return ids
 
     def track_rois(self) -> Optional[pl.DataFrame]:
@@ -2102,20 +2115,18 @@ class DiffusionAnalysisWidget(QWidget):
         on_error,
         busy_widgets: list,
         label: str,
-        reports_progress: bool = False,
     ) -> None:
-        """Run `worker` in the one host-wide slot. `reports_progress` means
-        its function was given `progress_callback`; until the first report
-        arrives (and throughout, for a worker that never reports) the bar
-        is a busy indicator, since a bulk fit's first batch includes JAX
-        compilation and can sit at 0 for a while."""
+        """Run `worker` in the one host-wide slot. Until the worker's first
+        report through `progress_callback` arrives (and throughout, for one
+        that never reports) the bar is a busy indicator, since a bulk fit's
+        first batch includes JAX compilation and can sit at 0 for a while."""
         if self._worker is not None:
             return
         for widget in busy_widgets:
             widget.setEnabled(False)
         self._progress_label = label
         self._progress_bar.setRange(0, 0)
-        self._progress_bar.setFormat(f"{label}...")
+        self._progress_bar.setFormat(f"{label}…")
         self._progress_bar.show()
 
         def _done(_widgets=busy_widgets) -> None:
@@ -2231,6 +2242,20 @@ class DiffusionAnalysisWidget(QWidget):
         ):
             self._set_tracks_layer_data(self._tracks_df_px)
 
+    def _reset_analysis_state(self) -> None:
+        """Forget every fit and the current track -- they belonged to the
+        track set that was loaded, not to the one about to be."""
+        self._classical_analysis = None
+        self._classical_comparison = None
+        self._classical_df = None
+        self._map_full_by_model = {}
+        self._map_df_by_model = {}
+        self._map_color_by = None
+        self._anisotropy_full_df = None
+        self._spatial_sources = {}
+        self._track_fit_rows = []
+        self._current_track_id = None
+
     def _clear_loaded_state(self) -> None:
         self._restore_previous_tracks_layer_if_synced()
         self._detach_mouse_callback()
@@ -2242,16 +2267,7 @@ class DiffusionAnalysisWidget(QWidget):
         self._base_track_df = None
         self._qc_columns = []
         self._joined_track_df = None
-        self._classical_analysis = None
-        self._classical_comparison = None
-        self._classical_df = None
-        self._map_full_by_model = {}
-        self._map_df_by_model = {}
-        self._map_color_by = None
-        self._anisotropy_full_df = None
-        self._spatial_sources = {}
-        self._track_fit_rows = []
-        self._current_track_id = None
+        self._reset_analysis_state()
         self.pixel_size_um = 1.0
         self.dt_s = 1.0
         self.units_known = False
@@ -2405,16 +2421,7 @@ class DiffusionAnalysisWidget(QWidget):
         self._layer_exposure_s = _UNSEEN
         self._adopt_track_table(layer, track_points_df)
 
-        self._classical_analysis = None
-        self._classical_comparison = None
-        self._classical_df = None
-        self._map_full_by_model = {}
-        self._map_df_by_model = {}
-        self._map_color_by = None
-        self._anisotropy_full_df = None
-        self._spatial_sources = {}
-        self._track_fit_rows = []
-        self._current_track_id = None
+        self._reset_analysis_state()
 
         self._tracks_pane.reset()
         self._tracks_pane.set_qc_columns(self._qc_columns)
@@ -2937,6 +2944,7 @@ class DiffusionAnalysisWidget(QWidget):
                 summary["by_roi"] = self._classical.summary_by_roi
 
         summary["tracks_summary_filters"] = self._summary_filter_record()
+        summary["repo_shas"] = _analysis_repo_shas()
         write_diffusion_results(self._result_dir, per_track_df, summary, self.tracks_summary())
         self._classical.report_saved(
             f"saved {per_track_df.height} fit(s) and the per-track summary "

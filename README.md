@@ -230,7 +230,7 @@ tracks), pressing *Save results* when the result is worth keeping. The "Diffusio
 the classical per-track Brownian MLE — by default just `D` (with its upper limit
 and `p_motion`) as a log-D histogram with median and IQR, about 2 s for ~500
 tracks; the calibrated non-Brownian score `z` (log D vs z, mean z ± SE) is an
-opt-in that costs ~15× more; MSD fits only as a labelled comparison. Saving
+opt-in that costs ~15× more; MSD fits only as a labelled comparison. *Save analysis*
 writes `tracks_summary.parquet`, one row per track — the table to read an
 experiment's tracks from and to pool across experiments (*Export CSV…* writes
 the same table as CSV). Every track is a row, filtered-out and unresolved ones

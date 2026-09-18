@@ -25,6 +25,7 @@ import seaborn as sns
 from matplotlib.figure import Figure
 
 from spt_pipeline import units
+from spt_pipeline.diffusion import resolved_mle_rows
 
 
 def plot_property_joint(
@@ -93,6 +94,16 @@ def numeric_columns(df: pl.DataFrame, exclude: tuple[str, ...] = ("track_id",)) 
     return [c for c, dtype in zip(df.columns, df.dtypes) if c not in exclude and dtype.is_numeric()]
 
 
+def _join_groups(rows: pl.DataFrame, groups: pl.DataFrame | None) -> tuple[pl.DataFrame, str | None]:
+    """`rows` with a `group` column joined on, and "group" as the seaborn
+    hue when it names more than one group -- else `rows` as given and no
+    hue, since one group is the same as none."""
+    if groups is None:
+        return rows, None
+    rows = rows.join(groups.select("track_id", "group"), on="track_id", how="left")
+    return rows, ("group" if rows["group"].drop_nulls().n_unique() > 1 else None)
+
+
 def plot_d_z_joint(
     mle_rows: pl.DataFrame,
     summary: dict,
@@ -124,14 +135,9 @@ def plot_d_z_joint(
     the same figure. The z marginal and its N(0,1) reference stay pooled:
     the reference is the same for every group.
     """
-    resolved = mle_rows.filter(
-        pl.col("z_nonbrownian").is_not_null() & (pl.col("D_um2_s") > 0)
+    resolved, hue = _join_groups(
+        mle_rows.filter(pl.col("z_nonbrownian").is_not_null() & (pl.col("D_um2_s") > 0)), groups
     )
-    hue = None
-    if groups is not None:
-        resolved = resolved.join(groups.select("track_id", "group"), on="track_id", how="left")
-        if resolved["group"].drop_nulls().n_unique() > 1:
-            hue = "group"
     x = np.log10(resolved["D_um2_s"].to_numpy().astype(float))
     y = resolved["z_nonbrownian"].to_numpy().astype(float)
     pdf = pd.DataFrame({"x": x, "y": y})
@@ -234,12 +240,7 @@ def plot_d_histogram(
     on shared bins, so whether the regions' D distributions separate is
     read off the same axes.
     """
-    resolved = mle_rows.filter((pl.col("status") == "ok") & (pl.col("D_um2_s") > 0))
-    hue = None
-    if groups is not None:
-        resolved = resolved.join(groups.select("track_id", "group"), on="track_id", how="left")
-        if resolved["group"].drop_nulls().n_unique() > 1:
-            hue = "group"
+    resolved, hue = _join_groups(resolved_mle_rows(mle_rows), groups)
     x = np.log10(resolved["D_um2_s"].to_numpy().astype(float))
 
     fig = Figure(figsize=(6.5, 4.2), layout="constrained")
