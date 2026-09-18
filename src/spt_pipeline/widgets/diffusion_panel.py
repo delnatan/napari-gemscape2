@@ -540,6 +540,39 @@ _PARAM_COLUMNS = {
 }
 
 
+def _label_corner_axes(figure, param_names: list[str]) -> None:
+    """Put units on `dk_bayes_viz.plot_posterior_corner`'s axes.
+
+    diffusionkit labels them with the bare parameter names ("D", "K",
+    "sigma"), which leaves a posterior over D reading the same as one over
+    alpha. The corner is a d x d grid in row-major order, labelled along
+    the bottom row (x) and the left column below the first row (y); each
+    label is redone from `units.mpl_label` of the parameter's column, the
+    same labels every other plot here uses."""
+    d = len(param_names)
+    axes = figure.axes
+    if len(axes) != d * d:
+        return
+    labels = [units.mpl_label(_PARAM_COLUMNS.get(name, name)) for name in param_names]
+    for j in range(d):
+        axes[(d - 1) * d + j].set_xlabel(labels[j], fontsize=9)
+    for i in range(1, d):
+        axes[i * d].set_ylabel(labels[i], fontsize=9)
+
+
+def _label_anisotropy_axes(figure) -> None:
+    """Say on diffusionkit's anisotropy plots that eps and log BF10 are
+    pure numbers -- their axes read "eps ..." and "log BF10" with no unit,
+    which elsewhere in this widget would mean "unit unknown"."""
+    for ax in figure.axes:
+        for get, set_ in ((ax.get_xlabel, ax.set_xlabel), (ax.get_ylabel, ax.set_ylabel)):
+            label = get()
+            if label.startswith("eps "):
+                set_(r"$\epsilon$" + label[3:] + " (dimensionless)")
+            elif label == "log BF10":
+                set_(r"$\log$ BF$_{10}$ (dimensionless)")
+
+
 def _track_fit_row(fit: "dk_bayes.TrackFit") -> dict:
     """One ad-hoc single-track fit (`method` "map" or "nuts"), normalized
     the same way as `_normalize_map_table` so both land in the same
@@ -1615,6 +1648,7 @@ class _BayesianTab(QWidget):
             param_names = list(fit.params.keys())
             flat, _trace = dk_bayes_viz.samples_dict_to_arrays(samples_dict, param_names)
             figure = dk_bayes_viz.plot_posterior_corner(flat, param_names)
+            _label_corner_axes(figure, param_names)
             if self._track_plot_window is None:
                 self._track_plot_window = PlotWindow("Posterior (per-track)", parent=self)
             self._track_plot_window.show_figure(figure)
@@ -1806,6 +1840,7 @@ class _AnisotropyTab(QWidget):
         style_status_label(self._status, "error")
 
     def _show_plot(self, figure) -> None:
+        _label_anisotropy_axes(figure)
         if self._plot_window is None:
             self._plot_window = PlotWindow("Anisotropy", parent=self)
         self._plot_window.show_figure(figure)
