@@ -793,14 +793,22 @@ def _load_ims(image_path: Path, channel: int, z_index: int):
         # `ImarisReader` hands back the attribute as a float when it is a
         # bare number and as the raw string when it carries a unit ("20
         # ms"); only the latter can be converted. Imaris's own writer puts
-        # it on `Channel <i>`, but many writers (Andor Fusion among them)
-        # leave it out entirely.
-        recorded = (reader.channels_info[channel] or {}).get("exposure_time")
-        exposure_s, exposure_source = _exposure_from_values(
-            [] if recorded is None else [recorded],
-            f"Imaris Channel {channel} ExposureTime",
-            notes,
-        )
+        # it on `Channel <i>`. Andor Fusion leaves it out and records the
+        # camera's exposure in its acquisition protocol instead
+        # (`ImarisReader.fusion_camera_exposures`), read when the channel
+        # attribute is absent.
+        info = reader.channels_info[channel] or {}
+        recorded = info.get("exposure_time")
+        if recorded is not None:
+            exposure_s, exposure_source = _exposure_from_values(
+                [recorded], f"Imaris Channel {channel} ExposureTime", notes
+            )
+        else:
+            exposure_s, exposure_source = _exposure_from_values(
+                reader.fusion_camera_exposures(info.get("name")),
+                "Andor Fusion protocol (camera ExposureTime)",
+                notes,
+            )
     finally:
         reader.close()
 

@@ -154,14 +154,14 @@ Changing the scale after a detect or link run re-derives what it cheaply can
 bundle saved across a scale change would be internally inconsistent.
 
 **Exposure time.** A third number, the camera exposure, is read the same way
-(`.nd2` capture text, an Imaris `Channel` `ExposureTime` with a unit, OME
+(`.nd2` capture text, an Imaris `Channel` `ExposureTime` with a unit, the
+camera's `ExposureTime` in an Andor Fusion `.ims`'s acquisition protocol, OME
 `Plane ExposureTime`) and recorded in the manifest as `exposure_s` /
 `exposure_s_source`. Detection and linking never use it; the diffusion
 analysis does, because its MLE models the motion blur of a continuous
 exposure. It is **never defaulted to 0**: 0 means "instantaneous", and on
 real data that biases `D` by about −25% and the non-Brownian score by +0.3 to
-+0.7. A file that doesn't record it (e.g. every Andor Fusion `.ims`) shows
-`exposure ?` in amber. You type it into "Image metadata" (the exposure box is
++0.7. A file that doesn't record it shows `exposure ?` in amber. You type it into "Image metadata" (the exposure box is
 not behind the override switch, so supplying it doesn't replace the file's
 pixel size or frame interval). The Diffusion panel's own exposure box is
 pre-filled from the layer, and it won't run until it has a value.

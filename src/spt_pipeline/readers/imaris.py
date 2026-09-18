@@ -3,7 +3,9 @@
 spt-pipeline can eventually stand alone outside the microscopy workspace.
 """
 
+import json
 import re
+from collections import defaultdict
 from datetime import datetime
 
 import h5py
@@ -325,6 +327,51 @@ class ImarisReader:
                 )
 
             self.channels_info.append(info)
+
+    # Features that only a camera device carries -- how its entries in the
+    # Fusion protocol are told apart from a shutter's or a light source's.
+    _CAMERA_FEATURES = ("SensorWidth", "ReadoutTime", "PixelReadoutRate")
+
+    def fusion_camera_exposures(self, channel_name):
+        """`ExposureTime` values ("20 ms") recorded for `channel_name` by
+        the camera(s) in Andor Fusion's acquisition protocol, or [] when
+        the file has none.
+
+        Fusion writes no `ExposureTime` on `DataSetInfo/Channel <i>`; the
+        exposure lives in the JSON at `DataSetInfo/CustomData/Protocol
+        Configuration V2`, under `ChannelsFeatureValues[<channel name>]`,
+        as one entry per (device, feature). More than one device there has
+        an `ExposureTime` -- Fusion's simulated camera (`CameraModel`
+        "Dummy") keeps a 100 ms default beside the real camera's value --
+        so only devices with camera features and a non-dummy model count.
+        Devices are grouped by type, since one device's features can be
+        split across instances."""
+        dataset = self._file.get("DataSetInfo/CustomData/Protocol Configuration V2")
+        if dataset is None:
+            return []
+        try:
+            raw = dataset[()]
+            text = raw.tobytes() if hasattr(raw, "tobytes") else raw
+            text = text.decode("utf-8", errors="replace") if isinstance(text, bytes) else str(text)
+            protocol = json.loads(text)
+            features = protocol.get("ChannelsFeatureValues", {}).get(channel_name) or []
+        except (ValueError, AttributeError, TypeError):
+            return []
+        devices = defaultdict(dict)
+        for entry in features:
+            try:
+                identifier = entry["FeatureIdentifier"]
+                device = identifier["DeviceUniqueIdentifier"]["DeviceTypeId"]
+                devices[device][identifier["FeatureName"]] = entry.get("Value")
+            except (KeyError, TypeError):
+                continue
+        return [
+            values["ExposureTime"]
+            for values in devices.values()
+            if values.get("ExposureTime")
+            and any(name in values for name in self._CAMERA_FEATURES)
+            and str(values.get("CameraModel", "")).strip().lower() != "dummy"
+        ]
 
     def read(self, c=0, t=0, z=None, res_level=0):
         """
