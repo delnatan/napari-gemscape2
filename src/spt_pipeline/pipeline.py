@@ -39,33 +39,26 @@ Two things the previous sfwloc-based pipeline did are gone because
     be a tuned `bootstrap_gate_px` is now a fitted `LinkParams`, recorded
     in `track_summary` for the record.
 
-`PipelineSession` + `load_session`/`run_preview_frame`/
-`run_calibration_step`/`run_detect_step`/`run_track_step` let each stage
-run independently and be re-run after tweaking that stage's own knobs,
-without redoing earlier stages -- this is what backs the dock widget's
-per-tab "Preview frame" / "Run detect" / "Run tracking" buttons (each
-stage builds on whatever the session already has: `run_detect_step` uses
-`session.sigma` from a prior calibration if the caller doesn't pass one
-explicitly; `run_track_step` needs `session.points_df` from a prior
-detect). `run_detect_track` composes them in one call for the headless CLI,
-where stepwise control isn't needed.
+`PipelineSession` + `load_session`/`run_detect_step`/`run_track_step` let
+each stage run independently and be re-run after tweaking that stage's own
+knobs, without redoing earlier stages -- this is what backs the dock
+widget's per-tab "Run detect" / "Run tracking" buttons (`run_track_step`
+needs `session.points_df` from a prior detect). `run_detect_track`
+composes them in one call for the headless CLI, where stepwise control
+isn't needed.
 
-Two things the interactive path does that the headless one doesn't:
+There is no sigma calibration step. The PSF width is a setting: run
+detect over a few frames, read the `fit_sigma` histogram, adjust, run
+again -- the distribution is on screen the whole time, so a bimodal or
+ragged width (two focal planes, junk fitted as signal) is seen rather than
+averaged into one number. The headless runner takes `sigma` explicitly.
 
-  - **Preview instead of calibrate.** `run_preview_frame` localizes one
-    frame with the reporting band off and hands back every fit, so the PSF
-    width is chosen by looking at the `fit_sigma` distribution and
-    adopting its median -- one visible round of exactly what
-    `run_calibration_step` iterates out of sight. An explicit
-    `DetectTrackParams.sigma` then skips calibration entirely; `sigma_init`
-    and `run_calibration_step` remain for unattended batch runs, where
-    there is nobody to look at a histogram.
-  - **Filters.** `DetectTrackParams.point_filters`/`track_filters` are
-    `{column: (lo, hi)}` cuts (see `filter_mask`) on per-detection columns
-    and per-track metrics. Like `is_aggregate`, they apply to what linking
-    sees and to which tracks survive -- never to `points_df`, which keeps
-    every detection so the rejected population stays auditable -- and they
-    are recorded in `session_manifest_extra`.
+`DetectTrackParams.point_filters`/`track_filters` are `{column: (lo, hi)}`
+cuts (see `filter_mask`) on per-detection columns and per-track metrics.
+Like `is_aggregate`, they apply to what linking sees and to which tracks
+survive -- never to `points_df`, which keeps every detection so the
+rejected population stays auditable -- and they are recorded in
+`session_manifest_extra`.
 """
 
 from __future__ import annotations
@@ -87,7 +80,7 @@ from spt_pipeline.io_formats import StackMetadata, load_stack
 from spt_pipeline.tracking_diagnostics import check_resolvability
 
 # The camera's own calibration, forwarded to every `spotsolve.localize`/
-# `localize_stack`/`calibrate_sigma` call. `offset` (ADU) is subtracted
+# `localize_stack` call. `offset` (ADU) is subtracted
 # before fitting; everything else about the camera -- gain, read noise --
 # is measured from each frame's own noise (`spotsolve` no longer takes
 # either as an input), so `offset` is the only knob left here.
@@ -144,18 +137,6 @@ DEFAULT_SPARSE_KWARGS = dict(
     itermax=50,
 )
 
-# Forwarded to `spotsolve.calibrate_sigma` as **kwargs, mirroring its own
-# defaults. It localizes the calibration frame(s) with the reporting band
-# off, takes the median fitted width, and repeats at that value until the
-# estimate moves by less than `tol` (relative) or `max_rounds` runs out;
-# `n_boot`/`seed` drive the bootstrap CI on that median.
-DEFAULT_CALIBRATION_KWARGS = dict(
-    tol=0.002,
-    max_rounds=8,
-    n_boot=2000,
-    seed=0,
-)
-
 # ProgressCallback(done, total, stage) -- called from whatever thread the
 # stage function executes on; the interactive widget wraps this in a
 # QObject signal to cross back onto the Qt event-loop thread safely.
@@ -164,11 +145,11 @@ ProgressCallback = Callable[[int, int, str], None]
 
 class PipelineCancelled(Exception):
     """Raised at a `cancel_event` checkpoint (see `run_detect_step`/
-    `run_track_step`/`run_calibration_step`'s `cancel_event` argument).
+    `run_track_step`'s `cancel_event` argument).
     Cooperative cancellation only -- takes effect at the next chunk
     (detect, when a `progress_callback` puts it on the chunked
     `localize_stack` path) or stage boundary, not instantly, since
-    `calibrate_sigma`, `localize_stack` and `link` are each one opaque
+    `localize_stack` and `link` are each one opaque
     Rust call with no interruption point of their own. Propagates like any
     other exception through `napari.qt.threading`'s `errored` signal; the
     widget is responsible for telling this apart from a real error."""
@@ -201,8 +182,7 @@ def filter_mask(df: pl.DataFrame, filters: Optional[FilterSpec]) -> pl.Series:
     to preview what a range does, `run_track_step` calls it to decide what
     linking sees, and `apply_track_filters` calls it on per-track metrics
     -- the same rule in all three, so what the histogram showed is what
-    the saved bundle got. Same role `calibration_accepted` plays for the
-    reporting band."""
+    the saved bundle got."""
     if df.height == 0:
         return pl.Series("pass", [], dtype=pl.Boolean)
     expr = None
@@ -231,15 +211,10 @@ def apply_filters(df: pl.DataFrame, filters: Optional[FilterSpec]) -> pl.DataFra
 
 @dataclass
 class DetectTrackParams:
-    # The in-focus PSF width the search runs at. Set it explicitly (the
-    # interactive path does, from a preview frame's measured `fit_sigma` --
-    # see `run_preview_frame`) to skip calibration entirely; leave it None
-    # to have `run_detect_track` measure it per file with
-    # `run_calibration_step`, which is what an unattended batch over
-    # many acquisitions wants.
-    sigma: Optional[float] = None
-    sigma_init: float = 1.3
-    calibration_frame_index: int = 0
+    # The in-focus PSF width (px) the search runs at -- required, and
+    # settled by eye: detect a few frames, read the `fit_sigma` histogram
+    # (see this module's docstring).
+    sigma: float
     min_track_length: int = 2
     # Over-bright cut, as a multiple of each frame's own median detection:
     # detections above it are FLAGGED `is_aggregate` (never deleted -- see
@@ -259,11 +234,7 @@ class DetectTrackParams:
     # Which spotsolve detector `run_detect_step` runs: "multi_emitter"
     # (default -- `spotsolve.localize`/`localize_stack`, joint fit + Bayesian
     # model selection) or "aguet" (`localize_aguet`/`localize_aguet_stack`,
-    # the independent-fit sparse baseline). Only the production detect step
-    # honors this -- `run_calibration_step`/`run_preview_frame` always
-    # measure sigma with the multi-emitter detector regardless, since a PSF
-    # width is a physical fact about the optics, not a property of which
-    # detector will run on it.
+    # the independent-fit sparse baseline).
     detector: str = "multi_emitter"
     camera_kwargs: dict = field(default_factory=lambda: dict(DEFAULT_CAMERA_KWARGS))
     # None picks `DEFAULT_DETECT_KWARGS` or `DEFAULT_SPARSE_KWARGS` to match
@@ -272,7 +243,6 @@ class DetectTrackParams:
     # `localize_aguet_stack` keyword arguments (`k_max`, `slack`, `band`) it
     # doesn't accept.
     detect_kwargs: Optional[dict] = None
-    calibration_kwargs: dict = field(default_factory=lambda: dict(DEFAULT_CALIBRATION_KWARGS))
     # Worker threads the chosen `detector`'s stack function hands frames to,
     # in `run_detect_step`. None means every core (os.cpu_count()) --
     # spotsolve's own default for either detector.
@@ -316,20 +286,8 @@ class PipelineSession:
     # is different from 0 ("instantaneous"): see `io_formats`.
     exposure_s: Optional[float] = None
 
+    # The sigma the last detect ran at.
     sigma: Optional[float] = None
-    calib_summary: Optional[dict] = None
-    calib_points_df: Optional[pl.DataFrame] = None
-    calibration_kwargs_used: Optional[dict] = None
-    calibration_frame_used: Optional[int] = None
-
-    # One frame localized with the reporting band OFF, for the Detect
-    # tab's "Preview frame" action -- every fit is a row, including the
-    # ones a real run would reject as out-of-band, which is the point:
-    # the `fit_sigma` histogram over this table is how `sigma` gets
-    # chosen. See `run_preview_frame`. Never written to the bundle.
-    preview_points_df: Optional[pl.DataFrame] = None
-    preview_summary: Optional[dict] = None
-    preview_frame_used: Optional[int] = None
 
     points_df: Optional[pl.DataFrame] = None
     # One row per frame (`loctable.FRAME_SCHEMA`): detection counts, the
@@ -356,7 +314,7 @@ class PipelineSession:
     # The saved manifest's `params`, when this session was rebuilt from a
     # bundle (`session_from_bundle`) rather than run here -- what
     # `session_manifest_extra` falls back on for anything the session
-    # never recomputed (the calibration CI, say), so a re-save of a
+    # never recomputed (the detect settings, say), so a re-save of a
     # reopened bundle doesn't erase its own provenance.
     source_params: Optional[dict] = None
 
@@ -379,8 +337,7 @@ def load_session(
     stack: Optional[tuple[np.ndarray, StackMetadata]] = None,
     exposure_s: Optional[float] = None,
 ) -> PipelineSession:
-    """Load a timelapse and start a fresh (un-calibrated, un-detected,
-    un-tracked) `PipelineSession`. `stack` is an already-read
+    """Load a timelapse and start a fresh (un-detected, un-tracked) `PipelineSession`. `stack` is an already-read
     `load_stack(image_path, channel, z_index)` result, so a caller that
     has the image in memory (the UI, which loaded it to display it) does
     not read it a second time.
@@ -420,218 +377,6 @@ def load_session(
         metadata=metadata,
         exposure_s=exposure_s if exposure_s is not None else metadata.exposure_s,
     )
-
-
-def run_calibration_step(
-    session: PipelineSession,
-    sigma_init: float,
-    calibration_kwargs: Optional[dict] = None,
-    camera_kwargs: Optional[dict] = None,
-    frame_index: int = 0,
-    mask: Optional[np.ndarray] = None,
-    cancel_event: Optional[threading.Event] = None,
-) -> PipelineSession:
-    """Measure the in-focus PSF sigma against `session.image[frame_index]`
-    (default: the first frame), via `spotsolve.calibrate_sigma`. Sets
-    `session.sigma`/`session.calib_summary` in place (and returns
-    `session`, for chaining).
-
-    Always uses the multi-emitter detector (`calibrate_sigma` is hardcoded
-    to it), regardless of `DetectTrackParams.detector` -- a PSF width is a
-    physical fact about the optics, not a property of which detector will
-    later run the production detect step against it.
-
-    `frame_index` matters when the default frame isn't a good calibration
-    reference -- e.g. sparser or better-focused elsewhere in the stack.
-
-    `sigma_init` only needs to be within ~25% of the truth:
-    `calibrate_sigma` localizes the frame with the reporting band off,
-    takes the median fitted width, and re-runs at that value until it
-    stops moving (`calibration_kwargs`' `tol`/`max_rounds`).
-    `calib_summary` carries the bootstrap 95% CI on that median and
-    whether the loop converged -- a `converged=False` estimate is the one
-    to distrust.
-
-    `session.calib_points_df` gets a per-spot table for the same frame,
-    re-localized at the measured sigma with the reporting band OFF
-    (`band=None`), so every fit is a row -- including the ones a detect run
-    would reject as out-of-band. Columns are `loctable.LOCALIZATION_SCHEMA`
-    (`y`/`x`/`fit_sigma`/`sigma_ratio`/`se_*`/`flux`/...) plus a derived
-    `accepted`, so every calibration spot's fit is inspectable and not
-    just the aggregate estimate. `run_preview_frame` returns the same
-    table for one frame without the fixed-point loop around it, and that
-    is what the napari widget shows now -- see `widgets/params_panel.py`'s
-    docstring for why this function is the headless path only.
-
-    `mask`, if given, is forwarded as `roi` to both calls -- calibrating on
-    the same region detection will run on.
-
-    `cancel_event`, if given, is only checked before this stage starts --
-    `calibrate_sigma` is one opaque Rust call with no interruption point
-    of its own, so a cancellation requested mid-fit still runs to
-    completion (see `PipelineCancelled`'s docstring).
-    """
-    _check_cancelled(cancel_event)
-    kwargs = dict(calibration_kwargs) if calibration_kwargs is not None else dict(DEFAULT_CALIBRATION_KWARGS)
-    camera = dict(camera_kwargs) if camera_kwargs is not None else dict(DEFAULT_CAMERA_KWARGS)
-    frame = session.image[frame_index]
-
-    calibration = spotsolve.calibrate_sigma(frame, sigma_init, roi=mask, **camera, **kwargs)
-
-    # Re-localize the same frame at the measured sigma, band off, purely to
-    # get an inspectable per-spot table -- `calibrate_sigma` returns the
-    # aggregate plus the raw widths, not positions.
-    result = spotsolve.localize(frame, calibration.sigma, roi=mask, band=None, images=False, **camera)
-    calib_points_df, _frame_row, _aggs = loctable.frame_tables(
-        result,
-        frame=frame_index,
-        t=frame_index * session.dt_s,
-        pixel_size=session.pixel_size_um,
-    )
-    calib_points_df = calib_points_df.with_columns(
-        calibration_accepted(calib_points_df).alias("accepted")
-    )
-
-    lo, hi = calibration.ci
-    session.sigma = calibration.sigma
-    session.calib_summary = {
-        "sigma_estimate": calibration.sigma,
-        "sigma_ci_lo": lo,
-        "sigma_ci_hi": hi,
-        "n_spots_used": calibration.n_spots,
-        "n_spots_total": calib_points_df.height,
-        "converged": calibration.converged,
-        "rounds": len(calibration.guesses),
-    }
-    session.calib_points_df = calib_points_df
-    session.calibration_kwargs_used = kwargs
-    session.calibration_frame_used = frame_index
-    session.camera_kwargs_used = camera
-    return session
-
-
-def calibration_accepted(
-    calib_points_df: pl.DataFrame, band: tuple[float, float] = spotsolve.BAND
-) -> pl.Series:
-    """Per-spot boolean: would a detect run at this sigma have reported
-    this calibration candidate, or rejected it as out-of-band? Just
-    `band[0] <= sigma_ratio <= band[1]` -- `calib_points_df` is built with
-    the reporting band off precisely so both kinds of spot are in the
-    table, and this is the one place that rule is written rather than
-    re-derived wherever a caller (e.g. the calibration-spots preview
-    layer) wants to show accepted vs. rejected spots.
-
-    Note this is a different question than which spots the sigma estimate
-    was computed from: `calibrate_sigma` takes the median over every
-    fitted width, band or no band."""
-    lo, hi = band
-    return (calib_points_df["sigma_ratio"] >= lo) & (calib_points_df["sigma_ratio"] <= hi)
-
-
-def run_preview_frame(
-    session: PipelineSession,
-    sigma: float,
-    frame_index: int = 0,
-    camera_kwargs: Optional[dict] = None,
-    detect_kwargs: Optional[dict] = None,
-    agg_ratio: Optional[float] = None,
-    mask: Optional[np.ndarray] = None,
-    cancel_event: Optional[threading.Event] = None,
-    detector: str = "multi_emitter",
-) -> PipelineSession:
-    """Localize ONE frame at `sigma` with `detector` ("multi_emitter", the
-    default, or "aguet"), so every fit lands in the table -- including, for
-    the multi-emitter detector, the ones a real detect run would bin as
-    out-of-band (its reporting band is forced off here). Sets
-    `session.preview_points_df` / `session.preview_summary` /
-    `session.preview_frame_used` in place (and returns `session`, for
-    chaining). Never touches `points_df`: a preview is something to look
-    at, not a result to link or save.
-
-    This is what makes `calibrate_sigma` unnecessary interactively. That
-    function's loop was: localize the frame with the band off, take the
-    median fitted width, re-run at it, repeat to a fixed point -- all of it
-    invisible, reported as one number plus a bootstrap CI. Here the same
-    loop is the user's: preview, look at the `fit_sigma` histogram, adopt
-    its median (`summary["fit_sigma_median"]`, what the Detect tab's "Use"
-    button reads), preview again. It converges in the same two or three
-    rounds, and the distribution it converged on is on screen the whole
-    time -- so a bimodal or ragged `fit_sigma` (two focal planes, junk
-    fitted as signal) is visible rather than averaged into a median with a
-    tight CI around it. `run_calibration_step` is still there for the
-    headless path, where there is nobody to look.
-
-    For `detector="multi_emitter"`, `summary` also carries `n_in_band`
-    against the CURRENT `detect_kwargs` band -- how many of these fits a
-    real run at this sigma would actually report -- since that, not the
-    raw fit count, is what a detect run yields. `accepted` is the same
-    question per row (see `calibration_accepted`), meant for the preview
-    layer's border color. `detector="aguet"` has no band to gate against
-    (every LoG-screened fit it makes is already a reported detection), so
-    every row previews as accepted and `n_in_band` is omitted; `n_failed`
-    (from the fit's own `info["failures"]`) is reported instead.
-
-    `cancel_event` is only checked before the call: one frame is one
-    opaque Rust call (see `PipelineCancelled`).
-    """
-    _check_cancelled(cancel_event)
-    camera = dict(camera_kwargs) if camera_kwargs is not None else dict(DEFAULT_CAMERA_KWARGS)
-    t = session.image.shape[0]
-    frame_index = max(0, min(frame_index, t - 1))
-    frame = session.image[frame_index]
-
-    n_failed = None
-    if detector == "aguet":
-        detect = dict(detect_kwargs) if detect_kwargs is not None else dict(DEFAULT_SPARSE_KWARGS)
-        band = None
-        result = spotsolve.localize_aguet(frame, sigma, roi=mask, images=False, **camera, **detect)
-        n_failed = len(result.info.get("failures", ()))
-    else:
-        detect = dict(detect_kwargs) if detect_kwargs is not None else dict(DEFAULT_DETECT_KWARGS)
-        # `band=None` regardless of what the Detect tab has set: the whole
-        # point of a preview is to show the fits the band would have
-        # removed, so the band can be chosen against them. `slack` (the
-        # range a fit may TAKE, as opposed to be reported at) is honored --
-        # it bounds the optimizer, so overriding it would preview a
-        # different fit.
-        preview_kwargs = dict(detect)
-        band = preview_kwargs.pop("band", None)
-        preview_kwargs["band"] = None
-        result = spotsolve.localize(frame, sigma, roi=mask, images=False, **camera, **preview_kwargs)
-
-    points_df, frame_row, _aggs = loctable.frame_tables(
-        result,
-        frame=frame_index,
-        t=frame_index * session.dt_s,
-        pixel_size=session.pixel_size_um,
-        agg_ratio=agg_ratio,
-    )
-    accepted = (
-        calibration_accepted(points_df, band)
-        if band is not None
-        else pl.Series("accepted", np.ones(points_df.height, dtype=bool))
-    )
-    points_df = points_df.with_columns(accepted.alias("accepted"))
-
-    fit_sigma = points_df["fit_sigma"].drop_nulls().to_numpy() if points_df.height else np.array([])
-    session.preview_points_df = points_df
-    session.preview_frame_used = frame_index
-    session.preview_summary = {
-        "sigma_used": sigma,
-        "detector": detector,
-        "n_fits": points_df.height,
-        "n_in_band": int(accepted.sum()) if points_df.height and band is not None else None,
-        "n_failed": n_failed,
-        "n_flagged": int(points_df["is_aggregate"].sum()) if points_df.height else 0,
-        # The median of THIS frame's fitted widths -- one round of what
-        # `calibrate_sigma` iterates. Preview again at it to do the next.
-        "fit_sigma_median": float(np.median(fit_sigma)) if fit_sigma.size else None,
-        "fit_sigma_mad": float(np.median(np.abs(fit_sigma - np.median(fit_sigma)))) if fit_sigma.size else None,
-        "band": list(band) if band is not None else None,
-        "median_flux": float(frame_row["median_flux"][0]) if frame_row.height else None,
-    }
-    session.camera_kwargs_used = camera
-    return session
 
 
 def _resolve_frame_range(frame_range: Optional[tuple[int, int]], t: int) -> tuple[int, int]:
@@ -682,9 +427,8 @@ def run_detect_step(
     run, and `frame` holds true stack indices (`start`..`end-1`), not a
     re-based 0..n range, on either path below.
 
-    `sigma`, if given, is the in-focus PSF width used as-is, skipping
-    calibration entirely. If omitted, falls back to `session.sigma` from a
-    prior `run_calibration_step` call -- raises if neither is available.
+    `sigma` is the in-focus PSF width. If omitted, falls back to
+    `session.sigma` (the last run's) -- raises if neither is available.
     Note this is the width the search runs AT; each emitter still gets its
     own fitted width (`fit_sigma`), and -- for `detector="multi_emitter"`
     only -- how far that may stray before the fit stops being reported is
@@ -729,7 +473,7 @@ def run_detect_step(
     if sigma is None:
         if session.sigma is None:
             raise ValueError(
-                "No sigma available -- run calibration first, or pass sigma explicitly."
+                "No sigma available -- pass sigma explicitly."
             )
         sigma = session.sigma
 
@@ -1075,7 +819,7 @@ def run_track_step(
     if session.source_params:
         # Linking was just redone, so a reopened bundle's recorded link
         # numbers and cuts no longer describe this session -- only its
-        # detect/calibration provenance still does.
+        # detect provenance still does.
         session.source_params = {
             key: value for key, value in session.source_params.items() if key not in _TRACK_KEYS
         }
@@ -1203,7 +947,6 @@ def session_manifest_extra(session: PipelineSession) -> dict:
     been through all three stages -- meant to be passed as
     `results.build_manifest`'s `params`."""
     ts = session.track_summary or {}
-    cs = session.calib_summary or {}
     params = {
         "pixel_size_um": session.pixel_size_um,
         "dt_s": session.dt_s,
@@ -1221,8 +964,6 @@ def session_manifest_extra(session: PipelineSession) -> dict:
         "channel": session.channel,
         "z_index": session.z_index,
         "sigma_px": session.sigma,
-        "sigma_ci_px": [cs.get("sigma_ci_lo"), cs.get("sigma_ci_hi")] if cs else None,
-        "sigma_converged": cs.get("converged"),
         "sigma_loc_um": ts.get("sigma_loc_um"),
         "D_est_um2_s": ts.get("D_est_um2_s"),
         "D_link_um2_s": ts.get("D_link_um2_s"),
@@ -1254,8 +995,6 @@ def session_manifest_extra(session: PipelineSession) -> dict:
         "camera_kwargs": session.camera_kwargs_used,
         "detector": session.detector_used,
         "detect_kwargs": _jsonable_detect_kwargs(session.detect_kwargs_used),
-        "calibration_kwargs": session.calibration_kwargs_used,
-        "calibration_frame": session.calibration_frame_used,
         "frame_range": list(session.frame_range_used) if session.frame_range_used is not None else None,
         "spotsolve_version": spotsolve.__version__,
         # Per-class linking numbers (`run_track_step` links each region on
@@ -1264,7 +1003,7 @@ def session_manifest_extra(session: PipelineSession) -> dict:
         "track_summary_by_class": ts.get("by_class"),
     }
     # A session rebuilt from a saved bundle never recomputed what earlier
-    # stages recorded (the calibration's CI, say): keep the bundle's own
+    # stages recorded (a detect setting, say): keep the bundle's own
     # value rather than overwrite it with None. Counts and versions are
     # always the current session's.
     for key, value in (session.source_params or {}).items():
@@ -1335,8 +1074,6 @@ def session_from_bundle(
         metadata=metadata,
         exposure_s=params.get("exposure_s", metadata.exposure_s),
         sigma=params.get("sigma_px"),
-        calibration_kwargs_used=params.get("calibration_kwargs"),
-        calibration_frame_used=params.get("calibration_frame"),
         points_df=points_df,
         camera_kwargs_used=params.get("camera_kwargs"),
         detect_kwargs_used=detect_kwargs,
@@ -1416,19 +1153,19 @@ def _jsonable_detect_kwargs(detect_kwargs: Optional[dict]) -> Optional[dict]:
 
 def run_detect_track(
     image_path: str | Path,
+    params: DetectTrackParams,
     pixel_size_um: Optional[float] = None,
     dt_s: Optional[float] = None,
     channel: int = 0,
     z_index: int = 0,
-    params: Optional[DetectTrackParams] = None,
     progress_callback: Optional[ProgressCallback] = None,
     cancel_event: Optional[threading.Event] = None,
     exposure_s: Optional[float] = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame, dict]:
-    """Run the full calibrate+detect+track pipeline on one timelapse in
-    one call, composing `load_session`/`run_calibration_step`/
-    `run_detect_step`/`run_track_step` -- for the headless CLI. See this
-    module's docstring for the stepwise alternative the widget uses.
+    """Run the full detect+track pipeline on one timelapse in one call,
+    composing `load_session`/`run_detect_step`/`run_track_step` -- for
+    the headless CLI. See this module's docstring for the stepwise
+    alternative the widget uses.
 
     `image_path` can be .tif/.tiff, .nd2, or .ims (see `io_formats.load_stack`).
     `channel`/`z_index` pick which plane to track for files with more than
@@ -1439,12 +1176,11 @@ def run_detect_track(
     `cancel_event`, if given, is forwarded to each stage -- see
     `PipelineCancelled`'s docstring for what "cancelled" actually means per
     stage (cooperative, frame-granular for detect, stage-boundary-only for
-    calibration/track).
+    track).
 
     Returns (points_df, tracks_df, manifest_extra) -- `manifest_extra` is
     meant to be passed as `results.build_manifest`'s `params`.
     """
-    params = params or DetectTrackParams()
     session = load_session(
         image_path,
         pixel_size_um=pixel_size_um,
@@ -1455,29 +1191,13 @@ def run_detect_track(
     )
     start, end = _resolve_frame_range(params.frame_range, session.image.shape[0])
     n_frames = end - start
-    total_steps = n_frames + 3
+    total_steps = n_frames + 2
 
     def report(done: int, total: int, stage: str) -> None:
         if progress_callback is not None:
             progress_callback(done, total, stage)
 
-    # An explicit `params.sigma` means the width was already settled --
-    # interactively, off a preview frame's `fit_sigma` histogram (see
-    # `run_preview_frame`) -- so there is nothing to measure. Only the
-    # unattended case, where nobody is looking at a histogram, falls back
-    # to `calibrate_sigma`.
-    if params.sigma is not None:
-        session.sigma = params.sigma
-    else:
-        report(0, total_steps, "calibrating sigma")
-        run_calibration_step(
-            session,
-            params.sigma_init,
-            params.calibration_kwargs,
-            camera_kwargs=params.camera_kwargs,
-            frame_index=params.calibration_frame_index,
-            cancel_event=cancel_event,
-        )
+    session.sigma = params.sigma
 
     detect_progress = (
         (lambda done, total, stage: report(done, total_steps, stage))
@@ -1497,7 +1217,7 @@ def run_detect_track(
     )
 
     def track_progress(done: int, total: int, stage: str) -> None:
-        report(n_frames + 1 + done, total_steps, stage)
+        report(n_frames + done, total_steps, stage)
 
     run_track_step(
         session,

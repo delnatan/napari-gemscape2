@@ -14,12 +14,12 @@ and subprocess-batch-script implementations of the same pipeline.
 Deliberately excluded (see the project plan): an in-app code-exec tab and
 the diffusion-analysis step -- this widget's job is browse/load/run-
 detect-track, nothing else. Pipeline parameter tuning (including the
-Detect tab's PSF-width preview loop and frame-range/regions scope controls)
+Detect tab's PSF width and frame-range/regions scope controls)
 lives in
 `widgets/params_panel.py::PipelineParamsWidget`, which stays viewer-
 agnostic; this module is what actually resolves the regions controls
 into a boolean mask and a labels image, by reading the Labels layer
-picked in that panel (`_build_regions`). "New regions layer" adds one and
+picked in that panel (`_build_regions`). "New layer" adds one and
 `_on_region_layers_changed` keeps the picker in step with the viewer
 (renames included), so which regions a run covers is a deliberate pick
 rather than a side-effect of which layer was last clicked. Each label is
@@ -45,7 +45,7 @@ outer `ExperimentListWidget` implement it, since the list no longer fills
 the whole panel now that the params form sits below it.
 
 The pipeline runs one image at a time, on the current row, from the
-params-panel tabs' own buttons. Preview, detect and track run
+params-panel tabs' own buttons. Detect and track run
 independently, in the background through one `self._worker` slot, against
 a `pipeline.PipelineSession` held in `self._session`, so changing one
 stage's knobs and re-running it doesn't force redoing the earlier stages.
@@ -138,7 +138,6 @@ from spt_pipeline.pipeline import (
     filter_mask,
     load_session,
     run_detect_step,
-    run_preview_frame,
     run_track_step,
     session_from_bundle,
     session_manifest_extra,
@@ -388,7 +387,7 @@ class ExperimentListWidget(QWidget):
     def __init__(self, napari_viewer) -> None:
         super().__init__()
         self.viewer = napari_viewer
-        # The one Preview/Detect/Track worker, while it runs against
+        # The one Detect/Track worker, while it runs against
         # `self._session_item`. Also what guards `_on_selection_changed`,
         # so clicking a different row mid-run can't rug the viewer layers
         # out from under it (Finding: napari's layer list going blank on a
@@ -461,7 +460,6 @@ class ExperimentListWidget(QWidget):
         open_button.clicked.connect(self._open_folder_dialog)
 
         self.params_panel = PipelineParamsWidget()
-        self.params_panel.previewRequested.connect(self._run_preview_step)
         self.params_panel.detectRequested.connect(self._run_detect_step)
         self.params_panel.detectCancelRequested.connect(self._cancel_active_run)
         self.params_panel.trackRequested.connect(self._run_track_step)
@@ -574,7 +572,7 @@ class ExperimentListWidget(QWidget):
         if current is None or self._reverting_selection:
             return
         if self._worker is not None and self._session_item is not None and current is not self._session_item:
-            # A calibrate/detect/track worker is still running against
+            # A detect/track worker is still running against
             # `self._session_item` -- switching away would otherwise wipe
             # its viewer layers and orphan the worker's eventual result
             # (see `self._worker`'s comment). Snap the selection back
@@ -594,7 +592,6 @@ class ExperimentListWidget(QWidget):
                 self._reverting_selection = False
                 return
         self._drop_session()
-        self.params_panel.set_preview_result(None)
         self.params_panel.set_detect_status("")
         self.params_panel.set_track_status("")
         self.params_panel.set_save_status("")
@@ -813,7 +810,7 @@ class ExperimentListWidget(QWidget):
         else:
             self.progress_label.setText(stage)
 
-    # -- Stepwise Calibrate / Detect / Track (current selection only) --
+    # -- Stepwise Detect / Track (current selection only) --
 
     def _ensure_session(self, item: ExperimentItem) -> PipelineSession:
         """The session for `item`, loading its image fresh if `item` isn't
@@ -929,7 +926,7 @@ class ExperimentListWidget(QWidget):
         panel = self.params_panel.regions_panel
         layer = self._regions_layer
         if layer is None or not any(layer is l for l in self.viewer.layers):
-            raise ValueError('no regions layer — press "New regions layer" and paint, or pick one')
+            raise ValueError('no regions layer — press "New layer" and paint, or pick one')
         labels = np.asarray(layer.data)
         if labels.shape != tuple(shape):
             raise ValueError(
@@ -965,124 +962,6 @@ class ExperimentListWidget(QWidget):
         self.progress_label.setText(f"error: {exc}")
         self._finish_step_worker()
 
-    def _run_preview_step(self) -> None:
-        """Localize ONE frame with the reporting band off and show every
-        fit, so `sigma` can be chosen by looking at the `fit_sigma`
-        distribution instead of by trusting `calibrate_sigma`'s median --
-        see `params_panel`'s module docstring for why this replaced the
-        Calibration tab."""
-        item = self.list_view.currentItem()
-        if item is None:
-            return
-        try:
-            session = self._ensure_session(item)
-        except Exception as exc:
-            self.params_panel.set_preview_status(f"error: {exc}", level="error")
-            return
-        self.params_panel.set_frame_bounds(session.image.shape[0])
-
-        mask = None
-        if self.params_panel.regions_panel.get_use_mask():
-            try:
-                mask, _labels, _regions = self._build_regions(session.image.shape[1:])
-            except Exception as exc:
-                self.params_panel.set_preview_status(f"error: {exc}", level="error")
-                return
-
-        frame_index = self.params_panel.get_preview_frame_index()
-        self.progress_label.setText(f"Previewing frame {frame_index}: {item.entry.image_path.name}")
-        self.params_panel.set_preview_status("previewing…")
-        worker = _run_preview_worker(
-            session,
-            self.params_panel.get_sigma(),
-            frame_index,
-            self.params_panel.get_camera_kwargs(),
-            self.params_panel.get_detect_kwargs(),
-            self.params_panel.get_agg_ratio(),
-            mask,
-            self.params_panel.get_detector(),
-        )
-        self._start_step_worker(
-            worker, lambda s, item=item: self._on_preview_finished(item, s), indeterminate=True
-        )
-
-    def _on_preview_finished(self, item: ExperimentItem, session: PipelineSession) -> None:
-        if self._session_item is not item:
-            # Selection changed to a different item while this ran --
-            # `_on_selection_changed` already reset `self._session`;
-            # don't resurrect a stale one for the item we've left.
-            self._finish_step_worker()
-            return
-        self._session = session
-        summary = session.preview_summary or {}
-        n_fits = summary.get("n_fits", 0)
-        # A preview that found nothing is a real answer (wrong sigma,
-        # wrong offset, blank frame) -- say so in red rather than
-        # leaving an empty status that reads like it never ran.
-        self.params_panel.set_preview_result(summary, level="error" if n_fits == 0 else "ok")
-        self._add_preview_layer(session)
-        # Preview is also where the filter histograms come from before any
-        # full run exists -- tune the cuts on one frame, then run the range.
-        # Deliberately only when a real detect hasn't already produced a
-        # bigger table: one frame is a worse population to judge against.
-        if session.points_df is None:
-            self.params_panel.set_point_filter_source(session.preview_points_df)
-        self._finish_step_worker()
-
-    def _add_preview_layer(self, session: PipelineSession) -> None:
-        """One box-shaped point per previewed fit, `features=` set to the
-        full per-spot table (`loctable.LOCALIZATION_SCHEMA`:
-        `y`/`x`/`fit_sigma`/`sigma_ratio`/`se_*`/`flux`/...) plus the
-        derived `accepted` -- napari shows a hovered/selected point's
-        features in the status bar, so every fit is inspectable, not just
-        the median in the status label.
-
-        `accepted` (green border) is whether a detect run at this sigma
-        would report the spot at all, or reject it as out-of-band (see
-        `pipeline.calibration_accepted`); gray-bordered points are the
-        out-of-band fits, which the preview includes precisely because the
-        multi-emitter detector runs with the band off. That is what makes
-        the band choosable: both populations are on the image at once. The
-        Aguet detector has no band -- every point previews green.
-
-        Faces are transparent (border color only) so the boxes outline
-        each fit without occluding the underlying image."""
-        df = session.preview_points_df
-        if df is None or df.height == 0:
-            if "preview spots" in self.viewer.layers:
-                del self.viewer.layers["preview spots"]
-            return
-        if "preview spots" in self.viewer.layers:
-            del self.viewer.layers["preview spots"]
-
-        features = {col: df[col].to_numpy() for col in df.columns}
-        # Sized off the sigma previewed at rather than a fit-window
-        # parameter -- spotsolve's boxes are an internal of the search, not
-        # a knob, so there is no box_size to read back. ~6 sigma is wide
-        # enough to frame the spot it marks at a glance.
-        sigma = (session.preview_summary or {}).get("sigma_used") or session.sigma or 1.3
-        box_size = max(3.0, 6.0 * sigma)
-
-        self.viewer.add_points(
-            df.select(["y", "x"]).to_numpy(),
-            name="preview spots",
-            features=features,
-            symbol="square",
-            size=box_size,
-            face_color="transparent",
-            border_color="accepted",
-            border_color_cycle=[
-                STATUS_COLORS[Status.COMPLETE].name(),
-                STATUS_COLORS[Status.UNTOUCHED].name(),
-            ],
-            border_width=0.15,
-        )
-        if session.preview_frame_used is not None and self.viewer.dims.ndim:
-            # Step the viewer to the frame just previewed -- the boxes are
-            # 2D and show on every frame, so without this they'd be drawn
-            # over whichever frame happens to be displayed.
-            self.viewer.dims.set_current_step(0, session.preview_frame_used)
-
     def _run_detect_step(self) -> None:
         item = self.list_view.currentItem()
         if item is None:
@@ -1104,9 +983,7 @@ class ExperimentListWidget(QWidget):
                 return
 
         # The Detect tab's sigma box, always -- not `session.sigma` from
-        # some earlier run. It IS the setting now that the preview loop
-        # feeds it (params_panel's docstring), so honoring a stale session
-        # value would mean the number on screen isn't the one that ran.
+        # some earlier run, so the number on screen is the one that ran.
         sigma = self.params_panel.get_sigma()
         self.progress_label.setText(f"Finding spots: {item.entry.image_path.name}")
         self._cancel_event = threading.Event()
@@ -1176,18 +1053,14 @@ class ExperimentListWidget(QWidget):
             level="error" if n_points == 0 else "ok",
         )
 
-        # Hand the real run's detections to the filter histograms (they
-        # may have been showing a single preview frame's) and draw the
-        # layer through whatever cuts are already set. The Detect tab
+        # Hand the run's detections to the filter histograms (where
+        # fit_sigma is read to settle the PSF width) and draw the layer
+        # through whatever cuts are already set. The Detect tab
         # pages through its steps rather than scrolling, so leaf it to the
         # filter page too -- that histogram is what there is to do next,
         # and it is no longer just below the Run button.
         self.params_panel.set_point_filter_source(session.points_df)
         self.params_panel.show_tab("Detect", "Filter")
-        if "preview spots" in self.viewer.layers:
-            # The preview's one frame is superseded by the real run; two
-            # overlapping spot layers on the same frame is just confusing.
-            del self.viewer.layers["preview spots"]
         self._update_points_layer(new_data=True)
         self.params_panel.set_save_enabled(False)
         self.params_panel.set_detect_save_enabled(n_points > 0)
@@ -1685,8 +1558,6 @@ class ExperimentListWidget(QWidget):
             self._update_points_layer()
         if tracks:
             self._update_tracks_layer()
-        if "preview spots" in self.viewer.layers:
-            del self.viewer.layers["preview spots"]
         metadata = self._session_layer_metadata()
         pairs = []
         if points:
@@ -1781,29 +1652,6 @@ def _load_item_worker(image_path: Path, result_dir: Path):
     if has_result(result_dir):
         return load_result_display(result_dir)
     return load_image_display(image_path)
-
-
-@thread_worker(start_thread=False)
-def _run_preview_worker(
-    session: PipelineSession,
-    sigma: float,
-    frame_index: int,
-    camera_kwargs: dict,
-    detect_kwargs: dict,
-    agg_ratio: float,
-    mask: Optional[np.ndarray],
-    detector: str = "multi_emitter",
-) -> PipelineSession:
-    return run_preview_frame(
-        session,
-        sigma,
-        frame_index=frame_index,
-        camera_kwargs=camera_kwargs,
-        detect_kwargs=detect_kwargs,
-        agg_ratio=agg_ratio,
-        mask=mask,
-        detector=detector,
-    )
 
 
 @thread_worker(start_thread=False)

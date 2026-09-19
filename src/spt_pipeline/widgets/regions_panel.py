@@ -86,7 +86,7 @@ class RegionsPanel(QWidget):
         self.layer_picker = QComboBox()
         self.layer_picker.setToolTip("Which Labels layer holds the regions.")
         self.layer_picker.currentTextChanged.connect(self._on_picker_changed)
-        self.new_layer_button = QPushButton("New regions layer")
+        self.new_layer_button = QPushButton("New layer")
         self.new_layer_button.setToolTip(
             "Add an empty 2D Labels layer the size of a frame, with the paint\n"
             "tool active -- 2D so the regions show on every frame."
@@ -106,7 +106,7 @@ class RegionsPanel(QWidget):
             "out of the cell's cytoplasm."
         )
         self.add_nucleus_button.clicked.connect(self._add_nucleus)
-        self.classes_button = QPushButton("Classes…")
+        self.classes_button = QPushButton("Classes")
         self.classes_button.setToolTip("Edit the list of region classes (comma-separated).")
         self.classes_button.clicked.connect(self._edit_classes)
 
@@ -124,9 +124,10 @@ class RegionsPanel(QWidget):
         self.table.setMaximumHeight(8 * self.table.fontMetrics().height() + 24)
         self.table.itemSelectionChanged.connect(self._on_row_selected)
 
+        # Two short rows rather than one: checkbox + picker + button side
+        # by side set the whole Detect page's minimum width.
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
-        top.addWidget(self.use_mask)
         top.addWidget(self.layer_picker, 1)
         top.addWidget(self.new_layer_button)
         buttons = QHBoxLayout()
@@ -138,6 +139,7 @@ class RegionsPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
+        layout.addWidget(self.use_mask)
         layout.addLayout(top)
         layout.addLayout(buttons)
         layout.addWidget(self.table)
