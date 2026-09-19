@@ -309,11 +309,11 @@ class _DetectTab(QWidget):
             "crowded and sparse fields.\n\n"
             "Sparse (Aguet): the spotfitlm-compatible baseline. LoG-screens\n"
             "candidates, then fits each one independently -- no multi-emitter\n"
-            "search, no width-band rejection (every screened fit is reported).\n"
+            "search, no width-band rejection (every screened fit is reported,\n"
+            "so frames_df's too_narrow/too_wide/edge counts stay 0).\n"
             "For genuinely sparse fields where the joint search is unneeded."
         )
         self.detector.currentIndexChanged.connect(self._on_detector_changed)
-        self._detector_note = note_label("")
 
         # --- PSF width ----------------------------------------------------
         self.sigma = _dspin(
@@ -412,7 +412,6 @@ class _DetectTab(QWidget):
         core_form.setContentsMargins(0, 0, 0, 0)
         core_form.addRow("sigma (px)", self.sigma)
         core_form.addRow("detector", self.detector)
-        core_form.addRow("", self._detector_note)
         core_form.addRow("offset (ADU)", self.offset)
         core_form.addRow("k_max", self.k_max)
         # Row labels carry the unit the same way "offset (ADU)" and
@@ -634,15 +633,8 @@ class _DetectTab(QWidget):
         self.expert_form.setRowVisible(self.count_penalty, not sparse)
         self.expert_form.setRowVisible(self.boxsize, sparse)
         self.expert_form.setRowVisible(self.itermax, sparse)
-        # Notes get a row only while they have something to say: an empty
-        # label still takes a row's height and spacing in a QFormLayout.
-        self._detector_note.setText(
-            "No width-band rejection: every screened fit is reported, so\n"
-            "frames_df's too_narrow/too_wide/edge counts stay 0."
-            if sparse
-            else ""
-        )
-        self.core_form.setRowVisible(self._detector_note, sparse)
+        # The count-rule note gets a row only while it has something to
+        # say: an empty label still takes a row's height and spacing.
         self._sync_selection_note()
 
     def _on_no_band_toggled(self, checked: bool) -> None:
