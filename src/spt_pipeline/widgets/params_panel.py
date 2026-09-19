@@ -629,15 +629,18 @@ class _DetectTab(QWidget):
         self.expert_form.setRowVisible(self.no_band, not sparse)
         self.expert_form.setRowVisible(self.selection, not sparse)
         self.expert_form.setRowVisible(self.count_penalty, not sparse)
-        self.expert_form.setRowVisible(self._selection_note, not sparse)
         self.expert_form.setRowVisible(self.boxsize, sparse)
         self.expert_form.setRowVisible(self.itermax, sparse)
+        # Notes get a row only while they have something to say: an empty
+        # label still takes a row's height and spacing in a QFormLayout.
         self._detector_note.setText(
             "No width-band rejection: every screened fit is reported, so\n"
             "frames_df's too_narrow/too_wide/edge counts stay 0."
             if sparse
             else ""
         )
+        self.core_form.setRowVisible(self._detector_note, sparse)
+        self._sync_selection_note()
 
     def _on_no_band_toggled(self, checked: bool) -> None:
         self.band_lo.setEnabled(not checked)
@@ -652,6 +655,14 @@ class _DetectTab(QWidget):
             if self.selection.currentData() == "bic"
             else ""
         )
+        self._sync_selection_note()
+
+    def _sync_selection_note(self) -> None:
+        # Called from the selection combo during construction too, before
+        # the expert form (and the detector choice's rows) exist.
+        if hasattr(self, "expert_form"):
+            show = self.get_detector() != "aguet" and bool(self._selection_note.text())
+            self.expert_form.setRowVisible(self._selection_note, show)
 
     def _on_run_button_clicked(self) -> None:
         if self._running:

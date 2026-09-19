@@ -81,7 +81,8 @@ class RegionsPanel(QWidget):
             "(spotsolve's roi argument), and label each detection with the\n"
             "region it fell in (region, region_class and cell columns).\n"
             "Tracking links each region on its own, so no track crosses a\n"
-            "boundary, with link parameters fitted per class."
+            "boundary, with link parameters fitted per class. Check it to show\n"
+            "the regions layer picker and table."
         )
         self.layer_picker = QComboBox()
         self.layer_picker.setToolTip("Which Labels layer holds the regions.")
@@ -136,13 +137,20 @@ class RegionsPanel(QWidget):
         buttons.addWidget(self.add_nucleus_button)
         buttons.addStretch()
         buttons.addWidget(self.classes_button)
+        # Everything under the checkbox folds away while it is off: a run
+        # without regions has no use for the picker or the table.
+        self._body = QWidget()
+        body = QVBoxLayout(self._body)
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(2)
+        body.addLayout(top)
+        body.addLayout(buttons)
+        body.addWidget(self.table)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
         layout.addWidget(self.use_mask)
-        layout.addLayout(top)
-        layout.addLayout(buttons)
-        layout.addWidget(self.table)
+        layout.addWidget(self._body)
         self.use_mask.toggled.connect(self._sync_enabled)
         self._sync_enabled()
 
@@ -324,6 +332,7 @@ class RegionsPanel(QWidget):
             self.layerChosen.emit(name)
 
     def _sync_enabled(self) -> None:
+        self._body.setVisible(self.use_mask.isChecked())
         has_layer = self._layer is not None
         self.layer_picker.setEnabled(self.layer_picker.count() > 0)
         for widget in (self.new_cell_button, self.add_nucleus_button, self.classes_button, self.table):
