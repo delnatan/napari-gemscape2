@@ -157,7 +157,10 @@ from spt_pipeline.widgets.regions_panel import RegionsPanel
 # off; `_SPIN_WIDTH` caps each field at what its digits need so the label
 # column isn't squeezed into wrapping.
 _SPIN_WIDTH = 72
-_UNIT_SPIN_WIDTH = 108  # wide enough for a spinbox that also carries a unit suffix
+# Decimal spinboxes need more: napari's theme gives every spinbox wide +/-
+# buttons, and at 72 px a value like "100.00" was clipped to "100.(".
+_DSPIN_WIDTH = 104
+_UNIT_SPIN_WIDTH = 140  # wide enough for a spinbox that also carries a unit suffix
 
 
 def _compact_form(form: QFormLayout) -> QFormLayout:
@@ -187,7 +190,7 @@ def _dspin(
     width: Optional[int] = None,
 ) -> QDoubleSpinBox:
     box = double_spinbox(value, minimum, maximum, step, decimals, tooltip=tooltip, suffix=suffix)
-    box.setMaximumWidth(width if width is not None else (_UNIT_SPIN_WIDTH if suffix else _SPIN_WIDTH))
+    box.setMaximumWidth(width if width is not None else (_UNIT_SPIN_WIDTH if suffix else _DSPIN_WIDTH))
     return box
 
 
