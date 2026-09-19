@@ -31,7 +31,7 @@ import polars as pl
 from spt_pipeline.io_formats import StackMetadata
 from spt_pipeline.results import load_result
 from spt_pipeline.pipeline import load_stack, track_features_df
-from spt_pipeline.rois import roi_to_shapes_kwargs
+from spt_pipeline.regions import LABELS_DTYPE, Regions
 
 # color_by defaults to track_length so a broken/short track (a linking
 # failure) stands out from a long one at a glance, instead of napari's
@@ -240,9 +240,10 @@ def add_tracks_layer(
 
 # The Tracks layer's own `data` columns; every other numeric column on a
 # track table rides along as a per-vertex property. Non-numeric ones (the
-# `roi` name, see `spt_pipeline.rois.label_points`) stay off: a Tracks
-# layer's properties feed its colormaps, and the ROI is carried there as
-# `roi_index` instead, named through the layer's `roi_names` metadata.
+# `region_class` name, see `spt_pipeline.regions.label_points`) stay off:
+# a Tracks layer's properties feed its colormaps, and the region is carried
+# there as its `region` label instead, named through the layer's
+# `region_classes` metadata ({label: class}).
 _TRACK_DATA_COLUMNS = ("track_id", "frame", "y", "x")
 
 
@@ -321,7 +322,8 @@ class ResultDisplay:
     points_df: pl.DataFrame
     tracks_df: pl.DataFrame
     manifest: dict
-    rois: list[dict]
+    labels: np.ndarray | None
+    regions: Regions | None
 
 
 def load_image_display(image_path: str | Path, channel: int = 0, z_index: int = 0) -> ImageDisplay:
@@ -342,14 +344,14 @@ def load_image_display(image_path: str | Path, channel: int = 0, z_index: int = 
 def load_result_display(bundle_dir: str | Path) -> ResultDisplay:
     """Read a bundle's tables and its source image. Thread-safe, like
     `load_image_display`."""
-    points_df, tracks_df, manifest, rois = load_result(bundle_dir)
+    points_df, tracks_df, manifest, labels, regions = load_result(bundle_dir)
     params = manifest.get("params", {})
     image = load_image_display(
         manifest["source_image_path"],
         channel=params.get("channel", 0),
         z_index=params.get("z_index", 0),
     )
-    return ResultDisplay(Path(bundle_dir), image, points_df, tracks_df, manifest, rois)
+    return ResultDisplay(Path(bundle_dir), image, points_df, tracks_df, manifest, labels, regions)
 
 
 def show_image(viewer, loaded: ImageDisplay):
@@ -371,15 +373,35 @@ def add_result_layers(viewer, result_dir: str | Path) -> None:
     show_result(viewer, load_result_display(result_dir))
 
 
+def region_classes(regions: Regions | None) -> dict[int, str]:
+    """`{label: class}` -- what a layer's `region_classes` metadata holds."""
+    return {label: r.class_ for label, r in regions.table.items()} if regions else {}
+
+
+REGIONS_LAYER_NAME = "regions"
+
+
+def add_regions_layer(viewer, labels: np.ndarray, regions: Regions | None = None, name: str = REGIONS_LAYER_NAME):
+    """A 2D Labels layer holding a regions image (see
+    `spt_pipeline.regions`), its `Regions` table kept on the layer's
+    metadata where `widgets.regions_panel` reads it. 2D, fewer dims than
+    the image stack, so it shows on every frame."""
+    return viewer.add_labels(
+        np.asarray(labels, dtype=LABELS_DTYPE),
+        name=name,
+        opacity=0.3,
+        metadata={"regions": regions if regions is not None else Regions()},
+    )
+
+
 def show_result(viewer, loaded: ResultDisplay) -> None:
-    """Clear `viewer` and add the image/points/tracks/ROI layers for one
-    loaded bundle -- any saved ROI (see `spt_pipeline.rois`) is added back
-    as a `"polygon"`-type Shapes layer under its original napari layer
-    name, so the region used for detection is visible again, not just the
-    results."""
+    """Clear `viewer` and add the image/points/tracks/regions layers for
+    one loaded bundle -- saved regions (see `spt_pipeline.regions`) come
+    back as a Labels layer, so the regions used for detection are visible
+    again (and reusable, or editable), not just the results."""
     show_image(viewer, loaded.image)
     result_dir = loaded.bundle_dir
-    points_df, tracks_df, rois = loaded.points_df, loaded.tracks_df, loaded.rois
+    points_df, tracks_df = loaded.points_df, loaded.tracks_df
     params = loaded.manifest.get("params", {})
 
     layer_metadata = layer_units_metadata(
@@ -387,18 +409,13 @@ def show_result(viewer, loaded: ResultDisplay) -> None:
     )
     pixel_size_um = layer_metadata["pixel_size_um"]
     dt_s = layer_metadata["dt_s"]
-    # What each `roi_index` on the rows is called (`rois.label_points`).
-    layer_metadata["roi_names"] = [roi["name"] for roi in rois]
+    # What each `region` label on the rows is (`regions.label_points`).
+    layer_metadata["region_classes"] = region_classes(loaded.regions)
 
+    if loaded.labels is not None:
+        add_regions_layer(viewer, loaded.labels, loaded.regions)
     add_points_layer(viewer, points_df, "points", layer_metadata)
     add_tracks_layer(viewer, tracks_df, pixel_size_um, dt_s, "tracks", layer_metadata)
-
-    # Last record first, so the first ends up on top of napari's layer
-    # list: `rois.json` is written in overlap-precedence order (first
-    # wins, see `rois.label_image`), and the layer list's top-first order
-    # is what the Detect tab reads that precedence back from.
-    for roi in reversed(rois):
-        viewer.add_shapes(**roi_to_shapes_kwargs(roi), edge_color="yellow")
 
 
 def launch_viewer(result_dir: str | Path):

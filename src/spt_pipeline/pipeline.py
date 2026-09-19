@@ -81,7 +81,8 @@ import polars as pl
 import spotsolve
 from spotsolve import loctable, tracking
 
-from spt_pipeline import rois as roi_tools
+from spt_pipeline import regions as region_tools
+from spt_pipeline.regions import Regions
 from spt_pipeline.io_formats import StackMetadata, load_stack
 from spt_pipeline.tracking_diagnostics import check_resolvability
 
@@ -279,7 +280,7 @@ class DetectTrackParams:
     # (start, end) frame slice, Python-slice semantics; None, or end <= 0,
     # means through the real last frame (see _resolve_frame_range).
     # Not `mask` -- that's an interactive-only concept (built from a live
-    # napari Shapes layer), not something a headless/serialized
+    # napari Labels layer), not something a headless/serialized
     # DetectTrackParams can carry. See run_detect_step's docstring.
     frame_range: Optional[tuple[int, int]] = None
     # QC cuts on per-detection columns (`flux`, `fit_sigma`, `se_pos`, ...)
@@ -345,12 +346,13 @@ class PipelineSession:
     detector_used: Optional[str] = None
     agg_ratio_used: Optional[float] = None
     frame_range_used: Optional[tuple[int, int]] = None
-    # Polygon ROI record(s) (see spt_pipeline.rois.shapes_layer_to_roi) for
-    # whatever napari Shapes layer backed run_detect_step's `mask`, if any
-    # -- set by the widget (not pipeline.py itself, which stays napari-
-    # agnostic), carried through to session_manifest_extra's caller so
-    # write_result can persist it alongside points/tracks.
-    roi: Optional[list[dict]] = None
+    # The painted regions image (`(H, W)` uint16, 0 = background) whose
+    # `labels > 0` was run_detect_step's `mask`, and the table naming each
+    # label (see `spt_pipeline.regions`) -- set by the widget (not
+    # pipeline.py itself, which stays napari-agnostic), carried through so
+    # write_result can persist them alongside points/tracks.
+    labels: Optional[np.ndarray] = None
+    regions: Optional[Regions] = None
     # The saved manifest's `params`, when this session was rebuilt from a
     # bundle (`session_from_bundle`) rather than run here -- what
     # `session_manifest_extra` falls back on for anything the session
@@ -697,8 +699,8 @@ def run_detect_step(
 
     `mask`, if given, is a full-frame `(H, W)` boolean array restricting
     where emitters may be placed, forwarded as `spotsolve`'s `roi` --
-    typically built from a napari Shapes layer (`widgets/
-    experiment_list.py`'s ROI handling).
+    typically `labels > 0` of a napari Labels layer (`widgets/
+    experiment_list.py`'s regions handling).
 
     Over-bright detections are FLAGGED (`is_aggregate`), never dropped
     here: `agg_ratio` (a multiple of each frame's own median detection --
@@ -1010,45 +1012,51 @@ def run_track_step(
             f"{n_after_aggregates} of them. Widen or clear them."
         )
 
-    roi_groups = _roi_groups(link_input)
+    class_groups = _region_groups(link_input)
     report(0, 2, "fitting link parameters")
-    # Fitted on everything even when linking per ROI: it is both the
-    # fallback for an ROI too sparse to fit on its own and the pooled
+    # Fitted on everything even when linking per region: it is both the
+    # fallback for a class too sparse to fit on its own and the pooled
     # numbers the top-level summary (and status line) report.
     link_params = tracking.fit_link_params(link_input)
 
     _check_cancelled(cancel_event)
     report(1, 2, "linking")
-    by_roi = None
-    if roi_groups is None:
+    by_class = None
+    if class_groups is None:
         tracks_df = tracking.link(link_input, link_params, brightness=link_with_flux)
     else:
-        # One ROI at a time, each with its own fitted LinkParams: regions
-        # are separated because their D and density differ, and a pooled
-        # D prior would gate one region's steps by the other's. Linking
-        # separately is also what guarantees no track crosses a boundary.
-        roi_areas = _roi_areas_px(session)
-        pieces, by_roi, next_id = [], {}, 0
-        for index, name, group in roi_groups:
-            group_params, fell_back = link_params, True
-            if group.height >= MIN_POINTS_FOR_ROI_FIT:
+        # LinkParams are fitted per class (every cell's nucleus pooled, say):
+        # classes are separated because their D and density differ, and a
+        # pooled D prior would gate one class's steps by the other's, while
+        # one region alone is usually too sparse to fit. Linking is then
+        # done one region at a time, which is what guarantees no track
+        # crosses a region boundary (nucleus -> cytoplasm, cell -> cell).
+        class_areas = _class_areas_px(session)
+        pieces, by_class, next_id = [], {}, 0
+        for name, class_rows, instances in class_groups:
+            class_params, fell_back = link_params, True
+            if class_rows.height >= MIN_POINTS_FOR_CLASS_FIT:
                 try:
-                    group_params, fell_back = tracking.fit_link_params(group), False
+                    class_params, fell_back = tracking.fit_link_params(class_rows), False
                 except Exception:
                     pass
-            linked = tracking.link(group, group_params, brightness=link_with_flux)
-            if linked.height:
-                linked = linked.with_columns(
-                    (pl.col("track_id").cast(pl.Int64) + next_id).alias("track_id")
-                )
-                next_id = int(linked["track_id"].max()) + 1
+            class_pieces = []
+            for rows in instances:
+                linked = tracking.link(rows, class_params, brightness=link_with_flux)
+                if linked.height:
+                    linked = linked.with_columns(
+                        (pl.col("track_id").cast(pl.Int64) + next_id).alias("track_id")
+                    )
+                    next_id = int(linked["track_id"].max()) + 1
+                class_pieces.append(linked)
+            linked = pl.concat(class_pieces, how="vertical_relaxed")
             kept = linked
             if min_track_length > 1 and kept.height:
                 kept = kept.filter(pl.len().over("track_id") >= min_track_length)
-            by_roi[name] = {
-                "roi_index": index,
+            by_class[name] = {
+                "n_regions": len(instances),
                 "fell_back_to_pooled": fell_back,
-                **_link_summary(session, group, kept, group_params, roi_areas.get(index)),
+                **_link_summary(session, class_rows, kept, class_params, class_areas.get(name)),
                 "n_tracks": kept["track_id"].n_unique() if kept.height else 0,
             }
             pieces.append(linked)
@@ -1060,8 +1068,8 @@ def run_track_step(
     report(2, 2, "done")
 
     area_px = None
-    if roi_groups is not None or session.roi:
-        area_px = sum(_roi_areas_px(session).values()) or None
+    if session.labels is not None:
+        area_px = int((session.labels > 0).sum()) or None
     summary = _link_summary(session, link_input, tracks_df, link_params, area_px)
 
     if session.source_params:
@@ -1084,46 +1092,53 @@ def run_track_step(
         "n_points_dropped_as_aggregate": points_df.height - n_after_aggregates,
         "n_points_dropped_by_filter": n_after_aggregates - link_input.height,
         "n_tracks_linked": n_tracks_linked,
-        "by_roi": by_roi,
+        "by_class": by_class,
     }
     return session
 
 
-# Below this many linkable detections an ROI's own `fit_link_params` is
+# Below this many linkable detections a class's own `fit_link_params` is
 # not attempted: the mixture fit over nearest-neighbour distances needs a
 # population to fit, and a handful of points in a small region would give
 # a prior worse than the pooled one it falls back on.
-MIN_POINTS_FOR_ROI_FIT = 50
+MIN_POINTS_FOR_CLASS_FIT = 50
+
+OUTSIDE_CLASS = "(outside)"
+UNASSIGNED_CLASS = "(unassigned)"
 
 
-def _roi_groups(link_input: pl.DataFrame) -> Optional[list[tuple[int, str, pl.DataFrame]]]:
-    """`[(roi_index, name, rows), ...]` when `link_input` is labeled with
-    more than one ROI (`rois.label_points`), else None -- one ROI or none
-    links as a single field, exactly as before ROIs could label. Rows
-    outside every ROI (`roi_index == -1`, possible only for a table
-    labeled after an unrestricted detect) form their own "(outside)"
-    group rather than being dropped."""
-    if "roi_index" not in link_input.columns:
+def _region_groups(
+    link_input: pl.DataFrame,
+) -> Optional[list[tuple[str, pl.DataFrame, list[pl.DataFrame]]]]:
+    """`[(class, class_rows, [rows of each region of that class]), ...]`
+    when `link_input` is labeled with more than one region
+    (`regions.label_points`), else None -- one region or none links as a
+    single field. Rows outside every region (`region == 0`, possible only
+    for a table labeled after an unrestricted detect) form their own
+    "(outside)" class rather than being dropped."""
+    if "region" not in link_input.columns:
         return None
-    indices = sorted(i for i in link_input["roi_index"].unique().to_list() if i is not None)
-    if len(indices) < 2:
+    if link_input["region"].drop_nulls().n_unique() < 2:
         return None
+    classed = link_input.with_columns(
+        pl.when(pl.col("region") == 0)
+        .then(pl.lit(OUTSIDE_CLASS))
+        .otherwise(pl.col("region_class").fill_null(UNASSIGNED_CLASS))
+        .alias("_class")
+    )
     groups = []
-    for index in indices:
-        rows = link_input.filter(pl.col("roi_index") == index)
-        name = rows["roi"][0] if "roi" in rows.columns and rows["roi"][0] is not None else "(outside)"
-        groups.append((index, name, rows))
-    return groups
+    for (name,), class_rows in classed.group_by("_class", maintain_order=True):
+        class_rows = class_rows.drop("_class")
+        instances = [rows for _, rows in class_rows.group_by("region", maintain_order=True)]
+        groups.append((name, class_rows, instances))
+    return sorted(groups, key=lambda g: g[0])
 
 
-def _roi_areas_px(session: PipelineSession) -> dict[int, int]:
-    """Pixel area of each saved ROI, as `rois.label_image` assigns them
-    (overlaps counted once, to the ROI that wins them)."""
-    if not session.roi:
+def _class_areas_px(session: PipelineSession) -> dict[str, int]:
+    """Pixel area of each region class in the session's labels image."""
+    if session.labels is None or session.regions is None:
         return {}
-    labels = roi_tools.label_image(session.roi, session.image.shape[1:])
-    values, counts = np.unique(labels[labels >= 0], return_counts=True)
-    return {int(v): int(c) for v, c in zip(values, counts)}
+    return region_tools.class_areas_px(session.labels, session.regions)
 
 
 def _link_summary(
@@ -1134,8 +1149,8 @@ def _link_summary(
     area_px: Optional[int] = None,
 ) -> dict:
     """The per-run linking numbers `track_summary` reports -- for the
-    whole field, or for one ROI's slice of it. `area_px` is the region
-    the detections could have come from: the ROI(s) when there are any,
+    whole field, or for one region class's slice of it. `area_px` is the
+    area the detections could have come from: the region(s) when there are any,
     else the full frame, so a density (and the crowding verdict built on
     it) isn't diluted by area nothing could be detected in."""
     # The linker's own CRLB, pooled, as one localization precision in
@@ -1243,10 +1258,10 @@ def session_manifest_extra(session: PipelineSession) -> dict:
         "calibration_frame": session.calibration_frame_used,
         "frame_range": list(session.frame_range_used) if session.frame_range_used is not None else None,
         "spotsolve_version": spotsolve.__version__,
-        # Per-ROI linking numbers (`run_track_step` links each ROI on its
-        # own when the table is labeled with more than one) -- None for a
-        # single-field run.
-        "track_summary_by_roi": ts.get("by_roi"),
+        # Per-class linking numbers (`run_track_step` links each region on
+        # its own, with LinkParams fitted per class, when the table is
+        # labeled with more than one) -- None for a single-field run.
+        "track_summary_by_class": ts.get("by_class"),
     }
     # A session rebuilt from a saved bundle never recomputed what earlier
     # stages recorded (the calibration's CI, say): keep the bundle's own
@@ -1266,7 +1281,7 @@ _TRACK_KEYS = frozenset({
     "drop_aggregates", "link_with_flux", "n_points_dropped_as_aggregate",
     "point_filters", "track_filters", "n_points_dropped_by_filter", "n_tracks_linked",
     "density_um2", "crowding_ratio", "resolvability_verdict", "resolvability_message",
-    "track_summary_by_roi",
+    "track_summary_by_class",
 })
 
 
@@ -1281,7 +1296,8 @@ def session_from_bundle(
     points_df: pl.DataFrame,
     tracks_df: Optional[pl.DataFrame],
     manifest: dict,
-    rois: Optional[list[dict]] = None,
+    labels: Optional[np.ndarray] = None,
+    regions: Optional[Regions] = None,
 ) -> PipelineSession:
     """A `PipelineSession` picking up where a saved bundle left off, so
     its detections can be linked (or its tracks re-filtered and re-saved)
@@ -1327,7 +1343,8 @@ def session_from_bundle(
         detector_used=params.get("detector"),
         agg_ratio_used=params.get("agg_ratio"),
         frame_range_used=tuple(frame_range) if frame_range is not None else None,
-        roi=list(rois) if rois else None,
+        labels=labels,
+        regions=regions,
         source_params=params,
         point_filters_used=filters("point_filters"),
     )
@@ -1338,7 +1355,7 @@ def session_from_bundle(
         session.link_with_flux_used = params.get("link_with_flux")
         session.track_filters_used = filters("track_filters")
         session.track_summary = {key: params.get(key) for key in _TRACK_KEYS}
-        session.track_summary["by_roi"] = params.get("track_summary_by_roi")
+        session.track_summary["by_class"] = params.get("track_summary_by_class")
     if session.pixel_size_um is None or session.dt_s is None:
         raise ValueError(
             f"{Path(image_path).name}: the saved bundle records no pixel size / frame "

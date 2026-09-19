@@ -118,8 +118,8 @@ def tracks_summary_table(
     experiments.
 
     `base` is the diffusion widget's per-track table (length, centroid in
-    px, shape from diffusionkit's `track_geometry`, `roi`, and per-point
-    detection QC aggregated per track); `classical` the classical run's
+    px, shape from diffusionkit's `track_geometry`, `region_class`/`cell`,
+    and per-point detection QC aggregated per track); `classical` the classical run's
     `mle_track_table`, or None before a run. Kept from `base`: every
     column except the per-point min/max, so the detection quality of a
     track reads as its mean `flux`, `bg`, `fit_sigma`, `se_x`/`se_y`, ...
@@ -156,7 +156,7 @@ def tracks_summary_table(
     lead = [
         c
         for c in (
-            "result_id", "track_id", "roi", "passes_filters", "track_length", "duration_s",
+            "result_id", "track_id", "region_class", "cell", "passes_filters", "track_length", "duration_s",
             "mean_step_um", "x_um", "y_um", "x_px", "y_px",
         )
         if c in table.columns
@@ -232,7 +232,7 @@ def summarize_mle(fits: pl.DataFrame) -> dict:
 
 
 def summarize_mle_by_group(fits: pl.DataFrame, groups: pl.DataFrame) -> dict[str, dict]:
-    """`summarize_mle` per group -- e.g. per ROI, when each region's
+    """`summarize_mle` per group -- e.g. per region class, when each region's
     tracks were linked on their own and the question is whether their
     motion differs. `groups` has `track_id` plus a `group` column; tracks
     it doesn't list are left out, and groups come back in `groups`' own

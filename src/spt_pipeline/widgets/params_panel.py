@@ -106,31 +106,20 @@ The Detect tab also exposes *scope* controls -- which frames and which
 pixels get analyzed, not how -- kept in its core section since these are
 exactly what make "explore one image incrementally" (this widget's whole
 point, vs. blindly running a batch job) practical: a frame-range pair
-(`get_frame_range`) and a "restrict to ROI" checkbox
-(`get_use_roi_mask`), plus a checkable list of Shapes layers (`get_roi_layer_names`)
-and a "Draw ROI…" button (`newRoiRequested`) that just asks for a fresh
-Shapes layer to draw on. A "cores" spinbox (`get_n_threads`) sits beside
-the frame range -- `localize_stack`'s `n_threads`, defaulted to every
-core (see `pipeline.run_detect_step`'s docstring for why this speeds up
-even the interactively-watched run, not just a headless batch).
-
-The list is what makes several ROIs on screen at once workable: draw as
-many Shapes layers as you like (rename them in napari's layer list -- the
-name shown here follows, and it's the name the ROI is saved under and its
-detections are labeled with, see `spt_pipeline.rois`), then check which
-ones this run covers. Each checked layer is one region; with more than one
-checked, tracking links each region on its own (`pipeline.run_track_step`).
-It replaced "whichever Shapes layer happens to be active", where the
-targeted region silently changed whenever the layer selection did -- and
-where a second ROI could only be used by clicking the right layer first.
+(`get_frame_range`) and the regions controls (`regions_panel`, a
+`widgets.regions_panel.RegionsPanel`): a "restrict to regions" checkbox,
+the Labels layer the regions are painted on, and the table naming each
+label's class and cell (see `spt_pipeline.regions`). A "cores" spinbox
+(`get_n_threads`) sits beside the frame range -- `localize_stack`'s
+`n_threads`, defaulted to every core (see `pipeline.run_detect_step`'s
+docstring for why this speeds up even the interactively-watched run, not
+just a headless batch).
 
 This widget stays viewer-agnostic (no napari `Viewer` reference), so
 `ExperimentListWidget` (which owns the viewer) is responsible for adding
-that layer (persistent/2D, transparent fill, polygon-lasso tool active --
-see `_on_new_roi_requested`), for keeping the list's contents in sync
-with the viewer's Shapes layers (`set_roi_choices`), and, once the ROI
-checkbox is checked, for turning the checked layers into the boolean mask
-array `spotsolve`'s `roi` argument expects and the labels each detection
+a regions layer when asked, keeping the layer picker in step with the
+viewer's Labels layers, and turning the chosen layer into the boolean
+mask `spotsolve`'s `roi` argument expects and the labels each detection
 is stamped with.
 """
 
@@ -141,7 +130,7 @@ from typing import Optional
 
 import polars as pl
 import spotsolve
-from qtpy.QtCore import Qt, Signal
+from qtpy.QtCore import Signal
 from qtpy.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -149,8 +138,6 @@ from qtpy.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QPushButton,
     QSpinBox,
     QTabWidget,
@@ -169,6 +156,7 @@ from spt_pipeline.pipeline import (
     FilterSpec,
 )
 from spt_pipeline.widgets.feature_filters import FeatureFilterPanel
+from spt_pipeline.widgets.regions_panel import RegionsPanel
 
 
 # A dock this narrow has no room for a numeric field to claim more width
@@ -283,7 +271,7 @@ class _DetectTab(QWidget):
     read noise are measured from each frame now), `sigma` with its preview
     loop (see this module's docstring -- this is what replaced the
     Calibration tab), the `detector` dropdown, that detector's own knobs, the
-    aggregate cut, a frame range and a "restrict to ROI" checkbox.
+    aggregate cut, a frame range and the regions controls.
 
     Two detectors, two knob sets, never both on screen at once -- the
     dropdown's choice sets which rows `_on_detector_changed` shows:
@@ -308,8 +296,6 @@ class _DetectTab(QWidget):
     previewRequested = Signal()
     runRequested = Signal()
     cancelRequested = Signal()
-    newRoiRequested = Signal()
-    roiLayerChanged = Signal()
     filtersChanged = Signal()
     saveRequested = Signal()
 
@@ -514,7 +500,7 @@ class _DetectTab(QWidget):
 
         # What gets analyzed, not how -- kept in core (not expert) since
         # these are exactly the knobs that let one image be explored
-        # incrementally (a few frames, a drawn ROI) instead of always
+        # incrementally (a few frames, painted regions) instead of always
         # committing to the whole stack. `set_frame_bounds` is called by
         # `ExperimentListWidget` once an image's frame count is known;
         # 0/0 means "process everything" (the common case, and the only
@@ -552,50 +538,7 @@ class _DetectTab(QWidget):
         cores_row.addWidget(self.n_threads)
         cores_row.addStretch()
 
-        self.use_roi_mask = QCheckBox("restrict to ROI")
-        self.use_roi_mask.setToolTip(
-            "Only place emitters inside the Shapes layers checked in the list\n"
-            "below (spotsolve's roi argument). Draw one with the button next to\n"
-            "it, or in napari, first."
-        )
-        # Which Shapes layers, chosen by name rather than by whatever
-        # happens to be selected in napari's layer list -- see this
-        # module's docstring. Kept in sync by `set_roi_choices`; each entry
-        # is the live layer name, so renaming a layer in napari renames it
-        # here (and that name is what the ROI is saved under and what its
-        # detections are labeled with).
-        self.roi_layers = QListWidget()
-        self.roi_layers.setToolTip(
-            "Which Shapes layers to use as ROIs -- each checked layer is one\n"
-            "region, named after the layer. Detections are labeled with the\n"
-            "region they fall in (the 'roi' column), and with more than one\n"
-            "region checked, tracking links each region separately, so no\n"
-            "track crosses a boundary and each gets its own fitted D.\n"
-            "Where regions overlap, the one higher in this list (and in\n"
-            "napari's layer list) wins."
-        )
-        # Compact: a few rows is plenty, and this sits in a tall tab.
-        self.roi_layers.setMaximumHeight(4 * self.roi_layers.fontMetrics().height() + 12)
-        self.roi_layers.itemChanged.connect(lambda _item: self.roiLayerChanged.emit())
-        self.new_roi_button = QPushButton("Draw ROI…")
-        self.new_roi_button.setToolTip(
-            "Add a new Shapes layer (transparent fill, polygon-lasso tool active)\n"
-            "for drawing the ROI -- 2D so it stays visible on every frame instead\n"
-            "of only the one it was drawn on. Each click adds another, so several\n"
-            "regions can be kept side by side and checked together."
-        )
-        self.new_roi_button.clicked.connect(self.newRoiRequested.emit)
-        roi_top = QHBoxLayout()
-        roi_top.setContentsMargins(0, 0, 0, 0)
-        roi_top.addWidget(self.use_roi_mask)
-        roi_top.addStretch()
-        roi_top.addWidget(self.new_roi_button)
-        roi_row = QVBoxLayout()
-        roi_row.setContentsMargins(0, 0, 0, 0)
-        roi_row.addLayout(roi_top)
-        roi_row.addWidget(self.roi_layers)
-        self._sync_roi_row()
-        self.use_roi_mask.toggled.connect(self._sync_roi_row)
+        self.regions_panel = RegionsPanel()
 
         # `slack` is the width range a fit may take; `band` the narrower
         # range actually reported as a detection. Both are multiples of
@@ -704,7 +647,7 @@ class _DetectTab(QWidget):
         detect_layout.addWidget(hline())
         detect_layout.addLayout(frame_row)
         detect_layout.addLayout(cores_row)
-        detect_layout.addLayout(roi_row)
+        detect_layout.addWidget(self.regions_panel)
         detect_layout.addWidget(_expert_section(expert_form))
         detect_layout.addWidget(hline())
         detect_layout.addLayout(run_row)
@@ -899,54 +842,6 @@ class _DetectTab(QWidget):
 
     def get_n_threads(self) -> int:
         return self.n_threads.value()
-
-    def get_use_roi_mask(self) -> bool:
-        return self.use_roi_mask.isChecked()
-
-    def set_use_roi_mask(self, enabled: bool) -> None:
-        self.use_roi_mask.setChecked(enabled)
-
-    def get_roi_layer_names(self) -> list[str]:
-        """Names of the checked Shapes layers, in list order (napari's
-        layer list, top first -- which is also overlap precedence, see
-        `spt_pipeline.rois.label_image`). Empty if none is checked."""
-        return [
-            self.roi_layers.item(i).text()
-            for i in range(self.roi_layers.count())
-            if self.roi_layers.item(i).checkState() == Qt.CheckState.Checked
-        ]
-
-    def set_roi_choices(self, names: list[str], checked: Optional[list[str]] = None) -> None:
-        """Replace the list's entries with the viewer's current Shapes
-        layer names, checking `checked` (the caller's own record of which
-        *layers* are targeted, which is how a rename keeps its check
-        instead of dropping it). With no record (`checked=None`: nothing
-        was ever picked) it keeps whichever checked names survived, else
-        checks the first entry -- the top of napari's layer list, which is
-        the order `ExperimentListWidget` passes them in.
-
-        Signals are blocked across the rebuild so this can't be mistaken
-        for the user picking something: `roiLayerChanged` is meant to fire
-        only when they actually change the targets."""
-        wanted = set(checked) if checked is not None else set(self.get_roi_layer_names())
-        wanted &= set(names)
-        if checked is None and not wanted and names:
-            wanted = {names[0]}
-        blocked = self.roi_layers.blockSignals(True)
-        self.roi_layers.clear()
-        for name in names:
-            item = QListWidgetItem(name)
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Checked if name in wanted else Qt.CheckState.Unchecked)
-            self.roi_layers.addItem(item)
-        self.roi_layers.blockSignals(blocked)
-        self._sync_roi_row()
-
-    def _sync_roi_row(self) -> None:
-        """Grey the list out unless the ROI checkbox is on and there is
-        something to pick, so an empty/irrelevant picker doesn't read as a
-        setting that is doing something."""
-        self.roi_layers.setEnabled(self.use_roi_mask.isChecked() and self.roi_layers.count() > 0)
 
     def get_agg_ratio(self) -> float:
         return self.agg_ratio.value()
@@ -1452,7 +1347,7 @@ class _TrackingTab(QWidget):
             "Write the bundle: points.parquet (every detection, unfiltered),\n"
             "tracks.parquet (the tracks that pass the filters above),\n"
             "manifest.json (what every stage ran with, including both filter\n"
-            "specs) and rois.json if an ROI was used.\n\n"
+            "specs) and labels.tif + regions.json if regions were used.\n\n"
             "Nothing is written until you press this -- adjust the filters and\n"
             "press it again to rewrite the same bundle.",
         )
@@ -1517,8 +1412,6 @@ class PipelineParamsWidget(QWidget):
     trackRequested = Signal()
     saveRequested = Signal()
     saveDetectionsRequested = Signal()
-    newRoiRequested = Signal()
-    roiLayerChanged = Signal()
     pointFiltersChanged = Signal()
     trackFiltersChanged = Signal()
     # The pixel size / frame interval override was turned on, off or
@@ -1535,8 +1428,6 @@ class PipelineParamsWidget(QWidget):
         self._detect.previewRequested.connect(self.previewRequested)
         self._detect.runRequested.connect(self.detectRequested)
         self._detect.cancelRequested.connect(self.detectCancelRequested)
-        self._detect.newRoiRequested.connect(self.newRoiRequested)
-        self._detect.roiLayerChanged.connect(self.roiLayerChanged)
         self._detect.filtersChanged.connect(self.pointFiltersChanged)
         self._detect.saveRequested.connect(self.saveDetectionsRequested)
         self._tracking.runRequested.connect(self.trackRequested)
@@ -1644,17 +1535,9 @@ class PipelineParamsWidget(QWidget):
     def get_n_threads(self) -> int:
         return self._detect.get_n_threads()
 
-    def get_use_roi_mask(self) -> bool:
-        return self._detect.get_use_roi_mask()
-
-    def set_use_roi_mask(self, enabled: bool) -> None:
-        self._detect.set_use_roi_mask(enabled)
-
-    def get_roi_layer_names(self) -> list[str]:
-        return self._detect.get_roi_layer_names()
-
-    def set_roi_choices(self, names: list[str], checked: Optional[list[str]] = None) -> None:
-        self._detect.set_roi_choices(names, checked)
+    @property
+    def regions_panel(self) -> RegionsPanel:
+        return self._detect.regions_panel
 
     def set_preview_result(self, summary: Optional[dict], level: str = "neutral") -> None:
         self._detect.set_preview_result(summary, level)
