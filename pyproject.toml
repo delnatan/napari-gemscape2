@@ -52,11 +52,26 @@ where = ["src"]
 "*" = ["*.yaml"]
 
 [tool.uv.sources]
-# maturin builds the Rust extension from the sibling checkout; a Rust
-# change needs a re-sync (`uv sync --reinstall-package spotsolve`).
-spotsolve = { path = "../spotsolve", editable = true }
-diffusionkit = { path = "../diffusionkit", editable = true }
-# Developed on its own (and as an editable member of the microscopy
-# workspace); this follows its main branch, and `uv lock --upgrade-package
-# qtkit` is what brings a newer commit in.
+# The standard install: no Rust toolchain and no sibling checkouts. spotsolve
+# comes from its GitHub release -- one abi3 wheel per platform, picked by
+# marker -- and falls back to the release's sdist (which needs Rust) anywhere
+# else, rather than to PyPI, where the name is not ours. To bump it, change
+# the version in every URL below and re-run `uv lock`.
+#
+# For development against local checkouts of spotsolve/diffusionkit/qtkit,
+# use the workspace in dev/ instead (see README "Setup"); it overrides all
+# three sources.
+spotsolve = [
+    { url = "https://github.com/delnatan/spotsolve/releases/download/v0.1.0/spotsolve-0.1.0-cp39-abi3-macosx_11_0_arm64.whl", marker = "sys_platform == 'darwin' and platform_machine == 'arm64'" },
+    { url = "https://github.com/delnatan/spotsolve/releases/download/v0.1.0/spotsolve-0.1.0-cp39-abi3-macosx_10_12_x86_64.whl", marker = "sys_platform == 'darwin' and platform_machine == 'x86_64'" },
+    { url = "https://github.com/delnatan/spotsolve/releases/download/v0.1.0/spotsolve-0.1.0-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+    { url = "https://github.com/delnatan/spotsolve/releases/download/v0.1.0/spotsolve-0.1.0-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
+    { url = "https://github.com/delnatan/spotsolve/releases/download/v0.1.0/spotsolve-0.1.0-cp39-abi3-win_amd64.whl", marker = "sys_platform == 'win32' and platform_machine == 'AMD64'" },
+    { url = "https://github.com/delnatan/spotsolve/releases/download/v0.1.0/spotsolve-0.1.0.tar.gz", marker = "(sys_platform != 'darwin' or platform_machine != 'arm64') and (sys_platform != 'darwin' or platform_machine != 'x86_64') and (sys_platform != 'linux' or platform_machine != 'x86_64') and (sys_platform != 'linux' or platform_machine != 'aarch64') and (sys_platform != 'win32' or platform_machine != 'AMD64')" },
+]
+# Pure Python; follows main, and uv.lock pins the commit. Note that PyPI's
+# `diffusionkit` is an unrelated package, so this source must stay.
+diffusionkit = { git = "https://github.com/delnatan/diffusionkit.git", branch = "main" }
+# Follows main likewise; `uv lock --upgrade-package qtkit` brings a newer
+# commit in.
 qtkit = { git = "https://github.com/delnatan/qtkit.git", branch = "main" }

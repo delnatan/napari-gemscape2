@@ -188,16 +188,38 @@ shown bare rather than guessed at.
 
 ## Setup
 
-The project has its own `uv`-managed virtual environment in `.venv`. `spotsolve`
-(one distribution with its Rust extension bundled, built here by maturin) and
-`diffusionkit` are path dependencies on sibling checkouts:
+Two ways to install, each its own `uv` environment.
+
+**Standard** — on any machine with [uv](https://docs.astral.sh/uv/), no Rust
+toolchain and no other checkouts:
 
 ```
-uv sync                 # add --extra bayes for the NUTS tab (JAX, NumPyro)
+git clone https://github.com/delnatan/napari-gemscape2.git
+cd napari-gemscape2
+uv sync                  # add --extra bayes for the NUTS tab (JAX, NumPyro)
+uv run napari
 ```
 
-Re-run `uv sync --reinstall-package spotsolve` after changing `spotsolve`'s Rust
-core, so the extension is rebuilt.
+`spotsolve` comes from its GitHub release wheel for your platform (macOS arm64
+and x86-64, Linux x86-64 and aarch64, Windows x86-64; anywhere else its sdist,
+which needs Rust), `diffusionkit` and `qtkit` from git. `uv.lock` pins all of
+them; `uv lock --upgrade-package diffusionkit` (or `qtkit`) moves to the latest
+commit, and a new spotsolve release means editing the version in
+`pyproject.toml`'s URLs.
+
+**Development** — `dev/` is a uv workspace over local checkouts of
+`spotsolve`, `diffusionkit` and `qtkit` next to this repo, all editable, with
+spotsolve's Rust extension built from source (needs [Rust](https://rustup.rs)):
+
+```
+./dev/bootstrap.sh       # clones whichever of the three is missing, then syncs
+uv run --project dev napari
+uv run --project dev --package spotsolve pytest     # a library's own tests
+```
+
+It includes the `[bayes]` extra plus maturin, pytest and ruff. Python edits in
+any of the four packages take effect on restart; after changing spotsolve's
+Rust code, rebuild with `uv sync --project dev --reinstall-package spotsolve`.
 
 ## Usage
 
