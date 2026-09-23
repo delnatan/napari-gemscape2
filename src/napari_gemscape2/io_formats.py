@@ -5,7 +5,7 @@ deliberately not a dependency on pyvistra itself: pyvistra's lazy 5D
 proxy/memmap machinery exists to support its interactive viewer, and this
 pipeline always wants the full stack in memory anyway
 (`spotsolve.localize_stack` is rayon-parallel over the whole array). Keeping this module self-contained
-(numpy/tifffile/h5py + the optional `nd2` package) also means spt-pipeline
+(numpy/tifffile/h5py + the optional `nd2` package) also means napari-gemscape2
 doesn't need to drag in pyvistra's viewer/app dependencies, which matters
 since this package is meant to eventually stand alone outside the
 microscopy workspace.
@@ -49,8 +49,8 @@ from xml.etree import ElementTree
 import numpy as np
 import tifffile
 
-from spt_pipeline import units
-from spt_pipeline.readers.imaris import ImarisReader
+from napari_gemscape2 import units
+from napari_gemscape2.readers.imaris import ImarisReader
 
 SUPPORTED_SUFFIXES = {".tif", ".tiff", ".nd2", ".ims"}
 

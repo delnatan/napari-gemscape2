@@ -28,10 +28,10 @@ from typing import Optional
 import numpy as np
 import polars as pl
 
-from spt_pipeline.io_formats import StackMetadata
-from spt_pipeline.results import load_result
-from spt_pipeline.pipeline import load_stack, track_features_df
-from spt_pipeline.regions import LABELS_DTYPE, Regions
+from napari_gemscape2.io_formats import StackMetadata
+from napari_gemscape2.results import load_result
+from napari_gemscape2.pipeline import load_stack, track_features_df
+from napari_gemscape2.regions import LABELS_DTYPE, Regions
 
 # color_by defaults to track_length so a broken/short track (a linking
 # failure) stands out from a long one at a glance, instead of napari's
@@ -240,7 +240,7 @@ def add_tracks_layer(
 
 # The Tracks layer's own `data` columns; every other numeric column on a
 # track table rides along as a per-vertex property. Non-numeric ones (the
-# `region_class` name, see `spt_pipeline.regions.label_points`) stay off:
+# `region_class` name, see `napari_gemscape2.regions.label_points`) stay off:
 # a Tracks layer's properties feed its colormaps, and the region is carried
 # there as its `region` label instead, named through the layer's
 # `region_classes` metadata ({label: class}).
@@ -383,7 +383,7 @@ REGIONS_LAYER_NAME = "regions"
 
 def add_regions_layer(viewer, labels: np.ndarray, regions: Regions | None = None, name: str = REGIONS_LAYER_NAME):
     """A 2D Labels layer holding a regions image (see
-    `spt_pipeline.regions`), its `Regions` table kept on the layer's
+    `napari_gemscape2.regions`), its `Regions` table kept on the layer's
     metadata where `widgets.regions_panel` reads it. 2D, fewer dims than
     the image stack, so it shows on every frame."""
     return viewer.add_labels(
@@ -396,7 +396,7 @@ def add_regions_layer(viewer, labels: np.ndarray, regions: Regions | None = None
 
 def show_result(viewer, loaded: ResultDisplay) -> None:
     """Clear `viewer` and add the image/points/tracks/regions layers for
-    one loaded bundle -- saved regions (see `spt_pipeline.regions`) come
+    one loaded bundle -- saved regions (see `napari_gemscape2.regions`) come
     back as a Labels layer, so the regions used for detection are visible
     again (and reusable, or editable), not just the results."""
     show_image(viewer, loaded.image)
@@ -419,7 +419,7 @@ def show_result(viewer, loaded: ResultDisplay) -> None:
 
 
 def launch_viewer(result_dir: str | Path):
-    """Standalone entry point (`spt view <dir>`) -- opens a fresh napari
+    """Standalone entry point (`gemscape2 view <dir>`) -- opens a fresh napari
     window with one bundle's layers loaded, blocking until it's closed."""
     import napari
 

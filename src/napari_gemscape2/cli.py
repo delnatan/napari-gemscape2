@@ -1,4 +1,4 @@
-"""`spt` CLI: headless, config-driven, unattended batch runner.
+"""`gemscape2` CLI: headless, config-driven, unattended batch runner.
 
 For scripted/reproducible runs outside napari. Calls the exact same
 `pipeline.run_detect_track` the interactive widget uses -- see
@@ -12,9 +12,9 @@ from pathlib import Path
 
 import typer
 
-from spt_pipeline import units
-from spt_pipeline.results import build_manifest, repo_shas, write_result
-from spt_pipeline.pipeline import DetectTrackParams, run_detect_track
+from napari_gemscape2 import units
+from napari_gemscape2.results import build_manifest, repo_shas, write_result
+from napari_gemscape2.pipeline import DetectTrackParams, run_detect_track
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -47,9 +47,9 @@ def detect_track(
     params = DetectTrackParams(**param_cfg)
 
     import spotsolve
-    import spt_pipeline
+    import napari_gemscape2
 
-    shas = repo_shas(spotsolve, spt_pipeline)
+    shas = repo_shas(spotsolve, napari_gemscape2)
 
     for entry in cfg["inputs"]:
         image_path = Path(entry["path"])
@@ -96,7 +96,7 @@ def detect_track(
 @app.command("view")
 def view(result_dir: Path) -> None:
     """Launch napari and load ONE results bundle's layers."""
-    from spt_pipeline.viewer import launch_viewer
+    from napari_gemscape2.viewer import launch_viewer
 
     launch_viewer(result_dir)
 

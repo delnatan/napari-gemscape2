@@ -6,7 +6,7 @@ to that one comparison. This generalizes it to arbitrary columns/labels/log
 scaling so any two trajectory properties (classical vs Bayesian D, alpha,
 r2, track length, anisotropy epsilon, ...) can be compared the same way.
 
-Axis labels default to `spt_pipeline.units.mpl_label(column)` rather than
+Axis labels default to `napari_gemscape2.units.mpl_label(column)` rather than
 to the raw column name: since the axes here are picked at runtime from
 whatever the tracks pane holds, a plot could otherwise put
 `radius_of_gyration_um` (µm) against `se_x_max` (px) with nothing on
@@ -24,8 +24,8 @@ import polars as pl
 import seaborn as sns
 from matplotlib.figure import Figure
 
-from spt_pipeline import units
-from spt_pipeline.diffusion import resolved_mle_rows
+from napari_gemscape2 import units
+from napari_gemscape2.diffusion import resolved_mle_rows
 
 
 def plot_property_joint(

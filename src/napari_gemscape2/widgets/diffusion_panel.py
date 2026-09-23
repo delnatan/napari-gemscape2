@@ -92,7 +92,7 @@ Both unit systems are therefore on screen at once, which is why nothing
 here shows a bare number:
 
   - the tracks pane's headers carry each column's unit
-    (`_UnitHeaderModel` over `spt_pipeline.units`), since `se_x_max` (px)
+    (`_UnitHeaderModel` over `napari_gemscape2.units`), since `se_x_max` (px)
     and `se_x_um_max` (µm) are adjacent columns of the same quantity;
   - each fit readout formats through `units.fmt`, including the per-track
     Bayesian fit, whose parameters are a D, a K, an alpha and a
@@ -162,8 +162,8 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from spt_pipeline import units
-from spt_pipeline.diffusion import (
+from napari_gemscape2 import units
+from napari_gemscape2.diffusion import (
     mle_rows,
     mle_track_table,
     msd_track_table,
@@ -172,21 +172,21 @@ from spt_pipeline.diffusion import (
     tracks_summary_table,
     tracks_to_diffusionkit_df,
 )
-from spt_pipeline.results import (
+from napari_gemscape2.results import (
     TRACKS_SUMMARY_FILENAME,
     load_diffusion_results,
     repo_shas,
     write_diffusion_results,
 )
-from spt_pipeline.joint_plot import (
+from napari_gemscape2.joint_plot import (
     numeric_columns,
     plot_d_histogram,
     plot_d_z_joint,
     plot_property_joint,
 )
-from spt_pipeline.pipeline import filter_mask
-from spt_pipeline.viewer import set_tracks_layer_data
-from spt_pipeline.widgets.feature_filters import FeatureFilterPanel
+from napari_gemscape2.pipeline import filter_mask
+from napari_gemscape2.viewer import set_tracks_layer_data
+from napari_gemscape2.widgets.feature_filters import FeatureFilterPanel
 
 # Look for the two viewer overlays this widget owns -- kept visually
 # distinct from DETECTED_POINTS_STYLE's magenta "+" (viewer.py) so a
@@ -348,7 +348,7 @@ class _UnitHeaderModel(ColumnTableModel):
     `radius_of_gyration_um` in µm, `flux_mean` in camera counts,
     `D_map_um2_s` in µm²/s -- 40-odd columns whose unit is a naming
     convention at best (`_um`) and absent at worst (`flux`, `se_x`,
-    `fit_sigma`). So each header shows `spt_pipeline.units.header` (the
+    `fit_sigma`). So each header shows `napari_gemscape2.units.header` (the
     name with its unit bracketed, the unit stated once) and each header's
     tooltip the exact column name, which is what the value is stored and
     filtered under.
@@ -536,7 +536,7 @@ def _normalize_map_table(table: pl.DataFrame, model: str) -> pl.DataFrame:
 
 
 # diffusionkit's per-track parameter names mapped to the column names
-# `spt_pipeline.units` knows their units by. Only `sigma` actually needs
+# `napari_gemscape2.units` knows their units by. Only `sigma` actually needs
 # the indirection, and it needs it badly: in a `TrackFit` it is the fitted
 # LOCALIZATION error in µm (diffusionkit's own bulk table calls it
 # `sigma_median_um`), while the same bare name in spotsolve's localization
@@ -552,12 +552,12 @@ _PARAM_COLUMNS = {
 
 def _analysis_repo_shas() -> dict:
     """Provenance for saved diffusion results: the diffusionkit and
-    spt_pipeline checkouts that computed them (the bundle's manifest
+    napari_gemscape2 checkouts that computed them (the bundle's manifest
     already records what produced the tracks)."""
     import diffusionkit
-    import spt_pipeline
+    import napari_gemscape2
 
-    return repo_shas(diffusionkit, spt_pipeline)
+    return repo_shas(diffusionkit, napari_gemscape2)
 
 
 def _label_corner_axes(figure, param_names: list[str]) -> None:
@@ -1704,7 +1704,7 @@ class _BayesianTab(QWidget):
         # "sigma"), and each carries a different unit -- which this
         # readout used to leave off entirely, so a D and an alpha were
         # printed identically. `_PARAM_COLUMNS` maps each to the column
-        # name `spt_pipeline.units` knows it by.
+        # name `napari_gemscape2.units` knows it by.
         lines = [f"track {fit.track_id}, model={fit.model}, method={fit.method}"]
         for name, value in fit.params.items():
             column = _PARAM_COLUMNS.get(name, name)
@@ -2343,7 +2343,7 @@ class DiffusionAnalysisWidget(QWidget):
         track_id/frame/y/x/se_y/se_x) and the per-track QC aggregates.
 
         None when the layer has no `se_y`/`se_x` (spotsolve's per-detection
-        CRLB, renamed for diffusionkit in spt_pipeline.diffusion). Requiring
+        CRLB, renamed for diffusionkit in napari_gemscape2.diffusion). Requiring
         them is how a Tracks layer from this pipeline is told apart from
         any other: without a position error there is no noise term to fit,
         so the check is load-bearing, not cosmetic."""

@@ -1,6 +1,6 @@
 """Vendored (near-verbatim) from pyvistra.readers.imaris -- self-contained
 (only h5py/numpy), copied directly rather than depending on pyvistra so
-spt-pipeline can eventually stand alone outside the microscopy workspace.
+napari-gemscape2 can eventually stand alone outside the microscopy workspace.
 """
 
 import json
@@ -43,7 +43,7 @@ class ImarisReader:
         # in the file, as opposed to the (0.0, 1.0) defaults below -- see
         # `_parse_metadata`. False means "no calibration", which a caller
         # cannot otherwise tell from the plausible-looking 1/width voxel
-        # size those defaults produce (spt_pipeline.io_formats._load_ims).
+        # size those defaults produce (napari_gemscape2.io_formats._load_ims).
         self.voxel_size_known = False
         # The unit the extents (and so `voxel_size`) are in, as recorded
         # in DataSetInfo/Image's "Unit" attribute. Usually "um"; None when

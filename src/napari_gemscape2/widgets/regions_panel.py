@@ -2,7 +2,7 @@
 and labels a run, and what each of its labels means.
 
 A region is one label value on a napari Labels layer (see
-`spt_pipeline.regions`). Painting is napari's own job -- brush, fill,
+`napari_gemscape2.regions`). Painting is napari's own job -- brush, fill,
 polygon and eraser on the layer -- and this panel adds what the image
 can't hold by itself: a class and a cell id per label, edited in a small
 table that follows the layer as it is painted (`_on_layer_painted`,
@@ -47,7 +47,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from spt_pipeline.regions import Region, Regions, present_labels, sync_table
+from napari_gemscape2.regions import Region, Regions, present_labels, sync_table
 
 METADATA_KEY = "regions"
 _NUCLEUS = "nucleus"

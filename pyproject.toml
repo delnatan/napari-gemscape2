@@ -3,9 +3,9 @@ requires = ["setuptools>=64.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "spt-pipeline"
+name = "napari-gemscape2"
 version = "0.1.0"
-description = "Batch orchestration + napari QC viewer connecting spotsolve (localization/tracking) and diffusionkit (diffusion analysis)"
+description = "napari plugin for single-particle tracking: spotsolve (localization/tracking) and diffusionkit (diffusion analysis)"
 readme = "README.md"
 requires-python = ">=3.13"
 license = { text = "MIT" }
@@ -25,27 +25,22 @@ dependencies = [
     "natsort",
     "qtpy",
     "napari[pyqt6]",
+    # One distribution with the Rust extension (`spotsolve_rs`) bundled.
     "spotsolve",
-    # The Rust extension `spotsolve` needs at import time. Not published:
-    # built from the sibling crate at ../spotsolve/rust/spotsolve-py (see
-    # [tool.uv.sources]), which is why it is named here explicitly rather
-    # than pulled in as one of spotsolve's own dependencies.
-    "spotsolve-rs",
-    # The [nested] extra (jaxns) is not optional for this project: the
-    # diffusion widget's Anisotropy tab calls diffusionkit.bayes.anisotropy,
-    # whose per-track evidence now comes from nested sampling. jaxns is
-    # imported lazily inside the fit, so without the extra the tab imports
-    # fine and then fails on the first run -- exactly the failure mode worth
-    # spending a dependency to avoid.
-    "diffusionkit[nested]",
+    "diffusionkit",
     "qtkit",
 ]
 
+[project.optional-dependencies]
+# Per-track NUTS in the diffusion widget (`diffusionkit.bayes.fit_track`).
+# Optional: it pulls in JAX/NumPyro, and the widget runs without it.
+bayes = ["diffusionkit[bayes,plots]"]
+
 [project.scripts]
-spt = "spt_pipeline.cli:main"
+gemscape2 = "napari_gemscape2.cli:main"
 
 [project.entry-points."napari.manifest"]
-spt-pipeline = "spt_pipeline:napari.yaml"
+napari-gemscape2 = "napari_gemscape2:napari.yaml"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
@@ -57,10 +52,9 @@ where = ["src"]
 "*" = ["*.yaml"]
 
 [tool.uv.sources]
+# maturin builds the Rust extension from the sibling checkout; a Rust
+# change needs a re-sync (`uv sync --reinstall-package spotsolve`).
 spotsolve = { path = "../spotsolve", editable = true }
-# Not editable: a compiled extension has nothing to pick up from the
-# source tree, and a plain path install builds it via maturin in release.
-spotsolve-rs = { path = "../spotsolve/rust/spotsolve-py" }
 diffusionkit = { path = "../diffusionkit", editable = true }
 # Developed on its own (and as an editable member of the microscopy
 # workspace); this follows its main branch, and `uv lock --upgrade-package

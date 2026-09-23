@@ -348,7 +348,7 @@ def tooltip(column: str) -> str:
         return f"{column} — in {unit}"
     if is_known(column):
         return f"{column} — dimensionless"
-    return f"{column} — unit not registered (see spt_pipeline.units)"
+    return f"{column} — unit not registered (see napari_gemscape2.units)"
 
 
 def mpl_label(column: str) -> str:

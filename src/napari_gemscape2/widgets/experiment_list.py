@@ -58,7 +58,7 @@ that actually guarantees per stage.
 There is deliberately no multi-file "run everything" here: an unattended
 run can't use the filter histograms, and a second, hands-off path through
 the same widget blurred what a saved bundle meant. Running a folder
-headlessly is the `spt detect-track` CLI's job (`pipeline.run_detect_track`);
+headlessly is the `gemscape2 detect-track` CLI's job (`pipeline.run_detect_track`);
 pooling results across experiments is a script's job, over the saved
 bundles.
 
@@ -119,8 +119,8 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from spt_pipeline import units
-from spt_pipeline.results import (
+from napari_gemscape2 import units
+from napari_gemscape2.results import (
     build_manifest,
     result_dir_for,
     has_result,
@@ -129,8 +129,8 @@ from spt_pipeline.results import (
     write_detection_result,
     write_result,
 )
-from spt_pipeline.io_formats import SUPPORTED_SUFFIXES as SUPPORTED_FORMATS
-from spt_pipeline.pipeline import (
+from napari_gemscape2.io_formats import SUPPORTED_SUFFIXES as SUPPORTED_FORMATS
+from napari_gemscape2.pipeline import (
     PipelineCancelled,
     PipelineSession,
     apply_filters,
@@ -144,8 +144,8 @@ from spt_pipeline.pipeline import (
     track_features_df,
     track_metrics_df,
 )
-from spt_pipeline.regions import Regions, label_points
-from spt_pipeline.viewer import (
+from napari_gemscape2.regions import Regions, label_points
+from napari_gemscape2.viewer import (
     ImageDisplay,
     ResultDisplay,
     add_image_layer,
@@ -162,15 +162,15 @@ from spt_pipeline.viewer import (
     show_image,
     show_result,
 )
-from spt_pipeline.widgets.params_panel import PipelineParamsWidget
+from napari_gemscape2.widgets.params_panel import PipelineParamsWidget
 
 
 def _repo_shas() -> dict:
     """Provenance for a bundle's manifest: the checkouts that produced it."""
     import spotsolve
-    import spt_pipeline
+    import napari_gemscape2
 
-    return repo_shas(spotsolve, spt_pipeline)
+    return repo_shas(spotsolve, napari_gemscape2)
 
 
 def _dropped_folder(event) -> Optional[Path]:
@@ -1156,7 +1156,7 @@ class ExperimentListWidget(QWidget):
         # linking is suspect, and neither number alone would show it.
         dropped = summary.get("n_points_dropped_by_filter") or 0
         filtered = f"  ({dropped} points cut by filters)" if dropped else ""
-        # Units from `spt_pipeline.units` rather than spelled out here, so
+        # Units from `napari_gemscape2.units` rather than spelled out here, so
         # this line, the diffusion panel's fit summaries and every plot
         # axis say µm²/s the same way.
         self.params_panel.set_track_status(
@@ -1316,7 +1316,7 @@ class ExperimentListWidget(QWidget):
             session.exposure_s if session is not None else None,
         )
         # What each `region` label on the layers' rows is (see
-        # `spt_pipeline.regions.label_points`).
+        # `napari_gemscape2.regions.label_points`).
         metadata["region_classes"] = region_classes(session.regions if session else None)
         return metadata
 

@@ -18,7 +18,7 @@ The source image is referenced by path in the manifest, not copied.
 
 `labels.tif` is the painted regions image (uint16, 0 = background) and
 `regions.json` names each of its labels (`regions.Regions.to_json`) -- see
-`spt_pipeline.regions`. Reloading a bundle (`viewer.show_result`) adds the
+`napari_gemscape2.regions`. Reloading a bundle (`viewer.show_result`) adds the
 image back as a Labels layer, so the same regions can be reused or edited.
 """
 
@@ -33,7 +33,7 @@ import numpy as np
 import polars as pl
 import tifffile
 
-from spt_pipeline.regions import LABELS_DTYPE, Regions
+from napari_gemscape2.regions import LABELS_DTYPE, Regions
 
 POINTS_FILENAME = "points.parquet"
 TRACKS_FILENAME = "tracks.parquet"

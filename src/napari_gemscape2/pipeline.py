@@ -74,10 +74,10 @@ import polars as pl
 import spotsolve
 from spotsolve import loctable, tracking
 
-from spt_pipeline import regions as region_tools
-from spt_pipeline.regions import Regions
-from spt_pipeline.io_formats import StackMetadata, load_stack
-from spt_pipeline.tracking_diagnostics import check_resolvability
+from napari_gemscape2 import regions as region_tools
+from napari_gemscape2.regions import Regions
+from napari_gemscape2.io_formats import StackMetadata, load_stack
+from napari_gemscape2.tracking_diagnostics import check_resolvability
 
 # The camera's own calibration, forwarded to every `spotsolve.localize`/
 # `localize_stack` call. `offset` (ADU) is subtracted
@@ -306,7 +306,7 @@ class PipelineSession:
     frame_range_used: Optional[tuple[int, int]] = None
     # The painted regions image (`(H, W)` uint16, 0 = background) whose
     # `labels > 0` was run_detect_step's `mask`, and the table naming each
-    # label (see `spt_pipeline.regions`) -- set by the widget (not
+    # label (see `napari_gemscape2.regions`) -- set by the widget (not
     # pipeline.py itself, which stays napari-agnostic), carried through so
     # write_result can persist them alongside points/tracks.
     labels: Optional[np.ndarray] = None

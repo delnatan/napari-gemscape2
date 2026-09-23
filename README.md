@@ -1,4 +1,4 @@
-# spt-pipeline
+# napari-gemscape2
 
 Batch orchestration and napari visualization for single-particle tracking, connecting:
 
@@ -28,7 +28,7 @@ being bridged across the gap. Fragmenting a trajectory is a safe failure and
 switching its identity is not, so trajectories come out short rather than wrong,
 and `min_track_length` is the knob that matters afterwards.
 
-`spt_pipeline.tracking_diagnostics.check_resolvability` reports whether a given
+`napari_gemscape2.tracking_diagnostics.check_resolvability` reports whether a given
 (D, dt, density) is trackable at all — the frame-to-frame step against the mean
 nearest-neighbor spacing. Read its verdict as an advisory: the closed forms are
 sample physics, but its thresholds were calibrated against the older LAP linker
@@ -79,7 +79,7 @@ judgements change is what the *linker* sees and which tracks the bundle keeps.
 `manifest.json` records the source image path, the camera and detection
 parameters, both filter specs, what the linker actually measured (PSF sigma, both
 diffusion-coefficient estimates, the fitted linking parameters), and the git SHA
-of `spotsolve` and `spt-pipeline` at run time.
+of `spotsolve` and `napari-gemscape2` at run time.
 
 ## Detect, then filter, then finalize
 
@@ -117,7 +117,7 @@ off the image file's own metadata and **shown, with their provenance, before
 anything runs**: the line above the Detect/Track tabs says e.g.
 `from file: 500 frames · 0.1083 µm/px · 0.0302 s/frame`, and its tooltip says
 which metadata field each came from. A headless run prints the same line
-(`spt detect-track`), and `manifest.json` records it (`pixel_size_um_source`,
+(`gemscape2 detect-track`), and `manifest.json` records it (`pixel_size_um_source`,
 `dt_s_source`, `metadata_notes`), so a bundle says not just what pixel size it
 used but where that came from.
 
@@ -171,7 +171,7 @@ not behind the override switch, so supplying it doesn't replace the file's
 pixel size or frame interval). The Diffusion panel's own exposure box is
 pre-filled from the layer, and it won't run until it has a value.
 
-In results, `spt_pipeline.units` is the single source of truth for what each
+In results, `napari_gemscape2.units` is the single source of truth for what each
 column is measured in: it labels the tracks-pane headers (`D_mle [µm²/s]`,
 `se_x_max [px]`, `se_x_um_max [µm]`), the filter rows' tooltips, the spatial
 map's color scale, every fit readout, and every plot axis — the last in the same
@@ -194,10 +194,10 @@ Re-run it after changing `spotsolve`'s Rust core, so the extension is rebuilt.
 
 ## Usage
 
-Headless batch run (see `pyproject.toml`'s `[project.scripts]` entry `spt`):
+Headless batch run (see `pyproject.toml`'s `[project.scripts]` entry `gemscape2`):
 
 ```
-spt detect-track config.toml
+gemscape2 detect-track config.toml
 ```
 
 ```toml
@@ -260,6 +260,6 @@ filters over per-track results — so a fitted `D` or `alpha` is filterable by t
 same drag as any other feature.
 
 The widgets work on one image at a time, on purpose. To process a whole folder
-without looking at each one, use `spt detect-track`. To compare experiments,
+without looking at each one, use `gemscape2 detect-track`. To compare experiments,
 read the saved bundles (`tracks.parquet`, `manifest.json`) into a script and
 pool them there.

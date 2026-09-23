@@ -100,7 +100,7 @@ point, vs. blindly running a batch job) practical: a frame-range pair
 (`get_frame_range`) and the regions controls (`regions_panel`, a
 `widgets.regions_panel.RegionsPanel`): a "restrict to regions" checkbox,
 the Labels layer the regions are painted on, and the table naming each
-label's class and cell (see `spt_pipeline.regions`). The "cores" spinbox
+label's class and cell (see `napari_gemscape2.regions`). The "cores" spinbox
 (`get_n_threads`, under Expert) is `localize_stack`'s `n_threads`,
 defaulted to every core (see `pipeline.run_detect_step`'s
 docstring for why this speeds up even the interactively-watched run, not
@@ -137,17 +137,17 @@ from qtpy.QtWidgets import (
 )
 from qtkit import CollapsibleSection, StepPager, double_spinbox, hline, note_label, style_status_label, wrapping_label
 
-from spt_pipeline import units
-from spt_pipeline.io_formats import StackMetadata
-from spt_pipeline.pipeline import (
+from napari_gemscape2 import units
+from napari_gemscape2.io_formats import StackMetadata
+from napari_gemscape2.pipeline import (
     DEFAULT_CAMERA_KWARGS,
     DEFAULT_DETECT_KWARGS,
     DEFAULT_SPARSE_KWARGS,
     TRACK_METRIC_COLUMNS,
     FilterSpec,
 )
-from spt_pipeline.widgets.feature_filters import FeatureFilterPanel
-from spt_pipeline.widgets.regions_panel import RegionsPanel
+from napari_gemscape2.widgets.feature_filters import FeatureFilterPanel
+from napari_gemscape2.widgets.regions_panel import RegionsPanel
 
 
 # A dock this narrow has no room for a numeric field to claim more width
