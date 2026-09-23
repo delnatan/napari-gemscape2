@@ -16,7 +16,7 @@ seeing its result were two different screens, and "Fit selected track"
 pointed at a selection you could not see.
 
 - **Tracks pane** -- one row per track (`qtkit.ColumnTableModel` in
-  a `QTableView`), the single place all per-track numbers live (classical
+  a `QTableView`, folded away by default behind a "Table" header), the single place all per-track numbers live (classical
   MLE, bulk MAP, anisotropy, and any one-off per-track fit, each in its own
   column group), plus a `min_track_length` spinbox and a
   `FeatureFilterPanel` over whatever columns that table currently holds.
@@ -32,7 +32,8 @@ pointed at a selection you could not see.
   boxes that track in the viewer (`self._highlight_layer`, a `Shapes` layer
   holding one rectangle on the track's principal axes -- see
   `oriented_track_box` -- since Tracks layers have no selection-highlight
-  of their own).
+  of their own) and moves the time slider to the track's last frame, so
+  its tail is drawn in full inside the box.
 - **Classical** -- `diffusionkit.classic.analyze_tracks`: per track, the
   Brownian displacement MLE's D (with blur from the camera exposure
   modelled) and its upper limit, read as a log-D histogram; opt-in, the
@@ -654,6 +655,10 @@ def _normalize_anisotropy_table(per_track: pl.DataFrame) -> pl.DataFrame:
     return per_track.select(cols)
 
 
+# Qt's "no maximum" for widget sizes; not exported by every qtpy binding.
+_QWIDGETSIZE_MAX = (1 << 24) - 1
+
+
 class _TracksPane(QWidget):
     """The per-track table and everything that decides which rows it shows.
 
@@ -710,6 +715,7 @@ class _TracksPane(QWidget):
         self._suppress_selection_signal = False
         self._qc_columns: list[str] = []
         self._displayed_df: Optional[pl.DataFrame] = None
+        self._total = 0
         self._joint_plot_window: Optional[PlotWindow] = None
 
         self._min_track_length = QSpinBox()
@@ -790,6 +796,11 @@ class _TracksPane(QWidget):
         # height while giving all of it back on demand.
         self.table = table_view(self._model)
         self.table.selectionModel().selectionChanged.connect(self._on_selection_changed)
+        # Folded by default: the rows are for troubleshooting a run, not
+        # for reading every time, and unfolded they take most of the dock.
+        # Selection still works folded -- a track clicked in the viewer
+        # selects its row, and the count line below names it.
+        self._table_section = CollapsibleSection("Table", self.table, expanded=False)
 
         self._count_label = status_label("")
 
@@ -799,9 +810,26 @@ class _TracksPane(QWidget):
         layout.addWidget(control_row)
         layout.addWidget(self._filter_section)
         layout.addWidget(self._plot_section)
-        layout.addWidget(self.table, 1)
+        layout.addWidget(self._table_section, 1)
         layout.addWidget(self._count_label)
+        layout.addStretch(0)
         self.setLayout(layout)
+
+        for section in (self._table_section, self._filter_section, self._plot_section):
+            section.toggled.connect(lambda _expanded: QTimer.singleShot(0, self._fit_height))
+        self._fit_height()
+
+    def _fit_height(self) -> None:
+        """With the table folded, cap this pane at its natural height so the
+        splitter hands everything below it to the analysis tabs, rather
+        than leaving a table-sized gap; unfolded, the cap comes off and the
+        splitter is draggable again. Re-run whenever a section folds, since
+        the natural height changes with it."""
+        if self._table_section.is_expanded():
+            self.setMaximumHeight(_QWIDGETSIZE_MAX)
+        else:
+            self.layout().activate()
+            self.setMaximumHeight(self.sizeHint().height())
 
     def min_track_length(self) -> int:
         return self._min_track_length.value()
@@ -888,12 +916,27 @@ class _TracksPane(QWidget):
         hidden = set(self.hidden_columns())
         self._displayed_df = df
         self._model.set_frame(df.select([c for c in df.columns if c not in hidden]))
-        self._count_label.setText(f"{df.height} of {total} tracks")
+        self._total = total
         style_status_label(
             self._count_label, "ok" if df.height else "caution" if total else "neutral"
         )
         if current is not None:
             self.select_track_id(current)
+        self._update_count_label()
+
+    def _update_count_label(self) -> None:
+        """"n of N tracks", plus the selected track when there is one --
+        with the table folded, this line is the only place the selection
+        the Bayesian tab's per-track fit acts on is written down."""
+        if self._displayed_df is None:
+            return
+        text = f"{self._displayed_df.height} of {self._total} tracks"
+        rows = self.table.selectionModel().selectedRows()
+        if rows:
+            track_id = self._model.row_dict(rows[0].row()).get("track_id")
+            if track_id is not None:
+                text += f" · track {int(track_id)} selected"
+        self._count_label.setText(text)
 
     def set_plot_columns(
         self, df: pl.DataFrame, prefer_x: Optional[str] = None, prefer_y: Optional[str] = None
@@ -935,6 +978,7 @@ class _TracksPane(QWidget):
         self._joint_plot_window.show_figure(figure)
 
     def _on_selection_changed(self, *_args) -> None:
+        self._update_count_label()
         if self._suppress_selection_signal:
             return
         indexes = self.table.selectionModel().selectedRows()
@@ -2017,6 +2061,8 @@ class DiffusionAnalysisWidget(QWidget):
         # minute (scanning rows vs. reading a fit's output), so it is a
         # drag, not a fixed ratio. Neither pane is collapsible: dragging
         # either to zero would hide the selection the other one acts on.
+        # The table itself folds instead (`_TracksPane._fit_height`), and
+        # while it is folded the tracks pane is capped at its own height.
         splitter = QSplitter(Qt.Orientation.Vertical)
         splitter.addWidget(self._tracks_pane)
         splitter.addWidget(tabs)
@@ -2629,6 +2675,7 @@ class DiffusionAnalysisWidget(QWidget):
     def on_table_row_selected(self, track_id: int) -> None:
         self._current_track_id = track_id
         self._update_highlight_layer(track_id)
+        self._jump_to_track_end(track_id)
 
     def on_viewer_track_clicked(self, track_id: int) -> None:
         self._current_track_id = track_id
@@ -2681,6 +2728,21 @@ class DiffusionAnalysisWidget(QWidget):
             # default track_id of 0 whenever the box had been cleared.
             self._highlight_layer.data = [corners]
             self._highlight_layer.features = features
+
+    def _jump_to_track_end(self, track_id: int) -> None:
+        """Move the time slider to the track's last frame, where the Tracks
+        layer draws its tail in full, ending inside the box. Only for
+        table selections -- a track clicked in the viewer is already on
+        screen, and yanking the slider away from it would be jarring."""
+        layer = self._live(self._tracks_layer)
+        if layer is None or self._tracks_df_px is None:
+            return
+        last = self._tracks_df_px.filter(pl.col("track_id") == track_id)["frame"].max()
+        if last is None:
+            return
+        # Tracks data is [id, t, y, x]: time is the layer's first axis.
+        world_axis = self.viewer.dims.ndim - layer.ndim
+        self.viewer.dims.set_point(world_axis, last * layer.scale[0] + layer.translate[0])
 
     def _sync_tracks_layer_display(self, filtered_ids: Optional[set]) -> None:
         """When the tracks pane's "sync viewer" checkbox is on,
