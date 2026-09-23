@@ -17,7 +17,12 @@ classifiers = [
 ]
 dependencies = [
     "numpy",
+    "scipy",
     "polars>=1.0.0",
+    # The analysis figures (joint_plot.py).
+    "matplotlib",
+    "pandas",
+    "seaborn",
     "tifffile",
     "nd2",
     "h5py",
