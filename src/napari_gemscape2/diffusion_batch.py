@@ -19,7 +19,7 @@ from diffusionkit import Acquisition
 
 from napari_gemscape2.diffusion import (
     EXPOSURE_CLAMP_FRACTION,
-    LEVEL,
+    Deconvolution,
     MIN_FRAMES,
     analysis_summary,
     analysis_tables,
@@ -29,6 +29,7 @@ from napari_gemscape2.diffusion import (
     msd_fits_blur_free,
     msd_track_table,
     passing_track_ids,
+    posterior_options,
     posterior_results_table,
     region_class_groups,
     tracks_summary_table,
@@ -48,6 +49,10 @@ class DiffusionSettings:
     # Needs exposure 0 (the alpha posterior has no blur model); asked for
     # at a nonzero exposure, it is skipped and every row says why.
     alpha: bool = False
+    # The posterior grids (`diffusion.GRID_FIELDS`, `GridPostOptions`'
+    # names): D's range is the flat prior's support. Unset keys are
+    # diffusionkit's defaults.
+    grid: dict = field(default_factory=dict)
     msd_comparison: bool = False
     # Overrides the bundle's recorded exposure. None: use the manifest's.
     exposure_s: Optional[float] = None
@@ -55,10 +60,16 @@ class DiffusionSettings:
     # track is fitted either way, as the widget does by default.
     min_track_length: int = 1
     filters: FilterSpec = field(default_factory=dict)
+    # The ensemble's deconvolution (`diffusion.Deconvolution`).
+    deconvolution: Deconvolution = field(default_factory=Deconvolution)
 
     @classmethod
     def names(cls) -> set[str]:
         return {f.name for f in fields(cls)}
+
+    def options(self):
+        """The run's `GridPostOptions`; raises ValueError for a bad grid."""
+        return posterior_options(self.min_frames, self.alpha, self.grid)
 
 
 def settings_from_summary(summary: dict) -> dict:
@@ -69,12 +80,16 @@ def settings_from_summary(summary: dict) -> dict:
     out = {
         "min_frames": summary.get("min_frames"),
         "alpha": summary.get("alpha_grid") is not None if "alpha_grid" in summary else None,
+        "grid": summary.get("grid"),
         "msd_comparison": summary.get("msd_comparison"),
         "min_track_length": record.get("min_track_length"),
         "filters": (
             {col: tuple(bounds) for col, bounds in record["ranges"].items()}
             if record.get("ranges")
             else None
+        ),
+        "deconvolution": (
+            Deconvolution.from_record(summary["deconvolution"]) if "deconvolution" in summary else None
         ),
     }
     return {key: value for key, value in out.items() if value is not None}
@@ -170,12 +185,7 @@ def analyze_bundle(
     base, _hideable = base_track_table(diffkit_tracks, track_points)
 
     analysis = analyze_posteriors(
-        diffkit_tracks,
-        Acquisition(dt_s=dt_s, exposure_s=exposure_s),
-        min_frames=settings.min_frames,
-        level=LEVEL,
-        alpha=settings.alpha,
-        progress=progress,
+        diffkit_tracks, Acquisition(dt_s=dt_s, exposure_s=exposure_s), settings.options(), progress=progress
     )
     msd = (
         msd_track_table(msd_fits_blur_free(diffkit_tracks, dt_s, settings.min_frames))
@@ -190,14 +200,16 @@ def analyze_bundle(
     table = tracks_summary_table(
         base, results, result_id=result_dir.name, pixel_size_um=pixel_size_um, passing_ids=ids
     )
-    summary = analysis_summary(analysis, ids, by_class, msd_comparison=msd is not None)
+    summary = analysis_summary(
+        analysis, ids, by_class, msd_comparison=msd is not None, deconvolution=settings.deconvolution
+    )
     summary["tracks_summary_filters"] = filter_record(settings.min_track_length, settings.filters)
     import diffusionkit
     import napari_gemscape2
 
     summary["repo_shas"] = repo_shas(diffusionkit, napari_gemscape2)
     write_diffusion_results(
-        result_dir, tracks_summary=table, summary=summary, **analysis_tables(analysis, ids, by_class)
+        result_dir, tracks_summary=table, summary=summary, **analysis_tables(analysis, ids, by_class, settings.deconvolution)
     )
     return BundleReport(
         n_tracks=base.height,

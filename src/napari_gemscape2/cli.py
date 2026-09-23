@@ -170,10 +170,16 @@ def diffusion(
         [diffusion]
         min_frames = 3          # shortest track fitted
         alpha = false           # α posterior (needs exposure 0; ~30x slower)
+        # the posterior grids (diffusionkit's GridPostOptions); D's range is
+        # the flat prior's support. Any key left out keeps the template's,
+        # else diffusionkit's default (shown).
+        grid = { D_min_um2_s = 1e-4, D_max_um2_s = 10.0, n_D = 501 }
         msd_comparison = false
         exposure_s = 0.01       # optional: overrides each bundle's recorded one
         min_track_length = 1    # which tracks pass (passes_filters, ensemble)
         filters = { D_median_um2_s = [0.001, inf], flux_mean = [800.0, inf] }
+        # the ensemble's deconvolution; any key left out keeps the template's
+        deconvolution = { iters = 500, smooth = 0.5 }
     An [[inputs]] entry's own `exposure_s` wins over both.
     """
     from napari_gemscape2.diffusion_batch import DiffusionSettings, analyze_bundle, settings_from_summary
@@ -196,6 +202,22 @@ def diffusion(
             inherited = settings_from_summary(saved)
             _describe_template(template, inherited, diff_cfg)
     settings_cfg = {**inherited, **diff_cfg}
+    if isinstance(diff_cfg.get("deconvolution"), dict):
+        from dataclasses import asdict
+
+        from napari_gemscape2.diffusion import Deconvolution
+
+        base_deconv = asdict(inherited.get("deconvolution", Deconvolution()))
+        try:
+            settings_cfg["deconvolution"] = Deconvolution(**{**base_deconv, **diff_cfg["deconvolution"]})
+        except TypeError as exc:
+            raise typer.BadParameter(f"[diffusion] deconvolution: {exc}", param_hint="CONFIG") from exc
+    if isinstance(diff_cfg.get("grid"), dict):
+        settings_cfg["grid"] = {**inherited.get("grid", {}), **diff_cfg["grid"]}
+    try:
+        DiffusionSettings(**{k: v for k, v in settings_cfg.items() if k != "filters"}).options()
+    except (TypeError, ValueError) as exc:
+        raise typer.BadParameter(f"[diffusion] {exc}", param_hint="CONFIG") from exc
     if settings_cfg.get("filters"):
         settings_cfg["filters"] = {col: tuple(bounds) for col, bounds in settings_cfg["filters"].items()}
 

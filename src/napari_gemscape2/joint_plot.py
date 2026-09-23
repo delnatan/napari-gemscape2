@@ -9,7 +9,8 @@ r2, track length, ...) can be compared the same way.
 The posterior figures (`plot_d_ensemble`, `plot_track_posterior`) follow
 one color assignment by role, not by series: per-track medians are a
 neutral histogram, the deconvolved distribution is blue, the summed
-(shared-value) posterior is orange. Region classes are separate panels
+(shared-value) posterior is orange, the pooled (averaged) posterior is aqua,
+and the per-track heat map is one blue ramp. Region classes are separate panels
 stacked on one shared x axis rather than more hues, so every panel reads
 the same way.
 
@@ -29,6 +30,7 @@ import numpy as np
 import pandas as pd
 import polars as pl
 import seaborn as sns
+from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.figure import Figure
 
 from napari_gemscape2 import units
@@ -105,6 +107,12 @@ def numeric_columns(df: pl.DataFrame, exclude: tuple[str, ...] = ("track_id",)) 
 _HIST_COLOR = "#c9c8c2"
 _DECONVOLVED_COLOR = "#2a78d6"
 _SUMMED_COLOR = "#eb6834"
+_POOLED_COLOR = "#1baf7a"
+# One hue, light to dark, its zero end receding into the figure's surface:
+# the per-track heat map is magnitude, not identity.
+_POSTERIOR_CMAP = LinearSegmentedColormap.from_list(
+    "posterior", ["#fcfcfb", "#cde2fb", "#86b6ef", "#2a78d6", "#184f95", "#0d366b"]
+)
 _INK = "#0b0b0b"
 _MUTED_INK = "#52514e"
 
@@ -142,6 +150,23 @@ def _interval_marker(ax, low: float, median: float, high: float, y: float, color
     ax.plot([median], [y], "o", color=color, ms=6, mec="white", mew=1.2, zorder=5)
 
 
+def _log_d_range(panels: list[dict], x: np.ndarray) -> tuple[float, float]:
+    """One log10-D range for every panel: wherever any panel has medians
+    or deconvolved mass, rather than the whole grid, which spans five
+    decades and would squeeze the data into a sliver."""
+    spans = []
+    for panel in panels:
+        # Not the pooled posterior: short tracks give it a tail decades long.
+        spans.append(_mass_range(panel["deconvolved"], x, tail=0.01))
+        medians = np.asarray(panel["medians"], dtype=float)
+        medians = medians[medians > 0]
+        if len(medians):
+            spans.append((np.log10(medians.min()), np.log10(medians.max())))
+    x_lo = max(min(lo for lo, _ in spans) - _LOG_D_PAD, x[0])
+    x_hi = min(max(hi for _, hi in spans) + _LOG_D_PAD, x[-1])
+    return x_lo, x_hi
+
+
 def plot_d_ensemble(
     d_grid: np.ndarray,
     panels: list[dict],
@@ -170,18 +195,7 @@ def plot_d_ensemble(
     fig = Figure(figsize=(8.5 if has_alpha else 6.0, 1.2 + 2.3 * n), layout="constrained")
     axes = fig.subplots(n, 2 if has_alpha else 1, squeeze=False, sharex="col")
     x = np.log10(d_grid)
-    # One x range for every panel (the axes are shared): wherever any
-    # panel has medians or deconvolved mass, rather than the whole grid,
-    # which spans five decades and would squeeze the data into a sliver.
-    spans = []
-    for panel in panels:
-        spans.append(_mass_range(panel["deconvolved"], x, tail=0.01))
-        medians = np.asarray(panel["medians"], dtype=float)
-        medians = medians[medians > 0]
-        if len(medians):
-            spans.append((np.log10(medians.min()), np.log10(medians.max())))
-    x_lo = max(min(lo for lo, _ in spans) - _LOG_D_PAD, x[0])
-    x_hi = min(max(hi for _, hi in spans) + _LOG_D_PAD, x[-1])
+    x_lo, x_hi = _log_d_range(panels, x)
     bins = np.arange(x_lo, x_hi + _LOG_D_BIN, _LOG_D_BIN)
     for row, panel in enumerate(panels):
         ax = axes[row][0]
@@ -224,6 +238,78 @@ def plot_d_ensemble(
     axes[-1][0].set_xlabel(units.mpl_log_label("D_um2_s"), fontsize=9)
     if has_alpha:
         axes[-1][1].set_xlabel(r"$\alpha$ (1 = Brownian, dashed)", fontsize=9)
+    if title:
+        fig.suptitle(title, fontsize=10, x=0.01, ha="left")
+    return fig
+
+
+def plot_d_posteriors(d_grid: np.ndarray, panels: list[dict], title: str | None = None) -> Figure:
+    """Every track's posterior next to what the population makes of them:
+    one row per panel (`ensemble_panels(..., track_posteriors=True)`).
+
+    Left, a heat map with one row per track, sorted by its posterior
+    median: a well-determined track is a short bright streak, a short or
+    noisy one a long faint smear. Right, on one density axis: the pooled
+    posterior (the tracks' posteriors averaged -- where they put D,
+    blurred by each one's uncertainty), the histogram of per-track
+    medians, and the deconvolved distribution (that blur removed). The
+    summed log posterior -- one D shared by every track -- is far
+    narrower than any of them, so it is the marker with its 90% interval
+    above the curves, as in `plot_d_ensemble`."""
+    n = len(panels)
+    fig = Figure(figsize=(10.5, 1.0 + 3.4 * n), layout="constrained")
+    axes = fig.subplots(n, 2, squeeze=False, sharex=True, gridspec_kw={"width_ratios": [1, 1.1]})
+    x = np.log10(d_grid)
+    dx = float(np.mean(np.diff(x)))
+    x_lo, x_hi = _log_d_range(panels, x)
+    bins = np.arange(x_lo, x_hi + _LOG_D_BIN, _LOG_D_BIN)
+    # One color scale for every heat map, so rows of different panels
+    # compare; the top 0.5% saturate rather than wash the rest out.
+    all_dens = np.concatenate([p["track_posteriors"].ravel() for p in panels]) / dx
+    vmax = float(np.percentile(all_dens, 99.5)) or 1.0
+    for row, panel in enumerate(panels):
+        ax_map, ax = axes[row]
+        _style_axis(ax_map)
+        ax_map.grid(False)
+        posts = panel["track_posteriors"]
+        image = ax_map.imshow(
+            posts / dx, aspect="auto", origin="lower", cmap=_POSTERIOR_CMAP, interpolation="nearest",
+            extent=[x[0] - dx / 2, x[-1] + dx / 2, 0, len(posts)], vmin=0, vmax=vmax,
+        )
+        ax_map.set_ylabel("tracks, by posterior median", fontsize=8, color=_MUTED_INK)
+        ax_map.set_title(
+            f"{panel['name']} · {panel['n_tracks']} tracks' posteriors (one row each)",
+            fontsize=9, loc="left", color=_INK,
+        )
+        colorbar = fig.colorbar(image, ax=ax_map, pad=0.01, shrink=0.85)
+        colorbar.set_label(r"density per $\log_{10} D$", fontsize=8, color=_MUTED_INK)
+        colorbar.ax.tick_params(colors=_MUTED_INK, labelsize=7)
+        colorbar.outline.set_visible(False)
+
+        _style_axis(ax)
+        medians = np.asarray(panel["medians"], dtype=float)
+        medians = np.log10(medians[medians > 0])
+        if len(medians):
+            ax.hist(medians, bins=bins, density=True, color=_HIST_COLOR, edgecolor="white",
+                    lw=0.5, label="per-track medians")
+        pooled = _density(panel["pooled"], x)
+        deconvolved = _density(panel["deconvolved"], x)
+        ax.plot(x, pooled, color=_POOLED_COLOR, lw=2, label="pooled posterior")
+        ax.plot(x, deconvolved, color=_DECONVOLVED_COLOR, lw=2, label="deconvolved")
+        top = max(pooled.max(), deconvolved.max(), ax.get_ylim()[1])
+        low, median, high = (np.log10(v) for v in panel["summed_interval"])
+        _interval_marker(ax, low, median, high, top * 1.08, _SUMMED_COLOR)
+        ax.plot([], [], "o-", color=_SUMMED_COLOR, lw=2, ms=5, label="summed log posterior (shared D), 90%")
+        ax.set_ylim(0, top * 1.18)
+        ax.set_ylabel(r"density per $\log_{10} D$", fontsize=8, color=_MUTED_INK)
+        ax.set_title(
+            f"shared D = {panel['summed_interval'][1]:.3g} µm²/s", fontsize=9, loc="left", color=_INK
+        )
+        if row == 0:
+            ax.legend(fontsize=7, frameon=False, loc="upper left")
+    axes[-1][0].set_xlim(x_lo, x_hi)
+    for ax in axes[-1]:
+        ax.set_xlabel(units.mpl_log_label("D_um2_s"), fontsize=9)
     if title:
         fig.suptitle(title, fontsize=10, x=0.01, ha="left")
     return fig

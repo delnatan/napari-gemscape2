@@ -242,6 +242,28 @@ def load_diffusion_summary(result_dir: str | Path) -> Optional[dict]:
     return json.loads(path.read_text()) if path.exists() else None
 
 
+def load_diffusion_results(result_dir: str | Path) -> Optional[dict]:
+    """What `write_diffusion_results` wrote, under its keyword names
+    (`summary`, `tracks_summary`, `posterior_D`, `posterior_alpha`; an
+    absent optional table is None) -- or None when there is no saved
+    posterior analysis to read back."""
+    result_dir = Path(result_dir)
+    summary = load_diffusion_summary(result_dir)
+    posterior_d_path = result_dir / POSTERIOR_D_FILENAME
+    summary_path = result_dir / TRACKS_SUMMARY_FILENAME
+    if summary is None or not posterior_d_path.exists() or not summary_path.exists():
+        return None
+    alpha_path = result_dir / POSTERIOR_ALPHA_FILENAME
+    return {
+        "summary": summary,
+        # Every row read before typing a column: one that is empty for the
+        # first thousand tracks (alpha, NUTS) would otherwise be a string.
+        "tracks_summary": pl.read_csv(summary_path, infer_schema_length=None),
+        "posterior_D": pl.read_parquet(posterior_d_path),
+        "posterior_alpha": pl.read_parquet(alpha_path) if alpha_path.exists() else None,
+    }
+
+
 def load_manifest(result_dir: str | Path) -> dict:
     """Just the manifest -- what a folder scan needs (`params.n_tracks`)
     without reading either table."""

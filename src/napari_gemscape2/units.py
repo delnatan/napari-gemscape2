@@ -154,6 +154,7 @@ _EXACT: dict[str, Optional[str]] = {
     # resolved through the statistic suffixes above.
     "posterior_status": None,
     "alpha_status": None,
+    "D_at_grid_edge": None,
     "log_posterior": None,
     "posterior": None,
     "weight": None,

@@ -284,12 +284,19 @@ track_filters = { track_length = [5.0, 1e9] }
 [diffusion]
 min_frames = 3          # shortest track fitted
 alpha = false           # the alpha posterior: needs exposure 0, ~30x slower
+# The posterior grids -- diffusionkit's GridPostOptions fields (also alpha_min,
+# alpha_max, n_alpha, n_K). D's range is the flat prior's support, so it is
+# part of the analysis. Keys left out keep the template's (or diffusionkit's
+# defaults, shown).
+grid = { D_min_um2_s = 1e-4, D_max_um2_s = 10.0, n_D = 501 }
 msd_comparison = false
 exposure_s = 0.01       # optional: overrides each bundle's recorded exposure
 # Which tracks pass (`passes_filters`) and so make up the ensemble -- the
 # diffusion widget's tracks-pane cuts, on any per-track column.
 min_track_length = 5
 filters = { flux_mean = [800.0, inf], D_median_um2_s = [0.001, inf] }
+# The ensemble's deconvolution; keys left out keep the template's (or the defaults).
+deconvolution = { iters = 500, smooth = 0.5 }
 ```
 
 `gemscape2 diffusion` writes the same files as the widget's *Save analysis*
@@ -305,15 +312,33 @@ tracks), pressing *Save results* when the result is worth keeping. The "Diffusio
 diffusionkit's grid posteriors: for each track, the posterior over D (flat
 prior in ln D, the exposure's blur modelled) summarized as its median and 5%/95%
 quantiles, and — with exposure 0, as an opt-in that costs ~30× more — the same
-for the fBm exponent α. About 1 s for ~500 tracks without α. The **Ensemble**
+for the fBm exponent α. The run is diffusionkit's own `gridpost.analyze_tracks`
+with the `GridPostOptions` the Posterior tab shows: *D min*/*D max* (µm²/s) and
+*D points* set the D grid, whose range is the flat prior's support, and the
+folded *α / K grid* section the rest. A track whose posterior is cut by an edge
+is marked `D_at_grid_edge` (its numbers move with the edge — near-immobile
+tracks reach *D min* this way), and the summary counts them. The grids are
+saved with the analysis, so `GridPostOptions(**summary["grid"])` in a
+diffusionkit script reproduces the widget's numbers exactly. About 1 s for ~500 tracks without α. The **Ensemble**
 plot reads them across the tracks the filters pass, per region class: the
 per-track medians, the *deconvolved* distribution of D (each track's own
 uncertainty removed; peak positions and masses are robust, widths are
 resolution-limited), and the *summed* posterior (one D shared by every track).
-MSD fits are a labelled opt-in comparison; the **Track** plot shows the
+The **Posteriors** plot shows every track's posterior as one row of a heat map,
+sorted by median, beside the *pooled* posterior (the tracks' posteriors
+averaged), the histogram of medians and the deconvolved distribution. The
+*Deconvolution* section sets its iterations and smoothing (it spreads D over
+the run's D grid); the plots and summary follow without a re-run. MSD fits are a labelled opt-in comparison; the **Track** plot shows the
 selected track's posterior; the **Map** tab colors each track's centroid by any
 result; the **NUTS** tab fits the selected track's full posterior (needs
 `--extra bayes`).
+
+Opening a bundle with a saved analysis — saved from the widget, a batch, or
+`gemscape2 diffusion` — restores it: plots, per-track columns, filters and
+settings, with no fit re-run. It is restored only if the tracks it was fitted on
+are still the bundle's, vertex for vertex (`tracks_sha256` in the summary);
+after a re-track or a new pixel size the saved numbers show as text and Run
+re-fits. Analyses saved before the fingerprint existed need one re-run.
 
 *Save analysis* writes into the bundle:
 
@@ -322,10 +347,13 @@ tracks_summary.csv        one row per track (below)
 posterior_D.parquet       every fitted track's log posterior: track_id, D_um2_s, log_posterior
 posterior_alpha.parquet   likewise over alpha (exposure 0 runs with α only)
 distributions_D.csv       the ensemble on the D grid, long by group ("all", then each
-                          region class): summed_log_posterior, summed_posterior, deconvolved
+                          region class): summed_log_posterior, summed_posterior,
+                          pooled_posterior, deconvolved
 distributions_alpha.csv   likewise on the α grid (summed only)
-diffusion_summary.json    settings (dt, exposure, grids, level), population numbers
-                          per group, the tracks-pane filters, and repo SHAs
+diffusion_summary.json    settings (dt, exposure, grid -- GridPostOptions' fields --,
+                          level, deconvolution),
+                          population numbers per group, the tracks-pane filters,
+                          the fitted tracks' fingerprint (tracks_sha256), and repo SHAs
 ```
 
 Points and tracks stay parquet (the atomic data); the tables people open in a
@@ -339,7 +367,8 @@ anywhere) — has every track as a row, filtered-out and excluded ones included:
 - size and position: `track_length`, `duration_s`, `mean_step_um`, mean
   `x_um`/`y_um` (and px);
 - the posterior: `posterior_status`, `D_median_um2_s`, `D_low_um2_s`,
-  `D_high_um2_s` (5% and 95% quantiles), and with α: `alpha_status`,
+  `D_high_um2_s` (5% and 95% quantiles), `D_at_grid_edge` (the posterior is
+  cut by the D grid's range), and with α: `alpha_status`,
   `alpha_median`, `alpha_low`, `alpha_high`; `D_msd_um2_s`/`alpha_msd` when the
   MSD comparison ran, `*_nuts*` for tracks fitted with NUTS;
 - shape: `radius_of_gyration_um`, `net_displacement_um`, `straightness`,

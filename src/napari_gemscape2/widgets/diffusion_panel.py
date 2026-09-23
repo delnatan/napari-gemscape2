@@ -50,7 +50,11 @@ Saving writes the per-track summary (`tracks_summary.csv`), every
 track's posterior (`posterior_D.parquet`, `posterior_alpha.parquet`),
 the ensemble distributions (`distributions_*.csv`) and the settings and
 population numbers (`diffusion_summary.json`) into the layer's bundle --
-see `results.py`.
+see `results.py`. Picking a layer whose bundle has a saved analysis
+restores it (`diffusion.restore_analysis`) when the tracks it was fitted
+on are still the layer's, which the summary's `tracks_sha256` decides:
+the plots, per-track columns, filters and settings come back as saved,
+with no fit re-run. A mismatch shows the saved numbers as text only.
 
 Every tab holds a plain reference to this module's
 `DiffusionAnalysisWidget` (`self.host`) rather than talking through Qt
@@ -126,8 +130,10 @@ from qtkit import (
 )
 from qtkit.napari import live_layer, tabify_with_open_widget
 from qtkit.plot import AxisPicker, PlotWindow
+from qtpy.QtGui import QValidator
 from qtpy.QtWidgets import (
     QCheckBox,
+    QDoubleSpinBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -144,24 +150,29 @@ from qtpy.QtWidgets import (
 )
 
 from napari_gemscape2 import units
+from diffusionkit.gridpost import GridPostOptions
+
 from napari_gemscape2.diffusion import (
-    ALPHA_GRID,
-    D_GRID_UM2_S,
     EXPOSURE_CLAMP_FRACTION,
-    LEVEL,
     MIN_FRAMES,
+    Deconvolution,
     PosteriorAnalysis,
+    SavedAnalysis,
+    StaleAnalysisError,
     analysis_summary,
     analysis_tables,
     analyze_posteriors,
     base_track_table,
     ensemble_panels,
     filter_record,
+    grid_record,
     msd_fits_blur_free,
     msd_track_table,
     passing_track_ids,
+    posterior_options,
     posterior_results_table,
     region_class_groups,
+    restore_analysis,
     summarize,
     track_posterior,
     tracks_summary_table,
@@ -169,6 +180,7 @@ from napari_gemscape2.diffusion import (
 )
 from napari_gemscape2.results import (
     TRACKS_SUMMARY_FILENAME,
+    load_diffusion_results,
     load_diffusion_summary,
     repo_shas,
     write_diffusion_results,
@@ -176,12 +188,14 @@ from napari_gemscape2.results import (
 from napari_gemscape2.joint_plot import (
     numeric_columns,
     plot_d_ensemble,
+    plot_d_posteriors,
     plot_property_joint,
     plot_track_posterior,
 )
 from napari_gemscape2.pipeline import filter_mask
 from napari_gemscape2.viewer import set_tracks_layer_data
 from napari_gemscape2.widgets.feature_filters import FeatureFilterPanel
+from napari_gemscape2.widgets.params_panel import _compact_form, _dspin, _ispin
 
 # Look for the two viewer overlays this widget owns -- kept visually
 # distinct from DETECTED_POINTS_STYLE's magenta "+" (viewer.py) so a
@@ -262,21 +276,19 @@ def _run_posterior_worker(
     diffkit_tracks: pl.DataFrame,
     dt_s: float,
     exposure_s: float,
-    min_frames: int,
-    alpha: bool,
+    options: GridPostOptions,
     msd_comparison: bool,
     progress,
 ) -> tuple[PosteriorAnalysis, Optional[pl.DataFrame]]:
     """`(analysis, msd_fits)`: the grid posteriors with the real exposure,
-    and -- when asked for -- diffusionkit.classic's MSD fits, run with the
-    exposure treated as 0 (see `diffusion.msd_fits_blur_free`)."""
+    on `options`' grids, and -- when asked for -- diffusionkit.classic's
+    MSD fits, run with the exposure treated as 0 (see
+    `diffusion.msd_fits_blur_free`)."""
     acquisition = Acquisition(dt_s=dt_s, exposure_s=exposure_s)
-    analysis = analyze_posteriors(
-        diffkit_tracks, acquisition, min_frames=min_frames, level=LEVEL, alpha=alpha, progress=progress
-    )
+    analysis = analyze_posteriors(diffkit_tracks, acquisition, options, progress=progress)
     msd_fits = None
     if msd_comparison:
-        msd_fits = msd_fits_blur_free(diffkit_tracks, dt_s, min_frames)
+        msd_fits = msd_fits_blur_free(diffkit_tracks, dt_s, options.min_frames)
     return analysis, msd_fits
 
 
@@ -639,6 +651,14 @@ class _TracksPane(QWidget):
     def min_track_length(self) -> int:
         return self._min_track_length.value()
 
+    def set_saved_filters(self, min_track_length: int, ranges: dict) -> None:
+        """A saved analysis's cuts, put back silently -- the caller
+        refreshes (`host.on_filters_changed`) once."""
+        blocked = self._min_track_length.blockSignals(True)
+        self._min_track_length.setValue(min_track_length)
+        self._min_track_length.blockSignals(blocked)
+        self.filters.set_filters(ranges or None)
+
     def sync_display_enabled(self) -> bool:
         return self._sync_display_checkbox.isChecked()
 
@@ -808,15 +828,66 @@ _POSTERIOR_HELP = (
     "likelihood is exact: each frame's localization error and the motion blur of "
     "the exposure are both modelled. A short track has a wide interval, and that "
     "width is the honest answer, not a failure."
+    "<br><br><b>Grid</b>: each posterior is evaluated on a grid in ln D, and the flat "
+    "prior is zero outside its range &mdash; so <i>D min</i>/<i>D max</i> are part of "
+    "the analysis, not a numerical detail. A track whose posterior is cut by an edge is "
+    "marked <i>D_at_grid_edge</i>: its median and interval move if the edge does. "
+    "Near-immobile tracks reach <i>D min</i> this way, since localization error only "
+    "lets the data bound D from above. These are diffusionkit's <tt>GridPostOptions</tt> "
+    "fields, saved with the analysis, so a script can repeat the run exactly."
     "<br><br><b>Ensemble</b>: <i>summed</i> adds every track's log posterior &mdash; "
     "the posterior of one D shared by all of them. It is sharp, but only meaningful "
     "if they really do share a D. <i>Deconvolved</i> is how D is distributed across "
     "tracks, with each track's own uncertainty taken out (a smoothed nonparametric "
     "maximum likelihood). Its peak locations and the mass under each peak are "
-    "robust; its peak widths are resolution-limited, not measured."
+    "robust; its peak widths are resolution-limited, not measured. <i>Pooled</i> "
+    "averages the tracks' posteriors: where they put D, blurred by each one's own "
+    "uncertainty &mdash; the deconvolution's starting point."
+    "<br><br><b>Deconvolution</b>: more <i>iterations</i> remove more of that blur; "
+    "<i>smoothing</i> (grid cells) keeps peaks from collapsing into "
+    "spikes &mdash; less sharpens them, more widens them. D is spread over the D grid, "
+    "the same range every track's prior has."
     "<br><br><b>α</b> (fBm exponent, K integrated out) has no motion-blur model, so "
     "it is only available for exposure 0. It costs ~30x D."
 )
+
+
+class _LogSpinBox(QDoubleSpinBox):
+    """A positive value spanning decades (a D grid edge): shown as `%g`
+    (1e-04, 10), typed in any float notation, and stepped by a factor of
+    10 -- a linear spinbox's fixed decimals and additive steps suit
+    neither end of 1e-4 to 10."""
+
+    def __init__(self, value: float, minimum: float, maximum: float, tooltip: str = "") -> None:
+        super().__init__()
+        self.setDecimals(12)  # the stored precision; the text is `%g`
+        self.setRange(minimum, maximum)
+        self.setValue(value)
+        self.setToolTip(tooltip)
+        # Its size hint comes from the range ends' short text (1e-09),
+        # which clips a value like 0.0001.
+        self.setFixedWidth(_LOG_SPIN_WIDTH)
+
+    def textFromValue(self, value: float) -> str:  # noqa: N802
+        return f"{value:g}"
+
+    def valueFromText(self, text: str) -> float:  # noqa: N802
+        return float(text)
+
+    def validate(self, text: str, pos: int):
+        try:
+            value = float(text)
+        except ValueError:
+            return QValidator.State.Intermediate, text, pos
+        if self.minimum() <= value <= self.maximum():
+            return QValidator.State.Acceptable, text, pos
+        return QValidator.State.Intermediate, text, pos
+
+    def stepBy(self, steps: int) -> None:  # noqa: N802
+        self.setValue(self.value() * 10.0**steps)
+
+
+_LOG_SPIN_WIDTH = 104
 
 
 class _PosteriorTab(QWidget):
@@ -831,10 +902,11 @@ class _PosteriorTab(QWidget):
     never at 0, and Run stays off until it has a value. Exposure 0 is also
     what makes the alpha posterior available (it has no blur model).
 
-    The summary and the Ensemble figure are read over the tracks the tracks
-    pane currently passes (and grouped by region class when there are
-    several), so a filter change updates them without a re-run -- the
-    per-track posteriors don't depend on which other tracks are in view."""
+    The summary and the Ensemble and Posteriors figures are read over the
+    tracks the tracks pane currently passes (and grouped by region class
+    when there are several), so a filter change -- or a deconvolution
+    setting -- updates them without a re-run: the per-track posteriors
+    don't depend on which other tracks are in view."""
 
     # The exposure box's "not set" value -- one step below 0, which is a
     # legitimate (stroboscopic) exposure and must not double as "unknown".
@@ -848,6 +920,7 @@ class _PosteriorTab(QWidget):
         self._summary_values: Optional[dict] = None
         self._summary_by_group: Optional[dict] = None
         self._ensemble_window: Optional[PlotWindow] = None
+        self._posteriors_window: Optional[PlotWindow] = None
         self._track_window: Optional[PlotWindow] = None
         self._msd_plot_window: Optional[PlotWindow] = None
         # What the layer said, so the exposure note can say where the box's
@@ -897,6 +970,53 @@ class _PosteriorTab(QWidget):
         exposure_row = flow_row(QLabel("exposure"), self._exposure)
         options_row = flow_row(QLabel("min points"), self._min_frames, self._alpha, self._msd_comparison)
 
+        # The posterior grids -- diffusionkit's `GridPostOptions` fields,
+        # read when Run is pressed. D's range is the flat prior's support,
+        # so it stays in view; the alpha/K grids fold away.
+        grid_default = GridPostOptions()
+        d_range_tip = (
+            "The range of D (µm²/s) the posterior is evaluated over -- the flat\n"
+            "prior's support, so it is part of the analysis: a track whose\n"
+            "posterior reaches an edge is cut there (and flagged D_at_grid_edge).\n"
+            f"diffusionkit's default: {grid_default.D_min_um2_s:g} to {grid_default.D_max_um2_s:g}."
+        )
+        self._grid_D_min = _LogSpinBox(grid_default.D_min_um2_s, 1e-9, 1e4, tooltip=d_range_tip)
+        self._grid_D_max = _LogSpinBox(grid_default.D_max_um2_s, 1e-9, 1e4, tooltip=d_range_tip)
+        self._grid_n_D = _ispin(
+            grid_default.n_D, 2, 100_000,
+            tooltip="Grid points in ln D, spaced evenly between D min and D max.\n"
+            f"diffusionkit's default {grid_default.n_D} gives ~2.3% steps over its default range.",
+        )
+        self._grid_alpha_min = _dspin(grid_default.alpha_min, 0.01, 1.99, 0.05, decimals=2,
+                                      tooltip="Lowest α on the α grid (above 0, where fGn degenerates).")
+        self._grid_alpha_max = _dspin(grid_default.alpha_max, 0.01, 1.99, 0.05, decimals=2,
+                                      tooltip="Highest α on the α grid (below 2, where fGn degenerates).")
+        self._grid_n_alpha = _ispin(grid_default.n_alpha, 2, 10_000, tooltip="Grid points in α.")
+        self._grid_n_K = _ispin(
+            grid_default.n_K, 2, 100_000,
+            tooltip="Grid points in ln K, the nuisance parameter α's posterior integrates\n"
+            "out. K's grid spans the same numeric range as D's.",
+        )
+        grid_form = _compact_form(QFormLayout())
+        grid_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        grid_form.addRow("D min (µm²/s)", self._grid_D_min)
+        grid_form.addRow("D max (µm²/s)", self._grid_D_max)
+        grid_form.addRow("D points", self._grid_n_D)
+        alpha_grid_box = QWidget()
+        alpha_grid_form = _compact_form(QFormLayout(alpha_grid_box))
+        alpha_grid_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        alpha_grid_form.addRow("α min", self._grid_alpha_min)
+        alpha_grid_form.addRow("α max", self._grid_alpha_max)
+        alpha_grid_form.addRow("α points", self._grid_n_alpha)
+        alpha_grid_form.addRow("K points", self._grid_n_K)
+        self._alpha_grid_section = CollapsibleSection("α / K grid", alpha_grid_box, expanded=False)
+        self._grid_reset = QPushButton("default grid")
+        self._grid_reset.setToolTip("diffusionkit's default grids (GridPostOptions()).")
+        self._grid_reset.clicked.connect(lambda: self.set_grid(GridPostOptions()))
+        self._grid_status = status_label("")
+        for box in self._grid_boxes():
+            box.valueChanged.connect(lambda _v: self._on_grid_changed())
+
         self._run_button = QPushButton("Run posteriors")
         self._run_button.clicked.connect(self._run)
         self._status = status_label("")
@@ -918,7 +1038,56 @@ class _PosteriorTab(QWidget):
         self._msd_plot_button = QPushButton("MSD")
         self._msd_plot_button.setToolTip("D vs α from the MSD fits (no uncertainties).")
         self._msd_plot_button.clicked.connect(self._show_msd_plot)
-        plot_row = flow_row(QLabel("plot:"), self._ensemble_button, self._track_button, self._msd_plot_button)
+        self._posteriors_button = QPushButton("Posteriors")
+        self._posteriors_button.setToolTip(
+            "Every track's posterior as one row of a heat map, sorted by its\n"
+            "median, beside the pooled posterior, the histogram of medians and\n"
+            "the deconvolved distribution -- over the tracks the filters pass."
+        )
+        self._posteriors_button.clicked.connect(self._show_posteriors)
+        plot_row = flow_row(
+            QLabel("plot:"),
+            self._ensemble_button,
+            self._posteriors_button,
+            self._track_button,
+            self._msd_plot_button,
+        )
+
+        # The ensemble's deconvolution: read on commit (no keyboard
+        # tracking), since each change re-deconvolves every group.
+        default = Deconvolution()
+        self._deconv_iters = _ispin(
+            default.iters, 1, 20_000,
+            tooltip="EM iterations. One is the pooled posterior; more remove more of the\n"
+            "blur each track's own uncertainty adds. Cost is linear in it.",
+        )
+        self._deconv_iters.setSingleStep(100)
+        # Units live in the row labels, not as suffixes: a suffix widens
+        # every field to fit it, which is what made this section too wide.
+        self._deconv_smooth = _dspin(
+            default.smooth, 0.0, 20.0, 0.25, decimals=2,
+            tooltip="Gaussian smoothing per iteration, in D grid cells.\n"
+            "0 lets peaks sharpen toward spikes; more widens them. Peak positions\n"
+            "and the mass under each are robust to it, widths are not.",
+        )
+        for box in (self._deconv_iters, self._deconv_smooth):
+            box.setKeyboardTracking(False)
+            box.valueChanged.connect(lambda _v: self._on_deconvolution_changed())
+        self._deconv_reset = QPushButton("defaults")
+        self._deconv_reset.clicked.connect(lambda: self.set_deconvolution(Deconvolution(), notify=True))
+        self._deconv_status = status_label("")
+        deconv_box = QWidget()
+        deconv_layout = QVBoxLayout(deconv_box)
+        deconv_layout.setContentsMargins(0, 0, 0, 0)
+        deconv_layout.setSpacing(2)
+        deconv_form = _compact_form(QFormLayout())
+        deconv_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        deconv_form.addRow("iterations", self._deconv_iters)
+        deconv_form.addRow("smoothing (cells)", self._deconv_smooth)
+        deconv_form.addRow("", self._deconv_reset)
+        deconv_layout.addLayout(deconv_form)
+        deconv_layout.addWidget(self._deconv_status)
+        self._deconv_section = CollapsibleSection("Deconvolution", deconv_box, expanded=False)
 
         help_text = note_label(_POSTERIOR_HELP)
         help_text.setTextFormat(Qt.TextFormat.RichText)
@@ -930,10 +1099,15 @@ class _PosteriorTab(QWidget):
         layout.addWidget(exposure_row)
         layout.addWidget(self._exposure_note)
         layout.addWidget(options_row)
+        layout.addLayout(grid_form)
+        layout.addWidget(self._alpha_grid_section)
+        layout.addWidget(self._grid_reset, alignment=Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(self._grid_status)
         layout.addWidget(self._run_button)
         layout.addWidget(self._status)
         layout.addWidget(self._summary)
         layout.addWidget(plot_row)
+        layout.addWidget(self._deconv_section)
         layout.addWidget(self._help)
         layout.addStretch()
         self.setLayout(layout)
@@ -963,6 +1137,72 @@ class _PosteriorTab(QWidget):
     def summary_by_group(self) -> Optional[dict]:
         return self._summary_by_group
 
+    def deconvolution(self) -> Deconvolution:
+        return Deconvolution(iters=self._deconv_iters.value(), smooth=self._deconv_smooth.value())
+
+    def set_deconvolution(self, deconvolution: Deconvolution, *, notify: bool = False) -> None:
+        for box, value in ((self._deconv_iters, deconvolution.iters), (self._deconv_smooth, deconvolution.smooth)):
+            blocked = box.blockSignals(True)
+            box.setValue(value)
+            box.blockSignals(blocked)
+        if notify:
+            self._on_deconvolution_changed()
+
+    def _on_deconvolution_changed(self) -> None:
+        self.refresh_summary()
+
+    def _grid_boxes(self) -> tuple:
+        return (
+            self._grid_D_min, self._grid_D_max, self._grid_n_D,
+            self._grid_alpha_min, self._grid_alpha_max, self._grid_n_alpha, self._grid_n_K,
+        )
+
+    def options(self) -> GridPostOptions:
+        """The next run's `GridPostOptions`, from the controls. Raises
+        ValueError for an invalid grid (see `_on_grid_changed`)."""
+        grid = dict(
+            D_min_um2_s=self._grid_D_min.value(),
+            D_max_um2_s=self._grid_D_max.value(),
+            n_D=self._grid_n_D.value(),
+            alpha_min=self._grid_alpha_min.value(),
+            alpha_max=self._grid_alpha_max.value(),
+            n_alpha=self._grid_n_alpha.value(),
+            n_K=self._grid_n_K.value(),
+        )
+        return posterior_options(self._min_frames.value(), self._alpha.isChecked(), grid)
+
+    def set_grid(self, options: GridPostOptions) -> None:
+        values = (
+            options.D_min_um2_s, options.D_max_um2_s, options.n_D,
+            options.alpha_min, options.alpha_max, options.n_alpha, options.n_K,
+        )
+        for box, value in zip(self._grid_boxes(), values):
+            blocked = box.blockSignals(True)
+            box.setValue(value)
+            box.blockSignals(blocked)
+        self._on_grid_changed()
+
+    def _on_grid_changed(self) -> None:
+        """Say whether the grid is valid, and whether the analysis shown
+        was run on a different one (its numbers are that grid's)."""
+        try:
+            options = self.options()
+        except ValueError as exc:
+            self._grid_status.setText(str(exc))
+            style_status_label(self._grid_status, "error")
+            self.refresh_inputs()
+            return
+        ran = self._analysis.options if self._analysis is not None else None
+        if ran is not None and grid_record(ran) != grid_record(options):
+            self._grid_status.setText(
+                f"shown: run on D {ran.D_min_um2_s:g}–{ran.D_max_um2_s:g} µm²/s, {ran.n_D} points — Run to use this grid"
+            )
+            style_status_label(self._grid_status, "caution")
+        else:
+            self._grid_status.setText("")
+            style_status_label(self._grid_status)
+        self.refresh_inputs()
+
     def reset(self) -> None:
         self._analysis = None
         self._msd_df = None
@@ -972,6 +1212,7 @@ class _PosteriorTab(QWidget):
         style_status_label(self._status)
         self._summary.setText("")
         self._refresh_plot_buttons()
+        self._on_grid_changed()
 
     def set_layer_exposure(self, exposure_s: Optional[float]) -> None:
         """What the newly loaded layer records -- pre-fills the box, or
@@ -1019,7 +1260,12 @@ class _PosteriorTab(QWidget):
         exposure, note, level = self._exposure_for_run()
         self._exposure_note.setText(note)
         style_status_label(self._exposure_note, level)
-        self._run_button.setEnabled(exposure is not None and self.host.has_tracks)
+        try:
+            self.options()
+            grid_ok = True
+        except ValueError:
+            grid_ok = False
+        self._run_button.setEnabled(exposure is not None and grid_ok and self.host.has_tracks)
         alpha_possible = exposure == 0
         self._alpha.setEnabled(alpha_possible)
         if not alpha_possible:
@@ -1028,6 +1274,7 @@ class _PosteriorTab(QWidget):
     def _refresh_plot_buttons(self) -> None:
         has_run = self._analysis is not None and len(self._analysis.fitted_ids) > 0
         self._ensemble_button.setEnabled(has_run)
+        self._posteriors_button.setEnabled(has_run)
         self._track_button.setEnabled(has_run)
         self._msd_plot_button.setEnabled(self._msd_df is not None)
 
@@ -1039,6 +1286,10 @@ class _PosteriorTab(QWidget):
         self._status.setText(text)
         style_status_label(self._status, "error")
 
+    def report_caution(self, text: str) -> None:
+        self._status.setText(text)
+        style_status_label(self._status, "caution")
+
     def show_loaded_summary(self, text: str) -> None:
         self._summary.setText(text)
 
@@ -1047,14 +1298,18 @@ class _PosteriorTab(QWidget):
         exposure, _note, _level = self._exposure_for_run()
         if tracks is None or exposure is None:
             return
+        try:
+            options = self.options()
+        except ValueError as exc:
+            self.report_error(f"grid: {exc}")
+            return
         self._status.setText("running…")
         style_status_label(self._status)
         worker = _run_posterior_worker(
             tracks,
             self.host.dt_s,
             exposure,
-            self._min_frames.value(),
-            self._alpha.isChecked(),
+            options,
             self._msd_comparison.isChecked(),
             self.host.progress_callback,
         )
@@ -1062,19 +1317,40 @@ class _PosteriorTab(QWidget):
 
     def _on_finished(self, result: tuple[PosteriorAnalysis, Optional[pl.DataFrame]]) -> None:
         analysis, msd_fits = result
-        self._analysis = analysis
-        self._msd_df = msd_track_table(msd_fits) if msd_fits is not None else None
-        self._refresh_plot_buttons()
-        self.refresh_inputs()
-        n_ok = len(analysis.fitted_ids)
+        n_ok = self._adopt(analysis, msd_track_table(msd_fits) if msd_fits is not None else None)
         self._status.setText(f"{n_ok} of {analysis.fits.height} tracks fitted")
         style_status_label(self._status, "ok" if n_ok else "caution")
-
-        display = posterior_results_table(analysis, self._msd_df)
-        self.host.set_posterior_results(analysis, display)
         self.refresh_summary()
         if n_ok:
             self._show_ensemble()
+
+    def _adopt(self, analysis: PosteriorAnalysis, msd_df: Optional[pl.DataFrame]) -> int:
+        """Make `analysis` this tab's, and hand its per-track columns to
+        the host. Returns how many tracks were fitted."""
+        self._analysis = analysis
+        self._msd_df = msd_df
+        self._refresh_plot_buttons()
+        self._on_grid_changed()
+        self.host.set_posterior_results(analysis, posterior_results_table(analysis, msd_df))
+        return len(analysis.fitted_ids)
+
+    def restore(self, saved: SavedAnalysis) -> None:
+        """A bundle's saved analysis, reopened (see the module docstring):
+        as if its run had just finished here, with the controls set to what
+        it was run and summarized with, so Run re-fits the same way. The
+        caller refreshes the summary once the filters are back too."""
+        analysis = saved.analysis
+        self._min_frames.setValue(analysis.min_frames)
+        self._alpha.setChecked(analysis.alpha_ids is not None and self._alpha.isEnabled())
+        self._msd_comparison.setChecked(saved.msd is not None)
+        self.set_deconvolution(saved.deconvolution)
+        n_ok = self._adopt(analysis, saved.msd)
+        self.set_grid(analysis.options)
+        self._status.setText(
+            f"saved analysis loaded: {n_ok} of {analysis.fits.height} tracks fitted, "
+            f"exposure {units.fmt_unit(analysis.acquisition.exposure_s, units.SECONDS)} — Run to re-fit"
+        )
+        style_status_label(self._status, "ok")
 
     def refresh_summary(self) -> None:
         """Recompute the population summary over the tracks the pane passes
@@ -1082,10 +1358,11 @@ class _PosteriorTab(QWidget):
         if self._analysis is None:
             return
         ids = self.host.combined_filtered_track_ids()
-        self._summary_values = summarize(self._analysis, ids)
+        deconvolution = self.deconvolution()
+        self._summary_values = summarize(self._analysis, ids, deconvolution)
         groups = self.host.group_track_ids(ids)
         self._summary_by_group = (
-            {name: summarize(self._analysis, group_ids) for name, group_ids in groups.items()}
+            {name: summarize(self._analysis, group_ids, deconvolution) for name, group_ids in groups.items()}
             if groups
             else None
         )
@@ -1095,19 +1372,38 @@ class _PosteriorTab(QWidget):
         )
         if self._ensemble_window is not None and self._ensemble_window.isVisible():
             self._show_ensemble()
+        if self._posteriors_window is not None and self._posteriors_window.isVisible():
+            self._show_posteriors()
 
-    def _show_ensemble(self) -> None:
+    def _panels(self, *, track_posteriors: bool = False) -> list[dict]:
+        """`ensemble_panels` over the tracks the filters pass, one per
+        region class when there are several -- or [] (and says so)."""
         if self._analysis is None:
-            return
+            return []
         ids = self.host.combined_filtered_track_ids()
         groups = self.host.group_track_ids(ids) or {"all": ids}
-        panels = ensemble_panels(self._analysis, groups)
+        panels = ensemble_panels(
+            self._analysis, groups, self.deconvolution(), track_posteriors=track_posteriors
+        )
         if not panels:
             self._status.setText("no fitted tracks pass the current filters")
             style_status_label(self._status, "caution")
+        return panels
+
+    def _show_posteriors(self) -> None:
+        panels = self._panels(track_posteriors=True)
+        if not panels:
+            return
+        if self._posteriors_window is None:
+            self._posteriors_window = PlotWindow("Posterior: every track", parent=self)
+        self._posteriors_window.show_figure(plot_d_posteriors(self._analysis.D_grid_um2_s, panels))
+
+    def _show_ensemble(self) -> None:
+        panels = self._panels()
+        if not panels:
             return
         figure = plot_d_ensemble(
-            D_GRID_UM2_S, panels, ALPHA_GRID if self._analysis.has_alpha else None
+            self._analysis.D_grid_um2_s, panels, self._analysis.alpha_grid if self._analysis.has_alpha else None
         )
         if self._ensemble_window is None:
             self._ensemble_window = PlotWindow("Posterior: ensemble", parent=self)
@@ -1191,7 +1487,7 @@ def _format_posterior_summary(summary: dict, analysis: Optional[PosteriorAnalysi
         key[2:]: value
         for key, value in summary.items()
         if key.startswith("n_")
-        and key not in ("n_tracks", "n_ok", "n_alpha")
+        and key not in ("n_tracks", "n_ok", "n_alpha", "n_D_at_grid_edge")
         and not key.startswith("n_frames")
     }
     counts = f"{summary.get('n_ok', 0)} fitted"
@@ -1202,6 +1498,11 @@ def _format_posterior_summary(summary: dict, analysis: Optional[PosteriorAnalysi
         lines.append(
             f"length {summary['n_frames_min']:.0f} / {summary['n_frames_median']:.0f} / "
             f"{summary['n_frames_max']:.0f} {units.POINTS} (min / median / max)"
+        )
+    if summary.get("n_D_at_grid_edge"):
+        lines.append(
+            f"{summary['n_D_at_grid_edge']} cut by the D grid's edge (D_at_grid_edge) — "
+            "their numbers depend on the grid range"
         )
     if summary.get("median_D_um2_s") is not None:
         lines.append(
@@ -2029,11 +2330,45 @@ class DiffusionAnalysisWidget(QWidget):
         layer.events.data.connect(self._on_tracks_layer_event)
         layer.events.properties.connect(self._on_tracks_layer_event)
 
-        saved_summary = load_diffusion_summary(self._result_dir) if self._result_dir is not None else None
-        if saved_summary is not None:
-            self._posterior_tab.show_loaded_summary("Saved analysis:\n" + _format_summary(saved_summary))
-            self._posterior_tab.report_saved("this bundle has a saved analysis — Run to redo it")
+        self._restore_saved_analysis()
         self._update_save_enabled()
+
+    def _restore_saved_analysis(self) -> None:
+        """Reopen the bundle's saved analysis when it was fitted on the
+        tracks now loaded -- see the module docstring. When it wasn't (or
+        can't be read), its numbers are shown as text only, and Run is the
+        way to plots."""
+        if self._result_dir is None or self._diffkit_tracks is None:
+            return
+        try:
+            tables = load_diffusion_results(self._result_dir)
+            if tables is None:
+                self._show_saved_summary_only(None)
+                return
+            saved = restore_analysis(self._diffkit_tracks, **tables)
+        except (StaleAnalysisError, OSError, ValueError, KeyError, pl.exceptions.PolarsError) as exc:
+            self._show_saved_summary_only(exc)
+            return
+        self._nuts_rows = list(saved.nuts_rows)
+        self._posterior_tab.restore(saved)
+        # The tracks pane's cuts it was summarized under -- after the
+        # results are joined in, since a cut may be on a result column.
+        record = saved.summary.get("tracks_summary_filters") or {}
+        self._tracks_pane.set_saved_filters(
+            record.get("min_track_length", 1),
+            {col: tuple(bounds) for col, bounds in (record.get("ranges") or {}).items()},
+        )
+        self.on_filters_changed()
+
+    def _show_saved_summary_only(self, reason: Optional[Exception]) -> None:
+        summary = load_diffusion_summary(self._result_dir)
+        if summary is None:
+            return
+        self._posterior_tab.show_loaded_summary("Saved analysis:\n" + _format_summary(summary))
+        if reason is None:
+            self._posterior_tab.report_saved("this bundle has a saved summary — Run to redo it")
+        else:
+            self._posterior_tab.report_caution(f"saved analysis not loaded: {reason} — Run to re-fit")
 
     def _on_tracks_layer_changed_externally(self) -> None:
         """The loaded Tracks layer was redrawn in place by someone else --
@@ -2434,9 +2769,14 @@ class DiffusionAnalysisWidget(QWidget):
             # region class when there are several.
             ids = self.combined_filtered_track_ids()
             by_class = self.group_track_ids(ids)
-            tables = analysis_tables(analysis, ids, by_class)
+            deconvolution = self._posterior_tab.deconvolution()
+            tables = analysis_tables(analysis, ids, by_class, deconvolution)
             summary = analysis_summary(
-                analysis, ids, by_class, msd_comparison=self._posterior_tab.msd_df is not None
+                analysis,
+                ids,
+                by_class,
+                msd_comparison=self._posterior_tab.msd_df is not None,
+                deconvolution=deconvolution,
             )
         summary["tracks_summary_filters"] = self._summary_filter_record()
         summary["repo_shas"] = _analysis_repo_shas()

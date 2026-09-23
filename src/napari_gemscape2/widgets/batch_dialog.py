@@ -79,6 +79,9 @@ def _detect_track_summary(params: dict) -> str:
 
 def _diffusion_summary_text(settings: dict) -> str:
     parts = [f"min_frames {settings.get('min_frames', '?')}"]
+    grid = settings.get("grid") or {}
+    if "D_min_um2_s" in grid and "D_max_um2_s" in grid:
+        parts.append(f"D grid {grid['D_min_um2_s']:g}–{grid['D_max_um2_s']:g} µm²/s")
     if settings.get("alpha"):
         parts.append("α")
     if settings.get("msd_comparison"):
