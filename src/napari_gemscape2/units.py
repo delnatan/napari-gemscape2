@@ -120,7 +120,6 @@ _EXACT: dict[str, Optional[str]] = {
     # Dimensionless by construction, listed so they read as "known with no
     # unit" rather than "unknown".
     "alpha": None,
-    "eps": None,
     "sigma_ratio": None,
     "flux_ratio": None,
     "flux_snr": None,
@@ -150,27 +149,18 @@ _EXACT: dict[str, Optional[str]] = {
     "dispersion": ADU,
     "r2": None,
     "r_squared": None,
-    "log_bf10": None,
-    "evidence": None,
-    # diffusionkit's Brownian displacement MLE (`classic.analyze_tracks`,
-    # `model == "brownian_mle"`). `z_nonbrownian` is a signed score,
-    # ~N(0,1) under Brownian motion + the provided localization noise;
-    # the p-values and likelihoods are pure numbers too.
-    "z_nonbrownian": None,
-    "z_nonbrownian_asymptotic": None,
-    "p_nonbrownian": None,
-    "p_motion": None,
-    "lr_motion": None,
-    "log_likelihood": None,
-    "alpha_1step": None,
-    "alpha_1step_se": None,
-    "n_boot": None,
-    "n_boot_valid": None,
+    # diffusionkit's grid posteriors: per-track statuses, and the
+    # posterior's own summaries are named `<quantity>_<median|low|high>`,
+    # resolved through the statistic suffixes above.
+    "posterior_status": None,
+    "alpha_status": None,
+    "log_posterior": None,
+    "posterior": None,
+    "weight": None,
     # diffusionkit's count of observations actually used for a track --
     # the same quantity as `track_length`.
     "n_frames": POINTS,
     "status": None,
-    "mle_status": None,
     "message": None,
     "track_id": None,
     "loc_id": None,
@@ -198,19 +188,18 @@ _AGGREGATE_SUFFIXES = ("_min", "_mean", "_max", "_sum")
 
 # A point estimate or interval edge of a fitted quantity, and the naming
 # this project uses to keep one quantity's several fits in separate
-# columns (`alpha_map` vs `alpha_classical` vs `alpha_track_fit`). Both
+# columns (`alpha_median` vs `alpha_msd` vs `alpha_nuts`). Both
 # kinds carry the base quantity's unit.
 _STATISTIC_SUFFIXES = (
     "_median",
     "_mean",
     "_lo",
     "_hi",
+    "_low",
+    "_high",
+    "_nuts",
     "_stderr",
     "_map",
-    "_classical",
-    "_classical_anom",
-    "_track_fit",
-    "_mle",
     "_msd",
     "_est",
     "_link",
@@ -366,7 +355,7 @@ def tooltip(column: str) -> str:
 
 def mpl_label(column: str) -> str:
     """A matplotlib axis label in mathtext: `radius_of_gyration_um` ->
-    `radius of gyration ($\\mu$m)`, `alpha_map` -> `$\\alpha$ map`.
+    `radius of gyration ($\\mu$m)`, `alpha_msd` -> `$\\alpha$ msd`.
 
     Matches the convention diffusionkit's own `viz` modules use --
     quantity, then unit in parentheses -- so this project's figures and

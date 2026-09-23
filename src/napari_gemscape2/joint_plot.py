@@ -4,7 +4,14 @@ properties. diffusionkit ships this exact diagnostic for D vs alpha
 column and always draws an alpha=1 Brownian reference line -- both specific
 to that one comparison. This generalizes it to arbitrary columns/labels/log
 scaling so any two trajectory properties (classical vs Bayesian D, alpha,
-r2, track length, anisotropy epsilon, ...) can be compared the same way.
+r2, track length, ...) can be compared the same way.
+
+The posterior figures (`plot_d_ensemble`, `plot_track_posterior`) follow
+one color assignment by role, not by series: per-track medians are a
+neutral histogram, the deconvolved distribution is blue, the summed
+(shared-value) posterior is orange. Region classes are separate panels
+stacked on one shared x axis rather than more hues, so every panel reads
+the same way.
 
 Axis labels default to `napari_gemscape2.units.mpl_label(column)` rather than
 to the raw column name: since the axes here are picked at runtime from
@@ -25,7 +32,6 @@ import seaborn as sns
 from matplotlib.figure import Figure
 
 from napari_gemscape2 import units
-from napari_gemscape2.diffusion import resolved_mle_rows
 
 
 def plot_property_joint(
@@ -94,191 +100,177 @@ def numeric_columns(df: pl.DataFrame, exclude: tuple[str, ...] = ("track_id",)) 
     return [c for c, dtype in zip(df.columns, df.dtypes) if c not in exclude and dtype.is_numeric()]
 
 
-def _join_groups(rows: pl.DataFrame, groups: pl.DataFrame | None) -> tuple[pl.DataFrame, str | None]:
-    """`rows` with a `group` column joined on, and "group" as the seaborn
-    hue when it names more than one group -- else `rows` as given and no
-    hue, since one group is the same as none."""
-    if groups is None:
-        return rows, None
-    rows = rows.join(groups.select("track_id", "group"), on="track_id", how="left")
-    return rows, ("group" if rows["group"].drop_nulls().n_unique() > 1 else None)
+# Roles, from the reference categorical palette's first two slots plus a
+# neutral; text stays in ink colors, never a series color.
+_HIST_COLOR = "#c9c8c2"
+_DECONVOLVED_COLOR = "#2a78d6"
+_SUMMED_COLOR = "#eb6834"
+_INK = "#0b0b0b"
+_MUTED_INK = "#52514e"
 
 
-def plot_d_z_joint(
-    mle_rows: pl.DataFrame,
-    summary: dict,
+def _style_axis(ax) -> None:
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color(_MUTED_INK)
+    ax.tick_params(colors=_MUTED_INK, labelsize=8)
+    ax.grid(axis="y", color="0.92", lw=0.6)
+    ax.set_axisbelow(True)
+
+
+def _density(weights: np.ndarray, x: np.ndarray) -> np.ndarray:
+    """Grid weights (sum to 1) as a density over `x` (the plotted axis),
+    so a curve and a density histogram share one y scale."""
+    return weights / np.gradient(x)
+
+
+def _mass_range(weights: np.ndarray, x: np.ndarray, tail: float = 1e-3) -> tuple[float, float]:
+    """The span of `x` holding all but `tail` of `weights` at each end."""
+    cdf = np.cumsum(weights)
+    return float(np.interp(tail, cdf, x)), float(np.interp(1 - tail, cdf, x))
+
+
+# Histogram bin width on a log10-D axis: about 12% in D, a few grid cells.
+_LOG_D_BIN = 0.05
+# Padding around the plotted D range, in decades.
+_LOG_D_PAD = 0.25
+
+
+def _interval_marker(ax, low: float, median: float, high: float, y: float, color: str) -> None:
+    ax.plot([low, high], [y, y], color=color, lw=2, solid_capstyle="round", zorder=4)
+    ax.plot([median], [y], "o", color=color, ms=6, mec="white", mew=1.2, zorder=5)
+
+
+def plot_d_ensemble(
+    d_grid: np.ndarray,
+    panels: list[dict],
+    alpha_grid: np.ndarray | None = None,
     title: str | None = None,
-    groups: pl.DataFrame | None = None,
 ) -> Figure:
-    """The Brownian-MLE population view: log10 D (x) against the
-    non-Brownian score z (y), one point per track that resolved motion.
+    """The population read of a posterior run: one row per panel (a region
+    class, or "all"), with log10 D on the left and alpha on the right when
+    alpha was computed.
 
-    What makes it more than `plot_property_joint`:
+    Each panel dict holds `name`, `n_tracks`, `medians` (per-track D
+    posterior medians), `deconvolved` and `summed` (weights on `d_grid`),
+    `summed_interval` (low, median, high), and optionally
+    `alpha_medians`, `alpha_summed_interval`.
 
-      - the z marginal is a density with the N(0,1) curve over it -- what
-        z would look like if every track were Brownian with correctly
-        calibrated localization SDs -- and the joint axis carries the
-        ±1.96 band, so "how many fall outside by chance" is visible;
-      - mean z ± its standard error is drawn on the marginal and written
-        in the title, since z is read at the population level (one short
-        track's z says little; a shift of the mean across ~100 does);
-      - `unresolved` tracks (D̂ = 0) have no log D and no z, so they can't
-        be plotted; the title counts them, with the median of their upper
-        limits, rather than letting them vanish.
-
-    `mle_rows` are the `brownian_mle` rows of `ClassicAnalysis.fits`;
-    `summary` is `diffusion.summarize_mle` over the same rows.
-
-    `groups` (`track_id`, `group`), when it names more than one group --
-    the region classes a run was split into -- colors the scatter and the D marginal
-    by group, so whether the regions' populations separate is read off
-    the same figure. The z marginal and its N(0,1) reference stay pooled:
-    the reference is the same for every group.
+    On one density axis: the histogram of per-track medians (what the
+    typical track says), and the deconvolved distribution (how D is spread
+    across tracks, with each track's own uncertainty removed -- widths
+    are resolution-limited). The summed posterior -- one D shared by every
+    track -- is far narrower than either, so rather than a curve that
+    would flatten the other two it is a marker with its 90% interval
+    above them.
     """
-    resolved, hue = _join_groups(
-        mle_rows.filter(pl.col("z_nonbrownian").is_not_null() & (pl.col("D_um2_s") > 0)), groups
-    )
-    x = np.log10(resolved["D_um2_s"].to_numpy().astype(float))
-    y = resolved["z_nonbrownian"].to_numpy().astype(float)
-    pdf = pd.DataFrame({"x": x, "y": y})
-    if hue is not None:
-        pdf["group"] = resolved["group"].fill_null("(none)").to_list()
-
-    g = sns.JointGrid(data=pdf, x="x", y="y", height=6, ratio=4)
-    # Recessive references first, so the data sits on top of them.
-    g.ax_joint.axhspan(-1.96, 1.96, color="0.95", zorder=0, lw=0)
-    for level in (-1.96, 1.96):
-        g.ax_joint.axhline(level, color="0.55", lw=0.8, ls="--", zorder=0)
-    g.ax_joint.axhline(0.0, color="0.55", lw=0.8, zorder=0)
-    if len(pdf) >= 3 and pdf["x"].nunique() > 1 and pdf["y"].nunique() > 1:
-        sns.kdeplot(
-            data=pdf, x="x", y="y", ax=g.ax_joint,
-            fill=True, cmap="Blues", alpha=0.6, thresh=0.05, levels=12, zorder=1,
+    has_alpha = alpha_grid is not None and any(p.get("alpha_medians") is not None for p in panels)
+    n = len(panels)
+    fig = Figure(figsize=(8.5 if has_alpha else 6.0, 1.2 + 2.3 * n), layout="constrained")
+    axes = fig.subplots(n, 2 if has_alpha else 1, squeeze=False, sharex="col")
+    x = np.log10(d_grid)
+    # One x range for every panel (the axes are shared): wherever any
+    # panel has medians or deconvolved mass, rather than the whole grid,
+    # which spans five decades and would squeeze the data into a sliver.
+    spans = []
+    for panel in panels:
+        spans.append(_mass_range(panel["deconvolved"], x, tail=0.01))
+        medians = np.asarray(panel["medians"], dtype=float)
+        medians = medians[medians > 0]
+        if len(medians):
+            spans.append((np.log10(medians.min()), np.log10(medians.max())))
+    x_lo = max(min(lo for lo, _ in spans) - _LOG_D_PAD, x[0])
+    x_hi = min(max(hi for _, hi in spans) + _LOG_D_PAD, x[-1])
+    bins = np.arange(x_lo, x_hi + _LOG_D_BIN, _LOG_D_BIN)
+    for row, panel in enumerate(panels):
+        ax = axes[row][0]
+        _style_axis(ax)
+        medians = np.asarray(panel["medians"], dtype=float)
+        medians = np.log10(medians[medians > 0])
+        if len(medians):
+            ax.hist(medians, bins=bins, density=True, color=_HIST_COLOR, edgecolor="white",
+                    lw=0.5, label="per-track medians")
+        dens = _density(panel["deconvolved"], x)
+        ax.plot(x, dens, color=_DECONVOLVED_COLOR, lw=1.8, label="deconvolved")
+        top = max(dens.max(), ax.get_ylim()[1])
+        low, median, high = (np.log10(v) for v in panel["summed_interval"])
+        _interval_marker(ax, low, median, high, top * 1.08, _SUMMED_COLOR)
+        ax.plot([], [], "o-", color=_SUMMED_COLOR, lw=2, ms=5, label="summed (shared D), 90%")
+        ax.set_ylim(0, top * 1.18)
+        ax.set_xlim(x_lo, x_hi)
+        ax.set_ylabel("density", fontsize=8, color=_MUTED_INK)
+        ax.set_title(
+            f"{panel['name']} · {panel['n_tracks']} tracks · shared D = "
+            f"{panel['summed_interval'][1]:.3g} µm²/s",
+            fontsize=9, loc="left", color=_INK,
         )
-    if hue is None:
-        sns.scatterplot(
-            data=pdf, x="x", y="y", ax=g.ax_joint,
-            s=18, alpha=0.6, color="0.15", edgecolor="none", zorder=2,
-        )
-        g.ax_marg_x.hist(pdf["x"], bins=30, color="steelblue", edgecolor="white")
-    else:
-        sns.scatterplot(
-            data=pdf, x="x", y="y", hue=hue, ax=g.ax_joint,
-            s=18, alpha=0.75, edgecolor="none", zorder=2,
-        )
-        sns.histplot(
-            data=pdf, x="x", hue=hue, ax=g.ax_marg_x, bins=30,
-            element="step", fill=False, legend=False,
-        )
-        g.ax_marg_x.set_xlabel("")
-        g.ax_marg_x.set_ylabel("")
-        g.ax_joint.legend(title="Region", fontsize=8, title_fontsize=8, loc="lower right")
-
-    # z is shown whole (it is a score, not a quantity with outliers to
-    # trim), with the axis never narrower than ±4 so the N(0,1) reference
-    # reads the same from one run to the next.
-    z_lo = min(-4.0, float(np.min(y)) - 0.25) if len(y) else -4.0
-    z_hi = max(4.0, float(np.max(y)) + 0.25) if len(y) else 4.0
-    bins = np.linspace(z_lo, z_hi, 41)
-    g.ax_marg_y.hist(
-        pdf["y"], bins=bins, density=True, color="steelblue", edgecolor="white",
-        orientation="horizontal",
-    )
-    grid = np.linspace(z_lo, z_hi, 400)
-    g.ax_marg_y.plot(np.exp(-0.5 * grid**2) / np.sqrt(2 * np.pi), grid, color="0.2", lw=1.2)
-    mean_z, se_z = summary.get("mean_z"), summary.get("se_mean_z")
-    if mean_z is not None:
-        g.ax_marg_y.axhline(mean_z, color="0.2", lw=1.2)
-        if se_z is not None:
-            g.ax_marg_y.axhspan(mean_z - se_z, mean_z + se_z, color="0.2", alpha=0.25, lw=0)
-    g.ax_joint.set_ylim(z_lo, z_hi)
-
-    g.ax_joint.set_xlabel(units.mpl_log_label("D_um2_s") + " — Brownian MLE")
-    g.ax_joint.set_ylabel(r"non-Brownian score $z$ (0 if Brownian; $-$ confined, $+$ directed)")
-
-    lines = [title or r"Brownian MLE: $D$ vs. $z$"]
-    stats = f"n = {len(pdf)}"
-    if mean_z is not None:
-        stats += f" · mean z = {mean_z:+.2f}"
-        if se_z is not None:
-            stats += f" ± {se_z:.2f} (SE)"
-    if summary.get("sd_z") is not None:
-        stats += f" · SD {summary['sd_z']:.2f}"
-    if summary.get("frac_abs_z_gt_1_96") is not None:
-        stats += f" · |z| > 1.96: {100 * summary['frac_abs_z_gt_1_96']:.1f}% (5% if Brownian)"
-    lines.append(stats)
-    n_unresolved = summary.get("n_unresolved", 0)
-    if n_unresolved:
-        upper = summary.get("unresolved_D_upper_median_um2_s")
-        note = f"{n_unresolved} unresolved (D̂ = 0, no z) not shown"
-        if upper is not None:
-            note += f"; median upper limit D < {upper:.3g} µm²/s"
-        lines.append(note)
-    g.ax_marg_x.set_title("\n".join(lines), fontsize=9, loc="left")
-    g.ax_marg_y.set_xlabel("density", fontsize=8)
-    return g.figure
+        if row == 0:
+            ax.legend(fontsize=7, frameon=False, loc="upper left")
+        if has_alpha:
+            ax_a = axes[row][1]
+            _style_axis(ax_a)
+            alpha_medians = panel.get("alpha_medians")
+            if alpha_medians is not None and len(alpha_medians):
+                ax_a.hist(alpha_medians, bins=np.linspace(0, 2, 26), density=True,
+                          color=_HIST_COLOR, edgecolor="white", lw=0.8)
+                ax_a.axvline(1.0, color=_MUTED_INK, lw=0.8, ls="--", zorder=0)
+                a_top = ax_a.get_ylim()[1]
+                a_low, a_med, a_high = panel["alpha_summed_interval"]
+                _interval_marker(ax_a, a_low, a_med, a_high, a_top * 1.08, _SUMMED_COLOR)
+                ax_a.set_ylim(0, a_top * 1.18)
+                ax_a.set_title(f"shared α = {a_med:.2f}", fontsize=9, loc="left", color=_INK)
+            ax_a.set_xlim(0, 2)
+    axes[-1][0].set_xlabel(units.mpl_log_label("D_um2_s"), fontsize=9)
+    if has_alpha:
+        axes[-1][1].set_xlabel(r"$\alpha$ (1 = Brownian, dashed)", fontsize=9)
+    if title:
+        fig.suptitle(title, fontsize=10, x=0.01, ha="left")
+    return fig
 
 
-def plot_d_histogram(
-    mle_rows: pl.DataFrame,
-    summary: dict,
-    title: str | None = None,
-    groups: pl.DataFrame | None = None,
+def plot_track_posterior(
+    track_id: int,
+    d_grid: np.ndarray,
+    d_weights: np.ndarray,
+    d_interval: tuple[float, float, float],
+    alpha_grid: np.ndarray | None = None,
+    alpha_weights: np.ndarray | None = None,
+    alpha_interval: tuple[float, float, float] | None = None,
+    n_frames: int | None = None,
 ) -> Figure:
-    """The routine read of a Brownian MLE run: the per-track D
-    distribution as a histogram of log10 D.
-
-    Log bins because D spans decades across a field of tracks -- on a
-    linear axis it is one spike at the low end. The median and the
-    interquartile range (`summary`, from `diffusion.summarize_mle`) are
-    drawn on it and written in the title. `unresolved` tracks (D̂ = 0)
-    have no log D, so they can't be binned; the title counts them with
-    the median of their upper limits instead of letting them vanish.
-
-    `groups` (`track_id`, `group`), when it names more than one group --
-    the region classes a run was split into -- draws one step histogram per group
-    on shared bins, so whether the regions' D distributions separate is
-    read off the same axes.
-    """
-    resolved, hue = _join_groups(resolved_mle_rows(mle_rows), groups)
-    x = np.log10(resolved["D_um2_s"].to_numpy().astype(float))
-
-    fig = Figure(figsize=(6.5, 4.2), layout="constrained")
-    ax = fig.add_subplot()
-    if len(x):
-        bins = np.histogram_bin_edges(x, bins="fd") if len(x) > 3 else 10
-        if not np.isscalar(bins) and len(bins) - 1 > 60:
-            bins = 60
-        if hue is None:
-            ax.hist(x, bins=bins, color="steelblue", edgecolor="white")
-        else:
-            pdf = pd.DataFrame({"x": x, "group": resolved["group"].fill_null("(none)").to_list()})
-            sns.histplot(data=pdf, x="x", hue="group", ax=ax, bins=bins, element="step", fill=False)
-            legend = ax.get_legend()
-            if legend is not None:
-                legend.set_title("Region")
-    median = summary.get("median_D_um2_s")
-    q25, q75 = summary.get("q25_D_um2_s"), summary.get("q75_D_um2_s")
-    if q25 and q75:
-        ax.axvspan(np.log10(q25), np.log10(q75), color="0.2", alpha=0.12, lw=0, zorder=0)
-    if median:
-        ax.axvline(np.log10(median), color="0.2", lw=1.2)
-    ax.set_xlabel(units.mpl_log_label("D_um2_s") + " — Brownian MLE")
-    ax.set_ylabel("tracks")
-
-    lines = [title or r"Brownian MLE: per-track $D$"]
-    stats = f"n = {len(x)}"
-    if median is not None:
-        stats += f" · median D = {median:.3g} µm²/s"
-        if q25 is not None and q75 is not None:
-            stats += f" (IQR {q25:.3g}–{q75:.3g})"
-    lines.append(stats)
-    n_unresolved = summary.get("n_unresolved", 0)
-    if n_unresolved:
-        upper = summary.get("unresolved_D_upper_median_um2_s")
-        note = f"{n_unresolved} unresolved (D̂ = 0) not shown"
-        if upper is not None:
-            note += f"; median upper limit D < {upper:.3g} µm²/s"
-        lines.append(note)
-    ax.set_title("\n".join(lines), fontsize=9, loc="left")
+    """One track's posterior over log10 D (and alpha, when computed), with
+    its median and the shaded 90% interval. A short track's posterior is
+    wide, and that width is the answer, not a defect."""
+    has_alpha = alpha_weights is not None
+    fig = Figure(figsize=(7.0 if has_alpha else 4.2, 2.8), layout="constrained")
+    axes = fig.subplots(1, 2 if has_alpha else 1, squeeze=False)[0]
+    specs = [(axes[0], np.log10(d_grid), d_weights, tuple(np.log10(v) for v in d_interval),
+              units.mpl_log_label("D_um2_s"))]
+    if has_alpha:
+        specs.append((axes[1], alpha_grid, alpha_weights, alpha_interval, r"$\alpha$"))
+    for ax, x, w, (low, median, high), label in specs:
+        _style_axis(ax)
+        dens = _density(w, x)
+        inside = (x >= low) & (x <= high)
+        ax.fill_between(x, dens, where=inside, color=_DECONVOLVED_COLOR, alpha=0.18, lw=0)
+        ax.plot(x, dens, color=_DECONVOLVED_COLOR, lw=1.8)
+        ax.axvline(median, color=_INK, lw=1)
+        ax.set_xlabel(label, fontsize=9)
+        ax.set_ylim(bottom=0)
+    lo, hi = _mass_range(d_weights, specs[0][1])
+    axes[0].set_xlim(lo - _LOG_D_PAD, hi + _LOG_D_PAD)
+    if has_alpha:
+        axes[1].axvline(1.0, color=_MUTED_INK, lw=0.8, ls="--", zorder=0)
+    axes[0].set_ylabel("posterior density", fontsize=8, color=_MUTED_INK)
+    low, median, high = d_interval
+    head = f"track {track_id}" + (f" · {n_frames} frames" if n_frames else "")
+    axes[0].set_title(
+        f"{head}\nD = {median:.3g} µm²/s [{low:.3g}, {high:.3g}]",
+        fontsize=9, loc="left", color=_INK,
+    )
+    if has_alpha:
+        a_low, a_med, a_high = alpha_interval
+        axes[1].set_title(f"α = {a_med:.2f} [{a_low:.2f}, {a_high:.2f}]", fontsize=9, loc="left",
+                          color=_INK)
     return fig

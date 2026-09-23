@@ -4,7 +4,8 @@ Batch orchestration and napari visualization for single-particle tracking, conne
 
 - [`spotsolve`](https://github.com/delnatan/spotsolve) — multi-emitter 2D localization
   by Bayesian model selection, plus frame-to-frame linking. Runs in Rust.
-- [`diffusionkit`](https://github.com/delnatan/diffusionkit) — classical (Brownian displacement MLE) and Bayesian diffusion analysis.
+- [`diffusionkit`](https://github.com/delnatan/diffusionkit) — per-track grid posteriors over D and α, their
+  ensemble (summed and deconvolved), classic MSD fits, and per-track NUTS.
 
 ## Particle tracking in the dense regime
 
@@ -169,16 +170,16 @@ bundle saved across a scale change would be internally inconsistent.
 camera's `ExposureTime` in an Andor Fusion `.ims`'s acquisition protocol, OME
 `Plane ExposureTime`) and recorded in the manifest as `exposure_s` /
 `exposure_s_source`. Detection and linking never use it; the diffusion
-analysis does, because its MLE models the motion blur of a continuous
-exposure. It is **never defaulted to 0**: 0 means "instantaneous", and on
-real data that biases `D` by about −25% and the non-Brownian score by +0.3 to
-+0.7. A file that doesn't record it shows `exposure ?` in amber. You type it into "Image metadata" (the exposure box is
+analysis does, because its D likelihood models the motion blur of a
+continuous exposure. It is **never defaulted to 0**: 0 means "instantaneous",
+and on real data that biases `D` low. (Exposure 0 is also the only case where
+the α posterior is available: it has no blur model.) A file that doesn't record it shows `exposure ?` in amber. You type it into "Image metadata" (the exposure box is
 not behind the override switch, so supplying it doesn't replace the file's
 pixel size or frame interval). The Diffusion panel's own exposure box is
 pre-filled from the layer, and it won't run until it has a value.
 
 In results, `napari_gemscape2.units` is the single source of truth for what each
-column is measured in: it labels the tracks-pane headers (`D_mle [µm²/s]`,
+column is measured in: it labels the tracks-pane headers (`D_median [µm²/s]`,
 `se_x_max [px]`, `se_x_um_max [µm]`), the filter rows' tooltips, the spatial
 map's color scale, every fit readout, and every plot axis — the last in the same
 mathtext style diffusionkit's own figures use, so a joint plot and an MSD plot
@@ -188,15 +189,15 @@ shown bare rather than guessed at.
 ## Setup
 
 The project has its own `uv`-managed virtual environment in `.venv`. `spotsolve`
-and `diffusionkit` are local path dependencies (sibling checkouts), and
-`spotsolve-rs` — the Rust extension `spotsolve` needs at import time — is built
-from `../spotsolve/rust/spotsolve-py`:
+(one distribution with its Rust extension bundled, built here by maturin) and
+`diffusionkit` are path dependencies on sibling checkouts:
 
 ```
-uv sync
+uv sync                 # add --extra bayes for the NUTS tab (JAX, NumPyro)
 ```
 
-Re-run it after changing `spotsolve`'s Rust core, so the extension is rebuilt.
+Re-run `uv sync --reinstall-package spotsolve` after changing `spotsolve`'s Rust
+core, so the extension is rebuilt.
 
 ## Usage
 
@@ -237,33 +238,55 @@ detection knobs, then filters on what it found, where `fit_sigma` settles the
 width) and **Track**
 (link, optionally with flux as a second link cue, then filters on the
 tracks), pressing *Save results* when the result is worth keeping. The "Diffusion analysis" widget then reads the tracks layer for
-the classical per-track Brownian MLE — by default just `D` (with its upper limit
-and `p_motion`) as a log-D histogram with median and IQR, about 2 s for ~500
-tracks; the calibrated non-Brownian score `z` (log D vs z, mean z ± SE) is an
-opt-in that costs ~15× more; MSD fits only as a labelled comparison. *Save analysis*
-writes `tracks_summary.parquet`, one row per track — the table to read an
-experiment's tracks from and to pool across experiments (*Export CSV…* writes
-the same table as CSV). Every track is a row, filtered-out and unresolved ones
-included, with:
+diffusionkit's grid posteriors: for each track, the posterior over D (flat
+prior in ln D, the exposure's blur modelled) summarized as its median and 5%/95%
+quantiles, and — with exposure 0, as an opt-in that costs ~30× more — the same
+for the fBm exponent α. About 1 s for ~500 tracks without α. The **Ensemble**
+plot reads them across the tracks the filters pass, per region class: the
+per-track medians, the *deconvolved* distribution of D (each track's own
+uncertainty removed; peak positions and masses are robust, widths are
+resolution-limited), and the *summed* posterior (one D shared by every track).
+MSD fits are a labelled opt-in comparison; the **Track** plot shows the
+selected track's posterior; the **Map** tab colors each track's centroid by any
+result; the **NUTS** tab fits the selected track's full posterior (needs
+`--extra bayes`).
+
+*Save analysis* writes into the bundle:
+
+```
+tracks_summary.csv        one row per track (below)
+posterior_D.parquet       every fitted track's log posterior: track_id, D_um2_s, log_posterior
+posterior_alpha.parquet   likewise over alpha (exposure 0 runs with α only)
+distributions_D.csv       the ensemble on the D grid, long by group ("all", then each
+                          region class): summed_log_posterior, summed_posterior, deconvolved
+distributions_alpha.csv   likewise on the α grid (summed only)
+diffusion_summary.json    settings (dt, exposure, grids, level), population numbers
+                          per group, the tracks-pane filters, and repo SHAs
+```
+
+Points and tracks stay parquet (the atomic data); the tables people open in a
+spreadsheet are CSV. `tracks_summary.csv` — the table to read an experiment's
+tracks from and to pool across experiments (*Export CSV…* writes the same table
+anywhere) — has every track as a row, filtered-out and excluded ones included:
 
 - identity: `result_id` (the bundle), `track_id`, `region_class`, `cell`, and `passes_filters`
   (the tracks pane's length and histogram cuts, recorded in
   `diffusion_summary.json`);
 - size and position: `track_length`, `duration_s`, `mean_step_um`, mean
   `x_um`/`y_um` (and px);
-- the classical fit: `mle_status`, `D_mle_um2_s`, `D_upper_mle_um2_s`,
-  `p_motion` (plus `z_nonbrownian`, `p_nonbrownian`, `alpha_1step` when z was
-  computed);
+- the posterior: `posterior_status`, `D_median_um2_s`, `D_low_um2_s`,
+  `D_high_um2_s` (5% and 95% quantiles), and with α: `alpha_status`,
+  `alpha_median`, `alpha_low`, `alpha_high`; `D_msd_um2_s`/`alpha_msd` when the
+  MSD comparison ran, `*_nuts*` for tracks fitted with NUTS;
 - shape: `radius_of_gyration_um`, `net_displacement_um`, `straightness`,
   `gyration_asymmetry`;
 - track quality, as the mean over the track's detections of each detector
   column: `flux_mean`, `bg_mean`, `fit_sigma_mean`, `se_x_mean`/`se_y_mean`,
-  ... — in the detector's units (`fit_sigma`, `se_x` in px; the `_um` variants
-  in µm).
+  `link_margin_mean`, ... — in the detector's units (`fit_sigma`, `se_x` in px;
+  the `_um` variants in µm).
 
-The Diffusion panel also runs Bayesian and per-track anisotropy fits, and offers the same histogram
-filters over per-track results — so a fitted `D` or `alpha` is filterable by the
-same drag as any other feature.
+The tracks pane's histogram filters cover per-track results too — so a
+posterior `D` or `alpha` is filterable by the same drag as any other feature.
 
 The widgets work on one image at a time, on purpose. To process a whole folder
 without looking at each one, use `gemscape2 detect-track`. To compare experiments,

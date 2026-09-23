@@ -7,6 +7,22 @@ A results bundle is a directory:
     <result_dir>/labels.tif     (optional -- only if regions were used)
     <result_dir>/regions.json   (alongside labels.tif)
 
+and, once the diffusion widget has saved an analysis of it
+(`write_diffusion_results`):
+    <result_dir>/tracks_summary.csv       one row per track
+    <result_dir>/posterior_D.parquet      every track's log posterior over D
+    <result_dir>/posterior_alpha.parquet  likewise over alpha (exposure 0 only)
+    <result_dir>/distributions_D.csv      the ensemble on the D grid
+    <result_dir>/distributions_alpha.csv  likewise on the alpha grid
+    <result_dir>/diffusion_summary.json   settings + population numbers
+
+Points and tracks are the atomic data, and stay parquet: everything else
+is derived from them. The per-track summary and the distributions are the
+tables people open in a spreadsheet or Prism, so they are CSV. The
+posteriors share one grid per quantity and run to hundreds of rows per
+track, so they are long-format parquet (`track_id`, grid value,
+`log_posterior`).
+
 Detection and tracking are two files, saved by two different actions
 (`write_result` for both, `write_detection_result` for points alone) -- a
 bundle can hold detections with no tracks yet, but never the reverse, since
@@ -28,6 +44,7 @@ import json
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import polars as pl
@@ -40,12 +57,19 @@ TRACKS_FILENAME = "tracks.parquet"
 MANIFEST_FILENAME = "manifest.json"
 LABELS_FILENAME = "labels.tif"
 REGIONS_FILENAME = "regions.json"
-DIFFUSION_FITS_FILENAME = "diffusion_fits.parquet"
 DIFFUSION_SUMMARY_FILENAME = "diffusion_summary.json"
 # One row per track: identity, size, position, shape, mean detection QC
-# and the classical D -- the table to read an experiment's tracks from and
-# to pool across experiments (`diffusion.tracks_summary_table`).
-TRACKS_SUMMARY_FILENAME = "tracks_summary.parquet"
+# and the posterior D (median, low, high) -- the table to read an
+# experiment's tracks from and to pool across experiments
+# (`diffusion.tracks_summary_table`).
+TRACKS_SUMMARY_FILENAME = "tracks_summary.csv"
+POSTERIOR_D_FILENAME = "posterior_D.parquet"
+POSTERIOR_ALPHA_FILENAME = "posterior_alpha.parquet"
+DISTRIBUTIONS_D_FILENAME = "distributions_D.csv"
+DISTRIBUTIONS_ALPHA_FILENAME = "distributions_alpha.csv"
+# Written by earlier versions of the diffusion widget; removed on the next
+# save so a bundle never mixes two analyses.
+_STALE_DIFFUSION_FILES = ("diffusion_fits.parquet", "tracks_summary.parquet")
 
 
 def git_sha(repo_path: str | Path) -> str | None:
@@ -174,42 +198,48 @@ def load_result(
 
 def write_diffusion_results(
     result_dir: str | Path,
-    per_track_df: pl.DataFrame,
+    *,
+    tracks_summary: pl.DataFrame,
     summary: dict,
-    tracks_summary_df: pl.DataFrame | None = None,
+    posterior_D: Optional[pl.DataFrame] = None,
+    posterior_alpha: Optional[pl.DataFrame] = None,
+    distributions_D: Optional[pl.DataFrame] = None,
+    distributions_alpha: Optional[pl.DataFrame] = None,
 ) -> None:
-    """Diffusion-widget results, written like the regions: an optional
-    extra on top of the core points/tracks/manifest bundle, not every
-    bundle has one. `per_track_df` holds one row per (track_id, method) --
-    the classical run's fits and any Bayesian per-track fits the user has
-    run, distinguished by a `method` column (see
-    `widgets/diffusion_panel.py`) -- so all of them live in one file.
-    `summary` holds the run settings and population-level scalars.
-
-    `tracks_summary_df`, when given, is the flat one-row-per-track table
-    (`TRACKS_SUMMARY_FILENAME`): the one to read, since `per_track_df`
-    mixes every method's rows and columns."""
+    """The diffusion widget's analysis of this bundle's tracks (see this
+    module's docstring for the files). An optional table left as None has
+    its file removed rather than kept, so what is on disk is always one
+    analysis -- an alpha posterior from an earlier run at exposure 0 never
+    sits beside a D posterior from a later one at 20 ms."""
     result_dir = Path(result_dir)
     result_dir.mkdir(parents=True, exist_ok=True)
-    per_track_df.write_parquet(result_dir / DIFFUSION_FITS_FILENAME)
+    tracks_summary.write_csv(result_dir / TRACKS_SUMMARY_FILENAME)
     (result_dir / DIFFUSION_SUMMARY_FILENAME).write_text(json.dumps(summary, indent=2))
-    if tracks_summary_df is not None:
-        tracks_summary_df.write_parquet(result_dir / TRACKS_SUMMARY_FILENAME)
+    for table, filename in (
+        (posterior_D, POSTERIOR_D_FILENAME),
+        (posterior_alpha, POSTERIOR_ALPHA_FILENAME),
+    ):
+        if table is None:
+            (result_dir / filename).unlink(missing_ok=True)
+        else:
+            table.write_parquet(result_dir / filename)
+    for table, filename in (
+        (distributions_D, DISTRIBUTIONS_D_FILENAME),
+        (distributions_alpha, DISTRIBUTIONS_ALPHA_FILENAME),
+    ):
+        if table is None:
+            (result_dir / filename).unlink(missing_ok=True)
+        else:
+            table.write_csv(result_dir / filename)
+    for filename in _STALE_DIFFUSION_FILES:
+        (result_dir / filename).unlink(missing_ok=True)
 
 
-def load_diffusion_results(
-    result_dir: str | Path,
-) -> tuple[pl.DataFrame | None, dict | None]:
-    """`(per_track_df, summary)`, or `(None, None)` if this bundle has no
-    saved diffusion results yet."""
-    result_dir = Path(result_dir)
-    fits_path = result_dir / DIFFUSION_FITS_FILENAME
-    summary_path = result_dir / DIFFUSION_SUMMARY_FILENAME
-    if not fits_path.exists():
-        return None, None
-    per_track_df = pl.read_parquet(fits_path)
-    summary = json.loads(summary_path.read_text()) if summary_path.exists() else None
-    return per_track_df, summary
+def load_diffusion_summary(result_dir: str | Path) -> Optional[dict]:
+    """The saved `diffusion_summary.json`, or None if this bundle has no
+    saved analysis yet."""
+    path = Path(result_dir) / DIFFUSION_SUMMARY_FILENAME
+    return json.loads(path.read_text()) if path.exists() else None
 
 
 def load_manifest(result_dir: str | Path) -> dict:
