@@ -1090,17 +1090,9 @@ def session_from_bundle(
     image, metadata = stack
 
     def filters(key: str) -> Optional[FilterSpec]:
-        spec = params.get(key)
-        return {col: tuple(bounds) for col, bounds in spec.items()} if spec else None
+        return _filters_from_record(params.get(key))
 
-    detect_kwargs = params.get("detect_kwargs")
-    if detect_kwargs is not None:
-        detect_kwargs = {
-            key: tuple(value) if key == "slack" and value is not None else value
-            for key, value in detect_kwargs.items()
-            # Written by spotsolve versions that still had a reporting band.
-            if key != "band"
-        }
+    detect_kwargs = _detect_kwargs_from_record(params.get("detect_kwargs"))
     frame_range = params.get("frame_range")
     has_tracks = tracks_df is not None and tracks_df.height > 0 and "track_id" in tracks_df.columns
     session = PipelineSession(
@@ -1140,6 +1132,49 @@ def session_from_bundle(
     return session
 
 
+def _filters_from_record(spec: Optional[dict]) -> Optional[FilterSpec]:
+    """A manifest's `{column: [lo, hi]}` back as a `FilterSpec`."""
+    return {col: tuple(bounds) for col, bounds in spec.items()} if spec else None
+
+
+def _detect_kwargs_from_record(detect_kwargs: Optional[dict]) -> Optional[dict]:
+    """A manifest's `detect_kwargs` back as `run_detect_step` takes them."""
+    if detect_kwargs is None:
+        return None
+    return {
+        key: tuple(value) if key == "slack" and value is not None else value
+        for key, value in detect_kwargs.items()
+        # Written by spotsolve versions that still had a reporting band.
+        if key != "band"
+    }
+
+
+def detect_track_params_from_manifest(manifest: dict) -> dict:
+    """The `DetectTrackParams` keyword arguments a saved bundle was made
+    with -- what lets a headless run reuse the settings one movie was
+    tuned on in the widget (`gemscape2 detect-track`'s `template`).
+
+    Only settings, never what they measured (`D_est_um2_s`, `n_points`,
+    ...), and only the keys the manifest actually records, so a missing
+    one falls through to `DetectTrackParams`' default. `frame_range` is
+    left out: a frame window is a fact about one movie (or a quick test
+    on a few frames), not a setting to carry to the next."""
+    params = manifest.get("params", {}) or {}
+    record = {
+        "sigma": params.get("sigma_px"),
+        "min_track_length": params.get("min_track_length"),
+        "exclude_flags": parse_flag_names(params.get("exclude_flags")),
+        "min_link_margin": params.get("min_link_margin"),
+        "link_with_flux": params.get("link_with_flux"),
+        "detector": params.get("detector"),
+        "camera_kwargs": params.get("camera_kwargs"),
+        "detect_kwargs": _detect_kwargs_from_record(params.get("detect_kwargs")),
+        "point_filters": _filters_from_record(params.get("point_filters")),
+        "track_filters": _filters_from_record(params.get("track_filters")),
+    }
+    return {key: value for key, value in record.items() if value is not None}
+
+
 def _metadata_provenance(session: PipelineSession) -> dict:
     """`StackMetadata.as_manifest_dict()` for this session's image, with
     each of the two required values marked as coming from the file or
@@ -1171,10 +1206,16 @@ def _metadata_provenance(session: PipelineSession) -> dict:
 def _jsonable_filters(filters: Optional[FilterSpec]) -> Optional[dict]:
     """A filter spec with its `(lo, hi)` tuples as lists -- same reason as
     `_jsonable_detect_kwargs`: `json.dumps` writes both as arrays, so
-    normalize here and keep the round-trip honest."""
+    normalize here and keep the round-trip honest. An open side is null,
+    however it was given (None, or a config's `-inf`/`inf`) -- JSON has no
+    infinity."""
     if not filters:
         return None
-    return {col: [lo, hi] for col, (lo, hi) in filters.items()}
+
+    def bound(value):
+        return None if value is None or not np.isfinite(value) else value
+
+    return {col: [bound(lo), bound(hi)] for col, (lo, hi) in filters.items()}
 
 
 def parse_flag_names(names: Optional[str]) -> Optional[int]:

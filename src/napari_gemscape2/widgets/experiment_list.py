@@ -55,12 +55,16 @@ items. Detect can be cancelled from its own button (`_cancel_active_run`)
 -- cooperatively, see `pipeline.PipelineCancelled`'s docstring for what
 that actually guarantees per stage.
 
-There is deliberately no multi-file "run everything" here: an unattended
-run can't use the filter histograms, and a second, hands-off path through
-the same widget blurred what a saved bundle meant. Running a folder
-headlessly is the `gemscape2 detect-track` CLI's job (`pipeline.run_detect_track`);
-pooling results across experiments is a script's job, over the saved
-bundles.
+Multi-file runs start from a finished movie: "Batch from this movie…"
+(`widgets/batch_dialog.py`) takes the current row's *saved* bundle as the
+template and runs its settings -- detect+track from its manifest, the
+diffusion analysis from its saved `diffusion_summary.json` -- over the
+other movies ticked in the dialog. That keeps the filter histograms'
+role: the cuts are chosen by looking at one movie, then reused, never
+set blind. The batch goes through the same `batch.detect_track_bundle`
+and `diffusion_batch.analyze_bundle` as the `gemscape2` CLI, and writes
+the CLI config that re-runs it. Pooling results across experiments is a
+script's job, over the saved bundles.
 
 Runs write **nothing** until "Save results" is pressed
 (`_save_result`). The filter histograms on both tabs are the reason:
@@ -105,6 +109,7 @@ from qtpy.QtWidgets import (
     QLabel,
     QListWidget,
     QFrame,
+    QHBoxLayout,
     QListWidgetItem,
     QMessageBox,
     QProgressBar,
@@ -120,6 +125,7 @@ from qtpy.QtWidgets import (
 )
 
 from napari_gemscape2 import units
+from napari_gemscape2.batch import write_batch_config
 from napari_gemscape2.results import (
     build_manifest,
     result_dir_for,
@@ -161,6 +167,13 @@ from napari_gemscape2.viewer import (
     set_tracks_layer_data,
     show_image,
     show_result,
+)
+from napari_gemscape2.widgets.batch_dialog import (
+    BatchDialog,
+    BatchEmitter,
+    BatchPlan,
+    batch_config_path,
+    run_batch_worker,
 )
 from napari_gemscape2.widgets.params_panel import PipelineParamsWidget
 
@@ -456,8 +469,23 @@ class ExperimentListWidget(QWidget):
         )
         self.list_view.confirm_reload = self._confirm_reload
 
-        open_button = QPushButton("Open folder…")
-        open_button.clicked.connect(self._open_folder_dialog)
+        self.open_button = QPushButton("Open folder…")
+        self.open_button.clicked.connect(self._open_folder_dialog)
+        self.batch_button = QPushButton("Batch from this movie…")
+        self.batch_button.setToolTip(
+            "Run the selected movie's saved settings (detect+track, and its\n"
+            "saved diffusion analysis) over other movies in this folder."
+        )
+        self.batch_button.clicked.connect(self._open_batch_dialog)
+        button_row = QHBoxLayout()
+        button_row.addWidget(self.open_button)
+        button_row.addWidget(self.batch_button)
+        # The running batch: its plan, cancel flag and one line per movie
+        # (shown when it ends). `self._worker` holds the worker itself, so
+        # everything that waits on a step run also waits on a batch.
+        self._batch_plan: Optional[BatchPlan] = None
+        self._batch_log: list[str] = []
+        self._batch_current = ""
 
         self.params_panel = PipelineParamsWidget()
         self.params_panel.detectRequested.connect(self._run_detect_step)
@@ -536,6 +564,10 @@ class ExperimentListWidget(QWidget):
         bottom_layout.addWidget(params_scroll, 1)
         bottom_layout.addWidget(self.progress_label)
         bottom_layout.addWidget(self.progress_bar)
+        self.batch_cancel_button = QPushButton("Cancel batch")
+        self.batch_cancel_button.setVisible(False)
+        self.batch_cancel_button.clicked.connect(self._cancel_active_run)
+        bottom_layout.addWidget(self.batch_cancel_button)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
         splitter.addWidget(self.list_view)
@@ -548,9 +580,142 @@ class ExperimentListWidget(QWidget):
 
         layout = QVBoxLayout()
         layout.addWidget(header)
-        layout.addWidget(open_button)
+        layout.addLayout(button_row)
         layout.addWidget(splitter)
         self.setLayout(layout)
+
+    # -- Batch from the current row's saved bundle --
+
+    def _open_batch_dialog(self) -> None:
+        item = self.list_view.currentItem()
+        if self._worker is not None:
+            self.progress_label.setText("a run is in progress -- wait for it to finish")
+            return
+        if item is None or not has_result(item.entry.result_dir):
+            QMessageBox.information(
+                self,
+                "Batch from this movie",
+                "Select a movie with saved results first: its saved settings are what the "
+                "batch runs on the others.",
+            )
+            return
+        template = item.entry.result_dir
+        entries = [
+            (other.entry.image_path, other.entry.result_dir, other.entry.status is Status.SKIP)
+            for other in self.list_view.items()
+            if other is not item
+        ]
+        try:
+            dialog = BatchDialog(template, self.list_view.results_root, entries, parent=self)
+        except Exception as exc:
+            QMessageBox.warning(self, "Batch from this movie", f"Can't read {template.name}: {exc}")
+            return
+        if dialog.exec() != BatchDialog.DialogCode.Accepted:
+            return
+        self._start_batch(dialog.plan())
+
+    def _start_batch(self, plan: BatchPlan) -> None:
+        if not plan.jobs:
+            return
+        self._batch_log = []
+        if plan.write_config:
+            config_path = batch_config_path(plan.results_root, plan.template)
+            try:
+                plan.results_root.mkdir(parents=True, exist_ok=True)
+                write_batch_config(
+                    config_path,
+                    results_root=plan.results_root,
+                    template=plan.template,
+                    inputs=[(job.image_path, job.result_dir.name) for job in plan.jobs],
+                    diffusion=plan.diffusion,
+                )
+                self._batch_log.append(f"config: {config_path}")
+            except Exception as exc:
+                self._batch_log.append(f"! config not written: {exc}")
+
+        self._batch_plan = plan
+        self._cancel_event = threading.Event()
+        emitter = BatchEmitter(self)
+        emitter.job_started.connect(self._on_batch_job_started)
+        emitter.progress.connect(self._on_batch_progress)
+        emitter.bundle_written.connect(self._on_batch_bundle_written)
+        emitter.job_finished.connect(self._on_batch_job_finished)
+        worker = run_batch_worker(plan, self._cancel_event, emitter)
+        # Kept alive until the worker is done with it.
+        worker.finished.connect(emitter.deleteLater)
+        self._set_batch_running(True)
+        self._start_step_worker(worker, self._on_batch_done, on_error=self._on_batch_error)
+
+    def _set_batch_running(self, running: bool) -> None:
+        # The list and the params stay put while movies are being written:
+        # showing a row mid-write, or starting a step run, would race it.
+        self.list_view.setEnabled(not running)
+        self.open_button.setEnabled(not running)
+        self.batch_button.setEnabled(not running)
+        self.params_panel.setEnabled(not running)
+        self.batch_cancel_button.setVisible(running)
+        self.batch_cancel_button.setEnabled(running)
+
+    def _batch_job_prefix(self, index: int) -> str:
+        return f"[{index + 1}/{len(self._batch_plan.jobs)}]"
+
+    def _on_batch_job_started(self, index: int, name: str) -> None:
+        self._batch_current = f"{self._batch_job_prefix(index)} {name}"
+        self.progress_bar.setRange(0, 0)
+        self.progress_label.setText(self._batch_current)
+
+    def _on_batch_progress(self, done: int, total: int, stage: str) -> None:
+        if not total:
+            self.progress_bar.setRange(0, 0)
+        self._on_progress(done, total, stage)
+        self.progress_label.setText(f"{self._batch_current}\n{self.progress_label.text()}")
+
+    def _batch_item(self, index: int) -> Optional[ExperimentItem]:
+        job = self._batch_plan.jobs[index]
+        for item in self.list_view.items():
+            if item.entry.result_dir == job.result_dir:
+                return item
+        return None
+
+    def _on_batch_bundle_written(self, index: int, n_tracks: int) -> None:
+        item = self._batch_item(index)
+        if item is not None:
+            item.set_status(Status.COMPLETE, n_tracks=n_tracks)
+            self.list_view.viewport().update()
+
+    def _on_batch_job_finished(self, index: int, ok: bool, message: str) -> None:
+        name = self._batch_plan.jobs[index].image_path.name
+        mark = "✓" if ok else "✗"
+        self._batch_log.append(f"{mark} {name}: {message}")
+
+    def _on_batch_done(self, completed: bool) -> None:
+        plan = self._batch_plan
+        n_ok = sum(line.startswith("✓") for line in self._batch_log)
+        n_failed = sum(line.startswith("✗") for line in self._batch_log)
+        self._end_batch()
+        headline = (
+            f"Batch finished: {n_ok} of {len(plan.jobs)} movies done"
+            if completed
+            else f"Batch cancelled: {n_ok} of {len(plan.jobs)} movies done"
+        )
+        if n_failed:
+            headline += f", {n_failed} failed"
+        self.progress_label.setText(headline)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning if n_failed else QMessageBox.Icon.Information)
+        box.setWindowTitle("Batch from this movie")
+        box.setText(headline)
+        box.setDetailedText("\n".join(self._batch_log))
+        box.exec()
+
+    def _on_batch_error(self, exc: Exception) -> None:
+        self._end_batch()
+        self.progress_label.setText(f"batch error: {exc}")
+
+    def _end_batch(self) -> None:
+        self._finish_step_worker()
+        self._set_batch_running(False)
+        self._batch_plan = None
 
     def _open_folder_dialog(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Select folder of timelapses")

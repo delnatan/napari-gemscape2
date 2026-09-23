@@ -223,15 +223,46 @@ Rust code, rebuild with `uv sync --project dev --reinstall-package spotsolve`.
 
 ## Usage
 
+Batch from napari: tune one movie in the widgets and save it (*Save
+results*, then *Save analysis* in the diffusion widget). Then, with that
+movie selected in the experiment list, press **Batch from this movie…**. In
+the dialog, tick the other movies (unanalyzed ones are pre-ticked) and the
+steps: detect + track, diffusion analysis, or both. The batch runs in the
+background, one movie at a time, turning each row green as its bundle is
+written. It also writes `results/batch_<template>.toml`, the config the CLI
+below reads, so the same batch can be re-run headless.
+
 Headless batch run (see `pyproject.toml`'s `[project.scripts]` entry `gemscape2`):
 
 ```
-gemscape2 detect-track config.toml
+gemscape2 detect-track config.toml   # detect + track every input
+gemscape2 diffusion config.toml      # then the diffusion analysis of each bundle
 ```
+
+Both read the same config. Relative paths in it are read from the config's
+own folder, so it runs the same from anywhere.
+
+The easy way to write one is to tune a single movie in the napari widgets,
+save it (*Save results*, then *Save analysis*), and name that bundle as the
+`template`. `detect-track` then reuses the settings in its `manifest.json`
+and `diffusion` reuses those in its `diffusion_summary.json`, with nothing
+copied by hand. Any key written under `[params]` or `[diffusion]` overrides
+the template's. Painted regions are not carried over, because a batch run uses the
+whole field.
 
 ```toml
 results_root = "results"
+template = "results/beads_dense"   # optional
 
+[[inputs]]
+path = "data/beads_timelapse_dense_2.tif"
+result_id = "beads_dense_2"   # optional, defaults to the stem
+exposure_s = 0.01             # optional; also pixel_size_um, dt_s
+```
+
+Without a template, or to override it:
+
+```toml
 [params]
 # PSF width in px -- required. Read it off the fit_sigma histogram of a few
 # detected frames in the napari widget.
@@ -245,14 +276,25 @@ camera_kwargs = { offset = 100.0 }
 link_with_flux = false
 # The same QC cuts the UI's histogram filters produce, as {column = [lo, hi]}.
 # Applied to what the linker sees and to which tracks are kept -- never to
-# points.parquet, which holds every detection either way.
-point_filters = { flux = [1200.0, 40000.0], fit_sigma = [1.0, 2.2] }
+# points.parquet, which holds every detection either way. TOML has no null:
+# an open side is -inf or inf. An inline table must fit on one line.
+point_filters = { flux = [1200.0, 40000.0], fit_sigma = [1.0, 2.2], se_pos = [-inf, 0.4] }
 track_filters = { track_length = [5.0, 1e9] }
 
-[[inputs]]
-path = "data/beads_timelapse_dense.tif"
-result_id = "beads_dense"   # optional, defaults to the stem
+[diffusion]
+min_frames = 3          # shortest track fitted
+alpha = false           # the alpha posterior: needs exposure 0, ~30x slower
+msd_comparison = false
+exposure_s = 0.01       # optional: overrides each bundle's recorded exposure
+# Which tracks pass (`passes_filters`) and so make up the ensemble -- the
+# diffusion widget's tracks-pane cuts, on any per-track column.
+min_track_length = 5
+filters = { flux_mean = [800.0, inf], D_median_um2_s = [0.001, inf] }
 ```
+
+`gemscape2 diffusion` writes the same files as the widget's *Save analysis*
+(see "Reproducible results bundles"), so a bundle analyzed headless reopens in
+the widget like any other.
 
 Interactive: open napari and use the "Experiment list" dock widget to browse a
 folder of raw images and work one image through **Detect** (PSF width and
@@ -310,7 +352,9 @@ anywhere) — has every track as a row, filtered-out and excluded ones included:
 The tracks pane's histogram filters cover per-track results too — so a
 posterior `D` or `alpha` is filterable by the same drag as any other feature.
 
-The widgets work on one image at a time, on purpose. To process a whole folder
-without looking at each one, use `gemscape2 detect-track`. To compare experiments,
-read the saved bundles (`tracks.parquet`, `manifest.json`) into a script and
-pool them there.
+The widgets tune one image at a time, on purpose. To process a whole folder
+without looking at each one, use **Batch from this movie…** in the experiment
+list, or `gemscape2 detect-track` and `gemscape2 diffusion` with one tuned movie
+as the `template`. To compare experiments, read the saved
+bundles' `tracks_summary.csv` into a script and pool them there (each row
+carries its `result_id`).

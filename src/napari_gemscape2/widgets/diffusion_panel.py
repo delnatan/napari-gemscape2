@@ -19,7 +19,7 @@ pointed at a selection you could not see.
   MSD comparison and NUTS results, each in its own column group), plus a `min_track_length` spinbox and a
   `FeatureFilterPanel` over whatever columns that table currently holds.
   Those columns include per-point detection quality aggregated to the
-  track (`flux_min`, `se_x_max`, ... -- see `_qc_aggregate_table`), so a
+  track (`flux_min`, `se_x_max`, ... -- see `diffusion.qc_aggregate_table`), so a
   QC cut and a fit-result cut are the same gesture on the same table
   rather than two panels at two granularities.
   Selecting a row is "the current track", kept in sync with the viewer both
@@ -109,8 +109,6 @@ from typing import Optional
 import numpy as np
 import polars as pl
 from diffusionkit import Acquisition
-from diffusionkit.classic import MSDOptions
-from diffusionkit.classic import analyze_tracks as analyze_msd
 from napari.layers import Points, Shapes, Tracks
 from napari.qt.threading import thread_worker
 from qtpy.QtCore import QObject, Qt, QTimer, Signal
@@ -149,17 +147,22 @@ from napari_gemscape2 import units
 from napari_gemscape2.diffusion import (
     ALPHA_GRID,
     D_GRID_UM2_S,
+    EXPOSURE_CLAMP_FRACTION,
     LEVEL,
     MIN_FRAMES,
-    POSTERIOR_COLUMNS,
     PosteriorAnalysis,
+    analysis_summary,
+    analysis_tables,
     analyze_posteriors,
-    distributions_table,
+    base_track_table,
     ensemble_panels,
+    filter_record,
+    msd_fits_blur_free,
     msd_track_table,
-    posterior_long_table,
+    passing_track_ids,
+    posterior_results_table,
+    region_class_groups,
     summarize,
-    track_geometry,
     track_posterior,
     tracks_summary_table,
     tracks_to_diffusionkit_df,
@@ -254,11 +257,6 @@ def oriented_track_box(
     return center + (signs * half) @ axes
 
 
-# The MSD comparison's lag window: diffusionkit's own default. Not exposed
-# -- the MSD fits are a cross-check here, not an analysis to tune.
-_MSD_MAX_LAG = 3
-
-
 @thread_worker(start_thread=False)
 def _run_posterior_worker(
     diffkit_tracks: pl.DataFrame,
@@ -270,20 +268,15 @@ def _run_posterior_worker(
     progress,
 ) -> tuple[PosteriorAnalysis, Optional[pl.DataFrame]]:
     """`(analysis, msd_fits)`: the grid posteriors with the real exposure,
-    and -- when asked for -- diffusionkit.classic's MSD fits.
-
-    The MSD fits have no blur model, so diffusionkit excludes them when
-    `exposure_s > 0`; the comparison therefore runs them with the exposure
-    treated as 0, which is exactly the assumption that biases them, and is
-    labelled as such wherever it shows."""
+    and -- when asked for -- diffusionkit.classic's MSD fits, run with the
+    exposure treated as 0 (see `diffusion.msd_fits_blur_free`)."""
     acquisition = Acquisition(dt_s=dt_s, exposure_s=exposure_s)
     analysis = analyze_posteriors(
         diffkit_tracks, acquisition, min_frames=min_frames, level=LEVEL, alpha=alpha, progress=progress
     )
     msd_fits = None
     if msd_comparison:
-        options = MSDOptions(max_lag=_MSD_MAX_LAG, min_frames=max(min_frames, 5), localization="provided")
-        msd_fits = analyze_msd(diffkit_tracks, Acquisition(dt_s=dt_s), options).fits
+        msd_fits = msd_fits_blur_free(diffkit_tracks, dt_s, min_frames)
     return analysis, msd_fits
 
 
@@ -344,16 +337,6 @@ class _ProgressRelay(QObject):
     progress = Signal(int, int)
 
 
-# Per-vertex columns that are position, identity, or already per-track --
-# nothing to summarize. `track_length` is taken from the diffusionkit table
-# instead (guaranteed present there), and y/x become the centroid.
-# `loc_id` is a detection's serial number: its min/mean/max are three
-# columns of pure noise in a table that already runs past fifty.
-# `flags` is a bitmask: its min/mean/max are not quantities.
-_QC_SKIP_COLUMNS = frozenset(
-    {"track_id", "loc_id", "frame", "y", "x", "track_length", "region", "cell", "flags"}
-)
-
 # Per-track posterior results this widget broadcasts onto the viewer's
 # Tracks layer as properties, so the trajectories themselves can be
 # colored by them (layer controls -> color by). `log10_D_median` rather
@@ -366,91 +349,6 @@ _TRACK_COLOR_COLUMNS = ("log10_D_median", "alpha_median")
 # "No exposure seen yet" for `DiffusionAnalysisWidget._layer_exposure_s`,
 # distinct from None ("the layer records none").
 _UNSEEN = object()
-
-# How each genuinely per-point column is collapsed to one number per track.
-# min/max are what actually replaced the old per-point "Data Explorer": its
-# rule was "keep a track only if EVERY one of its points passes this range",
-# which is `col_min >= lo and col_max <= hi` -- the same cut, expressed as a
-# track property, so it can sit in the same filter panel as `alpha` and be
-# read against the same table. The mean is the plain descriptive statistic
-# the min/max pair does not imply, and the one to filter on when the
-# question is about the track's typical quality rather than its worst point.
-_QC_AGGREGATIONS = (
-    ("min", lambda col: pl.col(col).min()),
-    ("mean", lambda col: pl.col(col).mean()),
-    ("max", lambda col: pl.col(col).max()),
-)
-
-
-def _qc_aggregate_table(tracks_df_px: pl.DataFrame) -> tuple[pl.DataFrame, list[str]]:
-    """Every per-vertex detection-quality column on the Tracks layer
-    (`flux`, `se_y`/`se_x`, `bg`, `fit_sigma`, ...), collapsed to one row
-    per track, plus the names of the columns that produced aggregates.
-
-    Columns that are already constant within each track are passed through
-    under their own name rather than tripled: `duration_s` and
-    `mean_step_um` are per-track numbers that `viewer.py` broadcast onto
-    every vertex, and `duration_s_min == duration_s_mean == duration_s_max`
-    would be three identical columns and two useless filter choices."""
-    numeric = [
-        col
-        for col, dtype in zip(tracks_df_px.columns, tracks_df_px.dtypes)
-        if col not in _QC_SKIP_COLUMNS and dtype.is_numeric()
-    ]
-    if not numeric:
-        return tracks_df_px.select("track_id").unique().sort("track_id"), []
-
-    # One pass to find out which of those are per-point and which are
-    # per-track-broadcast, rather than hardcoding a list that would go
-    # stale the moment the detector gains a column.
-    varies = tracks_df_px.group_by("track_id").agg(
-        pl.col(col).n_unique().alias(col) for col in numeric
-    )
-    per_point = [col for col in numeric if varies[col].max() is not None and varies[col].max() > 1]
-    per_track = [col for col in numeric if col not in per_point]
-
-    exprs = [pl.col(col).first().alias(col) for col in per_track]
-    for col in per_point:
-        exprs.extend(agg(col).alias(f"{col}_{suffix}") for suffix, agg in _QC_AGGREGATIONS)
-    return tracks_df_px.group_by("track_id").agg(exprs).sort("track_id"), per_point
-
-
-def _base_track_table(
-    diffkit_tracks: pl.DataFrame, tracks_df_px: pl.DataFrame
-) -> tuple[pl.DataFrame, list[str]]:
-    """One row per track: identity, position, shape
-    (`diffusion.track_geometry` -- radius of gyration,
-    straightness, ...) and detection-quality context columns that every
-    tab's results get left-joined onto, plus the names of
-    the aggregate QC columns (so the tracks pane can hide that group from
-    the table when it is not being used -- there are three per detector
-    field, and they are the widest group in the table).
-
-    Position columns are pixel-space (`tracks_df_px`, the viewer's own
-    coordinate system), not the physical-unit table."""
-    centroids = tracks_df_px.group_by("track_id").agg(
-        pl.col("y").mean().alias("y_px"), pl.col("x").mean().alias("x_px")
-    )
-    lengths = diffkit_tracks.group_by("track_id").agg(pl.col("track_length").first())
-    geometry = track_geometry(diffkit_tracks)
-    qc, per_point = _qc_aggregate_table(tracks_df_px)
-    qc_columns = [c for c in qc.columns if c != "track_id"]
-    table = (
-        lengths.join(centroids, on="track_id", how="left")
-        .join(geometry, on="track_id", how="left")
-        .join(qc, on="track_id", how="left")
-        .sort("track_id")
-    )
-    region_cols = [c for c in ("region_class", "cell") if c in tracks_df_px.columns]
-    if region_cols:
-        # Which region the track was linked in (`regions.label_points`) --
-        # one per track, since tracking links each region on its own.
-        regions = tracks_df_px.group_by("track_id").agg(pl.col(c).first() for c in region_cols)
-        table = table.join(regions, on="track_id", how="left")
-    # Only the tripled columns are the hideable group; the passed-through
-    # per-track ones (duration_s, mean_step_um) are core context.
-    hideable = [c for c in qc_columns if any(c.startswith(f"{col}_") for col in per_point)]
-    return table, hideable
 
 
 def _shared_tracks_unchanged(old: Optional[pl.DataFrame], new: pl.DataFrame) -> bool:
@@ -562,7 +460,7 @@ class _TracksPane(QWidget):
     The filter panel covers whatever columns the table currently holds.
     Before any fit that is `track_length`/`duration_s`/`mean_step_um` plus
     the per-point detection quality aggregated to the track (`flux_min`,
-    `se_x_max`, ... -- see `_qc_aggregate_table`); after a posterior run
+    `se_x_max`, ... -- see `diffusion.qc_aggregate_table`); after a posterior run
     it is also `D_median_um2_s`, `D_low_um2_s`, `alpha_median` and the
     rest. So "drop the tracks with a bad worst-point localization
     error, then keep the ones whose fitted alpha is below 0.8, and look at
@@ -904,12 +802,6 @@ class _TracksPane(QWidget):
         self._suppress_selection_signal = False
 
 
-# Exposure longer than the frame interval by at most this fraction is read
-# as a streaming acquisition (exposure == interval) whose measured median
-# interval came out a hair short, and clamped to it -- with a note. Past
-# it, the two numbers genuinely disagree and the run is refused.
-_EXPOSURE_CLAMP_FRACTION = 0.01
-
 _POSTERIOR_HELP = (
     "<b>Per track</b>, D is the median of its posterior (flat prior in ln D), and "
     "<b>low/high</b> are the 5% and 95% quantiles: a 90% credible interval. The "
@@ -1102,7 +994,7 @@ class _PosteriorTab(QWidget):
         dt = self.host.dt_s
         if exposure is None:
             return None, "not recorded on this layer — enter the camera exposure to run", "error"
-        if exposure > dt * (1 + _EXPOSURE_CLAMP_FRACTION):
+        if exposure > dt * (1 + EXPOSURE_CLAMP_FRACTION):
             return (
                 None,
                 f"longer than the frame interval ({units.fmt_unit(dt, 's/frame')}) — check both",
@@ -1178,11 +1070,7 @@ class _PosteriorTab(QWidget):
         self._status.setText(f"{n_ok} of {analysis.fits.height} tracks fitted")
         style_status_label(self._status, "ok" if n_ok else "caution")
 
-        display = analysis.fits.select(POSTERIOR_COLUMNS)
-        if not analysis.has_alpha:
-            display = display.drop("alpha_status", "alpha_median", "alpha_low", "alpha_high")
-        if self._msd_df is not None:
-            display = display.join(self._msd_df, on="track_id", how="left")
+        display = posterior_results_table(analysis, self._msd_df)
         self.host.set_posterior_results(analysis, display)
         self.refresh_summary()
         if n_ok:
@@ -1588,7 +1476,7 @@ class DiffusionAnalysisWidget(QWidget):
         self._base_track_df: Optional[pl.DataFrame] = None
         # Names of the aggregate detection-quality columns in
         # `_base_track_df` -- the group the tracks pane can hide from its
-        # table (see `_qc_aggregate_table`).
+        # table (see `diffusion.qc_aggregate_table`).
         self._qc_columns: list[str] = []
         self._joined_track_df: Optional[pl.DataFrame] = None
         # The last posterior run, and the per-track columns the tracks
@@ -1763,15 +1651,9 @@ class DiffusionAnalysisWidget(QWidget):
     def group_track_ids(self, ids: Optional[set]) -> Optional[dict[str, set]]:
         """`{region class: its track ids}` restricted to `ids` (None = all),
         or None when the loaded tracks don't span more than one class."""
-        groups = self.track_groups()
-        if groups is None:
+        if self._base_track_df is None:
             return None
-        if ids is not None:
-            groups = groups.filter(pl.col("track_id").is_in(list(ids)))
-        names = sorted(groups["group"].drop_nulls().unique().to_list())
-        return {
-            name: set(groups.filter(pl.col("group") == name)["track_id"].to_list()) for name in names
-        } or None
+        return region_class_groups(self._base_track_df, ids)
 
     def track_groups(self) -> Optional[pl.DataFrame]:
         """`(track_id, group)` naming each loaded track's region class, or
@@ -2008,6 +1890,12 @@ class DiffusionAnalysisWidget(QWidget):
             if name != "track_id" and name not in _TRACK_COLOR_COLUMNS
         }
         table = pl.DataFrame({**base_cols, **extra_cols})
+        # A missing value (a track's first `link_margin`, say) crossed into
+        # the layer as NaN; back to null, or every per-track mean over the
+        # column is NaN too (`diffusion.qc_aggregate_table`).
+        table = table.with_columns(
+            pl.col(c).fill_nan(None) for c, dtype in table.schema.items() if dtype.is_float()
+        )
         # The layer carries the region as its label (Tracks properties are
         # numeric); its class comes from the layer's `region_classes`
         # metadata ({label: class}).
@@ -2042,7 +1930,7 @@ class DiffusionAnalysisWidget(QWidget):
             )
         )
         self._diffkit_tracks = tracks_to_diffusionkit_df(track_points_df, self.pixel_size_um, self.dt_s)
-        self._base_track_df, self._qc_columns = _base_track_table(
+        self._base_track_df, self._qc_columns = base_track_table(
             self._diffkit_tracks, track_points_df
         )
         self._update_source_label()
@@ -2480,28 +2368,21 @@ class DiffusionAnalysisWidget(QWidget):
     def _passing_track_ids(self) -> Optional[set]:
         """Tracks passing the pane's length and histogram cuts -- the
         quality filters, as opposed to its region picker, which is a view
-        (every row carries its `region_class`). None when no cut is set."""
-        ids = None
-        min_len = self._tracks_pane.min_track_length()
-        if min_len > 1 and self._base_track_df is not None:
-            ids = set(
-                self._base_track_df.filter(pl.col("track_length") >= min_len)["track_id"].to_list()
-            )
-        cut = self._tracks_pane.filtered_track_ids()
-        if cut is not None:
-            ids = cut if ids is None else (ids & cut)
-        return ids
+        (every row carries its `region_class`). None when no cut is set.
+        Read against the unfiltered joined table (see
+        `_TracksPane.filtered_track_ids`)."""
+        if self._joined_track_df is None:
+            return None
+        return passing_track_ids(
+            self._joined_track_df,
+            self._tracks_pane.min_track_length(),
+            self._tracks_pane.filters.filters(),
+        )
 
     def _summary_filter_record(self) -> dict:
         """What `passes_filters` in the saved summary means, for the JSON
         beside it."""
-        return {
-            "min_track_length": self._tracks_pane.min_track_length(),
-            "ranges": {
-                column: [float(lo), float(hi)]
-                for column, (lo, hi) in (self._tracks_pane.filters.filters() or {}).items()
-            },
-        }
+        return filter_record(self._tracks_pane.min_track_length(), self._tracks_pane.filters.filters())
 
     def tracks_summary(self) -> Optional[pl.DataFrame]:
         """The per-track summary (`diffusion.tracks_summary_table`) for the
@@ -2552,35 +2433,11 @@ class DiffusionAnalysisWidget(QWidget):
             # set `passes_filters` marks in the summary table -- split by
             # region class when there are several.
             ids = self.combined_filtered_track_ids()
-            groups = {"all": ids}
             by_class = self.group_track_ids(ids)
-            if by_class:
-                groups.update(by_class)
-            tables = dict(
-                posterior_D=posterior_long_table(analysis),
-                posterior_alpha=posterior_long_table(analysis, alpha=True),
-                distributions_D=distributions_table(analysis, groups),
-                distributions_alpha=distributions_table(analysis, groups, alpha=True),
+            tables = analysis_tables(analysis, ids, by_class)
+            summary = analysis_summary(
+                analysis, ids, by_class, msd_comparison=self._posterior_tab.msd_df is not None
             )
-            # Flat keys with units in their names, so the JSON reads on its
-            # own and `_format_summary` can label each when reopened.
-            summary = {
-                "analysis": "diffusionkit.gridpost grid posteriors, flat prior in ln D",
-                "dt_s": analysis.acquisition.dt_s,
-                "exposure_s": analysis.acquisition.exposure_s,
-                "min_frames": analysis.min_frames,
-                "credible_level": analysis.level,
-                "D_grid_um2_s": [float(D_GRID_UM2_S[0]), float(D_GRID_UM2_S[-1]), len(D_GRID_UM2_S)],
-                "alpha_grid": (
-                    [float(ALPHA_GRID[0]), float(ALPHA_GRID[-1]), len(ALPHA_GRID)]
-                    if analysis.has_alpha
-                    else None
-                ),
-                "msd_comparison": self._posterior_tab.msd_df is not None,
-                **(self._posterior_tab.summary_values or {}),
-            }
-            if self._posterior_tab.summary_by_group:
-                summary["by_region_class"] = self._posterior_tab.summary_by_group
         summary["tracks_summary_filters"] = self._summary_filter_record()
         summary["repo_shas"] = _analysis_repo_shas()
         write_diffusion_results(self._result_dir, tracks_summary=table, summary=summary, **tables)

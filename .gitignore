@@ -3,3 +3,6 @@ __pycache__/
 .DS_Store
 *.egg-info/
 results/
+
+# Personal dev cheat sheet
+DEVNOTES.md
