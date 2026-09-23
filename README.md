@@ -1,10 +1,11 @@
-# spt-pipeline
+# napari-gemscape2
 
 Batch orchestration and napari visualization for single-particle tracking, connecting:
 
 - [`spotsolve`](https://github.com/delnatan/spotsolve) — multi-emitter 2D localization
   by Bayesian model selection, plus frame-to-frame linking. Runs in Rust.
-- [`diffusionkit`](https://github.com/delnatan/diffusionkit) — classical (Brownian displacement MLE) and Bayesian diffusion analysis.
+- [`diffusionkit`](https://github.com/delnatan/diffusionkit) — per-track grid posteriors over D and α, their
+  ensemble (summed and deconvolved), classic MSD fits, and per-track NUTS.
 
 ## Particle tracking in the dense regime
 
@@ -28,7 +29,7 @@ being bridged across the gap. Fragmenting a trajectory is a safe failure and
 switching its identity is not, so trajectories come out short rather than wrong,
 and `min_track_length` is the knob that matters afterwards.
 
-`spt_pipeline.tracking_diagnostics.check_resolvability` reports whether a given
+`napari_gemscape2.tracking_diagnostics.check_resolvability` reports whether a given
 (D, dt, density) is trackable at all — the frame-to-frame step against the mean
 nearest-neighbor spacing. Read its verdict as an advisory: the closed forms are
 sample physics, but its thresholds were calibrated against the older LAP linker
@@ -49,9 +50,10 @@ results/<result_id>/
 
 `points.parquet` is `spotsolve.loctable`'s localization table verbatim — one row
 per detection, carrying `se_y`/`se_x` (per-detection CRLB), `flux`, `bg`,
-`fit_sigma`/`sigma_ratio` and the `is_aggregate` flag. `tracks.parquet` is that
-same table with a `track_id` column added, so every detector column survives
-linking and stays available for QC downstream.
+`fit_sigma`/`sigma_ratio` and `flags` (spotsolve's `FitFlag` diagnostics).
+`tracks.parquet` is that same table with `track_id` added (plus the linker's
+`link_margin`/`link_rejected`), so every detector column survives linking and
+stays available for QC downstream.
 
 **Regions** are painted on a napari Labels layer (Detect tab → "New regions
 layer"). Each label value is one region, and each pixel belongs to exactly one
@@ -70,16 +72,18 @@ Reopening a row that already has a bundle resumes it: the saved points are the
 session's detections, so Track links them without re-running detect, and the
 saved regions come back as the picked regions layer.
 
-Nothing a QC decision rejects is deleted. Over-bright detections are **flagged**
-(`is_aggregate`), and the histogram filters described below are recorded as
-ranges rather than applied to `points.parquet` — so how much of a movie was junk
+Nothing a QC decision rejects is deleted. spotsolve reports every fit with its
+`FitFlag`s; the Track tab chooses which flags keep a fit away from the linker
+(none by default), and fits without a finite position error are never linked.
+The histogram filters described below are recorded as ranges rather than
+applied to `points.parquet` — so how much of a movie was junk
 stays an auditable fact about the run instead of a silent subtraction. What those
 judgements change is what the *linker* sees and which tracks the bundle keeps.
 
 `manifest.json` records the source image path, the camera and detection
 parameters, both filter specs, what the linker actually measured (PSF sigma, both
 diffusion-coefficient estimates, the fitted linking parameters), and the git SHA
-of `spotsolve` and `spt-pipeline` at run time.
+of `spotsolve` and `napari-gemscape2` at run time.
 
 ## Detect, then filter, then finalize
 
@@ -96,17 +100,20 @@ step. Set `sigma` on the Detect page, run detect on a few frames (the frame
 range), and read the `fit_sigma` histogram on the Filter page: its peak is the
 width to set. Run again and it should stop moving. A bimodal or ragged
 `fit_sigma` (two focal planes, junk being fitted as signal) is something you see
-rather than something a median averages away. One caveat: a run reports only fits
-inside the band (0.8–2.0 × sigma by default), so a sigma set far too high shows
-as a pile-up at the histogram's low edge rather than a peak. The expert
-"report every fit (no band)" box lifts that for one diagnostic run.
+rather than something a median averages away. A sigma set far too high shows as
+a pile-up at the histogram's low edge, where fits are pinned against the `slack`
+bound and flagged `AT_BOUND`.
 
 One unit caveat, since two are in play: `sigma` is in **pixels**, while `slack`
-and `band` are **multiples of whatever sigma the search is running at**
-(`spotsolve` tests them against `sigma_ratio = fit_sigma / sigma`). They are not
-multiples of the initial guess and not absolute pixels, so changing `sigma` moves
-both windows with it — the Detect tab prints the resulting px window underneath
-them for that reason.
+is a **multiple of whatever sigma the search is running at** (`sigma_ratio =
+fit_sigma / sigma`). It is not a multiple of the initial guess and not absolute
+pixels, so changing `sigma` moves the window with it — the Detect tab prints the
+resulting px window underneath it for that reason.
+
+Linking has one optional cutoff, `min_link_margin` (nats): a link that beats the
+best assignment without it by less than that is cut, ending the track rather than
+risking an identity swap. Read the `link_margin` distribution of a run at 0 before
+choosing one.
 
 ## Units, and where they come from
 
@@ -117,7 +124,7 @@ off the image file's own metadata and **shown, with their provenance, before
 anything runs**: the line above the Detect/Track tabs says e.g.
 `from file: 500 frames · 0.1083 µm/px · 0.0302 s/frame`, and its tooltip says
 which metadata field each came from. A headless run prints the same line
-(`spt detect-track`), and `manifest.json` records it (`pixel_size_um_source`,
+(`gemscape2 detect-track`), and `manifest.json` records it (`pixel_size_um_source`,
 `dt_s_source`, `metadata_notes`), so a bundle says not just what pixel size it
 used but where that came from.
 
@@ -163,16 +170,16 @@ bundle saved across a scale change would be internally inconsistent.
 camera's `ExposureTime` in an Andor Fusion `.ims`'s acquisition protocol, OME
 `Plane ExposureTime`) and recorded in the manifest as `exposure_s` /
 `exposure_s_source`. Detection and linking never use it; the diffusion
-analysis does, because its MLE models the motion blur of a continuous
-exposure. It is **never defaulted to 0**: 0 means "instantaneous", and on
-real data that biases `D` by about −25% and the non-Brownian score by +0.3 to
-+0.7. A file that doesn't record it shows `exposure ?` in amber. You type it into "Image metadata" (the exposure box is
+analysis does, because its D likelihood models the motion blur of a
+continuous exposure. It is **never defaulted to 0**: 0 means "instantaneous",
+and on real data that biases `D` low. (Exposure 0 is also the only case where
+the α posterior is available: it has no blur model.) A file that doesn't record it shows `exposure ?` in amber. You type it into "Image metadata" (the exposure box is
 not behind the override switch, so supplying it doesn't replace the file's
 pixel size or frame interval). The Diffusion panel's own exposure box is
 pre-filled from the layer, and it won't run until it has a value.
 
-In results, `spt_pipeline.units` is the single source of truth for what each
-column is measured in: it labels the tracks-pane headers (`D_mle [µm²/s]`,
+In results, `napari_gemscape2.units` is the single source of truth for what each
+column is measured in: it labels the tracks-pane headers (`D_median [µm²/s]`,
 `se_x_max [px]`, `se_x_um_max [µm]`), the filter rows' tooltips, the spatial
 map's color scale, every fit readout, and every plot axis — the last in the same
 mathtext style diffusionkit's own figures use, so a joint plot and an MSD plot
@@ -181,23 +188,45 @@ shown bare rather than guessed at.
 
 ## Setup
 
-The project has its own `uv`-managed virtual environment in `.venv`. `spotsolve`
-and `diffusionkit` are local path dependencies (sibling checkouts), and
-`spotsolve-rs` — the Rust extension `spotsolve` needs at import time — is built
-from `../spotsolve/rust/spotsolve-py`:
+Two ways to install, each its own `uv` environment.
+
+**Standard** — on any machine with [uv](https://docs.astral.sh/uv/), no Rust
+toolchain and no other checkouts:
 
 ```
-uv sync
+git clone https://github.com/delnatan/napari-gemscape2.git
+cd napari-gemscape2
+uv sync                  # add --extra bayes for the NUTS tab (JAX, NumPyro)
+uv run napari
 ```
 
-Re-run it after changing `spotsolve`'s Rust core, so the extension is rebuilt.
+`spotsolve` comes from its GitHub release wheel for your platform (macOS arm64
+and x86-64, Linux x86-64 and aarch64, Windows x86-64; anywhere else its sdist,
+which needs Rust), `diffusionkit` and `qtkit` from git. `uv.lock` pins all of
+them; `uv lock --upgrade-package diffusionkit` (or `qtkit`) moves to the latest
+commit, and a new spotsolve release means editing the version in
+`pyproject.toml`'s URLs.
+
+**Development** — `dev/` is a uv workspace over local checkouts of
+`spotsolve`, `diffusionkit` and `qtkit` next to this repo, all editable, with
+spotsolve's Rust extension built from source (needs [Rust](https://rustup.rs)):
+
+```
+./dev/bootstrap.sh       # clones whichever of the three is missing, then syncs
+uv run --project dev napari
+uv run --project dev --package spotsolve pytest     # a library's own tests
+```
+
+It includes the `[bayes]` extra plus maturin, pytest and ruff. Python edits in
+any of the four packages take effect on restart; after changing spotsolve's
+Rust code, rebuild with `uv sync --project dev --reinstall-package spotsolve`.
 
 ## Usage
 
-Headless batch run (see `pyproject.toml`'s `[project.scripts]` entry `spt`):
+Headless batch run (see `pyproject.toml`'s `[project.scripts]` entry `gemscape2`):
 
 ```
-spt detect-track config.toml
+gemscape2 detect-track config.toml
 ```
 
 ```toml
@@ -231,35 +260,57 @@ detection knobs, then filters on what it found, where `fit_sigma` settles the
 width) and **Track**
 (link, optionally with flux as a second link cue, then filters on the
 tracks), pressing *Save results* when the result is worth keeping. The "Diffusion analysis" widget then reads the tracks layer for
-the classical per-track Brownian MLE — by default just `D` (with its upper limit
-and `p_motion`) as a log-D histogram with median and IQR, about 2 s for ~500
-tracks; the calibrated non-Brownian score `z` (log D vs z, mean z ± SE) is an
-opt-in that costs ~15× more; MSD fits only as a labelled comparison. *Save analysis*
-writes `tracks_summary.parquet`, one row per track — the table to read an
-experiment's tracks from and to pool across experiments (*Export CSV…* writes
-the same table as CSV). Every track is a row, filtered-out and unresolved ones
-included, with:
+diffusionkit's grid posteriors: for each track, the posterior over D (flat
+prior in ln D, the exposure's blur modelled) summarized as its median and 5%/95%
+quantiles, and — with exposure 0, as an opt-in that costs ~30× more — the same
+for the fBm exponent α. About 1 s for ~500 tracks without α. The **Ensemble**
+plot reads them across the tracks the filters pass, per region class: the
+per-track medians, the *deconvolved* distribution of D (each track's own
+uncertainty removed; peak positions and masses are robust, widths are
+resolution-limited), and the *summed* posterior (one D shared by every track).
+MSD fits are a labelled opt-in comparison; the **Track** plot shows the
+selected track's posterior; the **Map** tab colors each track's centroid by any
+result; the **NUTS** tab fits the selected track's full posterior (needs
+`--extra bayes`).
+
+*Save analysis* writes into the bundle:
+
+```
+tracks_summary.csv        one row per track (below)
+posterior_D.parquet       every fitted track's log posterior: track_id, D_um2_s, log_posterior
+posterior_alpha.parquet   likewise over alpha (exposure 0 runs with α only)
+distributions_D.csv       the ensemble on the D grid, long by group ("all", then each
+                          region class): summed_log_posterior, summed_posterior, deconvolved
+distributions_alpha.csv   likewise on the α grid (summed only)
+diffusion_summary.json    settings (dt, exposure, grids, level), population numbers
+                          per group, the tracks-pane filters, and repo SHAs
+```
+
+Points and tracks stay parquet (the atomic data); the tables people open in a
+spreadsheet are CSV. `tracks_summary.csv` — the table to read an experiment's
+tracks from and to pool across experiments (*Export CSV…* writes the same table
+anywhere) — has every track as a row, filtered-out and excluded ones included:
 
 - identity: `result_id` (the bundle), `track_id`, `region_class`, `cell`, and `passes_filters`
   (the tracks pane's length and histogram cuts, recorded in
   `diffusion_summary.json`);
 - size and position: `track_length`, `duration_s`, `mean_step_um`, mean
   `x_um`/`y_um` (and px);
-- the classical fit: `mle_status`, `D_mle_um2_s`, `D_upper_mle_um2_s`,
-  `p_motion` (plus `z_nonbrownian`, `p_nonbrownian`, `alpha_1step` when z was
-  computed);
+- the posterior: `posterior_status`, `D_median_um2_s`, `D_low_um2_s`,
+  `D_high_um2_s` (5% and 95% quantiles), and with α: `alpha_status`,
+  `alpha_median`, `alpha_low`, `alpha_high`; `D_msd_um2_s`/`alpha_msd` when the
+  MSD comparison ran, `*_nuts*` for tracks fitted with NUTS;
 - shape: `radius_of_gyration_um`, `net_displacement_um`, `straightness`,
   `gyration_asymmetry`;
 - track quality, as the mean over the track's detections of each detector
   column: `flux_mean`, `bg_mean`, `fit_sigma_mean`, `se_x_mean`/`se_y_mean`,
-  ... — in the detector's units (`fit_sigma`, `se_x` in px; the `_um` variants
-  in µm).
+  `link_margin_mean`, ... — in the detector's units (`fit_sigma`, `se_x` in px;
+  the `_um` variants in µm).
 
-The Diffusion panel also runs Bayesian and per-track anisotropy fits, and offers the same histogram
-filters over per-track results — so a fitted `D` or `alpha` is filterable by the
-same drag as any other feature.
+The tracks pane's histogram filters cover per-track results too — so a
+posterior `D` or `alpha` is filterable by the same drag as any other feature.
 
 The widgets work on one image at a time, on purpose. To process a whole folder
-without looking at each one, use `spt detect-track`. To compare experiments,
+without looking at each one, use `gemscape2 detect-track`. To compare experiments,
 read the saved bundles (`tracks.parquet`, `manifest.json`) into a script and
 pool them there.

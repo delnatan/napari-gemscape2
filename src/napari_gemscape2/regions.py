@@ -15,7 +15,7 @@ all three (`label_points`: `region`, `region_class`, `cell`), so pooling
 by class is a `group_by("region_class")` and per-cell work stays possible.
 
 A bundle stores these as `labels.tif` and `regions.json` (see
-`spt_pipeline.results`).
+`napari_gemscape2.results`).
 """
 
 from __future__ import annotations

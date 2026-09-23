@@ -58,7 +58,7 @@ that actually guarantees per stage.
 There is deliberately no multi-file "run everything" here: an unattended
 run can't use the filter histograms, and a second, hands-off path through
 the same widget blurred what a saved bundle meant. Running a folder
-headlessly is the `spt detect-track` CLI's job (`pipeline.run_detect_track`);
+headlessly is the `gemscape2 detect-track` CLI's job (`pipeline.run_detect_track`);
 pooling results across experiments is a script's job, over the saved
 bundles.
 
@@ -119,8 +119,8 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from spt_pipeline import units
-from spt_pipeline.results import (
+from napari_gemscape2 import units
+from napari_gemscape2.results import (
     build_manifest,
     result_dir_for,
     has_result,
@@ -129,8 +129,8 @@ from spt_pipeline.results import (
     write_detection_result,
     write_result,
 )
-from spt_pipeline.io_formats import SUPPORTED_SUFFIXES as SUPPORTED_FORMATS
-from spt_pipeline.pipeline import (
+from napari_gemscape2.io_formats import SUPPORTED_SUFFIXES as SUPPORTED_FORMATS
+from napari_gemscape2.pipeline import (
     PipelineCancelled,
     PipelineSession,
     apply_filters,
@@ -144,8 +144,8 @@ from spt_pipeline.pipeline import (
     track_features_df,
     track_metrics_df,
 )
-from spt_pipeline.regions import Regions, label_points
-from spt_pipeline.viewer import (
+from napari_gemscape2.regions import Regions, label_points
+from napari_gemscape2.viewer import (
     ImageDisplay,
     ResultDisplay,
     add_image_layer,
@@ -162,15 +162,15 @@ from spt_pipeline.viewer import (
     show_image,
     show_result,
 )
-from spt_pipeline.widgets.params_panel import PipelineParamsWidget
+from napari_gemscape2.widgets.params_panel import PipelineParamsWidget
 
 
 def _repo_shas() -> dict:
     """Provenance for a bundle's manifest: the checkouts that produced it."""
     import spotsolve
-    import spt_pipeline
+    import napari_gemscape2
 
-    return repo_shas(spotsolve, spt_pipeline)
+    return repo_shas(spotsolve, napari_gemscape2)
 
 
 def _dropped_folder(event) -> Optional[Path]:
@@ -1001,7 +1001,6 @@ class ExperimentListWidget(QWidget):
             sigma,
             self.params_panel.get_camera_kwargs(),
             self.params_panel.get_detect_kwargs(),
-            self.params_panel.get_agg_ratio(),
             self.params_panel.get_frame_range(),
             mask,
             self._cancel_event,
@@ -1029,24 +1028,15 @@ class ExperimentListWidget(QWidget):
         self.list_view.viewport().update()
         n_points = session.points_df.height if session.points_df is not None else 0
         start, end = session.frame_range_used or (0, session.image.shape[0])
-        # The reject/aggregate counts are the reason frames_df is kept: a
-        # run that found plenty of spots but binned most of them as
-        # out-of-band is a focus or sigma problem, and that's only visible
-        # if the numbers are shown next to the detection count.
+        # Shown next to the detection count because a run where most fits
+        # carry a FitFlag (usually AT_BOUND: widths pinned against slack)
+        # is a sigma or focus problem, and the count alone hides it.
         extra = ""
         frames = session.frames_df
         if frames is not None and frames.height:
-            n_rejected = int(
-                frames["n_too_narrow"].sum() + frames["n_too_wide"].sum() + frames["n_edge"].sum()
-            )
-            n_flagged = int(frames["n_locs_flagged"].sum())
-            parts = []
-            if n_rejected:
-                parts.append(f"{n_rejected} out-of-band")
+            n_flagged = int(frames["n_flagged"].sum())
             if n_flagged:
-                parts.append(f"{n_flagged} aggregate")
-            if parts:
-                extra = "  (" + ", ".join(parts) + ")"
+                extra = f"  ({n_flagged} flagged)"
         self.params_panel.set_detect_status(
             f"{n_points} points across frames {start}-{end - 1}{extra}"
             + self._region_count_text(session),
@@ -1127,8 +1117,9 @@ class ExperimentListWidget(QWidget):
         worker = _run_track_worker(
             session,
             self.params_panel.get_min_track_length(),
-            self.params_panel.get_drop_aggregates(),
+            self.params_panel.get_exclude_flags(),
             self.params_panel.get_link_with_flux(),
+            self.params_panel.get_min_link_margin(),
             # The Detect tab's cuts decide what the linker sees -- applied
             # here rather than to `points_df`, which keeps every detection
             # (see run_track_step's docstring).
@@ -1154,9 +1145,18 @@ class ExperimentListWidget(QWidget):
         # MSD moment of the finished tracks, and the linker's own fitted
         # population mean. Agreement is reassuring; a large gap means the
         # linking is suspect, and neither number alone would show it.
-        dropped = summary.get("n_points_dropped_by_filter") or 0
-        filtered = f"  ({dropped} points cut by filters)" if dropped else ""
-        # Units from `spt_pipeline.units` rather than spelled out here, so
+        cuts = [
+            f"{n} {what}"
+            for n, what in (
+                (summary.get("n_points_dropped_invalid"), "points without a usable error"),
+                (summary.get("n_points_dropped_flagged"), "flagged points"),
+                (summary.get("n_points_dropped_by_filter"), "points cut by filters"),
+                (summary.get("n_links_rejected"), "links under the margin"),
+            )
+            if n
+        ]
+        filtered = f"  ({', '.join(cuts)})" if cuts else ""
+        # Units from `napari_gemscape2.units` rather than spelled out here, so
         # this line, the diffusion panel's fit summaries and every plot
         # axis say µm²/s the same way.
         self.params_panel.set_track_status(
@@ -1316,7 +1316,7 @@ class ExperimentListWidget(QWidget):
             session.exposure_s if session is not None else None,
         )
         # What each `region` label on the layers' rows is (see
-        # `spt_pipeline.regions.label_points`).
+        # `napari_gemscape2.regions.label_points`).
         metadata["region_classes"] = region_classes(session.regions if session else None)
         return metadata
 
@@ -1660,7 +1660,6 @@ def _run_detect_worker(
     sigma: float,
     camera_kwargs: dict,
     detect_kwargs: dict,
-    agg_ratio: float,
     frame_range: Optional[tuple[int, int]],
     mask: Optional[np.ndarray],
     cancel_event: threading.Event,
@@ -1676,7 +1675,6 @@ def _run_detect_worker(
         sigma=sigma,
         camera_kwargs=camera_kwargs,
         detect_kwargs=detect_kwargs,
-        agg_ratio=agg_ratio,
         frame_range=frame_range,
         mask=mask,
         progress_callback=progress_cb,
@@ -1690,8 +1688,9 @@ def _run_detect_worker(
 def _run_track_worker(
     session: PipelineSession,
     min_track_length: int,
-    drop_aggregates: bool,
+    exclude_flags: int,
     link_with_flux: bool,
+    min_link_margin: float,
     point_filters: dict,
     emitter: _ProgressEmitter,
 ) -> PipelineSession:
@@ -1701,8 +1700,9 @@ def _run_track_worker(
     return run_track_step(
         session,
         min_track_length,
-        drop_aggregates=drop_aggregates,
+        exclude_flags=exclude_flags,
         link_with_flux=link_with_flux,
+        min_link_margin=min_link_margin,
         point_filters=point_filters,
         progress_callback=progress_cb,
     )

@@ -30,7 +30,7 @@ import polars as pl
 from qtkit import FilterPanel, columns_of
 from qtpy.QtWidgets import QCheckBox
 
-from spt_pipeline import units
+from napari_gemscape2 import units
 
 # Columns no filter should offer: identity and coordinates. Filtering a
 # detection on its own `y`/`x` is a crop (that's what the ROI is for), and
@@ -52,7 +52,7 @@ class FeatureFilterPanel(FilterPanel):
 
     Adds two things to the base panel: each row's histogram carries a
     tooltip saying what its column is measured in
-    (`spt_pipeline.units.tooltip`). A row's column picker shows the bare
+    (`napari_gemscape2.units.tooltip`). A row's column picker shows the bare
     column name -- that is the base widget's, and the name is the one the
     cut is recorded under in `manifest.json`, so it should stay literal --
     but the tracks table offers `se_x_max` (px) and `se_x_um_max` (µm)

@@ -1,0 +1,17 @@
+name: napari-gemscape2
+display_name: GEMscape2
+visibility: hidden
+categories: ["Utilities", "Visualization"]
+contributions:
+  commands:
+    - id: napari-gemscape2.ExperimentListWidget
+      title: Experiment list
+      python_name: napari_gemscape2.widgets.experiment_list:ExperimentListWidget
+    - id: napari-gemscape2.DiffusionAnalysisWidget
+      title: Diffusion analysis
+      python_name: napari_gemscape2.widgets.diffusion_panel:DiffusionAnalysisWidget
+  widgets:
+    - command: napari-gemscape2.ExperimentListWidget
+      display_name: Experiment list
+    - command: napari-gemscape2.DiffusionAnalysisWidget
+      display_name: Diffusion analysis

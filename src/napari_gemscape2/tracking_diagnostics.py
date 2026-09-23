@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from spt_pipeline import units
+from napari_gemscape2 import units
 
 
 def rms_step_um(D_um2_s: float, dt_s: float) -> float:

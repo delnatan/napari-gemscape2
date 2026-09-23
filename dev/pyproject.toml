@@ -1,0 +1,48 @@
+# Development environment: napari-gemscape2 with spotsolve, diffusionkit and
+# qtkit from local checkouts next to this repo, all editable -- spotsolve's
+# Rust extension is built from source by maturin.
+#
+#     <parent>/napari-gemscape2/   this repo (any directory name)
+#     <parent>/spotsolve/
+#     <parent>/diffusionkit/
+#     <parent>/qtkit/
+#
+#     cd dev && uv sync          (or ./dev/bootstrap.sh to clone what's missing)
+#     uv run --project dev napari
+#
+# The three libraries are workspace members, so `uv run --project dev
+# --package spotsolve pytest` etc. run their own tests in this same env.
+# napari-gemscape2 itself can't be a member: its pyproject names non-workspace
+# sources (the release wheel URLs) for them, which uv rejects in a member. So
+# it is an editable path dependency, and `override-dependencies` replaces its
+# spotsolve/diffusionkit/qtkit requirements -- and with them those sources --
+# with the members below.
+
+[project]
+name = "napari-gemscape2-dev"
+version = "0"
+requires-python = ">=3.13"
+dependencies = [
+    "napari-gemscape2[bayes]",
+    "spotsolve",
+    "diffusionkit",
+    "qtkit",
+]
+
+[dependency-groups]
+dev = ["maturin>=1.14,<2", "pytest", "pytest-qt", "ruff"]
+
+[tool.uv]
+package = false
+# The extras napari-gemscape2[bayes] asks of diffusionkit have to be restated
+# here: an override replaces the whole requirement, extras included.
+override-dependencies = ["spotsolve", "diffusionkit[bayes,plots]", "qtkit"]
+
+[tool.uv.workspace]
+members = ["../../spotsolve", "../../diffusionkit", "../../qtkit"]
+
+[tool.uv.sources]
+napari-gemscape2 = { path = "..", editable = true }
+spotsolve = { workspace = true }
+diffusionkit = { workspace = true }
+qtkit = { workspace = true }

@@ -1,24 +1,22 @@
 """Diffusion-analysis dock widget: pick a Tracks layer already in the
-napari viewer and interactively explore its per-track diffusion behavior,
-using diffusionkit's classical per-track Brownian MLE, both speeds of its Bayesian fit
-(fast batched MAP for a spatial overview, full NUTS posterior for a track
-flagged interesting from that overview), and its nested-sampling
-anisotropy test.
+napari viewer and explore its per-track diffusion, using diffusionkit's
+grid posteriors over D (and alpha), the ensemble read across tracks, the
+classic MSD fits as a comparison, and -- optionally -- a full NUTS
+posterior for one selected track.
 
 Layout: one permanent **tracks pane** on top, a stack of **analysis tabs**
 below it, and a footer, split by a drag-resizable `QSplitter`.
 
 The tracks pane is not a tab, because everything else in the widget reads
-or writes it: every fit merges its results in as new columns, the Bayesian
+or writes it: every fit merges its results in as new columns, the NUTS
 tab's per-track action operates on whatever row is selected here, and the
 filters here decide what a fit runs on. Behind a tab, running a fit and
 seeing its result were two different screens, and "Fit selected track"
 pointed at a selection you could not see.
 
 - **Tracks pane** -- one row per track (`qtkit.ColumnTableModel` in
-  a `QTableView`, folded away by default behind a "Table" header), the single place all per-track numbers live (classical
-  MLE, bulk MAP, anisotropy, and any one-off per-track fit, each in its own
-  column group), plus a `min_track_length` spinbox and a
+  a `QTableView`, folded away by default behind a "Table" header), the single place all per-track numbers live (posterior,
+  MSD comparison and NUTS results, each in its own column group), plus a `min_track_length` spinbox and a
   `FeatureFilterPanel` over whatever columns that table currently holds.
   Those columns include per-point detection quality aggregated to the
   track (`flux_min`, `se_x_max`, ... -- see `_qc_aggregate_table`), so a
@@ -34,25 +32,25 @@ pointed at a selection you could not see.
   `oriented_track_box` -- since Tracks layers have no selection-highlight
   of their own) and moves the time slider to the track's last frame, so
   its tail is drawn in full inside the box.
-- **Classical** -- `diffusionkit.classic.analyze_tracks`: per track, the
-  Brownian displacement MLE's D (with blur from the camera exposure
-  modelled) and its upper limit, read as a log-D histogram; opt-in, the
-  bootstrap-calibrated non-Brownian score z (log D vs z, mean z ± SE); the
-  old MSD D/alpha fits only behind an "MSD comparison" toggle. See
-  `_ClassicalTab`. Saving writes the per-track summary table
-  (`diffusion.tracks_summary_table`) beside the fits.
-- **Bayesian** -- *Spatial MAP*: `diffusionkit.bayes.fit_population`
-  batched over every eligible track, fast enough to run on the whole
-  field of view; besides filling in tracks-pane columns, it also
-  places a `Points` layer in the viewer (`self._spatial_map_layer`, one
-  point per track centroid, colored by the fitted parameter) -- the
-  actual spatial map, and the reason this analysis benefits from staying
-  inside napari next to the image at all. *Per-track*: `bayes.fit_track`
-  (`method="map"` or `"nuts"`) against whichever track is selected in the
-  tracks pane -- the "promote this one track, flagged interesting
-  from the map, to expensive inference" step; `method="nuts"` additionally
-  renders a posterior corner plot.
-- **Anisotropy** -- `bayes.anisotropy.analyze`; see `_AnisotropyTab`.
+- **Posterior** -- `diffusion.analyze_posteriors` (diffusionkit.gridpost):
+  per track, the posterior median of D and its 5%/95% quantiles (with
+  the camera exposure's blur modelled), alpha when exposure is 0, and the
+  ensemble -- the summed (shared-D) posterior and the deconvolved
+  distribution of D across tracks -- over whatever the tracks pane
+  passes, per region class. The MSD fits are a labelled opt-in
+  comparison. See `_PosteriorTab`.
+- **Map** -- a `Points` layer in the viewer (`self._spatial_map_layer`,
+  one point per track centroid) colored by any per-track result: the
+  spatial map, and the reason this analysis stays inside napari next to
+  the image. See `_MapTab`.
+- **NUTS** -- `diffusionkit.bayes.fit_track` on the selected track, with
+  its corner plot; needs the optional `[bayes]` extra. See `_NutsTab`.
+
+Saving writes the per-track summary (`tracks_summary.csv`), every
+track's posterior (`posterior_D.parquet`, `posterior_alpha.parquet`),
+the ensemble distributions (`distributions_*.csv`) and the settings and
+population numbers (`diffusion_summary.json`) into the layer's bundle --
+see `results.py`.
 
 Every tab holds a plain reference to this module's
 `DiffusionAnalysisWidget` (`self.host`) rather than talking through Qt
@@ -78,9 +76,7 @@ All fits run through `napari.qt.threading.thread_worker`, sharing one
 `self._worker` slot host-wide (`start_worker`) so only one fit -- of any
 kind -- runs at a time. That one slot is also why there is one progress
 bar, in the footer, rather than one per tab: it shows tracks done / total
-for the bulk fits diffusionkit can report on (classical MLE, MAP,
-anisotropy), and a busy indicator for the ones it can't (a single-track
-fit).
+for the posterior run, and a busy indicator for a single-track NUTS fit.
 
 Track/spatial-map positions used for viewer overlays are kept in
 *pixels* (`self._tracks_df_px`, the same coordinate space as the image
@@ -92,11 +88,11 @@ Both unit systems are therefore on screen at once, which is why nothing
 here shows a bare number:
 
   - the tracks pane's headers carry each column's unit
-    (`_UnitHeaderModel` over `spt_pipeline.units`), since `se_x_max` (px)
+    (`_UnitHeaderModel` over `napari_gemscape2.units`), since `se_x_max` (px)
     and `se_x_um_max` (µm) are adjacent columns of the same quantity;
-  - each fit readout formats through `units.fmt`, including the per-track
-    Bayesian fit, whose parameters are a D, a K, an alpha and a
-    localization sigma with four different units (`_PARAM_COLUMNS`);
+  - each fit readout formats through `units.fmt`, including the NUTS fit,
+    whose parameters are a D, a K, an alpha and a localization sigma with
+    four different units (`_PARAM_COLUMNS`);
   - the spatial map gets a written color scale (`_map_scale_label`), a
     napari Points layer colored by a feature having no legend of its own;
   - and the two conversion factors everything above depends on --
@@ -112,21 +108,9 @@ from typing import Optional
 
 import numpy as np
 import polars as pl
-from diffusionkit import bayes as dk_bayes
-from diffusionkit.bayes import anisotropy as dk_anisotropy
-from diffusionkit.bayes import viz as dk_bayes_viz
-from diffusionkit.classic import (
-    Acquisition,
-    ClassicAnalysis,
-    MLEOptions,
-    MSDOptions,
-    analyze_tracks,
-)
-
-# Legacy, but still what the tracks pane's shape columns come from; taken
-# from its own module rather than through `diffusionkit.classic`, whose
-# fallback `__getattr__` warns on every legacy name it resolves.
-from diffusionkit.classic.features import track_geometry
+from diffusionkit import Acquisition
+from diffusionkit.classic import MSDOptions
+from diffusionkit.classic import analyze_tracks as analyze_msd
 from napari.layers import Points, Shapes, Tracks
 from napari.qt.threading import thread_worker
 from qtpy.QtCore import QObject, Qt, QTimer, Signal
@@ -136,7 +120,6 @@ from qtkit import (
     HistogramRangeWidget,
     double_spinbox,
     flow_row,
-    hline,
     note_label,
     scrolled,
     status_label,
@@ -162,31 +145,40 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from spt_pipeline import units
-from spt_pipeline.diffusion import (
-    mle_rows,
-    mle_track_table,
+from napari_gemscape2 import units
+from napari_gemscape2.diffusion import (
+    ALPHA_GRID,
+    D_GRID_UM2_S,
+    LEVEL,
+    MIN_FRAMES,
+    POSTERIOR_COLUMNS,
+    PosteriorAnalysis,
+    analyze_posteriors,
+    distributions_table,
+    ensemble_panels,
     msd_track_table,
-    summarize_mle,
-    summarize_mle_by_group,
+    posterior_long_table,
+    summarize,
+    track_geometry,
+    track_posterior,
     tracks_summary_table,
     tracks_to_diffusionkit_df,
 )
-from spt_pipeline.results import (
+from napari_gemscape2.results import (
     TRACKS_SUMMARY_FILENAME,
-    load_diffusion_results,
+    load_diffusion_summary,
     repo_shas,
     write_diffusion_results,
 )
-from spt_pipeline.joint_plot import (
+from napari_gemscape2.joint_plot import (
     numeric_columns,
-    plot_d_histogram,
-    plot_d_z_joint,
+    plot_d_ensemble,
     plot_property_joint,
+    plot_track_posterior,
 )
-from spt_pipeline.pipeline import filter_mask
-from spt_pipeline.viewer import set_tracks_layer_data
-from spt_pipeline.widgets.feature_filters import FeatureFilterPanel
+from napari_gemscape2.pipeline import filter_mask
+from napari_gemscape2.viewer import set_tracks_layer_data
+from napari_gemscape2.widgets.feature_filters import FeatureFilterPanel
 
 # Look for the two viewer overlays this widget owns -- kept visually
 # distinct from DETECTED_POINTS_STYLE's magenta "+" (viewer.py) so a
@@ -198,8 +190,7 @@ from spt_pipeline.widgets.feature_filters import FeatureFilterPanel
 # zoomed onto it, whereas a box reads at any zoom, and it leaves the
 # Tracks layer's own colored path -- which is what actually shows where
 # the molecule went -- unobscured. Drawn on the track's principal axes, so
-# its aspect ratio is a free read on whether the motion is anisotropic,
-# ahead of (and independent of) the Bayesian tab's formal test.
+# its aspect ratio is a free read on whether the motion is anisotropic.
 _TRACK_BOX_STYLE = dict(
     shape_type="rectangle",
     face_color="transparent",
@@ -221,7 +212,7 @@ _TRACK_BOX_TEXT = dict(
 # of a sub-pixel sliver -- the confined case being exactly the one worth
 # looking at. Both pad the short side as much as the long one, so for a
 # track only a few pixels across the box's aspect ratio understates the
-# anisotropy; it's a read to follow up in the Bayesian tab, not a measure.
+# anisotropy; it's a read, not a measure.
 _TRACK_BOX_PAD_PX = 2.0
 _TRACK_BOX_MIN_HALF_PX = 4.0
 
@@ -263,81 +254,44 @@ def oriented_track_box(
     return center + (signs * half) @ axes
 
 
-# The MSD comparison's lag window: diffusionkit's own default, and the
-# window its validation compared the MLE against. Not exposed -- the MSD
-# fits are a cross-check here, not an analysis to tune.
+# The MSD comparison's lag window: diffusionkit's own default. Not exposed
+# -- the MSD fits are a cross-check here, not an analysis to tune.
 _MSD_MAX_LAG = 3
 
 
 @thread_worker(start_thread=False)
-def _run_classical_worker(
+def _run_posterior_worker(
     diffkit_tracks: pl.DataFrame,
     dt_s: float,
     exposure_s: float,
     min_frames: int,
-    n_boot: int,
+    alpha: bool,
     msd_comparison: bool,
     progress,
-) -> tuple[ClassicAnalysis, Optional[ClassicAnalysis]]:
-    """`(analysis, comparison)`: the Brownian MLE with the real exposure,
-    and -- when asked for -- a second pass for the MSD fits alone.
+) -> tuple[PosteriorAnalysis, Optional[pl.DataFrame]]:
+    """`(analysis, msd_fits)`: the grid posteriors with the real exposure,
+    and -- when asked for -- diffusionkit.classic's MSD fits.
 
-    The second pass exists because diffusionkit only fits MSDs when
-    `exposure_s == 0`: they have no blur model, so with the real exposure
-    they come back `excluded`. The comparison therefore runs them with
-    the exposure treated as 0, which is exactly the assumption that biases
-    them, and is labelled as such everywhere it shows. Its MLE rows are
-    discarded (and its bootstrap skipped) -- the MLE that counts is the
-    first pass's."""
-    options = MSDOptions(max_lag=_MSD_MAX_LAG, min_frames=min_frames, localization="provided")
-    analysis = analyze_tracks(
-        diffkit_tracks,
-        Acquisition(dt_s=dt_s, exposure_s=exposure_s),
-        options,
-        MLEOptions(n_boot=n_boot),
-        progress=progress,
+    The MSD fits have no blur model, so diffusionkit excludes them when
+    `exposure_s > 0`; the comparison therefore runs them with the exposure
+    treated as 0, which is exactly the assumption that biases them, and is
+    labelled as such wherever it shows."""
+    acquisition = Acquisition(dt_s=dt_s, exposure_s=exposure_s)
+    analysis = analyze_posteriors(
+        diffkit_tracks, acquisition, min_frames=min_frames, level=LEVEL, alpha=alpha, progress=progress
     )
-    comparison = None
+    msd_fits = None
     if msd_comparison:
-        comparison = (
-            analysis
-            if exposure_s == 0
-            else analyze_tracks(diffkit_tracks, Acquisition(dt_s=dt_s), options, MLEOptions(n_boot=0))
-        )
-    return analysis, comparison
+        options = MSDOptions(max_lag=_MSD_MAX_LAG, min_frames=max(min_frames, 5), localization="provided")
+        msd_fits = analyze_msd(diffkit_tracks, Acquisition(dt_s=dt_s), options).fits
+    return analysis, msd_fits
 
 
 @thread_worker(start_thread=False)
-def _run_bulk_map_worker(diffkit_tracks: pl.DataFrame, dt_s: float, model: str, progress) -> pl.DataFrame:
-    # No `engine=`: diffusionkit now always uses the batched exact-MAP
-    # engine here. It dropped the SVI alternative because SVI reported
-    # uncertainty 3-10x too narrow, so there is no longer a choice to pass.
-    return dk_bayes.fit_population(
-        diffkit_tracks, dt_s, model=model, show_progress=False, progress=progress
-    )
+def _run_nuts_worker(track_df: pl.DataFrame, dt_s: float, model: str):
+    from diffusionkit import bayes as dk_bayes
 
-
-@thread_worker(start_thread=False)
-def _run_track_fit_worker(
-    track_df: pl.DataFrame, dt_s: float, model: str, method: str
-) -> "dk_bayes.TrackFit":
-    return dk_bayes.fit_track(track_df, dt_s, model=model, method=method)
-
-
-@thread_worker(start_thread=False)
-def _run_anisotropy_worker(
-    diffkit_tracks: pl.DataFrame,
-    dt_s: float,
-    min_track_length: int,
-    progress,
-) -> pl.DataFrame:
-    return dk_anisotropy.analyze(
-        diffkit_tracks,
-        dt_s,
-        min_track_length=min_track_length,
-        show_progress=False,
-        progress=progress,
-    )
+    return dk_bayes.fit_track(track_df, dt_s, model=model)
 
 
 class _UnitHeaderModel(ColumnTableModel):
@@ -346,9 +300,9 @@ class _UnitHeaderModel(ColumnTableModel):
     The tracks pane's table is where this pipeline's two unit systems
     meet: `se_x_max` is in pixels, `se_x_um_max` and
     `radius_of_gyration_um` in µm, `flux_mean` in camera counts,
-    `D_map_um2_s` in µm²/s -- 40-odd columns whose unit is a naming
+    `D_median_um2_s` in µm²/s -- 40-odd columns whose unit is a naming
     convention at best (`_um`) and absent at worst (`flux`, `se_x`,
-    `fit_sigma`). So each header shows `spt_pipeline.units.header` (the
+    `fit_sigma`). So each header shows `napari_gemscape2.units.header` (the
     name with its unit bracketed, the unit stated once) and each header's
     tooltip the exact column name, which is what the value is stored and
     filtered under.
@@ -395,16 +349,19 @@ class _ProgressRelay(QObject):
 # instead (guaranteed present there), and y/x become the centroid.
 # `loc_id` is a detection's serial number: its min/mean/max are three
 # columns of pure noise in a table that already runs past fifty.
-_QC_SKIP_COLUMNS = frozenset({"track_id", "loc_id", "frame", "y", "x", "track_length", "region", "cell"})
+# `flags` is a bitmask: its min/mean/max are not quantities.
+_QC_SKIP_COLUMNS = frozenset(
+    {"track_id", "loc_id", "frame", "y", "x", "track_length", "region", "cell", "flags"}
+)
 
-# Per-track MLE results this widget broadcasts onto the viewer's Tracks
-# layer as properties, so the trajectories themselves can be colored by
-# them (layer controls -> color by). `log10_D_mle` rather than D itself:
-# a Tracks layer colormap spans min..max linearly, and D spans decades.
-# Written by this widget, so they are dropped again whenever it reads
-# the layer back (`_layer_track_table`) -- otherwise they would come back
-# as "detection QC" columns and collide with the fit's own.
-_TRACK_COLOR_COLUMNS = ("log10_D_mle", "z_nonbrownian")
+# Per-track posterior results this widget broadcasts onto the viewer's
+# Tracks layer as properties, so the trajectories themselves can be
+# colored by them (layer controls -> color by). `log10_D_median` rather
+# than D itself: a Tracks layer colormap spans min..max linearly, and D
+# spans decades. Written by this widget, so they are dropped again
+# whenever it reads the layer back (`_layer_track_table`) -- otherwise
+# they would come back as "detection QC" columns.
+_TRACK_COLOR_COLUMNS = ("log10_D_median", "alpha_median")
 
 # "No exposure seen yet" for `DiffusionAnalysisWidget._layer_exposure_s`,
 # distinct from None ("the layer records none").
@@ -462,7 +419,7 @@ def _base_track_table(
     diffkit_tracks: pl.DataFrame, tracks_df_px: pl.DataFrame
 ) -> tuple[pl.DataFrame, list[str]]:
     """One row per track: identity, position, shape
-    (`diffusionkit.classic.track_geometry` -- radius of gyration,
+    (`diffusion.track_geometry` -- radius of gyration,
     straightness, ...) and detection-quality context columns that every
     tab's results get left-joined onto, plus the names of
     the aggregate QC columns (so the tracks pane can hide that group from
@@ -512,31 +469,8 @@ def _shared_tracks_unchanged(old: Optional[pl.DataFrame], new: pl.DataFrame) -> 
     return a.equals(b)
 
 
-def _normalize_map_table(table: pl.DataFrame, model: str) -> pl.DataFrame:
-    """`diffusionkit.bayes.fit_population`'s output trimmed to its point
-    estimates, under names that stay distinct across models so running
-    both keeps both in the tracks pane: `D_map_um2_s` from `normal`,
-    `K_map_um2_s_alpha` and `alpha_map` from `anomalous`. K, the
-    generalized diffusion coefficient, has units of um^2/s^alpha -- it is
-    not a D, and sharing a column with one would put two different
-    quantities on the same axis.
-
-    Physical units only. diffusionkit fits D in log space and also returns
-    `log10_D`, but that is exactly `log10(D_median)`, so it would be a
-    second copy of the same number for the joint plot's "log" checkbox to
-    reproduce. The intervals, stderrs, sigma and `converged` stay in the
-    full table that Save writes."""
-    if model == "normal":
-        return table.select("track_id", pl.col("D_median_um2_s").alias("D_map_um2_s"))
-    return table.select(
-        "track_id",
-        pl.col("K_median_um2_s_alpha").alias("K_map_um2_s_alpha"),
-        pl.col("alpha").alias("alpha_map"),
-    )
-
-
 # diffusionkit's per-track parameter names mapped to the column names
-# `spt_pipeline.units` knows their units by. Only `sigma` actually needs
+# `napari_gemscape2.units` knows their units by. Only `sigma` actually needs
 # the indirection, and it needs it badly: in a `TrackFit` it is the fitted
 # LOCALIZATION error in µm (diffusionkit's own bulk table calls it
 # `sigma_median_um`), while the same bare name in spotsolve's localization
@@ -552,12 +486,12 @@ _PARAM_COLUMNS = {
 
 def _analysis_repo_shas() -> dict:
     """Provenance for saved diffusion results: the diffusionkit and
-    spt_pipeline checkouts that computed them (the bundle's manifest
+    napari_gemscape2 checkouts that computed them (the bundle's manifest
     already records what produced the tracks)."""
     import diffusionkit
-    import spt_pipeline
+    import napari_gemscape2
 
-    return repo_shas(diffusionkit, spt_pipeline)
+    return repo_shas(diffusionkit, napari_gemscape2)
 
 
 def _label_corner_axes(figure, param_names: list[str]) -> None:
@@ -580,35 +514,18 @@ def _label_corner_axes(figure, param_names: list[str]) -> None:
         axes[i * d].set_ylabel(labels[i], fontsize=9)
 
 
-def _label_anisotropy_axes(figure) -> None:
-    """Say on diffusionkit's anisotropy plots that eps and log BF10 are
-    pure numbers -- their axes read "eps ..." and "log BF10" with no unit,
-    which elsewhere in this widget would mean "unit unknown"."""
-    for ax in figure.axes:
-        for get, set_ in ((ax.get_xlabel, ax.set_xlabel), (ax.get_ylabel, ax.set_ylabel)):
-            label = get()
-            if label.startswith("eps "):
-                set_(r"$\epsilon$" + label[3:] + " (dimensionless)")
-            elif label == "log BF10":
-                set_(r"$\log$ BF$_{10}$ (dimensionless)")
-
-
-def _track_fit_row(fit: "dk_bayes.TrackFit") -> dict:
-    """One ad-hoc single-track fit (`method` "map" or "nuts"), normalized
-    the same way as `_normalize_map_table` so both land in the same
-    `D_track_fit_um2_s` (normal) / `K_track_fit_um2_s_alpha` +
-    `alpha_track_fit` (anomalous) tracks-pane columns --
-    deliberately separate from the bulk MAP columns even when `method`
-    happens to be "map" too, since a bulk fit and a one-off single-track
-    fit are different actions the user can compare against each other."""
-    return {
-        "track_id": fit.track_id,
-        "model": fit.model,
-        "method": fit.method,
-        "D_track_fit_um2_s": fit.params.get("D"),
-        "K_track_fit_um2_s_alpha": fit.params.get("K"),
-        "alpha_track_fit": fit.params.get("alpha"),
-    }
+def _nuts_row(fit) -> dict:
+    """One NUTS fit as tracks-pane columns: the posterior median and 90%
+    HPDI of each parameter, under `_nuts` names that stay distinct from the
+    grid posterior's own columns (`D_nuts_um2_s`, `D_nuts_low_um2_s`, ...)."""
+    names = {"D": ("D", "_um2_s"), "K": ("K", "_um2_s_alpha"), "alpha": ("alpha", "")}
+    row = {"track_id": fit.track_id, "nuts_model": fit.model}
+    for name, (base, unit) in names.items():
+        if name in fit.params:
+            row[f"{base}_nuts{unit}"] = fit.params[name]
+            row[f"{base}_nuts_low{unit}"] = fit.lo[name]
+            row[f"{base}_nuts_high{unit}"] = fit.hi[name]
+    return row
 
 
 def _format_summary(summary: dict) -> str:
@@ -624,35 +541,7 @@ def _format_summary(summary: dict) -> str:
         # Nested records (by_region_class, filters, provenance) aren't one number.
         if not isinstance(value, dict)
     )
-    return lines + _format_mle_by_group(summary.get("by_region_class"))
-
-
-_ANISOTROPY_DISPLAY_COLUMNS = [
-    "track_id",
-    "log_bf10",
-    "log_bf10_stderr",
-    "evidence",
-    "eps_median",
-    "eps_lo",
-    "eps_hi",
-    "psi_median_rad",
-    "D_arith_mean_median_um2_s",
-    "D_par_median_um2_s",
-    "D_perp_median_um2_s",
-]
-
-
-def _normalize_anisotropy_table(per_track: pl.DataFrame) -> pl.DataFrame:
-    """`anisotropy.analyze`'s table trimmed to the columns worth showing
-    in the tracks pane / offering as a spatial-map color choice.
-
-    One nested-sampling run now yields the evidence AND the posterior it
-    came from, so `eps_*`/`psi_*`/`D_*` are always present -- there is no
-    longer a fast-vs-full split to degrade across. The intersection is
-    still taken rather than assumed, so a diffusionkit that adds or drops
-    a column doesn't break the table."""
-    cols = [c for c in _ANISOTROPY_DISPLAY_COLUMNS if c in per_track.columns]
-    return per_track.select(cols)
+    return lines + _format_by_group(summary.get("by_region_class"))
 
 
 # Qt's "no maximum" for widget sizes; not exported by every qtpy binding.
@@ -673,9 +562,9 @@ class _TracksPane(QWidget):
     The filter panel covers whatever columns the table currently holds.
     Before any fit that is `track_length`/`duration_s`/`mean_step_um` plus
     the per-point detection quality aggregated to the track (`flux_min`,
-    `se_x_max`, ... -- see `_qc_aggregate_table`); after a Classical,
-    Bayesian or Anisotropy run it is also `D_um2_s`, `alpha`, `log_bf10`
-    and the rest. So "drop the tracks with a bad worst-point localization
+    `se_x_max`, ... -- see `_qc_aggregate_table`); after a posterior run
+    it is also `D_median_um2_s`, `D_low_um2_s`, `alpha_median` and the
+    rest. So "drop the tracks with a bad worst-point localization
     error, then keep the ones whose fitted alpha is below 0.8, and look at
     where they are" is three drags in one panel, against one table, at one
     granularity. That single granularity is the point: this pane replaced
@@ -687,8 +576,8 @@ class _TracksPane(QWidget):
     The "Joint plot" section scatters any two of those same columns
     against each other, over the rows the table is currently showing -- so
     "D against flux_mean, for the tracks with alpha below 0.8" is a cut and
-    a plot on one table. It used to be a separate picker on the Classical
-    and Bayesian tabs, each over only that tab's own raw fit output; that
+    a plot on one table. It used to be a separate picker on each analysis
+    tab, each over only that tab's own raw fit output; that
     could not put a fit result against a track property at all, and it
     offered diffusionkit's `log10_*` columns next to the physical ones they
     are the log of, duplicating the picker's own "log x"/"log y" toggles.
@@ -760,15 +649,15 @@ class _TracksPane(QWidget):
             "was linked on its own, so no track spans two."
         )
         self._region_picker.currentIndexChanged.connect(lambda _i: self.host.on_filters_changed())
-        self._region_label.setVisible(False)
-        self._region_picker.setVisible(False)
+        # A row of its own, hidden whole: qtkit's FlowLayout still spaces a
+        # hidden item, which left a blank line in the control row.
+        self._region_row = flow_row(self._region_label, self._region_picker)
+        self._region_row.setVisible(False)
 
         length_label = QLabel("min length:")
         control_row = flow_row(
             length_label,
             self._min_track_length,
-            self._region_label,
-            self._region_picker,
             self._sync_display_checkbox,
             self._qc_columns_checkbox,
         )
@@ -808,6 +697,7 @@ class _TracksPane(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(3)
         layout.addWidget(control_row)
+        layout.addWidget(self._region_row)
         layout.addWidget(self._filter_section)
         layout.addWidget(self._plot_section)
         layout.addWidget(self._table_section, 1)
@@ -825,11 +715,28 @@ class _TracksPane(QWidget):
         than leaving a table-sized gap; unfolded, the cap comes off and the
         splitter is draggable again. Re-run whenever a section folds, since
         the natural height changes with it."""
-        if self._table_section.is_expanded():
+        # Folded, the section must not claim the stretch either, or it
+        # parks a gap under its header.
+        expanded = self._table_section.is_expanded()
+        self.layout().setStretchFactor(self._table_section, 1 if expanded else 0)
+        if expanded:
             self.setMaximumHeight(_QWIDGETSIZE_MAX)
         else:
-            self.layout().activate()
-            self.setMaximumHeight(self.sizeHint().height())
+            layout = self.layout()
+            layout.activate()
+            # At the width it actually has: the flow rows wrap, and a plain
+            # sizeHint doesn't know by how much.
+            height = (
+                layout.totalHeightForWidth(self.width())
+                if layout.hasHeightForWidth() and self.width() > 0
+                else self.sizeHint().height()
+            )
+            self.setMaximumHeight(height)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        if event.size().width() != event.oldSize().width() and not self._table_section.is_expanded():
+            QTimer.singleShot(0, self._fit_height)
 
     def min_track_length(self) -> int:
         return self._min_track_length.value()
@@ -862,9 +769,7 @@ class _TracksPane(QWidget):
         if current in names:
             self._region_picker.setCurrentText(current)
         self._region_picker.blockSignals(blocked)
-        visible = len(names) > 1
-        self._region_label.setVisible(visible)
-        self._region_picker.setVisible(visible)
+        self._region_row.setVisible(len(names) > 1)
 
     def selected_region_class(self) -> Optional[str]:
         """The region class picked, or None for all of them."""
@@ -923,11 +828,12 @@ class _TracksPane(QWidget):
         if current is not None:
             self.select_track_id(current)
         self._update_count_label()
+        QTimer.singleShot(0, self._fit_height)
 
     def _update_count_label(self) -> None:
         """"n of N tracks", plus the selected track when there is one --
         with the table folded, this line is the only place the selection
-        the Bayesian tab's per-track fit acts on is written down."""
+        the NUTS tab and the track plot act on is written down."""
         if self._displayed_df is None:
             return
         text = f"{self._displayed_df.height} of {self._total} tracks"
@@ -1004,46 +910,39 @@ class _TracksPane(QWidget):
 # it, the two numbers genuinely disagree and the run is refused.
 _EXPOSURE_CLAMP_FRACTION = 0.01
 
-_MLE_HELP = (
-    "<b>D</b> is per track: the maximum-likelihood diffusion coefficient of its "
-    "displacements, modelling the provided localization errors and the motion blur "
-    "of the exposure. <b>unresolved</b> means D̂ = 0 &mdash; localization noise "
-    "explains all the motion &mdash; and gets an upper limit instead of a value. "
-    "The histogram is of log D over resolved tracks; median and IQR are marked."
-    "<br><br><b>z</b> (optional) is read across tracks, not per track. It is calibrated so "
-    "that it is ~N(0,1) for Brownian tracks of any length, noise or D. At ~5 frames "
-    "a single track can't be called non-Brownian (even α = 0.5 is flagged only "
-    "4&ndash;8% of the time), but a mean-z shift of 0.4&ndash;0.7 is plain across "
-    "~100 tracks. From ~20 frames single tracks become partly informative."
-    "<br><br><b>Sign:</b> negative = sub-diffusive or confined; positive = "
-    "super-diffusive or directed. z says the motion departs from Brownian, not why."
-    "<br><br><b>Calibrate first:</b> run a bead or immobilized control with the same "
-    "exposure and localization errors. Its mean z should be ~0. If it isn't, the "
-    "exposure or the localization SDs are off, and a biological z shift isn't "
-    "interpretable until they are fixed."
+_POSTERIOR_HELP = (
+    "<b>Per track</b>, D is the median of its posterior (flat prior in ln D), and "
+    "<b>low/high</b> are the 5% and 95% quantiles: a 90% credible interval. The "
+    "likelihood is exact: each frame's localization error and the motion blur of "
+    "the exposure are both modelled. A short track has a wide interval, and that "
+    "width is the honest answer, not a failure."
+    "<br><br><b>Ensemble</b>: <i>summed</i> adds every track's log posterior &mdash; "
+    "the posterior of one D shared by all of them. It is sharp, but only meaningful "
+    "if they really do share a D. <i>Deconvolved</i> is how D is distributed across "
+    "tracks, with each track's own uncertainty taken out (a smoothed nonparametric "
+    "maximum likelihood). Its peak locations and the mass under each peak are "
+    "robust; its peak widths are resolution-limited, not measured."
+    "<br><br><b>α</b> (fBm exponent, K integrated out) has no motion-blur model, so "
+    "it is only available for exposure 0. It costs ~30x D."
 )
 
 
-class _ClassicalTab(QWidget):
-    """diffusionkit's rebuilt classical analysis
-    (`classic.analyze_tracks`): the per-track Brownian displacement MLE.
+class _PosteriorTab(QWidget):
+    """diffusionkit's grid posteriors (`diffusion.analyze_posteriors`):
+    per-track D with its 90% interval, and the ensemble read across tracks.
 
-    Routine work is D: each track's maximum-likelihood D with its upper
-    limit, shown as a log-D histogram with the median and IQR. That costs
-    about 2 s for ~500 tracks. The calibrated non-Brownian score z is
-    opt-in ("non-Brownian score z"), because it is what the run's time
-    goes into -- a parametric bootstrap per track, ~15x the cost -- and
-    it changes nothing about D. The old MSD fits stay available only as a
-    labelled comparison.
+    The one input not already on the layer is the camera **exposure** --
+    separate from the frame interval, and one the result depends on: the D
+    likelihood models the blur of a continuous exposure, so treating 20 ms
+    as instantaneous biases D low. It is pre-filled from the layer's
+    metadata and otherwise has to be typed -- the box starts at "not set",
+    never at 0, and Run stays off until it has a value. Exposure 0 is also
+    what makes the alpha posterior available (it has no blur model).
 
-    The one input here that is not already on the layer is the camera
-    **exposure** -- separate from the frame interval, and the input the
-    MLE's result depends on most: treating a 20 ms exposure as
-    instantaneous biases D by about -25% and mean z by +0.3 to +0.7. So it
-    is pre-filled from the layer's metadata (the file's record, or the
-    override in the experiment list's image panel) and otherwise has to be
-    typed -- the box starts at "not set", never at 0, and Run stays off
-    until it has a value."""
+    The summary and the Ensemble figure are read over the tracks the tracks
+    pane currently passes (and grouped by region class when there are
+    several), so a filter change updates them without a re-run -- the
+    per-track posteriors don't depend on which other tracks are in view."""
 
     # The exposure box's "not set" value -- one step below 0, which is a
     # legitimate (stroboscopic) exposure and must not double as "unknown".
@@ -1052,25 +951,22 @@ class _ClassicalTab(QWidget):
     def __init__(self, host: "DiffusionAnalysisWidget") -> None:
         super().__init__()
         self.host = host
-        self._analysis: Optional[ClassicAnalysis] = None
-        self._comparison: Optional[ClassicAnalysis] = None
+        self._analysis: Optional[PosteriorAnalysis] = None
+        self._msd_df: Optional[pl.DataFrame] = None
         self._summary_values: Optional[dict] = None
-        # `summarize_mle` per region class, when the analysed tracks span more than
-        # one -- shown under the pooled summary and saved beside it.
         self._summary_by_group: Optional[dict] = None
-        self._plot_window: Optional[PlotWindow] = None
-        self._hist_window: Optional[PlotWindow] = None
+        self._ensemble_window: Optional[PlotWindow] = None
+        self._track_window: Optional[PlotWindow] = None
         self._msd_plot_window: Optional[PlotWindow] = None
         # What the layer said, so the exposure note can say where the box's
-        # value came from (and "reset" has something to go back to).
+        # value came from.
         self._layer_exposure_s: Optional[float] = None
 
         self._exposure = double_spinbox(
             self._EXPOSURE_UNSET, self._EXPOSURE_UNSET, 3600.0, 0.001, decimals=4, suffix=" s",
             tooltip="Camera exposure per frame -- how long the sensor integrates, not\n"
-            "the frame interval. The MLE models the blur of a continuous\n"
-            "exposure; entering 0 when the camera really exposed for 20 ms\n"
-            "biases D by about -25% and shifts mean z by +0.3 to +0.7.\n\n"
+            "the frame interval. The D posterior models the blur of a continuous\n"
+            "exposure; entering 0 when the camera exposed for 20 ms biases D low.\n\n"
             "Pre-filled from the layer when the file (or the image panel's\n"
             "override) recorded it.",
         )
@@ -1082,78 +978,66 @@ class _ClassicalTab(QWidget):
         # `excluded`, and are counted. Distinct from the tracks pane's
         # `min length`, which only decides what the table shows.
         self._min_frames = QSpinBox()
-        self._min_frames.setRange(2, 10_000)
-        self._min_frames.setValue(MSDOptions().min_frames)
+        self._min_frames.setRange(MIN_FRAMES, 10_000)
+        self._min_frames.setValue(MIN_FRAMES)
         self._min_frames.setToolTip(
             "Tracks with fewer localizations than this are excluded (and counted\n"
-            "as such). diffusionkit's default is 5; the MLE and z are calibrated\n"
-            "for short tracks, so there is no need to raise it for accuracy."
+            f"as such). {MIN_FRAMES} is diffusionkit's own minimum; a short track\n"
+            "just gets a wide posterior, so there is no need to raise it for accuracy."
         )
 
-        # Off by default: D, its upper limit and p_motion come from the
-        # likelihood alone, and the bootstrap that calibrates z is nearly
-        # all of a run's cost.
-        self._compute_z = QCheckBox("non-Brownian score z")
-        self._compute_z.setToolTip(
-            "Also compute z, a per-track score calibrated to N(0,1) under\n"
-            "Brownian motion, read across tracks (mean z ± SE). It needs a\n"
-            "parametric bootstrap per track -- ~50 ms per track at 500 reps,\n"
-            "about 15x the cost of D alone -- and leaves D unchanged."
+        self._alpha = QCheckBox("α (slow)")
+        self._alpha.setToolTip(
+            "Also compute the posterior over the fBm exponent α, with K\n"
+            "integrated out. No motion-blur model exists for it, so it needs\n"
+            "exposure = 0. About 30x the cost of D (~50 ms per track)."
         )
-        self._n_boot = QSpinBox()
-        self._n_boot.setRange(100, 100_000)
-        self._n_boot.setSingleStep(100)
-        self._n_boot.setValue(MLEOptions().n_boot)
-        self._n_boot.setSuffix(" reps")
-        self._n_boot.setToolTip("Parametric-bootstrap replicates per track that calibrate z to N(0,1).")
-        self._n_boot.setEnabled(False)
-        self._compute_z.toggled.connect(self._n_boot.setEnabled)
-
-        self._msd_comparison = QCheckBox("MSD comparison (D, α)")
+        self._msd_comparison = QCheckBox("MSD")
         self._msd_comparison.setToolTip(
-            "Also fit the old 3-lag MSD models (Brownian D; power-law K and α),\n"
-            "for comparison only. They have no confidence intervals and no blur\n"
-            "model, so they are run with the exposure treated as 0 -- which biases\n"
-            "them on real data -- and their α has a null spread that fills [0, 2]\n"
-            "for short tracks. Adds D_msd / α_msd columns and a D vs α plot."
+            "Also fit the classic 3-lag MSD models (Brownian D; power-law K and α)\n"
+            "for comparison. They have no uncertainties and no blur model, so with\n"
+            "exposure > 0 they are run with the exposure treated as 0 -- which\n"
+            "biases them. Adds D_msd / α_msd columns and a D vs α plot."
         )
 
-        form = QFormLayout()
-        form.setContentsMargins(0, 0, 0, 0)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        form.addRow("exposure", self._exposure)
-        form.addRow("", self._exposure_note)
-        form.addRow("min points for fit", self._min_frames)
-        form.addRow(flow_row(self._compute_z, self._n_boot))
+        # Flow rows rather than a form: a form's field column is too narrow
+        # in a dock for three controls, and clipped them.
+        exposure_row = flow_row(QLabel("exposure"), self._exposure)
+        options_row = flow_row(QLabel("min points"), self._min_frames, self._alpha, self._msd_comparison)
 
-        self._run_button = QPushButton("Run D (Brownian MLE)")
+        self._run_button = QPushButton("Run posteriors")
         self._run_button.clicked.connect(self._run)
         self._status = status_label("")
         self._summary = status_label("")
         self._summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
-        self._hist_button = QPushButton("D histogram")
-        self._hist_button.setToolTip("Reopen the log D histogram of the last run.")
-        self._hist_button.clicked.connect(self._show_histogram)
-        self._plot_button = QPushButton("D vs z plot")
-        self._plot_button.setToolTip("Reopen the log D vs z population plot (runs with z only).")
-        self._plot_button.clicked.connect(self._show_plot)
-        self._msd_plot_button = QPushButton("MSD comparison plot")
-        self._msd_plot_button.setToolTip(
-            "D vs α from the MSD fits (exposure treated as 0; no confidence intervals)."
+        self._ensemble_button = QPushButton("Ensemble")
+        self._ensemble_button.setToolTip(
+            "Per-track medians, the deconvolved distribution and the summed\n"
+            "(shared-D) posterior, over the tracks the filters pass -- one\n"
+            "panel per region class when there are several."
         )
+        self._ensemble_button.clicked.connect(self._show_ensemble)
+        self._track_button = QPushButton("Track")
+        self._track_button.setToolTip(
+            "The selected track's posterior. Stays open and follows the selection."
+        )
+        self._track_button.clicked.connect(self._show_track)
+        self._msd_plot_button = QPushButton("MSD")
+        self._msd_plot_button.setToolTip("D vs α from the MSD fits (no uncertainties).")
         self._msd_plot_button.clicked.connect(self._show_msd_plot)
-        plot_row = flow_row(self._hist_button, self._plot_button, self._msd_plot_button)
+        plot_row = flow_row(QLabel("plot:"), self._ensemble_button, self._track_button, self._msd_plot_button)
 
-        help_text = note_label(_MLE_HELP)
+        help_text = note_label(_POSTERIOR_HELP)
         help_text.setTextFormat(Qt.TextFormat.RichText)
-        self._help = CollapsibleSection("Reading D (and z)", help_text, expanded=False)
+        self._help = CollapsibleSection("Reading the posteriors", help_text, expanded=False)
 
         layout = QVBoxLayout()
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
-        layout.addLayout(form)
-        layout.addWidget(self._msd_comparison)
+        layout.addWidget(exposure_row)
+        layout.addWidget(self._exposure_note)
+        layout.addWidget(options_row)
         layout.addWidget(self._run_button)
         layout.addWidget(self._status)
         layout.addWidget(self._summary)
@@ -1172,8 +1056,12 @@ class _ClassicalTab(QWidget):
         self.host.sync_layer_exposure()
 
     @property
-    def analysis(self) -> Optional[ClassicAnalysis]:
+    def analysis(self) -> Optional[PosteriorAnalysis]:
         return self._analysis
+
+    @property
+    def msd_df(self) -> Optional[pl.DataFrame]:
+        return self._msd_df
 
     @property
     def summary_values(self) -> Optional[dict]:
@@ -1185,7 +1073,7 @@ class _ClassicalTab(QWidget):
 
     def reset(self) -> None:
         self._analysis = None
-        self._comparison = None
+        self._msd_df = None
         self._summary_values = None
         self._summary_by_group = None
         self._status.setText("")
@@ -1228,21 +1116,28 @@ class _ClassicalTab(QWidget):
                 "caution",
             )
         if self._layer_exposure_s is not None and exposure == self._layer_exposure_s:
-            return exposure, "from the layer's metadata", "neutral"
-        if exposure == 0:
+            note = "from the layer's metadata"
+        elif exposure == 0:
             return exposure, "0 = instantaneous (stroboscopic) — no blur modelled", "caution"
-        return exposure, "entered here — not recorded on the layer", "neutral"
+        else:
+            note = "entered here — not recorded on the layer"
+        return exposure, note + (" · α needs 0" if exposure > 0 else ""), "neutral"
 
     def refresh_inputs(self) -> None:
         exposure, note, level = self._exposure_for_run()
         self._exposure_note.setText(note)
         style_status_label(self._exposure_note, level)
         self._run_button.setEnabled(exposure is not None and self.host.has_tracks)
+        alpha_possible = exposure == 0
+        self._alpha.setEnabled(alpha_possible)
+        if not alpha_possible:
+            self._alpha.setChecked(False)
 
     def _refresh_plot_buttons(self) -> None:
-        self._hist_button.setEnabled(self._analysis is not None)
-        self._plot_button.setEnabled(bool((self._summary_values or {}).get("n_z")))
-        self._msd_plot_button.setEnabled(self._comparison is not None)
+        has_run = self._analysis is not None and len(self._analysis.fitted_ids) > 0
+        self._ensemble_button.setEnabled(has_run)
+        self._track_button.setEnabled(has_run)
+        self._msd_plot_button.setEnabled(self._msd_df is not None)
 
     def report_saved(self, text: str) -> None:
         self._status.setText(text)
@@ -1262,87 +1157,100 @@ class _ClassicalTab(QWidget):
             return
         self._status.setText("running…")
         style_status_label(self._status)
-        worker = _run_classical_worker(
+        worker = _run_posterior_worker(
             tracks,
             self.host.dt_s,
             exposure,
             self._min_frames.value(),
-            self._n_boot.value() if self._compute_z.isChecked() else 0,
+            self._alpha.isChecked(),
             self._msd_comparison.isChecked(),
             self.host.progress_callback,
         )
-        self.host.start_worker(
-            worker,
-            self._on_finished,
-            self._on_error,
-            [self._run_button],
-            "Brownian MLE",
-        )
+        self.host.start_worker(worker, self._on_finished, self._on_error, [self._run_button], "posteriors")
 
-    def _on_finished(self, result: tuple[ClassicAnalysis, Optional[ClassicAnalysis]]) -> None:
-        analysis, comparison = result
+    def _on_finished(self, result: tuple[PosteriorAnalysis, Optional[pl.DataFrame]]) -> None:
+        analysis, msd_fits = result
         self._analysis = analysis
-        self._comparison = comparison
-        summary = summarize_mle(analysis.fits)
-        self._summary_values = summary
-        groups = self.host.track_groups()
-        if groups is not None:
-            groups = groups.filter(pl.col("track_id").is_in(mle_rows(analysis.fits)["track_id"]))
-        self._summary_by_group = (
-            summarize_mle_by_group(analysis.fits, groups)
-            if groups is not None and groups["group"].n_unique() > 1
-            else None
-        )
+        self._msd_df = msd_track_table(msd_fits) if msd_fits is not None else None
         self._refresh_plot_buttons()
         self.refresh_inputs()
+        n_ok = len(analysis.fitted_ids)
+        self._status.setText(f"{n_ok} of {analysis.fits.height} tracks fitted")
+        style_status_label(self._status, "ok" if n_ok else "caution")
 
-        n_ok = summary.get("n_ok", 0)
-        self._status.setText(f"{n_ok} of {summary['n_tracks']} tracks resolved motion")
-        style_status_label(self._status, "ok" if summary["median_D_um2_s"] is not None else "caution")
+        display = analysis.fits.select(POSTERIOR_COLUMNS)
+        if not analysis.has_alpha:
+            display = display.drop("alpha_status", "alpha_median", "alpha_low", "alpha_high")
+        if self._msd_df is not None:
+            display = display.join(self._msd_df, on="track_id", how="left")
+        self.host.set_posterior_results(analysis, display)
+        self.refresh_summary()
+        if n_ok:
+            self._show_ensemble()
+
+    def refresh_summary(self) -> None:
+        """Recompute the population summary over the tracks the pane passes
+        -- called after a run and whenever the filters change."""
+        if self._analysis is None:
+            return
+        ids = self.host.combined_filtered_track_ids()
+        self._summary_values = summarize(self._analysis, ids)
+        groups = self.host.group_track_ids(ids)
+        self._summary_by_group = (
+            {name: summarize(self._analysis, group_ids) for name, group_ids in groups.items()}
+            if groups
+            else None
+        )
         self._summary.setText(
-            _format_mle_summary(summary, analysis) + _format_mle_by_group(self._summary_by_group)
+            _format_posterior_summary(self._summary_values, self._analysis)
+            + _format_by_group(self._summary_by_group)
         )
+        if self._ensemble_window is not None and self._ensemble_window.isVisible():
+            self._show_ensemble()
 
-        display = mle_track_table(analysis.fits)
-        if comparison is not None:
-            display = display.join(msd_track_table(comparison.fits), on="track_id", how="left")
-        self.host.set_classical_results(analysis, comparison, display)
-        if summary["median_D_um2_s"] is not None:
-            self._show_histogram()
-        if summary["n_z"]:
-            self._show_plot()
-        if comparison is not None:
-            self._show_msd_plot()
-
-    def _show_histogram(self) -> None:
-        if self._analysis is None or self._summary_values is None:
+    def _show_ensemble(self) -> None:
+        if self._analysis is None:
             return
-        figure = plot_d_histogram(
-            mle_rows(self._analysis.fits),
-            self._summary_values,
-            groups=self.host.track_groups() if self._summary_by_group else None,
-        )
-        if self._hist_window is None:
-            self._hist_window = PlotWindow("Brownian MLE: D histogram", parent=self)
-        self._hist_window.show_figure(figure)
-
-    def _show_plot(self) -> None:
-        if self._analysis is None or not (self._summary_values or {}).get("n_z"):
+        ids = self.host.combined_filtered_track_ids()
+        groups = self.host.group_track_ids(ids) or {"all": ids}
+        panels = ensemble_panels(self._analysis, groups)
+        if not panels:
+            self._status.setText("no fitted tracks pass the current filters")
+            style_status_label(self._status, "caution")
             return
-        figure = plot_d_z_joint(
-            mle_rows(self._analysis.fits),
-            self._summary_values,
-            groups=self.host.track_groups() if self._summary_by_group else None,
+        figure = plot_d_ensemble(
+            D_GRID_UM2_S, panels, ALPHA_GRID if self._analysis.has_alpha else None
         )
-        if self._plot_window is None:
-            self._plot_window = PlotWindow("Brownian MLE: D vs z", parent=self)
-        self._plot_window.show_figure(figure)
+        if self._ensemble_window is None:
+            self._ensemble_window = PlotWindow("Posterior: ensemble", parent=self)
+        self._ensemble_window.show_figure(figure)
+
+    def _show_track(self) -> None:
+        track_id = self.host.selected_track_id
+        if self._analysis is None:
+            return
+        if track_id is None:
+            self._status.setText("select a track (table or viewer) first")
+            style_status_label(self._status, "caution")
+            return
+        data = track_posterior(self._analysis, track_id)
+        if data is None:
+            self._status.setText(f"track {track_id} was not fitted (see its posterior_status)")
+            style_status_label(self._status, "caution")
+            return
+        if self._track_window is None:
+            self._track_window = PlotWindow("Posterior: selected track", parent=self)
+        self._track_window.show_figure(plot_track_posterior(**data))
+
+    def on_track_selected(self) -> None:
+        """Follow the selection while the track window is open."""
+        if self._track_window is not None and self._track_window.isVisible():
+            self._show_track()
 
     def _show_msd_plot(self) -> None:
-        if self._comparison is None:
+        if self._msd_df is None:
             return
-        df = msd_track_table(self._comparison.fits)
-        usable = df.filter(
+        usable = self._msd_df.filter(
             pl.col("D_msd_um2_s").is_not_null()
             & (pl.col("D_msd_um2_s") > 0)
             & pl.col("alpha_msd").is_not_null()
@@ -1351,12 +1259,13 @@ class _ClassicalTab(QWidget):
             self._status.setText("MSD comparison: too few tracks with a positive D and an α to plot")
             style_status_label(self._status, "caution")
             return
+        exposure0 = self._analysis is not None and self._analysis.acquisition.exposure_s > 0
         figure = plot_property_joint(
             usable,
             "D_msd_um2_s",
             "alpha_msd",
             log_x=True,
-            title="MSD comparison — exposure treated as 0, no CIs",
+            title="MSD comparison — no uncertainties" + (", exposure treated as 0" if exposure0 else ""),
         )
         if self._msd_plot_window is None:
             self._msd_plot_window = PlotWindow("MSD comparison: D vs α", parent=self)
@@ -1367,187 +1276,110 @@ class _ClassicalTab(QWidget):
         style_status_label(self._status, "error")
 
 
-def _format_mle_by_group(by_group: Optional[dict]) -> str:
-    """One line per region class under the pooled summary: each region was linked
-    on its own, and whether its motion differs from the others' is the
-    reason it was drawn."""
+def _format_by_group(by_group: Optional[dict]) -> str:
+    """One line per region class under the pooled summary: each region was
+    linked on its own, and whether its motion differs is why it was drawn."""
     if not by_group:
         return ""
     lines = ["", "by region class:"]
     for name, summary in by_group.items():
         line = (
-            f"  {name}: {summary['n_tracks']} tracks · median D = "
+            f"  {name}: {summary['n_tracks']} · median D "
             f"{units.fmt(summary.get('median_D_um2_s'), 'D_um2_s')}"
         )
-        if summary.get("mean_z") is not None:
-            se = summary.get("se_mean_z")
-            line += f" · z {summary['mean_z']:+.2f}" + (f" ± {se:.2f}" if se is not None else "")
-            line += f" · |z| > 1.96: {100 * summary['frac_abs_z_gt_1_96']:.0f}%"
+        if summary.get("summed_D_median_um2_s") is not None:
+            line += f" · shared {summary['summed_D_median_um2_s']:.3g}"
+        if summary.get("median_alpha") is not None:
+            line += f" · α {summary['median_alpha']:.2f}"
         lines.append(line)
     return "\n".join(lines)
 
 
-def _format_mle_summary(summary: dict, analysis: ClassicAnalysis) -> str:
-    """The population summary as a few lines of text beside the plot --
-    counts by diffusionkit status first, since `unresolved`/`excluded`/
-    `invalid_input` tracks are part of the result, not noise to drop."""
-    n_ok = summary.get("n_ok", 0)
+def _format_posterior_summary(summary: dict, analysis: Optional[PosteriorAnalysis] = None) -> str:
+    """The population summary as a few short lines -- counts by
+    diffusionkit status first, since excluded/invalid tracks are part of
+    the result, not noise to drop."""
     others = {
         key[2:]: value
         for key, value in summary.items()
-        if key.startswith("n_") and key not in ("n_tracks", "n_ok", "n_z") and not key.startswith("n_frames")
+        if key.startswith("n_")
+        and key not in ("n_tracks", "n_ok", "n_alpha")
+        and not key.startswith("n_frames")
     }
-    counts = f"{n_ok} ok"
+    counts = f"{summary.get('n_ok', 0)} fitted"
     if others:
         counts += " · " + " · ".join(f"{count} {status}" for status, count in sorted(others.items()))
     lines = [f"{summary['n_tracks']} tracks: {counts}"]
     if summary.get("n_frames_median") is not None:
         lines.append(
-            "length (min / median / max): "
-            f"{summary['n_frames_min']:.0f} / {summary['n_frames_median']:.0f} / "
-            f"{summary['n_frames_max']:.0f} {units.POINTS}"
+            f"length {summary['n_frames_min']:.0f} / {summary['n_frames_median']:.0f} / "
+            f"{summary['n_frames_max']:.0f} {units.POINTS} (min / median / max)"
         )
-    median = f"median D = {units.fmt(summary.get('median_D_um2_s'), 'D_um2_s')}"
-    if summary.get("q25_D_um2_s") is not None and summary.get("q75_D_um2_s") is not None:
-        median += f" (IQR {summary['q25_D_um2_s']:.3g}–{summary['q75_D_um2_s']:.3g})"
-    lines.append(median + ", resolved tracks")
-    if summary.get("n_unresolved"):
+    if summary.get("median_D_um2_s") is not None:
         lines.append(
-            f"{summary['n_unresolved']} unresolved (D̂ = 0): median upper limit "
-            f"D < {units.fmt(summary.get('unresolved_D_upper_median_um2_s'), 'D_um2_s')}"
+            f"median D {units.fmt(summary['median_D_um2_s'], 'D_um2_s')} "
+            f"(IQR {summary['q25_D_um2_s']:.3g}–{summary['q75_D_um2_s']:.3g})"
         )
-    if summary.get("mean_z") is not None:
-        se = summary.get("se_mean_z")
-        sd = summary.get("sd_z")
+    if summary.get("summed_D_median_um2_s") is not None:
         lines.append(
-            f"z: mean {summary['mean_z']:+.3f}"
-            + (f" ± {se:.3f} (SE)" if se is not None else "")
-            + (f" · SD {sd:.2f}" if sd is not None else "")
+            f"shared D {summary['summed_D_median_um2_s']:.3g} "
+            f"[{summary['summed_D_low_um2_s']:.3g}, {summary['summed_D_high_um2_s']:.3g}] · "
+            f"deconvolved mode {summary['deconvolved_D_mode_um2_s']:.3g}"
         )
+    if summary.get("median_alpha") is not None:
         lines.append(
-            f"|z| > 1.96: {100 * summary['frac_abs_z_gt_1_96']:.1f}% of tracks (≈5% if Brownian)"
+            f"median α {summary['median_alpha']:.2f} (IQR {summary['q25_alpha']:.2f}–"
+            f"{summary['q75_alpha']:.2f}) · shared α {summary['summed_alpha_median']:.2f}"
         )
-    acquisition = analysis.acquisition
-    lines.append(
-        f"dt {units.fmt_unit(acquisition.dt_s, 's/frame')} · exposure "
-        f"{units.fmt_unit(acquisition.exposure_s, units.SECONDS)} · "
-        + (f"z from {analysis.mle_options.n_boot} bootstrap reps" if analysis.mle_options.n_boot else "no z")
-    )
+    if analysis is not None:
+        acquisition = analysis.acquisition
+        lines.append(
+            f"dt {units.fmt_unit(acquisition.dt_s, 's/frame')} · exposure "
+            f"{units.fmt_unit(acquisition.exposure_s, units.SECONDS)}"
+        )
     return "\n".join(lines)
 
 
-class _BayesianTab(QWidget):
+class _MapTab(QWidget):
+    """The spatial map: one point per track at its centroid, colored by any
+    per-track number a run produced (`DiffusionAnalysisWidget.
+    register_spatial_source`) -- the reason this analysis stays inside
+    napari next to the image. Nothing to run here; the color range is set
+    by dragging the histogram, and a written scale says what the colors
+    mean, since a napari Points layer colored by a feature has no legend."""
+
     def __init__(self, host: "DiffusionAnalysisWidget") -> None:
         super().__init__()
         self.host = host
-        self._track_plot_window: Optional[PlotWindow] = None
-
-        self._model_picker = QComboBox()
-        self._model_picker.addItems(["anomalous", "normal"])
-        self._model_picker.setToolTip(
-            "Shared by both actions below -- the bulk map and the per-track "
-            "fit answer the same question at two costs, so fitting one model "
-            "in bulk and a different one per track would make the two "
-            "uncomparable."
-        )
-        model_form = QFormLayout()
-        model_form.setContentsMargins(0, 0, 0, 0)
-        model_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        model_form.addRow("model", self._model_picker)
-
-        self._map_button = QPushButton("Run MAP fit (all tracks)")
-        self._map_button.clicked.connect(self._run_map)
-        self._map_status = status_label("")
-
+        self._hint = note_label("Run the posteriors first — the map colors each track's centroid by a result.")
         self._color_by_picker = QComboBox()
         self._color_by_picker.setEnabled(False)
         self._color_by_picker.currentTextChanged.connect(self._on_color_by_changed)
         # D spans orders of magnitude across a field of tracks, so a linear
-        # histogram is one tall spike at the low end -- log bins are what
-        # make the rest of the distribution visible enough to drag a handle
-        # into.
-        self._map_log_scale_check = QCheckBox("log scale")
+        # histogram is one tall spike at the low end.
+        self._map_log_scale_check = QCheckBox("log")
         self._map_log_scale_check.setEnabled(False)
         self._map_log_scale_check.toggled.connect(self._on_map_log_scale_toggled)
         color_form = QFormLayout()
         color_form.setContentsMargins(0, 0, 0, 0)
         color_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        color_form.addRow("color map by", self._color_by_picker)
-        color_form.addRow("", self._map_log_scale_check)
-        # What the map's colors mean, in words and in a unit: the picker
-        # above it names a column and the histogram below sets the color
-        # range, but neither said what the numbers on that range are --
-        # so a viridis field of dots carried no scale at all. Updated by
-        # `_on_color_by_changed`/`refresh_color_by_choices`.
+        color_form.addRow("color by", flow_row(self._color_by_picker, self._map_log_scale_check))
         self._map_scale_label = status_label("")
         self._map_histogram = HistogramRangeWidget()
         self._map_histogram.setEnabled(False)
         self._map_histogram.rangeChanged.connect(self._on_map_range_changed)
 
-        self._method_picker = QComboBox()
-        self._method_picker.addItems(["map", "nuts"])
-        self._method_picker.setToolTip(
-            "map: fast point estimate + interval.\n"
-            "nuts: full MCMC posterior (slower -- tens of seconds), "
-            "opens a posterior corner-plot pop-up when done."
-        )
-        method_form = QFormLayout()
-        method_form.setContentsMargins(0, 0, 0, 0)
-        method_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        method_form.addRow("method", self._method_picker)
-        self._track_fit_button = QPushButton("Fit selected track")
-        self._track_fit_button.setToolTip("Fits whichever track is selected in the table above.")
-        self._track_fit_button.clicked.connect(self._run_track_fit)
-        self._track_status = status_label("")
-        self._track_result_label = status_label("")
-
-        map_body = QWidget()
-        map_layout = QVBoxLayout(map_body)
-        map_layout.setContentsMargins(0, 0, 0, 0)
-        map_layout.setSpacing(4)
-        map_layout.addWidget(self._map_button)
-        map_layout.addWidget(self._map_status)
-        map_layout.addLayout(color_form)
-        map_layout.addWidget(self._map_scale_label)
-        map_layout.addWidget(self._map_histogram)
-
-        track_body = QWidget()
-        track_layout = QVBoxLayout(track_body)
-        track_layout.setContentsMargins(0, 0, 0, 0)
-        track_layout.setSpacing(4)
-        track_layout.addLayout(method_form)
-        track_layout.addWidget(self._track_fit_button)
-        track_layout.addWidget(self._track_status)
-        track_layout.addWidget(self._track_result_label)
-
-        # Three collapsible sections rather than one long scroll of rules
-        # and bold labels: this is the tallest tab, and the two actions are
-        # used at different moments (map the whole field first, then
-        # promote one track to expensive inference), so only one of them is
-        # usually wanted on screen. Spatial MAP starts open because it is
-        # the entry point -- the per-track fit needs a selection that the
-        # map is how you find.
-        self._map_section = CollapsibleSection(
-            "Spatial MAP (all tracks)", map_body, expanded=True
-        )
-        self._track_section = CollapsibleSection("Per-track fit", track_body)
-
         layout = QVBoxLayout()
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
-        layout.addLayout(model_form)
-        layout.addWidget(hline())
-        layout.addWidget(self._map_section)
-        layout.addWidget(self._track_section)
+        layout.addWidget(self._hint)
+        layout.addLayout(color_form)
+        layout.addWidget(self._map_scale_label)
+        layout.addWidget(self._map_histogram)
         layout.addStretch()
         self.setLayout(layout)
 
     def reset(self) -> None:
-        self._map_status.setText("")
-        style_status_label(self._map_status)
-        self._track_status.setText("")
-        style_status_label(self._track_status)
-        self._track_result_label.setText("")
         self._color_by_picker.blockSignals(True)
         self._color_by_picker.clear()
         self._color_by_picker.blockSignals(False)
@@ -1555,33 +1387,7 @@ class _BayesianTab(QWidget):
         self._map_histogram.setEnabled(False)
         self._map_log_scale_check.setEnabled(False)
         self._map_scale_label.setText("")
-
-    def _run_map(self) -> None:
-        tracks = self.host.diffkit_tracks_for_fit()
-        if tracks is None:
-            return
-        model = self._model_picker.currentText()
-        self._map_status.setText("running…")
-        style_status_label(self._map_status)
-        worker = _run_bulk_map_worker(tracks, self.host.dt_s, model, self.host.progress_callback)
-        self.host.start_worker(
-            worker,
-            lambda table, m=model: self._on_map_finished(table, m),
-            self._on_map_error,
-            [self._map_button],
-            f"MAP ({model})",
-        )
-
-    def _on_map_finished(self, table: pl.DataFrame, model: str) -> None:
-        self._map_status.setText(f"fit {table.height} tracks ({model})")
-        style_status_label(self._map_status, "ok" if table.height else "caution")
-        map_df = _normalize_map_table(table, model)
-        color_by = "alpha_map" if model == "anomalous" else "D_map_um2_s"
-        self.host.set_map_results(table, map_df, model, color_by)
-
-    def _on_map_error(self, exc: Exception) -> None:
-        self._map_status.setText(f"error: {exc}")
-        style_status_label(self._map_status, "error")
+        self._hint.setVisible(True)
 
     def _on_color_by_changed(self, column: str) -> None:
         if not column:
@@ -1594,21 +1400,15 @@ class _BayesianTab(QWidget):
         self._update_map_scale_label(vmin, vmax)
 
     def _on_map_log_scale_toggled(self, enabled: bool) -> None:
-        """Re-bin the map histogram on a log10 axis. `set_log_scale` is
-        silent and may clamp the range off zero/negative values, so the
-        host's contrast limits are re-synced from it explicitly -- unlike
-        a drag, nothing else would tell them the range moved."""
+        """Re-bin the histogram on a log10 axis. `set_log_scale` is silent
+        and may clamp the range off zero/negative values, so the host's
+        contrast limits are re-synced from it explicitly."""
         self._map_histogram.set_log_scale(enabled)
         vmin, vmax = self._map_histogram.range()
         self.host.set_map_contrast_limits(vmin, vmax)
         self._update_map_scale_label(vmin, vmax)
 
-    def _update_map_scale_label(
-        self, vmin: Optional[float] = None, vmax: Optional[float] = None
-    ) -> None:
-        """State what the map's color ramp is showing and over what range,
-        in that quantity's own unit -- the legend a napari Points layer
-        colored by a feature doesn't come with."""
+    def _update_map_scale_label(self, vmin: Optional[float] = None, vmax: Optional[float] = None) -> None:
         column = self._color_by_picker.currentText()
         if not column:
             self._map_scale_label.setText("")
@@ -1617,16 +1417,13 @@ class _BayesianTab(QWidget):
             vmin, vmax = self._map_histogram.range()
         unit = units.unit_of(column)
         self._map_scale_label.setText(
-            f"map color: {units.header(column)}   "
-            f"{vmin:.4g} → {vmax:.4g}{' ' + unit if unit else ''}"
+            f"{units.header(column)}: {vmin:.4g} → {vmax:.4g}{' ' + unit if unit else ''}"
         )
         self._map_scale_label.setToolTip(units.tooltip(column))
 
     def on_spatial_source_registered(self, preferred_color_by: Optional[str] = None) -> None:
-        """Called by the host whenever *any* tab (this one's own MAP fit,
-        or the Anisotropy tab) adds a new spatial-map color choice --
-        repopulates the "color map by" picker with the union of every
-        registered source's columns."""
+        """A run added color choices: repopulate the picker with the union
+        of every registered source's columns."""
         self.refresh_color_by_choices(prefer=preferred_color_by)
         self._refresh_map_histogram(reset_range=True)
 
@@ -1642,6 +1439,7 @@ class _BayesianTab(QWidget):
             self._color_by_picker.setCurrentText(columns[0])
         self._color_by_picker.blockSignals(False)
         enabled = bool(columns)
+        self._hint.setVisible(not enabled)
         self._color_by_picker.setEnabled(enabled)
         self._map_histogram.setEnabled(enabled)
         self._map_log_scale_check.setEnabled(enabled)
@@ -1649,9 +1447,8 @@ class _BayesianTab(QWidget):
             self.host.set_map_color_by(self._color_by_picker.currentText())
 
     def refresh_map_histogram(self) -> None:
-        """Called by the host after filters change -- the map's color
-        range stays as the user set it, only the underlying data (and
-        thus the histogram bars) needs to reflect the new filtered set."""
+        """After a filter change: the color range stays as set, only the
+        histogram's data follows the new filtered set."""
         self._refresh_map_histogram(reset_range=False)
 
     def _refresh_map_histogram(self, reset_range: bool) -> None:
@@ -1669,261 +1466,109 @@ class _BayesianTab(QWidget):
         self._map_histogram.blockSignals(False)
         self._update_map_scale_label()
 
-    def _run_track_fit(self) -> None:
-        track_id = self.host.selected_track_id
-        if track_id is None:
-            self._track_section.set_expanded(True)
-            self._track_status.setText("select a track in the table above first")
-            style_status_label(self._track_status, "caution")
-            return
-        track_df = self.host.diffkit_track(track_id)
-        if track_df is None or track_df.height == 0:
-            return
-        model = self._model_picker.currentText()
-        method = self._method_picker.currentText()
-        self._track_status.setText(
-            "running... (NUTS sampling can take tens of seconds)"
-            if method == "nuts"
-            else "running... (first fit compiles, may take a few seconds)"
-        )
-        style_status_label(self._track_status)
-        worker = _run_track_fit_worker(track_df, self.host.dt_s, model, method)
-        self.host.start_worker(
-            worker,
-            self._on_track_fit_finished,
-            self._on_track_fit_error,
-            [self._track_fit_button],
-            f"{method.upper()} fit, track {track_id}",
-        )
 
-    def _on_track_fit_finished(self, fit: "dk_bayes.TrackFit") -> None:
-        self._track_status.setText(f"track {fit.track_id} fit (n={fit.track_length})")
-        style_status_label(self._track_status, "ok")
+def _bayes_available() -> bool:
+    """Whether diffusionkit's NUTS stack (JAX, NumPyro) is installed -- the
+    optional `[bayes]` extra. Checked without importing it: importing jax
+    takes seconds and switches it to float64 process-wide."""
+    import importlib.util
 
-        # Parameter names come from diffusionkit ("D", "K", "alpha",
-        # "sigma"), and each carries a different unit -- which this
-        # readout used to leave off entirely, so a D and an alpha were
-        # printed identically. `_PARAM_COLUMNS` maps each to the column
-        # name `spt_pipeline.units` knows it by.
-        lines = [f"track {fit.track_id}, model={fit.model}, method={fit.method}"]
-        for name, value in fit.params.items():
-            column = _PARAM_COLUMNS.get(name, name)
-            interval = f"[{fit.lo[name]:.4g}, {fit.hi[name]:.4g}]"
-            lines.append(f"  {name} = {units.fmt(value, column)}  {interval}")
-        self._track_result_label.setText("\n".join(lines))
-
-        if fit.method == "nuts":
-            samples_dict, _mcmc = fit.raw
-            param_names = list(fit.params.keys())
-            flat, _trace = dk_bayes_viz.samples_dict_to_arrays(samples_dict, param_names)
-            figure = dk_bayes_viz.plot_posterior_corner(flat, param_names)
-            _label_corner_axes(figure, param_names)
-            if self._track_plot_window is None:
-                self._track_plot_window = PlotWindow("Posterior (per-track)", parent=self)
-            self._track_plot_window.show_figure(figure)
-
-        self.host.set_track_fit_result(_track_fit_row(fit))
-
-    def _on_track_fit_error(self, exc: Exception) -> None:
-        self._track_status.setText(f"error: {exc}")
-        style_status_label(self._track_status, "error")
+    return all(importlib.util.find_spec(name) is not None for name in ("jax", "numpyro"))
 
 
-class _AnisotropyTab(QWidget):
-    """`diffusionkit.bayes.anisotropy.analyze` -- a model-*comparison*
-    question (is this track diffusing anisotropically) rather than a point
-    estimate, so it gets its own tab rather than a third `model=` choice
-    on the Bayesian tab's existing MAP/per-track sections. One bulk run
-    over every eligible track, like Bayesian's Spatial MAP; results
-    register into the shared spatial-map color-by picker
-    (`DiffusionAnalysisWidget.register_spatial_source`) and merge into the
-    tracks-pane table, same as every other tab's.
-
-    This tab used to offer two speeds -- a fast log-BF detector and a
-    slower "full posterior" pass -- and an upper track-length cap.
-    diffusionkit removed all three, and the tab follows rather than
-    emulating them:
-
-      - The evidence now comes from nested sampling, and ONE run yields
-        both `log_bf10` and the eps/psi/D posterior. There is nothing left
-        for a second, slower button to compute.
-      - The old cap (`max_track_length=10`) existed because the previous
-        Monte-Carlo estimator broke above it, which had the effect of
-        restricting the analysis to exactly the tracks too short to answer
-        the question. Nested sampling stays valid as tracks get long, so
-        only a lower bound remains.
-      - There is no ensemble score. Summing per-track log BF10 answers
-        "does each track have its own independent anisotropy", not "do
-        these tracks share an axis", and it manufactures anisotropy out of
-        ordinary D-heterogeneity. The summary below therefore counts
-        tracks by Jeffreys-scale `evidence` label instead of reporting one
-        pooled number.
-
-    Read `log_bf10` against `log_bf10_stderr`: on a short track the
-    sampler's own uncertainty is larger than the evidence, and the
-    `evidence` column says so in words rather than leaving a near-zero
-    number to be over-read."""
+class _NutsTab(QWidget):
+    """`diffusionkit.bayes.fit_track`: a full NUTS posterior for the one
+    track selected in the tracks pane -- the per-track diagnostic for when
+    a posterior's shape matters (the K/alpha/sigma correlations the 1D
+    grid posteriors don't show). Tens of seconds per track, so there is no
+    bulk version. Needs the optional `[bayes]` extra (JAX, NumPyro)."""
 
     def __init__(self, host: "DiffusionAnalysisWidget") -> None:
         super().__init__()
         self.host = host
-        self._per_track: Optional[pl.DataFrame] = None
         self._plot_window: Optional[PlotWindow] = None
+        self._available = _bayes_available()
 
-        self._min_track_length = QSpinBox()
-        self._min_track_length.setRange(2, 10_000)
-        self._min_track_length.setValue(5)
-        self._min_track_length.setToolTip(
-            "Skip tracks shorter than this. There is no upper bound: nested "
-            "sampling stays valid as a track gets long, and long tracks are "
-            "the ones that can actually answer the question."
+        self._model_picker = QComboBox()
+        self._model_picker.addItems(["anomalous", "normal"])
+        self._model_picker.setToolTip(
+            "anomalous: K, α and the localization σ. normal: D and σ."
         )
-        form = QFormLayout()
-        form.setContentsMargins(0, 0, 0, 0)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        form.addRow("min points for fit", self._min_track_length)
-
-        self._run_button = QPushButton("Run anisotropy analysis")
-        self._run_button.setToolTip(
-            "Nested sampling per track -- scales with track count and can take\n"
-            "tens of seconds or more. Yields the evidence and the eps/psi/D\n"
-            "posterior in one pass."
-        )
-        self._run_button.clicked.connect(self._run)
+        self._fit_button = QPushButton("Fit selected track")
+        self._fit_button.setToolTip("Full NUTS posterior (4 chains) for the track selected above.")
+        self._fit_button.clicked.connect(self._run)
         self._status = status_label("")
-        self._summary = status_label("")
+        self._result_label = status_label("")
+        self._result_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
-        self._log_bf_button = QPushButton("log BF10 distribution")
-        self._log_bf_button.setEnabled(False)
-        self._log_bf_button.clicked.connect(self._show_log_bf_plot)
-        self._eps_vs_bf_button = QPushButton("ε vs log BF10")
-        self._eps_vs_bf_button.setEnabled(False)
-        self._eps_vs_bf_button.clicked.connect(self._show_eps_vs_bf_plot)
-        self._eps_forest_button = QPushButton("ε forest (top tracks)")
-        self._eps_forest_button.setEnabled(False)
-        self._eps_forest_button.clicked.connect(self._show_eps_forest_plot)
-
-        plots_body = QWidget()
-        plots_layout = QVBoxLayout(plots_body)
-        plots_layout.setContentsMargins(0, 0, 0, 0)
-        plots_layout.setSpacing(4)
-        plots_layout.addWidget(self._log_bf_button)
-        plots_layout.addWidget(self._eps_vs_bf_button)
-        plots_layout.addWidget(self._eps_forest_button)
-        # Open once there is something to plot (see `_on_finished`) and
-        # folded away before then, so three permanently-disabled buttons
-        # aren't the tallest thing on the tab.
-        self._plots_section = CollapsibleSection("Plots", plots_body)
+        row = flow_row(QLabel("model"), self._model_picker, self._fit_button)
 
         layout = QVBoxLayout()
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
-        layout.addLayout(form)
-        layout.addWidget(self._run_button)
+        layout.addWidget(row)
         layout.addWidget(self._status)
-        layout.addWidget(self._summary)
-        layout.addWidget(hline())
-        layout.addWidget(self._plots_section)
+        layout.addWidget(self._result_label)
         layout.addStretch()
         self.setLayout(layout)
+        if not self._available:
+            self._fit_button.setEnabled(False)
+            self._model_picker.setEnabled(False)
+            self._status.setText("needs the [bayes] extra: uv sync --extra bayes")
+            style_status_label(self._status, "caution")
 
     def reset(self) -> None:
-        self._per_track = None
-        self._status.setText("")
-        style_status_label(self._status)
-        self._summary.setText("")
-        self._log_bf_button.setEnabled(False)
-        self._eps_vs_bf_button.setEnabled(False)
-        self._eps_forest_button.setEnabled(False)
-        self._plots_section.set_expanded(False)
+        if self._available:
+            self._status.setText("")
+            style_status_label(self._status)
+        self._result_label.setText("")
 
     def _run(self) -> None:
-        tracks = self.host.diffkit_tracks_for_fit()
-        if tracks is None:
+        track_id = self.host.selected_track_id
+        if track_id is None:
+            self._status.setText("select a track (table or viewer) first")
+            style_status_label(self._status, "caution")
             return
-        self._status.setText("running… (nested sampling per track, can take a while)")
+        track_df = self.host.diffkit_track(track_id)
+        if track_df is None or track_df.height < 3:
+            self._status.setText(f"track {track_id} is too short to fit")
+            style_status_label(self._status, "caution")
+            return
+        model = self._model_picker.currentText()
+        self._status.setText("running… (compiles on first use; tens of seconds)")
         style_status_label(self._status)
-        worker = _run_anisotropy_worker(
-            tracks, self.host.dt_s, self._min_track_length.value(), self.host.progress_callback
-        )
+        worker = _run_nuts_worker(track_df, self.host.dt_s, model)
         self.host.start_worker(
-            worker,
-            self._on_finished,
-            self._on_error,
-            [self._run_button],
-            "anisotropy",
+            worker, self._on_finished, self._on_error, [self._fit_button], f"NUTS, track {track_id}"
         )
 
-    def _on_finished(self, per_track: pl.DataFrame) -> None:
-        self._per_track = per_track
-        n = per_track.height
-        self._status.setText(f"analyzed {n} track(s)")
-        style_status_label(self._status, "ok" if n else "caution")
+    def _on_finished(self, fit) -> None:
+        from diffusionkit.bayes import viz as dk_bayes_viz
 
-        has_eps = "eps_median" in per_track.columns
-        if n:
-            self._summary.setText(self._summarize(per_track))
-        self._log_bf_button.setEnabled(n > 0)
-        self._eps_vs_bf_button.setEnabled(has_eps and n > 0)
-        self._eps_forest_button.setEnabled(has_eps and n > 0)
-        self._plots_section.set_expanded(n > 0)
+        self._status.setText(f"track {fit.track_id} fit (n={fit.track_length})")
+        style_status_label(self._status, "ok")
+        # Parameter names come from diffusionkit ("D", "K", "alpha",
+        # "sigma"), each with its own unit; `_PARAM_COLUMNS` maps each to
+        # the column name `napari_gemscape2.units` knows it by.
+        lines = [f"track {fit.track_id}, {fit.model} (median, 90% HPDI)"]
+        for name, value in fit.params.items():
+            column = _PARAM_COLUMNS.get(name, name)
+            lines.append(f"  {name} = {units.fmt(value, column)}  [{fit.lo[name]:.4g}, {fit.hi[name]:.4g}]")
+        self._result_label.setText("\n".join(lines))
 
-        self.host.set_anisotropy_results(per_track, _normalize_anisotropy_table(per_track))
-
-    @staticmethod
-    def _summarize(per_track: pl.DataFrame) -> str:
-        """Counts by Jeffreys-scale `evidence` label, plus the median eps.
-
-        Deliberately not a pooled score: see this class's docstring for why
-        summing per-track log BF10 answers a different question than the
-        one it appears to. Counting labels keeps the per-track structure
-        visible -- "3 of 200 tracks show strong evidence" is a statement a
-        reader can act on, and a sum is not."""
-        lines = []
-        if "evidence" in per_track.columns:
-            counts = (
-                per_track.group_by("evidence")
-                .len()
-                .sort("len", descending=True)
-            )
-            lines.append(
-                "  ".join(
-                    f"{row['len']}x {row['evidence']}" for row in counts.iter_rows(named=True)
-                )
-            )
-        if "eps_median" in per_track.columns:
-            # eps is tanh(|h|) in diffusionkit's log-Euclidean
-            # coordinates, i.e. (D∥ − D⊥)/(D∥ + D⊥): a normalized
-            # difference in [0, 1), 0 being isotropic. Dimensionless, and
-            # said so, since every other number this widget reports does
-            # carry a unit and a bare figure would read as an oversight.
-            lines.append(
-                f"median ε = {per_track['eps_median'].median():.3g} "
-                "  (dimensionless: (D∥−D⊥)/(D∥+D⊥), 0 = isotropic)"
-            )
-        return "\n".join(lines)
+        samples_dict, _mcmc = fit.raw
+        param_names = list(fit.params.keys())
+        flat, _trace = dk_bayes_viz.samples_dict_to_arrays(samples_dict, param_names)
+        figure = dk_bayes_viz.plot_posterior_corner(flat, param_names)
+        _label_corner_axes(figure, param_names)
+        if self._plot_window is None:
+            self._plot_window = PlotWindow("NUTS posterior (selected track)", parent=self)
+        self._plot_window.show_figure(figure)
+        self.host.set_nuts_result(_nuts_row(fit))
 
     def _on_error(self, exc: Exception) -> None:
         self._status.setText(f"error: {exc}")
         style_status_label(self._status, "error")
-
-    def _show_plot(self, figure) -> None:
-        _label_anisotropy_axes(figure)
-        if self._plot_window is None:
-            self._plot_window = PlotWindow("Anisotropy", parent=self)
-        self._plot_window.show_figure(figure)
-
-    def _show_log_bf_plot(self) -> None:
-        if self._per_track is not None:
-            self._show_plot(dk_anisotropy.plot_log_bf_distribution(self._per_track, "log BF10 per track"))
-
-    def _show_eps_vs_bf_plot(self) -> None:
-        if self._per_track is not None:
-            self._show_plot(dk_anisotropy.plot_eps_vs_log_bf(self._per_track, "eps vs. log BF10"))
-
-    def _show_eps_forest_plot(self) -> None:
-        if self._per_track is not None:
-            self._show_plot(dk_anisotropy.plot_eps_forest(self._per_track, "eps posterior, top tracks"))
 
 
 class DiffusionAnalysisWidget(QWidget):
@@ -1946,26 +1591,17 @@ class DiffusionAnalysisWidget(QWidget):
         # table (see `_qc_aggregate_table`).
         self._qc_columns: list[str] = []
         self._joined_track_df: Optional[pl.DataFrame] = None
-        # The last Classical run (`ClassicAnalysis`, all models' rows),
-        # its optional MSD comparison pass, and the per-track columns the
-        # tracks pane shows from them.
-        self._classical_analysis: Optional[ClassicAnalysis] = None
-        self._classical_comparison: Optional[ClassicAnalysis] = None
-        self._classical_df: Optional[pl.DataFrame] = None
-        # model name -> that model's latest bulk MAP table: the full
-        # diffusionkit output (what Save writes) and its trimmed point
-        # estimates (what the tracks pane shows). Keyed by model so running
-        # "normal" after "anomalous" adds columns instead of replacing them.
-        self._map_full_by_model: dict[str, pl.DataFrame] = {}
-        self._map_df_by_model: dict[str, pl.DataFrame] = {}
+        # The last posterior run, and the per-track columns the tracks
+        # pane shows from it (plus the MSD comparison's, when run).
+        self._posterior: Optional[PosteriorAnalysis] = None
+        self._posterior_df: Optional[pl.DataFrame] = None
         self._map_color_by: Optional[str] = None
-        self._anisotropy_full_df: Optional[pl.DataFrame] = None
         # name -> per-track df (track_id + one or more value columns) --
         # every tab that produces a per-track number registers here, and
         # the spatial map / its color-by picker draw from the union of
         # whatever's currently registered (see register_spatial_source).
         self._spatial_sources: dict[str, pl.DataFrame] = {}
-        self._track_fit_rows: list[dict] = []
+        self._nuts_rows: list[dict] = []
         self._current_track_id: Optional[int] = None
         self._worker = None
         # The Tracks layer's recorded exposure as last seen, to tell a
@@ -2003,9 +1639,9 @@ class DiffusionAnalysisWidget(QWidget):
         self._source_label = status_label("no Tracks layer in this viewer")
 
         self._tracks_pane = _TracksPane(self)
-        self._classical = _ClassicalTab(self)
-        self._bayesian = _BayesianTab(self)
-        self._anisotropy = _AnisotropyTab(self)
+        self._posterior_tab = _PosteriorTab(self)
+        self._map_tab = _MapTab(self)
+        self._nuts_tab = _NutsTab(self)
 
         # Each page scrolls independently rather than the whole tab widget
         # scrolling: wrapping the QTabWidget itself would carry the tab bar
@@ -2013,14 +1649,12 @@ class DiffusionAnalysisWidget(QWidget):
         # exactly when you want to be able to switch away from it.
         tabs = QTabWidget()
         tabs.setDocumentMode(True)
-        tabs.addTab(scrolled(self._classical), "Classical")
-        tabs.addTab(scrolled(self._bayesian), "Bayesian")
-        tabs.addTab(scrolled(self._anisotropy), "Anisotropy")
-        tabs.setTabToolTip(
-            0, "Per-track Brownian displacement MLE: D and non-Brownian z (diffusionkit.classic.analyze_tracks)"
-        )
-        tabs.setTabToolTip(1, "Bayesian MAP / NUTS fits (diffusionkit.bayes)")
-        tabs.setTabToolTip(2, "Anisotropy model comparison (diffusionkit.bayes.anisotropy)")
+        tabs.addTab(scrolled(self._posterior_tab), "Posterior")
+        tabs.addTab(scrolled(self._map_tab), "Map")
+        tabs.addTab(scrolled(self._nuts_tab), "NUTS")
+        tabs.setTabToolTip(0, "Per-track grid posteriors over D (and α), and the ensemble (diffusionkit.gridpost)")
+        tabs.setTabToolTip(1, "Color each track's centroid in the viewer by a result")
+        tabs.setTabToolTip(2, "Full NUTS posterior for the selected track (diffusionkit.bayes)")
 
         # One session-wide switch, not a copy on each tab -- see this
         # module's docstring.
@@ -2035,9 +1669,11 @@ class DiffusionAnalysisWidget(QWidget):
         # them into the same bundle.
         self._save_button = QPushButton("Save analysis")
         self._save_button.setToolTip(
-            "Write the fits (diffusion_fits.parquet), the run settings and\n"
-            f"population summary (diffusion_summary.json) and the per-track\n"
-            f"summary ({TRACKS_SUMMARY_FILENAME}) into this layer's bundle."
+            f"Write the per-track summary ({TRACKS_SUMMARY_FILENAME}), every\n"
+            "track's posterior (posterior_D/_alpha.parquet), the ensemble\n"
+            "distributions (distributions_D/_alpha.csv, over the tracks the\n"
+            "filters pass) and the settings and population summary\n"
+            "(diffusion_summary.json) into this layer's bundle."
         )
         self._save_button.clicked.connect(self._save_results)
         self._save_button.setEnabled(False)
@@ -2124,6 +1760,19 @@ class DiffusionAnalysisWidget(QWidget):
             ids = region_ids if ids is None else (ids & region_ids)
         return ids
 
+    def group_track_ids(self, ids: Optional[set]) -> Optional[dict[str, set]]:
+        """`{region class: its track ids}` restricted to `ids` (None = all),
+        or None when the loaded tracks don't span more than one class."""
+        groups = self.track_groups()
+        if groups is None:
+            return None
+        if ids is not None:
+            groups = groups.filter(pl.col("track_id").is_in(list(ids)))
+        names = sorted(groups["group"].drop_nulls().unique().to_list())
+        return {
+            name: set(groups.filter(pl.col("group") == name)["track_id"].to_list()) for name in names
+        } or None
+
     def track_groups(self) -> Optional[pl.DataFrame]:
         """`(track_id, group)` naming each loaded track's region class, or
         None when the tracks don't span more than one -- what per-class
@@ -2140,7 +1789,8 @@ class DiffusionAnalysisWidget(QWidget):
     def on_filters_changed(self) -> None:
         self._rebuild_track_table()
         self._update_spatial_map_layer()
-        self._bayesian.refresh_map_histogram()
+        self._map_tab.refresh_map_histogram()
+        self._posterior_tab.refresh_summary()
 
     def diffkit_tracks_for_fit(self) -> Optional[pl.DataFrame]:
         """The tracks a fit should run on, honoring the footer's one
@@ -2170,8 +1820,7 @@ class DiffusionAnalysisWidget(QWidget):
     ) -> None:
         """Run `worker` in the one host-wide slot. Until the worker's first
         report through `progress_callback` arrives (and throughout, for one
-        that never reports) the bar is a busy indicator, since a bulk fit's
-        first batch includes JAX compilation and can sit at 0 for a while."""
+        that never reports) the bar is a busy indicator."""
         if self._worker is not None:
             return
         for widget in busy_widgets:
@@ -2202,7 +1851,7 @@ class DiffusionAnalysisWidget(QWidget):
 
     def _on_worker_progress(self, done: int, total: int) -> None:
         if self._worker is None or total <= 0 or done <= 0:
-            # Stay a busy indicator through the first (compiling) batch; a
+            # Stay a busy indicator until there is progress to show; a
             # determinate bar parked at 0% reads as hung.
             return
         self._progress_bar.setRange(0, total)
@@ -2297,15 +1946,11 @@ class DiffusionAnalysisWidget(QWidget):
     def _reset_analysis_state(self) -> None:
         """Forget every fit and the current track -- they belonged to the
         track set that was loaded, not to the one about to be."""
-        self._classical_analysis = None
-        self._classical_comparison = None
-        self._classical_df = None
-        self._map_full_by_model = {}
-        self._map_df_by_model = {}
+        self._posterior = None
+        self._posterior_df = None
         self._map_color_by = None
-        self._anisotropy_full_df = None
         self._spatial_sources = {}
-        self._track_fit_rows = []
+        self._nuts_rows = []
         self._current_track_id = None
 
     def _clear_loaded_state(self) -> None:
@@ -2326,10 +1971,10 @@ class DiffusionAnalysisWidget(QWidget):
         self._source_label.setText("no Tracks layer in this viewer")
         style_status_label(self._source_label)
         self._tracks_pane.reset()
-        self._classical.reset()
-        self._classical.set_layer_exposure(None)
-        self._bayesian.reset()
-        self._anisotropy.reset()
+        self._posterior_tab.reset()
+        self._posterior_tab.set_layer_exposure(None)
+        self._map_tab.reset()
+        self._nuts_tab.reset()
         self._save_button.setEnabled(False)
         self._export_csv_button.setEnabled(False)
         self._clear_overlay_layers()
@@ -2343,7 +1988,7 @@ class DiffusionAnalysisWidget(QWidget):
         track_id/frame/y/x/se_y/se_x) and the per-track QC aggregates.
 
         None when the layer has no `se_y`/`se_x` (spotsolve's per-detection
-        CRLB, renamed for diffusionkit in spt_pipeline.diffusion). Requiring
+        CRLB, renamed for diffusionkit in napari_gemscape2.diffusion). Requiring
         them is how a Tracks layer from this pipeline is told apart from
         any other: without a position error there is no noise term to fit,
         so the check is load-bearing, not cosmetic."""
@@ -2408,15 +2053,15 @@ class DiffusionAnalysisWidget(QWidget):
         self.sync_layer_exposure()
 
     def sync_layer_exposure(self) -> None:
-        """Hand the loaded layer's recorded exposure to the Classical tab
+        """Hand the loaded layer's recorded exposure to the Posterior tab
         if it changed since last looked at -- see `_adopt_track_table`."""
         layer = self._tracks_layer
         layer_exposure = layer.metadata.get("exposure_s") if layer is not None else None
         if self._layer_exposure_s is _UNSEEN or layer_exposure != self._layer_exposure_s:
             self._layer_exposure_s = layer_exposure
-            self._classical.set_layer_exposure(layer_exposure)
+            self._posterior_tab.set_layer_exposure(layer_exposure)
         else:
-            self._classical.refresh_inputs()
+            self._posterior_tab.refresh_inputs()
 
     def _update_source_label(self) -> None:
         """Name the loaded layer, its bundle, and -- the part that is not
@@ -2428,23 +2073,26 @@ class DiffusionAnalysisWidget(QWidget):
         column here, and every D and K fitted from them, is those two
         numbers. A layer that carries neither still gets 1.0 for both
         (see `viewer.layer_units_metadata`) because the conversion has to
-        run on something -- and then `D_map_um2_s` is really px²/frame
+        run on something -- and then `D_median_um2_s` is really px²/frame
         under a µm²/s name. That case gets said out loud rather than
         rendered identically to a calibrated one."""
         layer = self._tracks_layer
         if layer is None:
             return
+        # The bundle by name: its full path runs to several lines in a
+        # dock, so it lives in the tooltip.
         where = (
-            f"→ {self._result_dir}"
+            f"→ {self._result_dir.name}"
             if self._result_dir is not None
-            else "(no known results bundle — results can't be saved)"
+            else "(no results bundle — can't save)"
         )
+        self._source_label.setToolTip(str(self._result_dir) if self._result_dir is not None else "")
         scale = (
             f"{units.fmt_unit(self.pixel_size_um, units.UM + '/px')} · "
             f"{units.fmt_unit(self.dt_s, 's/frame')}"
         )
         if self.units_known:
-            self._source_label.setText(f"'{layer.name}' {where}\n{scale}")
+            self._source_label.setText(f"'{layer.name}' {where} · {scale}")
             style_status_label(self._source_label, "neutral")
         else:
             self._source_label.setText(
@@ -2479,9 +2127,9 @@ class DiffusionAnalysisWidget(QWidget):
         self._tracks_pane.reset()
         self._tracks_pane.set_qc_columns(self._qc_columns)
         self._tracks_pane.set_region_choices(self._region_classes_loaded())
-        self._classical.reset()
-        self._bayesian.reset()
-        self._anisotropy.reset()
+        self._posterior_tab.reset()
+        self._map_tab.reset()
+        self._nuts_tab.reset()
         self._rebuild_track_table()
         self._tracks_pane.set_plot_columns(
             self._joined_track_df, prefer_x="radius_of_gyration_um", prefer_y="flux_mean"
@@ -2493,14 +2141,10 @@ class DiffusionAnalysisWidget(QWidget):
         layer.events.data.connect(self._on_tracks_layer_event)
         layer.events.properties.connect(self._on_tracks_layer_event)
 
-        saved_per_track, saved_summary = (
-            load_diffusion_results(self._result_dir) if self._result_dir is not None else (None, None)
-        )
-        n_saved = saved_per_track.height if saved_per_track is not None else 0
+        saved_summary = load_diffusion_summary(self._result_dir) if self._result_dir is not None else None
         if saved_summary is not None:
-            self._classical.show_loaded_summary("Loaded saved results:\n" + _format_summary(saved_summary))
-        if n_saved:
-            self._classical.report_saved(f"{n_saved} saved fit(s) found")
+            self._posterior_tab.show_loaded_summary("Saved analysis:\n" + _format_summary(saved_summary))
+            self._posterior_tab.report_saved("this bundle has a saved analysis — Run to redo it")
         self._update_save_enabled()
 
     def _on_tracks_layer_changed_externally(self) -> None:
@@ -2528,7 +2172,8 @@ class DiffusionAnalysisWidget(QWidget):
         self._tracks_pane.set_region_choices(self._region_classes_loaded())
         self._rebuild_track_table()
         self._update_spatial_map_layer()
-        self._bayesian.refresh_map_histogram()
+        self._map_tab.refresh_map_histogram()
+        self._posterior_tab.refresh_summary()
         self._update_save_enabled()
 
     def _region_classes_loaded(self) -> list[str]:
@@ -2539,12 +2184,7 @@ class DiffusionAnalysisWidget(QWidget):
         return sorted(set(base["region_class"].drop_nulls().to_list()))
 
     def _update_save_enabled(self) -> None:
-        has_results = (
-            self._classical_analysis is not None
-            or bool(self._map_full_by_model)
-            or self._anisotropy_full_df is not None
-            or bool(self._track_fit_rows)
-        )
+        has_results = self._posterior is not None or bool(self._nuts_rows)
         self._save_button.setEnabled(has_results and self._result_dir is not None)
         self._export_csv_button.setEnabled(self._base_track_df is not None)
 
@@ -2554,24 +2194,9 @@ class DiffusionAnalysisWidget(QWidget):
         if self._base_track_df is None:
             return
         df = self._base_track_df
-        if self._classical_df is not None:
-            df = df.join(self._classical_df, on="track_id", how="left")
-        for map_df in self._map_df_by_model.values():
-            df = df.join(map_df, on="track_id", how="left")
-        anisotropy_df = self._spatial_sources.get("anisotropy")
-        if anisotropy_df is not None:
-            df = df.join(anisotropy_df, on="track_id", how="left")
-        if self._track_fit_rows:
-            fit_df = (
-                pl.DataFrame(self._track_fit_rows)
-                .group_by("track_id", maintain_order=True)
-                .last()
-                .select(
-                    "track_id", "D_track_fit_um2_s", "K_track_fit_um2_s_alpha", "alpha_track_fit", "model", "method"
-                )
-                .rename({"model": "track_fit_model", "method": "track_fit_method"})
-            )
-            df = df.join(fit_df, on="track_id", how="left")
+        results = self._per_track_results()
+        if results is not None:
+            df = df.join(results, on="track_id", how="left")
 
         # Keep the unfiltered join around and hand it to the Track
         # Explorer's histograms BEFORE narrowing: a filter has to be drawn
@@ -2590,35 +2215,37 @@ class DiffusionAnalysisWidget(QWidget):
         if self._current_track_id is not None and self._current_track_id not in set(df["track_id"].to_list()):
             # The selected track just got filtered out -- clear it rather
             # than leave a stale highlight in the viewer and a stale
-            # target for "Fit selected track" pointing at a track that
+            # target for the NUTS fit pointing at a track that
             # isn't even in the table anymore.
             self._current_track_id = None
             self._clear_highlight_layer()
 
         self._sync_tracks_layer_display(ids)
 
-    def set_classical_results(
-        self,
-        analysis: ClassicAnalysis,
-        comparison: Optional[ClassicAnalysis],
-        display_df: pl.DataFrame,
-    ) -> None:
-        """A Classical run finished: keep it for Save, join its per-track
-        columns into the tracks pane, offer D and z as spatial-map colors,
-        and put them on the Tracks layer itself (`_TRACK_COLOR_COLUMNS`)."""
-        self._classical_analysis = analysis
-        self._classical_comparison = comparison
-        self._classical_df = display_df
+    def _per_track_results(self) -> Optional[pl.DataFrame]:
+        """Every analysis column, one row per track: the posterior run's
+        (and MSD comparison's), and the latest NUTS fit of each track."""
+        df = self._posterior_df
+        if self._nuts_rows:
+            nuts = pl.DataFrame(self._nuts_rows).group_by("track_id", maintain_order=True).last()
+            df = nuts if df is None else df.join(nuts, on="track_id", how="full", coalesce=True)
+        return df
+
+    def set_posterior_results(self, analysis: PosteriorAnalysis, display_df: pl.DataFrame) -> None:
+        """A posterior run finished: keep it for Save, join its per-track
+        columns into the tracks pane, offer them as spatial-map colors, and
+        put `_TRACK_COLOR_COLUMNS` on the Tracks layer itself."""
+        self._posterior = analysis
+        self._posterior_df = display_df
         numeric = [c for c, dtype in zip(display_df.columns, display_df.dtypes) if dtype.is_numeric()]
-        self.register_spatial_source("classical_mle", display_df.select(numeric))
+        self.register_spatial_source("posterior", display_df.select(numeric))
         self._rebuild_track_table()
-        with_z = "z_nonbrownian" in display_df.columns
         self._tracks_pane.set_plot_columns(
             self._joined_track_df,
-            prefer_x="D_mle_um2_s",
-            prefer_y="z_nonbrownian" if with_z else "track_length",
+            prefer_x="D_median_um2_s",
+            prefer_y="alpha_median" if analysis.has_alpha else "track_length",
         )
-        self._bayesian.on_spatial_source_registered("D_mle_um2_s")
+        self._map_tab.on_spatial_source_registered("D_median_um2_s")
         self._update_save_enabled()
 
     def register_spatial_source(self, name: str, df: pl.DataFrame) -> None:
@@ -2639,26 +2266,6 @@ class DiffusionAnalysisWidget(QWidget):
                 return df.select("track_id", column)
         return None
 
-    def set_map_results(self, full_df: pl.DataFrame, display_df: pl.DataFrame, model: str, color_by: str) -> None:
-        self._map_full_by_model[model] = full_df
-        self._map_df_by_model[model] = display_df
-        self.register_spatial_source(f"bulk_map_{model}", display_df)
-        self._rebuild_track_table()
-        if model == "anomalous":
-            prefer_x, prefer_y = "K_map_um2_s_alpha", "alpha_map"
-        else:
-            prefer_x, prefer_y = "D_map_um2_s", "alpha_map" if "anomalous" in self._map_df_by_model else None
-        self._tracks_pane.set_plot_columns(self._joined_track_df, prefer_x=prefer_x, prefer_y=prefer_y)
-        self._bayesian.on_spatial_source_registered(color_by)
-        self._update_save_enabled()
-
-    def set_anisotropy_results(self, full_df: pl.DataFrame, display_df: pl.DataFrame) -> None:
-        self._anisotropy_full_df = full_df
-        self.register_spatial_source("anisotropy", display_df)
-        self._rebuild_track_table()
-        self._bayesian.on_spatial_source_registered("log_bf10")
-        self._update_save_enabled()
-
     def set_map_color_by(self, color_by: str) -> None:
         self._map_color_by = color_by
         self._update_spatial_map_layer()
@@ -2667,8 +2274,8 @@ class DiffusionAnalysisWidget(QWidget):
         if self._live(self._spatial_map_layer) is not None and vmin < vmax:
             self._spatial_map_layer.face_contrast_limits = (vmin, vmax)
 
-    def set_track_fit_result(self, row: dict) -> None:
-        self._track_fit_rows.append(row)
+    def set_nuts_result(self, row: dict) -> None:
+        self._nuts_rows.append(row)
         self._rebuild_track_table()
         self._update_save_enabled()
 
@@ -2676,11 +2283,13 @@ class DiffusionAnalysisWidget(QWidget):
         self._current_track_id = track_id
         self._update_highlight_layer(track_id)
         self._jump_to_track_end(track_id)
+        self._posterior_tab.on_track_selected()
 
     def on_viewer_track_clicked(self, track_id: int) -> None:
         self._current_track_id = track_id
         self._update_highlight_layer(track_id)
         self._tracks_pane.select_track_id(track_id)
+        self._posterior_tab.on_track_selected()
 
     # -- viewer overlays --
 
@@ -2760,23 +2369,20 @@ class DiffusionAnalysisWidget(QWidget):
         self._set_tracks_layer_data(self._with_track_colors(df))
 
     def _with_track_colors(self, df: pl.DataFrame) -> pl.DataFrame:
-        """`df` with the Classical run's per-track `_TRACK_COLOR_COLUMNS`
-        broadcast onto its vertices, when there is a run. Tracks without
-        a value (unresolved, excluded) get NaN, which napari leaves
-        uncolored rather than pinning to one end of the colormap."""
-        if self._classical_df is None:
+        """`df` with the posterior run's per-track `_TRACK_COLOR_COLUMNS`
+        broadcast onto its vertices, when there is a run. Tracks without a
+        value (excluded) get NaN, which napari leaves uncolored rather than
+        pinning to one end of the colormap."""
+        if self._posterior_df is None:
             return df
-        present = [c for c in _TRACK_COLOR_COLUMNS[1:] if c in self._classical_df.columns]
-        colors = self._classical_df.select(
+        present = [c for c in _TRACK_COLOR_COLUMNS[1:] if c in self._posterior_df.columns]
+        colors = self._posterior_df.select(
             "track_id",
-            pl.when(pl.col("D_mle_um2_s") > 0)
-            .then(pl.col("D_mle_um2_s").log10())
-            .otherwise(None)
-            .alias("log10_D_mle"),
+            pl.col("D_median_um2_s").log10().alias("log10_D_median"),
             *present,
         )
         return df.join(colors, on="track_id", how="left").with_columns(
-            pl.col(c).cast(pl.Float64).fill_null(float("nan")) for c in ["log10_D_mle", *present]
+            pl.col(c).cast(pl.Float64).fill_null(float("nan")) for c in ["log10_D_median", *present]
         )
 
     def _set_tracks_layer_data(self, df: pl.DataFrame) -> None:
@@ -2899,7 +2505,7 @@ class DiffusionAnalysisWidget(QWidget):
 
     def tracks_summary(self) -> Optional[pl.DataFrame]:
         """The per-track summary (`diffusion.tracks_summary_table`) for the
-        loaded layer and the current classical run, if any."""
+        loaded layer and the current results, if any."""
         if self._base_track_df is None:
             return None
         result_id = self._result_dir.name if self._result_dir is not None else None
@@ -2907,7 +2513,7 @@ class DiffusionAnalysisWidget(QWidget):
             result_id = self._tracks_layer.name
         return tracks_summary_table(
             self._base_track_df,
-            self._classical_df,
+            self._per_track_results(),
             result_id=result_id,
             pixel_size_um=self.pixel_size_um,
             passing_ids=self._passing_track_ids(),
@@ -2928,90 +2534,54 @@ class DiffusionAnalysisWidget(QWidget):
         try:
             table.write_csv(path)
         except OSError as exc:
-            self._classical.report_error(f"could not write {path}: {exc}")
+            self._posterior_tab.report_error(f"could not write {path}: {exc}")
             return
-        self._classical.report_saved(f"exported {table.height} tracks to {path}")
+        self._posterior_tab.report_saved(f"exported {table.height} tracks to {path}")
 
     def _save_results(self) -> None:
         if self._result_dir is None:
             return
-        tables = []
-        if self._classical_analysis is not None:
-            # diffusionkit's own `method` (displacement_mle / msd_ols /
-            # msd_nls) is kept, prefixed like the other analyses' tags.
-            # MSD rows come from the comparison pass when there was one --
-            # the main pass's are all `excluded` whenever exposure > 0 --
-            # tagged `_exposure0` since that pass ignored the blur.
-            fits = self._classical_analysis.fits
-            comparison = self._classical_comparison
-            if comparison is not None and comparison is not self._classical_analysis:
-                fits = pl.concat(
-                    [
-                        fits.filter(pl.col("model") == "brownian_mle").with_columns(
-                            ("classic_" + pl.col("method")).alias("method")
-                        ),
-                        comparison.fits.filter(pl.col("model") != "brownian_mle").with_columns(
-                            ("classic_" + pl.col("method") + "_exposure0").alias("method")
-                        ),
-                    ]
-                )
-            else:
-                fits = fits.with_columns(("classic_" + pl.col("method")).alias("method"))
-            tables.append(fits)
-        for model, map_full_df in self._map_full_by_model.items():
-            tables.append(map_full_df.with_columns(pl.lit(f"bayes_map_bulk_{model}").alias("method")))
-        if self._anisotropy_full_df is not None:
-            tables.append(self._anisotropy_full_df.with_columns(pl.lit("bayes_anisotropy").alias("method")))
-        if self._track_fit_rows:
-            rows = []
-            for row in self._track_fit_rows:
-                tagged = dict(row)
-                tagged["method"] = f"bayes_{row['method']}_{row['model']}"
-                rows.append(tagged)
-            tables.append(pl.DataFrame(rows))
-        if not tables:
+        table = self.tracks_summary()
+        if table is None:
             return
-        per_track_df = tables[0] if len(tables) == 1 else pl.concat(tables, how="diagonal_relaxed")
-        groups = self.track_groups()
-        if groups is not None and "track_id" in per_track_df.columns:
-            # Which region class each fitted track was linked in, so the
-            # saved table can be split the same way without the tracks file.
-            per_track_df = per_track_df.join(
-                groups.rename({"group": "region_class"}).with_columns(
-                    pl.col("track_id").cast(per_track_df.schema["track_id"])
-                ),
-                on="track_id",
-                how="left",
+        analysis = self._posterior
+        summary: dict = {}
+        tables: dict = {}
+        if analysis is not None:
+            # The ensemble is over the tracks the filters pass -- the same
+            # set `passes_filters` marks in the summary table -- split by
+            # region class when there are several.
+            ids = self.combined_filtered_track_ids()
+            groups = {"all": ids}
+            by_class = self.group_track_ids(ids)
+            if by_class:
+                groups.update(by_class)
+            tables = dict(
+                posterior_D=posterior_long_table(analysis),
+                posterior_alpha=posterior_long_table(analysis, alpha=True),
+                distributions_D=distributions_table(analysis, groups),
+                distributions_alpha=distributions_table(analysis, groups, alpha=True),
             )
-
-        summary = {}
-        analysis = self._classical_analysis
-        if analysis is not None and self._classical.summary_values is not None:
-            # The settings travel with the tables -- diffusionkit's own
-            # guidance, since the fits alone don't say what exposure or
-            # bootstrap produced them. Flat keys so `_format_summary` can
-            # label each with its unit when the bundle is reopened.
+            # Flat keys with units in their names, so the JSON reads on its
+            # own and `_format_summary` can label each when reopened.
             summary = {
-                "classical_analysis": "diffusionkit.classic.analyze_tracks (brownian_mle)",
+                "analysis": "diffusionkit.gridpost grid posteriors, flat prior in ln D",
                 "dt_s": analysis.acquisition.dt_s,
                 "exposure_s": analysis.acquisition.exposure_s,
-                "min_frames": analysis.options.min_frames,
-                "localization": analysis.options.localization,
-                "n_boot": analysis.mle_options.n_boot,
-                "bootstrap_seed": analysis.mle_options.seed,
-                "D_upper_level": analysis.mle_options.upper_level,
-                "msd_comparison": self._classical_comparison is not None,
-                "msd_comparison_max_lag": analysis.options.max_lag,
-                "msd_comparison_exposure_s": 0.0 if self._classical_comparison is not None else None,
-                **self._classical.summary_values,
+                "min_frames": analysis.min_frames,
+                "credible_level": analysis.level,
+                "D_grid_um2_s": [float(D_GRID_UM2_S[0]), float(D_GRID_UM2_S[-1]), len(D_GRID_UM2_S)],
+                "alpha_grid": (
+                    [float(ALPHA_GRID[0]), float(ALPHA_GRID[-1]), len(ALPHA_GRID)]
+                    if analysis.has_alpha
+                    else None
+                ),
+                "msd_comparison": self._posterior_tab.msd_df is not None,
+                **(self._posterior_tab.summary_values or {}),
             }
-            if self._classical.summary_by_group:
-                summary["by_region_class"] = self._classical.summary_by_group
-
+            if self._posterior_tab.summary_by_group:
+                summary["by_region_class"] = self._posterior_tab.summary_by_group
         summary["tracks_summary_filters"] = self._summary_filter_record()
         summary["repo_shas"] = _analysis_repo_shas()
-        write_diffusion_results(self._result_dir, per_track_df, summary, self.tracks_summary())
-        self._classical.report_saved(
-            f"saved {per_track_df.height} fit(s) and the per-track summary "
-            f"({TRACKS_SUMMARY_FILENAME}) to {self._result_dir}"
-        )
+        write_diffusion_results(self._result_dir, tracks_summary=table, summary=summary, **tables)
+        self._posterior_tab.report_saved(f"saved {table.height} tracks' analysis to {self._result_dir.name}/")
