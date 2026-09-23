@@ -23,8 +23,8 @@ completions leaf for you: `ExperimentListWidget` calls
 The filters are `widgets/feature_filters.FeatureFilterPanel` in both
 places, and neither deletes anything: a filter decides what the next stage
 sees (linking, for the Detect tab's) and what the saved bundle keeps
-(tracks.parquet, for the Track tab's), exactly as `drop_aggregates`
-already did for flagged aggregates. `points.parquet` holds every detection
+(tracks.parquet, for the Track tab's), as the Track tab's flag exclusion
+does for fits spotsolve flagged. `points.parquet` holds every detection
 either way and `manifest.json` records the ranges, so what a run kept is
 readable off the bundle afterwards.
 
@@ -33,10 +33,9 @@ setting on the Detect page: run detect on a few frames (the frame range),
 read the `fit_sigma` histogram on the Filter page, adjust sigma, run
 again. The distribution is on screen throughout, so a bimodal or ragged
 width -- two focal planes, junk fitted as signal -- is seen rather than
-averaged into one number. One caveat: a real run reports only fits inside
-the band (0.8-2.0 x sigma by default), so a badly overestimated sigma
-shows as a wall at the histogram's low edge rather than a peak; the
-expert "report every fit (no band)" box lifts that for a run.
+averaged into one number. spotsolve reports every fit, so a badly
+overestimated sigma shows as a pile-up at the low `slack` bound (those
+fits carry `FitFlag.AT_BOUND`) rather than as missing detections.
 
 `offset` is the one camera fact spotsolve takes (noise is measured from
 each frame), and `PipelineParamsWidget.get_camera_kwargs` is the single
@@ -53,13 +52,11 @@ the line red and unfolds the section, since `pipeline.load_session` will
 refuse to run without it and the box to fix it is right there.
 
 A note on units, since two different ones are in play: `sigma` is in
-**pixels**, while `slack` and `band` are **multiples of whatever sigma the
-search is running at** -- `spotsolve` reports `sigma_ratio = fit_sigma /
-sigma` and rejects a fit when that ratio leaves `band`. They are not
-multiples of the *initial* guess, and they are not absolute pixels, so
-moving `sigma` moves both windows with it. The expert section therefore
-prints the current px window under those two rows, recomputed whenever
-`sigma` changes.
+**pixels**, while `slack` is a **multiple of whatever sigma the search is
+running at** (`spotsolve` reports `sigma_ratio = fit_sigma / sigma`). It is
+not a multiple of the *initial* guess, and not absolute pixels, so moving
+`sigma` moves the window with it. The expert section therefore prints the
+current px window under that row, recomputed whenever `sigma` changes.
 
 Each tab shows only the handful of knobs that matter for day-to-day
 tuning; the rest collapse under a per-tab "Expert settings"
@@ -72,17 +69,16 @@ pipeline offered three detectors, each with its own ~20-key solver-kwargs
 dict, and a linker with a hand-tuned bootstrap gate. `spotsolve`'s default
 detector has a fixed decision rule (an emitter exists iff it lowers the
 box's Poisson deviance by a set number of nats) and the linker has no dials
-at all, so what's left to expose there is genuinely the camera, the PSF
-width, and the reporting band -- physical facts about the instrument rather
+at all, so what's left to expose there is genuinely the camera and the PSF
+width -- physical facts about the instrument rather
 than solver tuning. A knob that isn't here is not hidden; it doesn't exist.
 
 `spotsolve` now also ships a second detector, Aguet -- LoG-screened
-candidates fitted one at a time, with no multi-emitter search and no
-width-band rejection (the spotfitlm-compatible sparse baseline). The
-"detector" dropdown at the top of the Detect tab's core section picks
-between them; the knobs beneath it swap to match (`k_max`/`threshold`/
-`slack`/`band` for the default, `significance`/`boxsize`/`itermax` for
-Aguet) rather than showing both detectors' settings at once.
+candidates fitted one at a time, with no multi-emitter search (the
+spotfitlm-compatible sparse baseline). The "detector" dropdown at the top
+of the Detect tab's core section picks between them; the knobs beneath it
+swap to match (`k_max`/`threshold`/`slack`/count rule for the default,
+`significance`/`boxsize`/`itermax` for Aguet) rather than showing both detectors' settings at once.
 
 Each tab owns its stage's "Run" button and a one-line status label, wired
 to `PipelineParamsWidget`'s `detectRequested`/`trackRequested`/
@@ -127,6 +123,7 @@ from qtpy.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -252,8 +249,8 @@ class _DetectTab(QWidget):
 
     Core: `sigma`, `offset` (the one camera fact `spotsolve` still takes --
     gain and read noise are measured from each frame now), the `detector`
-    dropdown, that detector's own knobs, the aggregate cut, a frame range
-    and the regions controls.
+    dropdown, that detector's own knobs, a frame range and the regions
+    controls.
 
     Two detectors, two knob sets, never both on screen at once -- the
     dropdown's choice sets which rows `_on_detector_changed` shows:
@@ -262,8 +259,8 @@ class _DetectTab(QWidget):
         `k_max` (most emitters one box may be fitted with jointly -- the
         crowding ceiling) and the LoG `threshold` (one cut, used both for
         seeding a box and for trying another emitter inside one) in core;
-        `slack`/`band` (expert) -- the width ranges a fit may take and be
-        reported at, both as multiples of `sigma` and echoed in px. There is
+        `slack` and the count rule (expert) -- `slack` is the width range a
+        fit may take, as a multiple of `sigma`, echoed in px. There is
         no sparsity weight, iteration budget or refinement schedule to set:
         the search's accept/reject rule is a fixed deviance improvement, and
         it runs to its own convergence.
@@ -272,8 +269,7 @@ class _DetectTab(QWidget):
         screening cut, a per-pixel level rather than a z-score) in core;
         `boxsize`/`itermax` (expert) -- the fit-crop size and this
         detector's own iteration budget. No `k_max` (fits are independent,
-        never joint) and no `slack`/`band` (every screened fit is reported;
-        there is no width-based reject to gate on)."""
+        never joint) and no `slack` (its width is fitted free)."""
 
     runRequested = Signal()
     cancelRequested = Signal()
@@ -292,7 +288,6 @@ class _DetectTab(QWidget):
         d = DEFAULT_DETECT_KWARGS
         s = DEFAULT_SPARSE_KWARGS
         slack_lo, slack_hi = d["slack"]
-        band_lo, band_hi = d["band"]
 
         # --- detector choice --------------------------------------------
         # Which spotsolve function `get_detect_kwargs`/pipeline.run_detect_
@@ -309,9 +304,8 @@ class _DetectTab(QWidget):
             "crowded and sparse fields.\n\n"
             "Sparse (Aguet): the spotfitlm-compatible baseline. LoG-screens\n"
             "candidates, then fits each one independently -- no multi-emitter\n"
-            "search, no width-band rejection (every screened fit is reported,\n"
-            "so frames_df's too_narrow/too_wide/edge counts stay 0).\n"
-            "For genuinely sparse fields where the joint search is unneeded."
+            "search. For genuinely sparse fields where the joint search is\n"
+            "unneeded."
         )
         self.detector.currentIndexChanged.connect(self._on_detector_changed)
 
@@ -320,14 +314,14 @@ class _DetectTab(QWidget):
             1.3, 0.3, 10.0, 0.1, decimals=3,
             tooltip="In-focus PSF sigma in PIXELS -- the width the search runs\n"
             "at. Each emitter still gets its own fitted width (fit_sigma);\n"
-            "this sets where the search starts and what slack/band are\n"
-            "multiples of.\n\n"
+            "this sets where the search starts and what slack is a\n"
+            "multiple of.\n\n"
             "To settle it: run detect on a few frames, read fit_sigma's peak\n"
-            "on the Filter page, set it here, run again. Only fits within the\n"
-            "band (0.8-2.0 x sigma by default) are reported, so a pile-up at\n"
-            "the histogram's low edge means sigma is set too high.",
+            "on the Filter page, set it here, run again. A pile-up at the\n"
+            "histogram's low edge (fits flagged AT_BOUND) means sigma is set\n"
+            "too high.",
         )
-        self.sigma.valueChanged.connect(self._update_band_note)
+        self.sigma.valueChanged.connect(self._update_slack_note)
 
         # --- detection knobs -------------------------------------------
         self.k_max = _ispin(
@@ -396,18 +390,6 @@ class _DetectTab(QWidget):
             "sparse data; lower it for fewer false positives.",
         )
 
-        # Over-bright cut, relative to each frame's own median detection --
-        # relative so that one number survives bleaching and illumination
-        # drift over a long movie. Detections above it are flagged, not
-        # deleted (see pipeline.run_detect_step); the Track tab decides
-        # whether linking sees them. Shared by both detectors.
-        self.agg_ratio = _dspin(
-            spotsolve.AGG_AMP_RATIO, 1.0, 1e6, 1.0, decimals=2,
-            tooltip="Flag a detection as an aggregate when its flux exceeds this\n"
-            "multiple of the frame's median detection. Flagged, never deleted --\n"
-            "the Track tab decides whether linking sees them.",
-        )
-
         self.core_form = core_form = _compact_form(QFormLayout())
         core_form.setContentsMargins(0, 0, 0, 0)
         core_form.addRow("sigma (px)", self.sigma)
@@ -415,12 +397,11 @@ class _DetectTab(QWidget):
         core_form.addRow("offset (ADU)", self.offset)
         core_form.addRow("k_max", self.k_max)
         # Row labels carry the unit the same way "offset (ADU)" and
-        # "sigma (px)" do -- a z-score, a p-value and a multiple of the
-        # frame's median flux are exactly the kind of thing a bare number
-        # invites getting wrong -- kept short so the column stays narrow.
+        # "sigma (px)" do -- a z-score and a p-value are exactly the kind
+        # of thing a bare number invites getting wrong -- kept short so the
+        # column stays narrow.
         core_form.addRow("threshold (sd)", self.threshold)
         core_form.addRow("significance (p)", self.significance)
-        core_form.addRow("aggregate (× med)", self.agg_ratio)
 
         # What gets analyzed, not how -- kept in core (not expert) since
         # these are exactly the knobs that let one image be explored
@@ -459,14 +440,10 @@ class _DetectTab(QWidget):
 
         self.regions_panel = RegionsPanel()
 
-        # `slack` is the width range a fit may take; `band` the narrower
-        # range actually reported as a detection. Both are multiples of
-        # `sigma`, not absolute pixels -- spotsolve compares them against
-        # `sigma_ratio = fit_sigma / sigma` -- so `_update_band_note`
-        # prints what they currently come to in px. A fit outside `band` is
-        # an out-of-band reject (too narrow / too wide / edge), which is how
-        # out-of-focus and non-PSF-shaped junk stays out of the table;
-        # `frames_df` counts them per frame.
+        # `slack` is the width range a fit may take, as a multiple of
+        # `sigma`, not absolute pixels -- so `_update_slack_note` prints
+        # what it currently comes to in px. A fit ending on either bound is
+        # still reported, flagged `AT_BOUND`.
         self.slack_lo = _dspin(
             slack_lo, 0.1, 10.0, 0.05, decimals=3,
             tooltip="Narrowest width a fit may take, as a MULTIPLE OF SIGMA.",
@@ -475,43 +452,19 @@ class _DetectTab(QWidget):
             slack_hi, 0.1, 20.0, 0.05, decimals=3,
             tooltip="Widest width a fit may take, as a MULTIPLE OF SIGMA.",
         )
-        self.band_lo = _dspin(
-            band_lo, 0.1, 10.0, 0.05, decimals=3,
-            tooltip="Narrowest width reported as a detection, as a MULTIPLE OF\n"
-            "SIGMA -- spotsolve tests it against sigma_ratio = fit_sigma/sigma.",
-        )
-        self.band_hi = _dspin(
-            band_hi, 0.1, 20.0, 0.05, decimals=3,
-            tooltip="Widest width reported as a detection, as a MULTIPLE OF\n"
-            "SIGMA -- spotsolve tests it against sigma_ratio = fit_sigma/sigma.",
-        )
-        for box in (self.slack_lo, self.slack_hi, self.band_lo, self.band_hi):
-            box.valueChanged.connect(self._update_band_note)
-        self.no_band = QCheckBox("report every fit (no band)")
-        self.no_band.setToolTip(
-            "Report every fit regardless of width (spotsolve's band=None).\n"
-            "A diagnostic: it puts out-of-focus and non-PSF-shaped fits into\n"
-            "points_df as if they were detections. Use it for one few-frame run\n"
-            "when the fit_sigma histogram piles up at an edge; leave it\n"
-            "unchecked for analysis."
-        )
-        self.no_band.toggled.connect(self._on_no_band_toggled)
+        for box in (self.slack_lo, self.slack_hi):
+            box.valueChanged.connect(self._update_slack_note)
 
         self._slack_row = slack_row = QHBoxLayout()
         slack_row.setContentsMargins(0, 0, 0, 0)
         slack_row.addWidget(self.slack_lo)
         slack_row.addWidget(QLabel("to"))
         slack_row.addWidget(self.slack_hi)
-        self._band_row = band_row = QHBoxLayout()
-        band_row.setContentsMargins(0, 0, 0, 0)
-        band_row.addWidget(self.band_lo)
-        band_row.addWidget(QLabel("to"))
-        band_row.addWidget(self.band_hi)
 
         # Aguet's own expert knobs: the odd fit-crop size and this
         # detector's optimizer iteration budget. Both rarely need changing
-        # -- there's no per-emitter search to bound the way slack/band
-        # bound the multi-emitter fit.
+        # -- there's no per-emitter search to bound the way slack bounds
+        # the multi-emitter fit.
         self.boxsize = _ispin(
             s["boxsize"], 3, 99,
             tooltip="Odd fit-crop size, px, around each screened candidate.\n"
@@ -524,20 +477,18 @@ class _DetectTab(QWidget):
             "changing.",
         )
 
-        self._band_note = note_label("")
+        self._slack_note = note_label("")
         self.expert_form = expert_form = _compact_form(QFormLayout())
         expert_form.setContentsMargins(0, 0, 0, 0)
         expert_form.addRow("slack (× sigma)", slack_row)
-        expert_form.addRow("band (× sigma)", band_row)
-        expert_form.addRow("", self._band_note)
-        expert_form.addRow("", self.no_band)
+        expert_form.addRow("", self._slack_note)
         expert_form.addRow("count rule", self.selection)
         expert_form.addRow("penalty", self.count_penalty)
         expert_form.addRow("", self._selection_note)
         expert_form.addRow("cores", self.n_threads)
         expert_form.addRow("boxsize (px)", self.boxsize)
         expert_form.addRow("max iterations", self.itermax)
-        self._update_band_note()
+        self._update_slack_note()
         self._on_detector_changed()
 
         self.run_button, self.status_label, run_row = _run_row("Run detect")
@@ -591,20 +542,15 @@ class _DetectTab(QWidget):
 
     # -- PSF width ---------------------------------------------------------
 
-    def _update_band_note(self) -> None:
-        """Restate `slack`/`band` in pixels at the current `sigma`. They
-        are ratios against the working sigma, not absolute widths, so this
-        line is the only place the actual px window a fit is being judged
-        against is visible -- and it moves whenever sigma does."""
+    def _update_slack_note(self) -> None:
+        """Restate `slack` in pixels at the current `sigma`. It is a ratio
+        against the working sigma, not an absolute width, so this line is
+        the only place the actual px window a fit may take is visible --
+        and it moves whenever sigma does."""
         sigma = self.sigma.value()
-        band = (
-            "band off (every fit reported)"
-            if self.no_band.isChecked()
-            else f"reported {self.band_lo.value() * sigma:.2f}–{self.band_hi.value() * sigma:.2f} px"
-        )
-        self._band_note.setText(
+        self._slack_note.setText(
             f"× sigma, not px: at sigma = {sigma:.3f} px a fit may take "
-            f"{self.slack_lo.value() * sigma:.2f}–{self.slack_hi.value() * sigma:.2f} px, {band}."
+            f"{self.slack_lo.value() * sigma:.2f}–{self.slack_hi.value() * sigma:.2f} px."
         )
 
     def get_sigma(self) -> float:
@@ -626,9 +572,7 @@ class _DetectTab(QWidget):
         self.core_form.setRowVisible(self.threshold, not sparse)
         self.core_form.setRowVisible(self.significance, sparse)
         self.expert_form.setRowVisible(self._slack_row, not sparse)
-        self.expert_form.setRowVisible(self._band_row, not sparse)
-        self.expert_form.setRowVisible(self._band_note, not sparse)
-        self.expert_form.setRowVisible(self.no_band, not sparse)
+        self.expert_form.setRowVisible(self._slack_note, not sparse)
         self.expert_form.setRowVisible(self.selection, not sparse)
         self.expert_form.setRowVisible(self.count_penalty, not sparse)
         self.expert_form.setRowVisible(self.boxsize, sparse)
@@ -636,11 +580,6 @@ class _DetectTab(QWidget):
         # The count-rule note gets a row only while it has something to
         # say: an empty label still takes a row's height and spacing.
         self._sync_selection_note()
-
-    def _on_no_band_toggled(self, checked: bool) -> None:
-        self.band_lo.setEnabled(not checked)
-        self.band_hi.setEnabled(not checked)
-        self._update_band_note()
 
     def _on_selection_changed(self) -> None:
         """BIC is still experimental (spotsolve's docs/COUNT_SELECTION.md)
@@ -726,9 +665,6 @@ class _DetectTab(QWidget):
     def get_n_threads(self) -> int:
         return self.n_threads.value()
 
-    def get_agg_ratio(self) -> float:
-        return self.agg_ratio.value()
-
     def get_camera_kwargs(self) -> dict:
         return dict(offset=self.offset.value())
 
@@ -743,7 +679,6 @@ class _DetectTab(QWidget):
             k_max=self.k_max.value(),
             threshold=None if self.threshold.value() == self.threshold.minimum() else self.threshold.value(),
             slack=(self.slack_lo.value(), self.slack_hi.value()),
-            band=None if self.no_band.isChecked() else (self.band_lo.value(), self.band_hi.value()),
             selection=self.selection.currentData(),
             count_penalty=self.count_penalty.value(),
         )
@@ -1131,6 +1066,22 @@ class _ImageInfoPanel(QWidget):
         return " · ".join(parts)
 
 
+# What each `spotsolve.FitFlag` means (spotsolve's
+# docs/LOCALIZATION_QUALITY.md), as the Track tab's checkbox tooltips.
+_FLAG_TOOLTIPS = {
+    spotsolve.FitFlag.EDGE: "Three fitted sigmas extend beyond an image edge.",
+    spotsolve.FitFlag.NOT_CONVERGED: "Final refinement did not meet its gradient tolerance.",
+    spotsolve.FitFlag.STALLED: "The optimizer stopped without an acceptable step\n"
+    "(also not converged).",
+    spotsolve.FitFlag.COVARIANCE_UNAVAILABLE: "No positive finite variance for some parameter.\n"
+    "Fits without a usable position error are never linked anyway.",
+    spotsolve.FitFlag.AT_BOUND: "A fitted parameter (often the width, against slack)\n"
+    "or the shared background sits on an optimization bound.",
+    spotsolve.FitFlag.CONTEXT_UNSETTLED: "Neighboring light changed after this fit beyond\n"
+    "refinement tolerance.",
+}
+
+
 class _TrackingTab(QWidget):
     """Three pages -- Link, Filter, Save: what little the linker leaves to
     the caller, then a filter stack over the tracks it produced, then the
@@ -1149,6 +1100,16 @@ class _TrackingTab(QWidget):
     alongside position and CRLB. Off by default -- position/CRLB alone is
     the well-tested path; flux helps most in a crowded field where two
     candidates sit at nearly the same distance but different brightness.
+
+    What the linker is fed: one checkbox per `spotsolve.FitFlag`, each
+    excluding the fits carrying it (all off by default -- spotsolve's
+    flags are diagnostics, not verdicts; `pipeline.run_track_step` always
+    drops fits with no usable position error regardless). And one knob on
+    what it may do: `min_link_margin` (nats), which cuts a link that beats
+    the best alternative assignment by less than that, ending the track
+    instead of risking a swap. Every linked row carries its `link_margin`
+    (in tracks.parquet, and per track in the diffusion panel's QC
+    columns) -- the distribution to read before choosing a cutoff.
 
     `min_track_length` filters the final `tracks_df` (see
     `pipeline.run_track_step`) -- default 2 drops bare singletons (a
@@ -1181,14 +1142,29 @@ class _TrackingTab(QWidget):
             "so an n-point track spans n-1 intervals and its duration_s is\n"
             "(n-1) x dt. 1 = keep everything, including singletons.",
         )
-        self.drop_aggregates = QCheckBox("exclude flagged aggregates from linking")
-        self.drop_aggregates.setChecked(True)
-        self.drop_aggregates.setToolTip(
-            "Hide detections flagged is_aggregate (Detect tab's aggregate ratio)\n"
-            "from the linker. On by default: an over-bright blob is not a point\n"
-            "emitter, and its position is a flux-weighted compromise between\n"
-            "whatever is inside it. points.parquet keeps them either way."
+        self.min_link_margin = _dspin(
+            0.0, 0.0, 1e3, 0.5, decimals=2,
+            tooltip="Cut a link whose score beats the best assignment without it\n"
+            "by less than this many nats: the track ends there instead of\n"
+            "risking an identity swap. 0 keeps every link (spotsolve's\n"
+            "default). Not a probability; read the link_margin column of a\n"
+            "run at 0 before choosing one.",
         )
+        # One box per FitFlag, laid out two to a row. Checked = linking
+        # does not see fits carrying that flag.
+        self._flag_boxes: dict[spotsolve.FitFlag, QCheckBox] = {}
+        flag_grid = QGridLayout()
+        flag_grid.setContentsMargins(0, 0, 0, 0)
+        flag_grid.setHorizontalSpacing(8)
+        flag_grid.setVerticalSpacing(0)
+        for i, (flag, tip) in enumerate(_FLAG_TOOLTIPS.items()):
+            box = QCheckBox(flag.name.lower().replace("_", " "))
+            box.setToolTip(tip)
+            self._flag_boxes[flag] = box
+            flag_grid.addWidget(box, i // 2, i % 2)
+        flags_body = QWidget()
+        flags_body.setLayout(flag_grid)
+        self._flags_section = CollapsibleSection("Exclude fits flagged", flags_body)
         self.link_with_flux = QCheckBox("use flux as a link cue")
         self.link_with_flux.setToolTip(
             "Also score candidate links by brightness continuity (each\n"
@@ -1199,6 +1175,7 @@ class _TrackingTab(QWidget):
         form = _compact_form(QFormLayout())
         form.setContentsMargins(0, 0, 0, 0)
         form.addRow("min track length (points)", self.min_track_length)
+        form.addRow("min link margin (nats)", self.min_link_margin)
 
         self.run_button, self.status_label, run_row = _run_row("Run tracking")
         self.run_button.clicked.connect(self.runRequested.emit)
@@ -1208,12 +1185,15 @@ class _TrackingTab(QWidget):
         link_layout.setContentsMargins(0, 0, 0, 0)
         link_layout.setSpacing(2)
         link_layout.addLayout(form)
-        link_layout.addWidget(self.drop_aggregates)
         link_layout.addWidget(self.link_with_flux)
+        link_layout.addWidget(self._flags_section)
         link_layout.addWidget(
-            note_label(
-                "No gate to set: linking parameters are measured from the movie. "
-                "The Detect tab's filters decide which detections the linker sees."
+            _allow_wrapped_height(
+                note_label(
+                    "No gate to set: linking parameters are measured from the movie. "
+                    "The Detect tab's filters and the flags above decide which "
+                    "detections the linker sees."
+                )
             )
         )
         link_layout.addWidget(hline())
@@ -1265,11 +1245,15 @@ class _TrackingTab(QWidget):
     def get_min_track_length(self) -> int:
         return self.min_track_length.value()
 
-    def get_drop_aggregates(self) -> bool:
-        return self.drop_aggregates.isChecked()
+    def get_exclude_flags(self) -> int:
+        """The checked `FitFlag`s, as the bitmask `run_track_step` takes."""
+        return sum(int(flag) for flag, box in self._flag_boxes.items() if box.isChecked())
 
     def get_link_with_flux(self) -> bool:
         return self.link_with_flux.isChecked()
+
+    def get_min_link_margin(self) -> float:
+        return self.min_link_margin.value()
 
 
 class PipelineParamsWidget(QWidget):
@@ -1402,9 +1386,6 @@ class PipelineParamsWidget(QWidget):
     def get_detector(self) -> str:
         return self._detect.get_detector()
 
-    def get_agg_ratio(self) -> float:
-        return self._detect.get_agg_ratio()
-
     def get_frame_range(self) -> Optional[tuple[int, int]]:
         return self._detect.get_frame_range()
 
@@ -1435,11 +1416,14 @@ class PipelineParamsWidget(QWidget):
     def get_min_track_length(self) -> int:
         return self._tracking.get_min_track_length()
 
-    def get_drop_aggregates(self) -> bool:
-        return self._tracking.get_drop_aggregates()
+    def get_exclude_flags(self) -> int:
+        return self._tracking.get_exclude_flags()
 
     def get_link_with_flux(self) -> bool:
         return self._tracking.get_link_with_flux()
+
+    def get_min_link_margin(self) -> float:
+        return self._tracking.get_min_link_margin()
 
     def set_track_status(self, text: str, level: str = "neutral") -> None:
         self._tracking.set_status(text, level)

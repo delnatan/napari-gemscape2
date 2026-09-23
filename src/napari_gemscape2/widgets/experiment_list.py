@@ -1001,7 +1001,6 @@ class ExperimentListWidget(QWidget):
             sigma,
             self.params_panel.get_camera_kwargs(),
             self.params_panel.get_detect_kwargs(),
-            self.params_panel.get_agg_ratio(),
             self.params_panel.get_frame_range(),
             mask,
             self._cancel_event,
@@ -1029,24 +1028,15 @@ class ExperimentListWidget(QWidget):
         self.list_view.viewport().update()
         n_points = session.points_df.height if session.points_df is not None else 0
         start, end = session.frame_range_used or (0, session.image.shape[0])
-        # The reject/aggregate counts are the reason frames_df is kept: a
-        # run that found plenty of spots but binned most of them as
-        # out-of-band is a focus or sigma problem, and that's only visible
-        # if the numbers are shown next to the detection count.
+        # Shown next to the detection count because a run where most fits
+        # carry a FitFlag (usually AT_BOUND: widths pinned against slack)
+        # is a sigma or focus problem, and the count alone hides it.
         extra = ""
         frames = session.frames_df
         if frames is not None and frames.height:
-            n_rejected = int(
-                frames["n_too_narrow"].sum() + frames["n_too_wide"].sum() + frames["n_edge"].sum()
-            )
-            n_flagged = int(frames["n_locs_flagged"].sum())
-            parts = []
-            if n_rejected:
-                parts.append(f"{n_rejected} out-of-band")
+            n_flagged = int(frames["n_flagged"].sum())
             if n_flagged:
-                parts.append(f"{n_flagged} aggregate")
-            if parts:
-                extra = "  (" + ", ".join(parts) + ")"
+                extra = f"  ({n_flagged} flagged)"
         self.params_panel.set_detect_status(
             f"{n_points} points across frames {start}-{end - 1}{extra}"
             + self._region_count_text(session),
@@ -1127,8 +1117,9 @@ class ExperimentListWidget(QWidget):
         worker = _run_track_worker(
             session,
             self.params_panel.get_min_track_length(),
-            self.params_panel.get_drop_aggregates(),
+            self.params_panel.get_exclude_flags(),
             self.params_panel.get_link_with_flux(),
+            self.params_panel.get_min_link_margin(),
             # The Detect tab's cuts decide what the linker sees -- applied
             # here rather than to `points_df`, which keeps every detection
             # (see run_track_step's docstring).
@@ -1154,8 +1145,17 @@ class ExperimentListWidget(QWidget):
         # MSD moment of the finished tracks, and the linker's own fitted
         # population mean. Agreement is reassuring; a large gap means the
         # linking is suspect, and neither number alone would show it.
-        dropped = summary.get("n_points_dropped_by_filter") or 0
-        filtered = f"  ({dropped} points cut by filters)" if dropped else ""
+        cuts = [
+            f"{n} {what}"
+            for n, what in (
+                (summary.get("n_points_dropped_invalid"), "points without a usable error"),
+                (summary.get("n_points_dropped_flagged"), "flagged points"),
+                (summary.get("n_points_dropped_by_filter"), "points cut by filters"),
+                (summary.get("n_links_rejected"), "links under the margin"),
+            )
+            if n
+        ]
+        filtered = f"  ({', '.join(cuts)})" if cuts else ""
         # Units from `napari_gemscape2.units` rather than spelled out here, so
         # this line, the diffusion panel's fit summaries and every plot
         # axis say µm²/s the same way.
@@ -1660,7 +1660,6 @@ def _run_detect_worker(
     sigma: float,
     camera_kwargs: dict,
     detect_kwargs: dict,
-    agg_ratio: float,
     frame_range: Optional[tuple[int, int]],
     mask: Optional[np.ndarray],
     cancel_event: threading.Event,
@@ -1676,7 +1675,6 @@ def _run_detect_worker(
         sigma=sigma,
         camera_kwargs=camera_kwargs,
         detect_kwargs=detect_kwargs,
-        agg_ratio=agg_ratio,
         frame_range=frame_range,
         mask=mask,
         progress_callback=progress_cb,
@@ -1690,8 +1688,9 @@ def _run_detect_worker(
 def _run_track_worker(
     session: PipelineSession,
     min_track_length: int,
-    drop_aggregates: bool,
+    exclude_flags: int,
     link_with_flux: bool,
+    min_link_margin: float,
     point_filters: dict,
     emitter: _ProgressEmitter,
 ) -> PipelineSession:
@@ -1701,8 +1700,9 @@ def _run_track_worker(
     return run_track_step(
         session,
         min_track_length,
-        drop_aggregates=drop_aggregates,
+        exclude_flags=exclude_flags,
         link_with_flux=link_with_flux,
+        min_link_margin=min_link_margin,
         point_filters=point_filters,
         progress_callback=progress_cb,
     )

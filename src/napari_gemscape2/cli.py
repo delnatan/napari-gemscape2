@@ -14,7 +14,7 @@ import typer
 
 from napari_gemscape2 import units
 from napari_gemscape2.results import build_manifest, repo_shas, write_result
-from napari_gemscape2.pipeline import DetectTrackParams, run_detect_track
+from napari_gemscape2.pipeline import DetectTrackParams, parse_flag_names, run_detect_track
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -30,6 +30,8 @@ def detect_track(
         [params]
         sigma = 1.3   # PSF width, px (required) -- read it off the fit_sigma
                       # histogram of a few detected frames in the napari widget
+        exclude_flags = ["STALLED"]   # optional: spotsolve FitFlag names
+        min_link_margin = 0.0         # optional, nats
 
         [[inputs]]
         path = "data/beads_timelapse_dense.tif"
@@ -44,6 +46,10 @@ def detect_track(
             "widget and read it off the fit_sigma histogram.",
             param_hint="CONFIG",
         )
+    if isinstance(param_cfg.get("exclude_flags"), list):
+        # TOML names the flags (`exclude_flags = ["EDGE", "STALLED"]`);
+        # the pipeline takes spotsolve's bitmask.
+        param_cfg["exclude_flags"] = parse_flag_names("|".join(param_cfg["exclude_flags"]))
     params = DetectTrackParams(**param_cfg)
 
     import spotsolve

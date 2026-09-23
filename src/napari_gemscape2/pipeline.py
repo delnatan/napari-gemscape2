@@ -14,8 +14,8 @@ answered as one problem) and `spotsolve.tracking.link` (frame-to-frame
 linking scored by likelihood ratio under a per-track posterior over D).
 `spotsolve.loctable` defines the table that passes between them, and this
 module emits it verbatim -- `se_y`/`se_x` (per-detection CRLB), `flux`,
-`is_aggregate` and the rest -- so nothing downstream has to learn a second
-schema.
+`flags` (`spotsolve.FitFlag`) and the rest -- so nothing downstream has to
+learn a second schema.
 
 Two things the previous sfwloc-based pipeline did are gone because
 `spotsolve` makes them unnecessary rather than because they were dropped:
@@ -28,8 +28,8 @@ Two things the previous sfwloc-based pipeline did are gone because
     no dense/sparse/DAOPHOT algorithm to hand-pick per file. `spotsolve`
     now also ships `localize_aguet`/`localize_aguet_stack`
     (`detector="aguet"`): independent single-emitter fits behind a LoG
-    screen, with no multi-emitter search and no width-band rejection --
-    the spotfitlm-compatible baseline for genuinely sparse fields, kept
+    screen, with no multi-emitter search -- the spotfitlm-compatible
+    baseline for genuinely sparse fields, kept
     on as an option rather than the default because the joint fit's
     model selection is the more general rule when in doubt.
   - Linking takes no gate. `spotsolve.tracking.fit_link_params` measures
@@ -53,12 +53,15 @@ again -- the distribution is on screen the whole time, so a bimodal or
 ragged width (two focal planes, junk fitted as signal) is seen rather than
 averaged into one number. The headless runner takes `sigma` explicitly.
 
-`DetectTrackParams.point_filters`/`track_filters` are `{column: (lo, hi)}`
-cuts (see `filter_mask`) on per-detection columns and per-track metrics.
-Like `is_aggregate`, they apply to what linking sees and to which tracks
-survive -- never to `points_df`, which keeps every detection so the
-rejected population stays auditable -- and they are recorded in
-`session_manifest_extra`.
+spotsolve reports every fit it makes; nothing is rejected at detection.
+What linking sees is decided in `run_track_step`, in three layers:
+`loctable.filter_quality` (finite coordinates and positive SEs -- always,
+since the linker and diffusionkit both need them), `exclude_flags` (fits
+carrying chosen `FitFlag`s), and `point_filters`. `point_filters`/
+`track_filters` are `{column: (lo, hi)}` cuts (see `filter_mask`) on
+per-detection columns and per-track metrics. None of these touch
+`points_df`, which keeps every detection so the rejected population stays
+auditable, and all are recorded in `session_manifest_extra`.
 """
 
 from __future__ import annotations
@@ -91,11 +94,9 @@ DEFAULT_CAMERA_KWARGS = dict(
 # Forwarded to `spotsolve.localize`/`localize_stack` as **kwargs, mirroring
 # that function's own defaults (`spotsolve.native`).
 #
-# `slack` is the width range a fit is allowed to take and `band` the range
-# actually reported as a detection, both as multiples of `sigma` -- a fit
-# landing outside `band` is an out-of-band reject (too narrow, too wide, or
-# too close to an edge) rather than a detection, which is how out-of-focus
-# and non-PSF-shaped junk is kept out of the table. `k_max` caps how many
+# `slack` is the width range a fit is allowed to take, as multiples of
+# `sigma`. Every fit is reported; one that ends on a width bound carries
+# `FitFlag.AT_BOUND` instead of being dropped. `k_max` caps how many
 # emitters one box may be fitted with jointly.
 #
 # One cut on the LoG z-statistic (sd of the frame's own noise), used both
@@ -116,7 +117,6 @@ DEFAULT_DETECT_KWARGS = dict(
     k_max=spotsolve.K_MAX,
     threshold=None,
     slack=spotsolve.SLACK,
-    band=spotsolve.BAND,
     selection="fixed",
     count_penalty=0.0,
 )
@@ -126,8 +126,7 @@ DEFAULT_DETECT_KWARGS = dict(
 # (`spotsolve.aguet`). None of `DEFAULT_DETECT_KWARGS`' keys apply here --
 # Aguet fits one emitter per LoG-screened candidate independently rather
 # than searching a box jointly, so there is no `k_max` (nothing to search
-# jointly for), no `slack`/`band` (every screened fit is reported; there is
-# no width-based accept/reject) and no `threshold` (the screening cut is
+# jointly for), no `slack` (its width is fitted free) and no `threshold` (the screening cut is
 # `significance`, a per-pixel level rather than a z-score). `boxsize` is the
 # odd fit-crop size around each candidate and `itermax` its optimizer's
 # iteration budget -- both rarely need changing.
@@ -216,15 +215,15 @@ class DetectTrackParams:
     # (see this module's docstring).
     sigma: float
     min_track_length: int = 2
-    # Over-bright cut, as a multiple of each frame's own median detection:
-    # detections above it are FLAGGED `is_aggregate` (never deleted -- see
-    # `run_detect_step`). None uses spotsolve's own AGG_AMP_RATIO.
-    agg_ratio: Optional[float] = None
-    # Whether linking sees the flagged aggregates. Default True (drop them):
-    # an over-bright blob is not a point emitter, and its position is a
-    # flux-weighted compromise between whatever is inside it, so linking it
-    # produces a trajectory of something that isn't a particle.
-    drop_aggregates: bool = True
+    # `spotsolve.FitFlag` bits whose fits linking does not see (a bitmask;
+    # 0 keeps every fit). Off by default, following spotsolve: a flag is a
+    # diagnostic, not a verdict that the detection is wrong.
+    exclude_flags: int = 0
+    # `spotsolve.tracking.link`'s `min_link_margin`, in nats: a proposed
+    # link whose score beats the best alternative assignment by less than
+    # this is cut, ending the track instead of risking an identity swap.
+    # 0 keeps every link the assignment made.
+    min_link_margin: float = 0.0
     # Whether `spotsolve.tracking.link` also scores candidate links by
     # brightness continuity (each detection's `flux`/`se_flux`), on top of
     # position and CRLB. Off by default -- it's an extra cue for a crowded
@@ -240,7 +239,7 @@ class DetectTrackParams:
     # None picks `DEFAULT_DETECT_KWARGS` or `DEFAULT_SPARSE_KWARGS` to match
     # `detector` (see `run_detect_step`) -- left as None rather than always
     # defaulting to the multi-emitter dict, which would silently hand
-    # `localize_aguet_stack` keyword arguments (`k_max`, `slack`, `band`) it
+    # `localize_aguet_stack` keyword arguments (`k_max`, `slack`) it
     # doesn't accept.
     detect_kwargs: Optional[dict] = None
     # Worker threads the chosen `detector`'s stack function hands frames to,
@@ -255,7 +254,7 @@ class DetectTrackParams:
     frame_range: Optional[tuple[int, int]] = None
     # QC cuts on per-detection columns (`flux`, `fit_sigma`, `se_pos`, ...)
     # and on per-track metrics (`track_length`, `mean_step_um`,
-    # `duration_s`). Like `is_aggregate`, these are applied to what linking
+    # `duration_s`). Like `exclude_flags`, these are applied to what linking
     # sees and to the final track set -- never to `points_df` itself, which
     # keeps every detection so the rejected population stays auditable.
     point_filters: FilterSpec = field(default_factory=dict)
@@ -290,19 +289,16 @@ class PipelineSession:
     sigma: Optional[float] = None
 
     points_df: Optional[pl.DataFrame] = None
-    # One row per frame (`loctable.FRAME_SCHEMA`): detection counts, the
-    # out-of-band reject breakdown, and the aggregate flux share. Kept on
-    # the session rather than folded into `points_df` because it's a fact
-    # about the frame, not about any one detection -- and it's what makes
-    # "why did this frame find nothing" answerable after the fact. Its
-    # `n_too_narrow`/`n_too_wide`/`n_edge` columns are always 0 when
-    # `detector_used == "aguet"`: that detector has no width-band rejection
-    # to count (see `run_detect_step`).
+    # One row per frame (`loctable.FRAME_SCHEMA`): detection and flagged
+    # counts, median flux and precision, background and the measured
+    # dispersion. Kept on the session rather than folded into `points_df`
+    # because it's a fact about the frame, not about any one detection --
+    # and it's what makes "why did this frame find nothing" answerable
+    # after the fact.
     frames_df: Optional[pl.DataFrame] = None
     camera_kwargs_used: Optional[dict] = None
     detect_kwargs_used: Optional[dict] = None
     detector_used: Optional[str] = None
-    agg_ratio_used: Optional[float] = None
     frame_range_used: Optional[tuple[int, int]] = None
     # The painted regions image (`(H, W)` uint16, 0 = background) whose
     # `labels > 0` was run_detect_step's `mask`, and the table naming each
@@ -321,7 +317,8 @@ class PipelineSession:
     tracks_df: Optional[pl.DataFrame] = None
     track_summary: Optional[dict] = None
     link_params: Optional[tracking.LinkParams] = None
-    drop_aggregates_used: Optional[bool] = None
+    exclude_flags_used: Optional[int] = None
+    min_link_margin_used: Optional[float] = None
     link_with_flux_used: Optional[bool] = None
     min_track_length_used: Optional[int] = None
     point_filters_used: Optional[FilterSpec] = None
@@ -398,7 +395,6 @@ def run_detect_step(
     sigma: Optional[float] = None,
     camera_kwargs: Optional[dict] = None,
     detect_kwargs: Optional[dict] = None,
-    agg_ratio: Optional[float] = None,
     frame_range: Optional[tuple[int, int]] = None,
     mask: Optional[np.ndarray] = None,
     progress_callback: Optional[ProgressCallback] = None,
@@ -417,9 +413,7 @@ def run_detect_step(
     baseline). `detect_kwargs` must match whichever is chosen (`None` picks
     `DEFAULT_DETECT_KWARGS`/`DEFAULT_SPARSE_KWARGS` accordingly) -- the two
     detectors take disjoint keyword arguments, so a dict built for one
-    raises a `TypeError` if forwarded to the other. `session.frames_df`'s
-    `n_too_narrow`/`n_too_wide`/`n_edge` columns are always 0 for
-    `detector="aguet"`: it has no width-band rejection to count.
+    raises a `TypeError` if forwarded to the other.
 
     Sets `session.points_df` (one row per detection,
     `loctable.LOCALIZATION_SCHEMA`) and `session.frames_df` (one row per
@@ -430,9 +424,9 @@ def run_detect_step(
     `sigma` is the in-focus PSF width. If omitted, falls back to
     `session.sigma` (the last run's) -- raises if neither is available.
     Note this is the width the search runs AT; each emitter still gets its
-    own fitted width (`fit_sigma`), and -- for `detector="multi_emitter"`
-    only -- how far that may stray before the fit stops being reported is
-    `detect_kwargs`' `slack`/`band`.
+    own fitted width (`fit_sigma`); for `detector="multi_emitter"`,
+    `detect_kwargs`' `slack` bounds how far it may stray, and a fit ending
+    on that bound is flagged `AT_BOUND` rather than dropped.
 
     `frame_range`, if given, is a `(start, end)` pair (Python-slice
     semantics: `end` exclusive) restricting which frames are processed --
@@ -446,14 +440,10 @@ def run_detect_step(
     typically `labels > 0` of a napari Labels layer (`widgets/
     experiment_list.py`'s regions handling).
 
-    Over-bright detections are FLAGGED (`is_aggregate`), never dropped
-    here: `agg_ratio` (a multiple of each frame's own median detection --
-    relative to the frame so that one number survives bleaching and
-    illumination drift) sets the cut, and `frames_df` records what share
-    of each frame's flux landed in aggregates. Whether linking sees them
-    is `run_track_step`'s `drop_aggregates`, so "how much of this movie
-    was junk" stays an auditable fact about the run rather than a silent
-    deletion.
+    Every fit spotsolve makes is kept, with its `FitFlag` diagnostics in
+    `flags`; which ones linking sees is `run_track_step`'s decision, so
+    "how much of this movie was junk" stays an auditable fact about the
+    run rather than a silent deletion.
 
     Both paths run every frame through whichever rayon-parallel stack
     function `detector` selects -- `n_threads` (default: every core,
@@ -518,12 +508,11 @@ def run_detect_step(
     loc_id0 = 0
     for offset, result in enumerate(results):
         i = start + offset
-        locs, frame_row, _aggs = loctable.frame_tables(
+        locs, frame_row = loctable.frame_tables(
             result,
             frame=i,
             t=i * session.dt_s,
             pixel_size=session.pixel_size_um,
-            agg_ratio=agg_ratio,
             loc_id0=loc_id0,
         )
         loc_id0 += locs.height
@@ -536,7 +525,6 @@ def run_detect_step(
     session.camera_kwargs_used = camera
     session.detect_kwargs_used = detect
     session.detector_used = detector
-    session.agg_ratio_used = agg_ratio
     session.frame_range_used = (start, end)
     # A fresh detection table supersedes whatever bundle this session was
     # rebuilt from, so none of that bundle's recorded numbers still apply.
@@ -665,8 +653,9 @@ def apply_track_filters(
 def run_track_step(
     session: PipelineSession,
     min_track_length: int = 2,
-    drop_aggregates: bool = True,
+    exclude_flags: int = 0,
     link_with_flux: bool = False,
+    min_link_margin: float = 0.0,
     point_filters: Optional[FilterSpec] = None,
     track_filters: Optional[FilterSpec] = None,
     progress_callback: Optional[ProgressCallback] = None,
@@ -692,11 +681,23 @@ def run_track_step(
     is why `min_track_length` matters more here than a gap-closing linker
     would need it to.
 
-    `drop_aggregates` (default True) removes detections flagged
-    `is_aggregate` by `run_detect_step` before linking, via
-    `loctable.filter_aggregates`. `session.points_df` is left whole either
-    way -- the filter applies to what the linker sees, not to what was
-    saved, so the aggregate share stays auditable in `frames_df`.
+    What the linker sees is `session.points_df` narrowed three times, and
+    `session.points_df` itself is left whole each time -- the cuts apply to
+    what the linker sees, not to what was saved:
+
+      1. `loctable.filter_quality`: finite coordinates and positive
+         `se_y`/`se_x`. Always applied -- a fit without a usable position
+         error can't be scored by the linker or analyzed by diffusionkit.
+      2. `exclude_flags`: fits carrying any of these `spotsolve.FitFlag`
+         bits (default 0, none excluded).
+      3. `point_filters` (below).
+
+    `min_link_margin` (nats, default 0) is `spotsolve.tracking.link`'s own:
+    a proposed link that beats the best assignment forbidding it by less
+    than this is cut, ending the track rather than risking a swap. Link
+    diagnostics are always requested, so every row carries `link_margin`
+    (null at a track's start) and `link_rejected` -- the distribution to
+    read before choosing a cutoff.
 
     `link_with_flux` (default False) additionally scores each candidate
     link by brightness continuity -- each detection's `flux`/`se_flux` --
@@ -707,11 +708,11 @@ def run_track_step(
 
     `point_filters` is the same idea generalized to any per-detection
     column (`{column: (lo, hi)}` -- see `filter_mask`): the Detect tab's
-    histogram cuts, applied on top of the aggregate drop to decide what
-    linking sees. `track_filters` applies to the linked result, keeping
+    histogram cuts, applied on top of the quality and flag cuts to decide
+    what linking sees. `track_filters` applies to the linked result, keeping
     whole tracks by their `track_metrics_df` row (see
     `apply_track_filters`). Both leave `session.points_df` whole, for the
-    same reason `drop_aggregates` does, and both are recorded in
+    same reason, and both are recorded in
     `session_manifest_extra` so what the run kept is readable off the
     bundle rather than only off whoever dragged the handle.
 
@@ -739,21 +740,35 @@ def run_track_step(
             progress_callback(done, total, stage)
 
     points_df = session.points_df
-    link_input = loctable.filter_aggregates(points_df, keep_flagged=not drop_aggregates)
-    n_after_aggregates = link_input.height
+    if not points_df.height:
+        raise ValueError("No detections to link -- run detect first.")
+    link_input = loctable.filter_quality(points_df)
+    n_valid = link_input.height
+    if exclude_flags:
+        link_input = link_input.filter((pl.col("flags") & exclude_flags) == 0)
+    n_after_flags = link_input.height
     link_input = apply_filters(link_input, point_filters)
     if link_input.height == 0:
-        if not points_df.height:
-            raise ValueError("No detections to link -- run detect first.")
-        if n_after_aggregates == 0:
+        if n_valid == 0:
             raise ValueError(
-                "No linkable detections -- every detection was flagged as an aggregate "
-                "(raise agg_ratio, or set drop_aggregates=False to link them anyway)."
+                "No linkable detections -- none has a finite position and a positive "
+                "position standard error."
+            )
+        if n_after_flags == 0:
+            raise ValueError(
+                f"No linkable detections -- every usable fit carries an excluded flag "
+                f"({flag_names(exclude_flags)}). Exclude fewer flags."
             )
         raise ValueError(
             f"No linkable detections -- the point filters "
             f"({', '.join(sorted(point_filters or {}))}) rejected all "
-            f"{n_after_aggregates} of them. Widen or clear them."
+            f"{n_after_flags} of them. Widen or clear them."
+        )
+
+    def link(rows: pl.DataFrame, params: tracking.LinkParams) -> pl.DataFrame:
+        return tracking.link(
+            rows, params, brightness=link_with_flux,
+            min_link_margin=min_link_margin, diagnostics=True,
         )
 
     class_groups = _region_groups(link_input)
@@ -767,7 +782,7 @@ def run_track_step(
     report(1, 2, "linking")
     by_class = None
     if class_groups is None:
-        tracks_df = tracking.link(link_input, link_params, brightness=link_with_flux)
+        tracks_df = link(link_input, link_params)
     else:
         # LinkParams are fitted per class (every cell's nucleus pooled, say):
         # classes are separated because their D and density differ, and a
@@ -786,7 +801,7 @@ def run_track_step(
                     pass
             class_pieces = []
             for rows in instances:
-                linked = tracking.link(rows, class_params, brightness=link_with_flux)
+                linked = link(rows, class_params)
                 if linked.height:
                     linked = linked.with_columns(
                         (pl.col("track_id").cast(pl.Int64) + next_id).alias("track_id")
@@ -825,20 +840,36 @@ def run_track_step(
         }
     session.tracks_df = tracks_df
     session.link_params = link_params
-    session.drop_aggregates_used = drop_aggregates
+    session.exclude_flags_used = exclude_flags
     session.link_with_flux_used = link_with_flux
+    session.min_link_margin_used = min_link_margin
     session.min_track_length_used = min_track_length
     session.point_filters_used = dict(point_filters) if point_filters else None
     session.track_filters_used = dict(track_filters) if track_filters else None
     session.track_summary = {
         **summary,
         "n_points_linked": link_input.height,
-        "n_points_dropped_as_aggregate": points_df.height - n_after_aggregates,
-        "n_points_dropped_by_filter": n_after_aggregates - link_input.height,
+        "n_points_dropped_invalid": points_df.height - n_valid,
+        "n_points_dropped_flagged": n_valid - n_after_flags,
+        "n_points_dropped_by_filter": n_after_flags - link_input.height,
+        "n_links_rejected": _n_links_rejected(tracks_df),
         "n_tracks_linked": n_tracks_linked,
         "by_class": by_class,
     }
     return session
+
+
+def flag_names(bits: int) -> str:
+    """`spotsolve.FitFlag` bits as `"EDGE|STALLED"`, for messages and
+    the manifest -- a bare integer mask says nothing to a reader."""
+    return "|".join(flag.name for flag in spotsolve.FitFlag if flag and bits & flag) or "none"
+
+
+def _n_links_rejected(tracks_df: pl.DataFrame) -> int:
+    """Links `min_link_margin` cut, over the tracks kept."""
+    if "link_rejected" not in tracks_df.columns:
+        return 0
+    return int(tracks_df["link_rejected"].sum())
 
 
 # Below this many linkable detections a class's own `fit_link_params` is
@@ -973,10 +1004,16 @@ def session_manifest_extra(session: PipelineSession) -> dict:
         "se_inflate": ts.get("se_inflate"),
         "n_linked_steps": ts.get("n_linked_steps"),
         "min_track_length": session.min_track_length_used,
-        "drop_aggregates": session.drop_aggregates_used,
+        "exclude_flags": (
+            flag_names(session.exclude_flags_used)
+            if session.exclude_flags_used is not None
+            else None
+        ),
         "link_with_flux": session.link_with_flux_used,
-        "agg_ratio": session.agg_ratio_used,
-        "n_points_dropped_as_aggregate": ts.get("n_points_dropped_as_aggregate"),
+        "min_link_margin": session.min_link_margin_used,
+        "n_points_dropped_invalid": ts.get("n_points_dropped_invalid"),
+        "n_points_dropped_flagged": ts.get("n_points_dropped_flagged"),
+        "n_links_rejected": ts.get("n_links_rejected"),
         # What the histogram filters were set to, as plain
         # {column: [lo, hi]} -- the record of which detections and tracks
         # this bundle's results were computed from. points.parquet still
@@ -1017,8 +1054,8 @@ def session_manifest_extra(session: PipelineSession) -> dict:
 _TRACK_KEYS = frozenset({
     "sigma_loc_um", "D_est_um2_s", "D_link_um2_s", "immobile_fraction", "p_cont",
     "lam_birth_per_px2", "se_inflate", "n_linked_steps", "min_track_length",
-    "drop_aggregates", "link_with_flux", "n_points_dropped_as_aggregate",
-    "point_filters", "track_filters", "n_points_dropped_by_filter", "n_tracks_linked",
+    "exclude_flags", "link_with_flux", "min_link_margin", "n_points_dropped_invalid",
+    "n_points_dropped_flagged", "n_links_rejected", "point_filters", "track_filters", "n_points_dropped_by_filter", "n_tracks_linked",
     "density_um2", "crowding_ratio", "resolvability_verdict", "resolvability_message",
     "track_summary_by_class",
 })
@@ -1059,8 +1096,10 @@ def session_from_bundle(
     detect_kwargs = params.get("detect_kwargs")
     if detect_kwargs is not None:
         detect_kwargs = {
-            key: tuple(value) if key in ("slack", "band") and value is not None else value
+            key: tuple(value) if key == "slack" and value is not None else value
             for key, value in detect_kwargs.items()
+            # Written by spotsolve versions that still had a reporting band.
+            if key != "band"
         }
     frame_range = params.get("frame_range")
     has_tracks = tracks_df is not None and tracks_df.height > 0 and "track_id" in tracks_df.columns
@@ -1078,7 +1117,6 @@ def session_from_bundle(
         camera_kwargs_used=params.get("camera_kwargs"),
         detect_kwargs_used=detect_kwargs,
         detector_used=params.get("detector"),
-        agg_ratio_used=params.get("agg_ratio"),
         frame_range_used=tuple(frame_range) if frame_range is not None else None,
         labels=labels,
         regions=regions,
@@ -1088,8 +1126,9 @@ def session_from_bundle(
     if has_tracks:
         session.tracks_df = tracks_df
         session.min_track_length_used = params.get("min_track_length")
-        session.drop_aggregates_used = params.get("drop_aggregates")
+        session.exclude_flags_used = parse_flag_names(params.get("exclude_flags"))
         session.link_with_flux_used = params.get("link_with_flux")
+        session.min_link_margin_used = params.get("min_link_margin")
         session.track_filters_used = filters("track_filters")
         session.track_summary = {key: params.get(key) for key in _TRACK_KEYS}
         session.track_summary["by_class"] = params.get("track_summary_by_class")
@@ -1138,16 +1177,25 @@ def _jsonable_filters(filters: Optional[FilterSpec]) -> Optional[dict]:
     return {col: [lo, hi] for col, (lo, hi) in filters.items()}
 
 
+def parse_flag_names(names: Optional[str]) -> Optional[int]:
+    """`flag_names`' inverse, for a manifest read back: `"EDGE|STALLED"`
+    -> the bitmask. None stays None (a bundle linked before flags existed)."""
+    if names is None:
+        return None
+    return sum(
+        spotsolve.FitFlag[name] for name in names.split("|") if name and name != "none"
+    )
+
+
 def _jsonable_detect_kwargs(detect_kwargs: Optional[dict]) -> Optional[dict]:
-    """`detect_kwargs` with `slack`/`band` as lists rather than tuples --
+    """`detect_kwargs` with `slack` as a list rather than a tuple --
     `json.dumps` writes both as arrays, but reading a manifest back gives
     lists either way, so normalize here and keep the round-trip honest."""
     if detect_kwargs is None:
         return None
     out = dict(detect_kwargs)
-    for key in ("slack", "band"):
-        if out.get(key) is not None:
-            out[key] = list(out[key])
+    if out.get("slack") is not None:
+        out["slack"] = list(out["slack"])
     return out
 
 
@@ -1208,7 +1256,6 @@ def run_detect_track(
         session,
         camera_kwargs=params.camera_kwargs,
         detect_kwargs=params.detect_kwargs,
-        agg_ratio=params.agg_ratio,
         frame_range=params.frame_range,
         progress_callback=detect_progress,
         cancel_event=cancel_event,
@@ -1222,8 +1269,9 @@ def run_detect_track(
     run_track_step(
         session,
         params.min_track_length,
-        drop_aggregates=params.drop_aggregates,
+        exclude_flags=params.exclude_flags,
         link_with_flux=params.link_with_flux,
+        min_link_margin=params.min_link_margin,
         point_filters=params.point_filters,
         track_filters=params.track_filters,
         progress_callback=track_progress,

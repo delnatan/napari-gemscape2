@@ -49,9 +49,10 @@ results/<result_id>/
 
 `points.parquet` is `spotsolve.loctable`'s localization table verbatim — one row
 per detection, carrying `se_y`/`se_x` (per-detection CRLB), `flux`, `bg`,
-`fit_sigma`/`sigma_ratio` and the `is_aggregate` flag. `tracks.parquet` is that
-same table with a `track_id` column added, so every detector column survives
-linking and stays available for QC downstream.
+`fit_sigma`/`sigma_ratio` and `flags` (spotsolve's `FitFlag` diagnostics).
+`tracks.parquet` is that same table with `track_id` added (plus the linker's
+`link_margin`/`link_rejected`), so every detector column survives linking and
+stays available for QC downstream.
 
 **Regions** are painted on a napari Labels layer (Detect tab → "New regions
 layer"). Each label value is one region, and each pixel belongs to exactly one
@@ -70,9 +71,11 @@ Reopening a row that already has a bundle resumes it: the saved points are the
 session's detections, so Track links them without re-running detect, and the
 saved regions come back as the picked regions layer.
 
-Nothing a QC decision rejects is deleted. Over-bright detections are **flagged**
-(`is_aggregate`), and the histogram filters described below are recorded as
-ranges rather than applied to `points.parquet` — so how much of a movie was junk
+Nothing a QC decision rejects is deleted. spotsolve reports every fit with its
+`FitFlag`s; the Track tab chooses which flags keep a fit away from the linker
+(none by default), and fits without a finite position error are never linked.
+The histogram filters described below are recorded as ranges rather than
+applied to `points.parquet` — so how much of a movie was junk
 stays an auditable fact about the run instead of a silent subtraction. What those
 judgements change is what the *linker* sees and which tracks the bundle keeps.
 
@@ -96,17 +99,20 @@ step. Set `sigma` on the Detect page, run detect on a few frames (the frame
 range), and read the `fit_sigma` histogram on the Filter page: its peak is the
 width to set. Run again and it should stop moving. A bimodal or ragged
 `fit_sigma` (two focal planes, junk being fitted as signal) is something you see
-rather than something a median averages away. One caveat: a run reports only fits
-inside the band (0.8–2.0 × sigma by default), so a sigma set far too high shows
-as a pile-up at the histogram's low edge rather than a peak. The expert
-"report every fit (no band)" box lifts that for one diagnostic run.
+rather than something a median averages away. A sigma set far too high shows as
+a pile-up at the histogram's low edge, where fits are pinned against the `slack`
+bound and flagged `AT_BOUND`.
 
 One unit caveat, since two are in play: `sigma` is in **pixels**, while `slack`
-and `band` are **multiples of whatever sigma the search is running at**
-(`spotsolve` tests them against `sigma_ratio = fit_sigma / sigma`). They are not
-multiples of the initial guess and not absolute pixels, so changing `sigma` moves
-both windows with it — the Detect tab prints the resulting px window underneath
-them for that reason.
+is a **multiple of whatever sigma the search is running at** (`sigma_ratio =
+fit_sigma / sigma`). It is not a multiple of the initial guess and not absolute
+pixels, so changing `sigma` moves the window with it — the Detect tab prints the
+resulting px window underneath it for that reason.
+
+Linking has one optional cutoff, `min_link_margin` (nats): a link that beats the
+best assignment without it by less than that is cut, ending the track rather than
+risking an identity swap. Read the `link_margin` distribution of a run at 0 before
+choosing one.
 
 ## Units, and where they come from
 

@@ -84,6 +84,7 @@ _EXACT: dict[str, Optional[str]] = {
     "se_pos": PX,
     "sigma": PX,
     "fit_sigma": PX,
+    "sigma_se": PX,
     "median_se_pos": PX,
     # Brightness, in camera counts above the offset.
     "flux": ADU,
@@ -126,7 +127,19 @@ _EXACT: dict[str, Optional[str]] = {
     "straightness": None,
     "gyration_asymmetry": None,
     "immobile_fraction": None,
-    "agg_flux_fraction": None,
+    "link_margin": "nats",
+    "min_link_margin": "nats",
+    "link_rejected": None,
+    # spotsolve's per-fit diagnostics: a `FitFlag` bitmask, and the
+    # conditional/marginal Fisher variance ratio per parameter (a pure
+    # number; small means strongly coupled to another fitted parameter).
+    "flags": None,
+    "fisher_flux": None,
+    "fisher_y": None,
+    "fisher_x": None,
+    "fisher_sigma": None,
+    "n_locs": None,
+    "n_flagged": None,
     "crowding_ratio": None,
     "p_cont": None,
     "se_inflate": None,
