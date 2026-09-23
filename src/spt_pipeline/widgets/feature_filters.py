@@ -5,8 +5,8 @@ are worth filtering on.
 Used three times, against three tables:
 
   - `params_panel._DetectTab` -- per-detection columns (`flux`,
-    `fit_sigma`, `se_pos`, `bg`, ...) from a preview frame or a finished
-    detect run. Decides what linking sees.
+    `fit_sigma`, `se_pos`, `bg`, ...) from a detect run. Decides what
+    linking sees, and is where `fit_sigma` settles the PSF width.
   - `params_panel._TrackingTab` -- per-track metrics
     (`pipeline.TRACK_METRIC_COLUMNS`). Decides which tracks the bundle
     keeps.

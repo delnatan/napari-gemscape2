@@ -114,8 +114,6 @@ _EXACT: dict[str, Optional[str]] = {
     "dt_s": "s/frame",
     "dt_spread_s": "s",
     "sigma_px": PX,
-    "sigma_init": PX,
-    "sigma_estimate": PX,
     "sigma_ci_px": PX,
     "mean_localization_offset_um2": UM2,
     # Dimensionless by construction, listed so they read as "known with no

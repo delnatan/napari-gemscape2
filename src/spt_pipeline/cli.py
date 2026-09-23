@@ -28,7 +28,8 @@ def detect_track(
     Config format:
         results_root = "results"
         [params]
-        sigma_init = 1.3
+        sigma = 1.3   # PSF width, px (required) -- read it off the fit_sigma
+                      # histogram of a few detected frames in the napari widget
 
         [[inputs]]
         path = "data/beads_timelapse_dense.tif"
@@ -36,7 +37,14 @@ def detect_track(
     """
     cfg = tomllib.loads(config.read_text())
     results_root = Path(cfg.get("results_root", "results"))
-    params = DetectTrackParams(**cfg.get("params", {}))
+    param_cfg = cfg.get("params", {})
+    if param_cfg.get("sigma") is None:
+        raise typer.BadParameter(
+            "[params] needs `sigma` (PSF width, px). Detect a few frames in the napari "
+            "widget and read it off the fit_sigma histogram.",
+            param_hint="CONFIG",
+        )
+    params = DetectTrackParams(**param_cfg)
 
     import spotsolve
     import spt_pipeline
@@ -50,9 +58,9 @@ def detect_track(
         typer.echo(f"[{result_id}] {image_path}")
         points_df, tracks_df, manifest_extra = run_detect_track(
             image_path,
+            params,
             pixel_size_um=entry.get("pixel_size_um"),
             dt_s=entry.get("dt_s"),
-            params=params,
             exposure_s=entry.get("exposure_s"),
         )
         manifest = build_manifest(

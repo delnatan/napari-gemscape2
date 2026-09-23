@@ -3,9 +3,9 @@ two tabbed pages -- **Detect** and **Track** -- each of which is a small
 detect -> filter -> finalize flow of its own, the shape Imaris and
 TrackMate use for spot detection:
 
-    Detect:  PSF width -> Detect -> Filter
-             (offset + PSF + detection knobs, [Preview frame] /
-             [Run detect], then histogram filters on what it found)
+    Detect:  Detect -> Filter -> Save
+             (offset + PSF width + detection knobs, [Run detect], then
+             histogram filters on what it found)
     Track:   Link -> Filter -> Save
              (linking knobs, [Run tracking], histogram filters on the
              tracks it linked, then [Save results])
@@ -28,27 +28,19 @@ already did for flagged aggregates. `points.parquet` holds every detection
 either way and `manifest.json` records the ranges, so what a run kept is
 readable off the bundle afterwards.
 
-**There is no Calibration tab.** `spotsolve.calibrate_sigma`'s loop was:
-localize a frame with the reporting band off, take the median fitted
-width, re-run at it, repeat to a fixed point -- and it reported one number
-with a bootstrap CI, with the distribution behind it never shown. The
-Detect tab's "Preview frame" button is that same loop with the user in it:
-preview at the current sigma, look at the `fit_sigma` histogram, click
-"Use" to adopt its median, preview again. It settles in the same two or
-three rounds and the distribution is on screen throughout, so a bimodal or
-ragged `fit_sigma` -- two focal planes, junk being fitted as signal -- is
-something you see rather than something a median averages away.
-`pipeline.run_calibration_step` is still there for the headless CLI,
-where there is nobody to look.
+**There is no calibration or preview step.** The PSF width (`sigma`) is a
+setting on the Detect page: run detect on a few frames (the frame range),
+read the `fit_sigma` histogram on the Filter page, adjust sigma, run
+again. The distribution is on screen throughout, so a bimodal or ragged
+width -- two focal planes, junk fitted as signal -- is seen rather than
+averaged into one number. One caveat: a real run reports only fits inside
+the band (0.8-2.0 x sigma by default), so a badly overestimated sigma
+shows as a wall at the histogram's low edge rather than a peak; the
+expert "report every fit (no band)" box lifts that for a run.
 
-The camera fact that's left -- `offset` -- moved here with it: it's read
-by preview, detect and calibrate alike, and with calibration no longer a
-tab of its own, the one tab that always needs it is this one. `gain` and
-`read_noise` are gone entirely: `spotsolve` now measures noise from each
-frame rather than taking a camera calibration as input, so there is
-nothing left to expose for them.
-`PipelineParamsWidget.get_camera_kwargs` remains the single source of
-truth that `ExperimentListWidget` forwards to every stage.
+`offset` is the one camera fact spotsolve takes (noise is measured from
+each frame), and `PipelineParamsWidget.get_camera_kwargs` is the single
+source of truth `ExperimentListWidget` forwards to every stage.
 
 Above both tabs sits `_ImageInfoPanel`: a one-line readout of the
 *image's own* metadata -- frame count, pixel size, frame interval -- over
@@ -93,44 +85,32 @@ between them; the knobs beneath it swap to match (`k_max`/`threshold`/
 Aguet) rather than showing both detectors' settings at once.
 
 Each tab owns its stage's "Run" button and a one-line status label, wired
-to `PipelineParamsWidget`'s `previewRequested`/`detectRequested`/
-`trackRequested`/`saveRequested` signals -- `ExperimentListWidget` connects
-these to run that single stage (via `pipeline.py`'s `run_preview_frame`/
-`run_detect_step`/`run_track_step`) against whatever the earlier stages
+to `PipelineParamsWidget`'s `detectRequested`/`trackRequested`/
+`saveRequested` signals -- `ExperimentListWidget` connects these to run
+that single stage (via `pipeline.py`'s `run_detect_step`/`run_track_step`) against whatever the earlier stages
 already produced, instead of always re-running the whole pipeline as one
 atomic unit. The status labels are read-only; the widget calls
-`set_preview_status`/`set_detect_status`/`set_track_status` back with each
+`set_detect_status`/`set_track_status` back with each
 stage's result.
 
 The Detect tab also exposes *scope* controls -- which frames and which
 pixels get analyzed, not how -- kept in its core section since these are
 exactly what make "explore one image incrementally" (this widget's whole
 point, vs. blindly running a batch job) practical: a frame-range pair
-(`get_frame_range`) and a "restrict to ROI" checkbox
-(`get_use_roi_mask`), plus a checkable list of Shapes layers (`get_roi_layer_names`)
-and a "Draw ROI…" button (`newRoiRequested`) that just asks for a fresh
-Shapes layer to draw on. A "cores" spinbox (`get_n_threads`) sits beside
-the frame range -- `localize_stack`'s `n_threads`, defaulted to every
-core (see `pipeline.run_detect_step`'s docstring for why this speeds up
-even the interactively-watched run, not just a headless batch).
-
-The list is what makes several ROIs on screen at once workable: draw as
-many Shapes layers as you like (rename them in napari's layer list -- the
-name shown here follows, and it's the name the ROI is saved under and its
-detections are labeled with, see `spt_pipeline.rois`), then check which
-ones this run covers. Each checked layer is one region; with more than one
-checked, tracking links each region on its own (`pipeline.run_track_step`).
-It replaced "whichever Shapes layer happens to be active", where the
-targeted region silently changed whenever the layer selection did -- and
-where a second ROI could only be used by clicking the right layer first.
+(`get_frame_range`) and the regions controls (`regions_panel`, a
+`widgets.regions_panel.RegionsPanel`): a "restrict to regions" checkbox,
+the Labels layer the regions are painted on, and the table naming each
+label's class and cell (see `spt_pipeline.regions`). The "cores" spinbox
+(`get_n_threads`, under Expert) is `localize_stack`'s `n_threads`,
+defaulted to every core (see `pipeline.run_detect_step`'s
+docstring for why this speeds up even the interactively-watched run, not
+just a headless batch).
 
 This widget stays viewer-agnostic (no napari `Viewer` reference), so
 `ExperimentListWidget` (which owns the viewer) is responsible for adding
-that layer (persistent/2D, transparent fill, polygon-lasso tool active --
-see `_on_new_roi_requested`), for keeping the list's contents in sync
-with the viewer's Shapes layers (`set_roi_choices`), and, once the ROI
-checkbox is checked, for turning the checked layers into the boolean mask
-array `spotsolve`'s `roi` argument expects and the labels each detection
+a regions layer when asked, keeping the layer picker in step with the
+viewer's Labels layers, and turning the chosen layer into the boolean
+mask `spotsolve`'s `roi` argument expects and the labels each detection
 is stamped with.
 """
 
@@ -141,7 +121,7 @@ from typing import Optional
 
 import polars as pl
 import spotsolve
-from qtpy.QtCore import Qt, Signal
+from qtpy.QtCore import Signal
 from qtpy.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -149,8 +129,6 @@ from qtpy.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QPushButton,
     QSpinBox,
     QTabWidget,
@@ -169,6 +147,7 @@ from spt_pipeline.pipeline import (
     FilterSpec,
 )
 from spt_pipeline.widgets.feature_filters import FeatureFilterPanel
+from spt_pipeline.widgets.regions_panel import RegionsPanel
 
 
 # A dock this narrow has no room for a numeric field to claim more width
@@ -178,7 +157,10 @@ from spt_pipeline.widgets.feature_filters import FeatureFilterPanel
 # off; `_SPIN_WIDTH` caps each field at what its digits need so the label
 # column isn't squeezed into wrapping.
 _SPIN_WIDTH = 72
-_UNIT_SPIN_WIDTH = 108  # wide enough for a spinbox that also carries a unit suffix
+# Decimal spinboxes need more: napari's theme gives every spinbox wide +/-
+# buttons, and at 72 px a value like "100.00" was clipped to "100.(".
+_DSPIN_WIDTH = 104
+_UNIT_SPIN_WIDTH = 140  # wide enough for a spinbox that also carries a unit suffix
 
 
 def _compact_form(form: QFormLayout) -> QFormLayout:
@@ -208,7 +190,7 @@ def _dspin(
     width: Optional[int] = None,
 ) -> QDoubleSpinBox:
     box = double_spinbox(value, minimum, maximum, step, decimals, tooltip=tooltip, suffix=suffix)
-    box.setMaximumWidth(width if width is not None else (_UNIT_SPIN_WIDTH if suffix else _SPIN_WIDTH))
+    box.setMaximumWidth(width if width is not None else (_UNIT_SPIN_WIDTH if suffix else _DSPIN_WIDTH))
     return box
 
 
@@ -263,27 +245,15 @@ def _save_page(button_text: str, tooltip: str) -> tuple[QPushButton, QLabel, QWi
 
 
 class _DetectTab(QWidget):
-    """Three pages -- PSF width, Detect, Filter -- leafed through with the
+    """Three pages -- Detect, Filter, Save -- leafed through with the
     `qtkit.StepPager` header: the PSF width, the detector choice and its
-    knobs plus scope, and the two actions that produce something to look at
-    (preview one frame / run the range), then a filter stack over what
-    they found.
+    knobs plus scope and the Run button, then a filter stack over what it
+    found (where `fit_sigma` is read to settle the PSF width), then Save.
 
-    One consequence of paging worth knowing: the preview loop's two
-    halves now sit on neighbouring pages -- "Use" on PSF width, the
-    `fit_sigma` histogram on Filter. The loop still closes without
-    leafing, because `set_preview_result` puts the median (and its MAD) in
-    the status line right under the button and on the button's own label;
-    page across when what you want is the *shape* of that distribution --
-    a bimodal `fit_sigma` is the thing a median hides, and seeing it is
-    the whole reason this is a preview loop rather than
-    `calibrate_sigma`.
-
-    Core: `offset` (the one camera fact `spotsolve` still takes -- gain and
-    read noise are measured from each frame now), `sigma` with its preview
-    loop (see this module's docstring -- this is what replaced the
-    Calibration tab), the `detector` dropdown, that detector's own knobs, the
-    aggregate cut, a frame range and a "restrict to ROI" checkbox.
+    Core: `sigma`, `offset` (the one camera fact `spotsolve` still takes --
+    gain and read noise are measured from each frame now), the `detector`
+    dropdown, that detector's own knobs, the aggregate cut, a frame range
+    and the regions controls.
 
     Two detectors, two knob sets, never both on screen at once -- the
     dropdown's choice sets which rows `_on_detector_changed` shows:
@@ -305,18 +275,14 @@ class _DetectTab(QWidget):
         never joint) and no `slack`/`band` (every screened fit is reported;
         there is no width-based reject to gate on)."""
 
-    previewRequested = Signal()
     runRequested = Signal()
     cancelRequested = Signal()
-    newRoiRequested = Signal()
-    roiLayerChanged = Signal()
     filtersChanged = Signal()
     saveRequested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
         self._running = False
-        self._measured_sigma: Optional[float] = None
         self.offset = _dspin(
             DEFAULT_CAMERA_KWARGS["offset"], 0.0, 1e6, 1.0, decimals=2,
             tooltip="Camera offset / baseline, ADU -- subtracted before fitting.\n"
@@ -335,7 +301,7 @@ class _DetectTab(QWidget):
         # disjoint keyword arguments, so showing both at once would just
         # invite setting one that the current choice ignores.
         self.detector = QComboBox()
-        self.detector.addItem("Multi-emitter (default)", "multi_emitter")
+        self.detector.addItem("Multi-emitter", "multi_emitter")
         self.detector.addItem("Sparse (Aguet)", "aguet")
         self.detector.setToolTip(
             "Multi-emitter (default): fits each box jointly, deciding how many\n"
@@ -343,68 +309,25 @@ class _DetectTab(QWidget):
             "crowded and sparse fields.\n\n"
             "Sparse (Aguet): the spotfitlm-compatible baseline. LoG-screens\n"
             "candidates, then fits each one independently -- no multi-emitter\n"
-            "search, no width-band rejection (every screened fit is reported).\n"
+            "search, no width-band rejection (every screened fit is reported,\n"
+            "so frames_df's too_narrow/too_wide/edge counts stay 0).\n"
             "For genuinely sparse fields where the joint search is unneeded."
         )
         self.detector.currentIndexChanged.connect(self._on_detector_changed)
-        self._detector_note = note_label("")
 
-        # --- PSF width, and the preview loop that measures it ----------
+        # --- PSF width ----------------------------------------------------
         self.sigma = _dspin(
             1.3, 0.3, 10.0, 0.1, decimals=3,
             tooltip="In-focus PSF sigma in PIXELS -- the width the search runs\n"
             "at. Each emitter still gets its own fitted width (fit_sigma);\n"
             "this sets where the search starts and what slack/band are\n"
             "multiples of.\n\n"
-            "Don't agonize: preview a frame, read the median fit_sigma off\n"
-            "the histogram, click Use, preview again. Two or three rounds is\n"
-            "the whole of what calibrate_sigma used to do out of sight.",
+            "To settle it: run detect on a few frames, read fit_sigma's peak\n"
+            "on the Filter page, set it here, run again. Only fits within the\n"
+            "band (0.8-2.0 x sigma by default) are reported, so a pile-up at\n"
+            "the histogram's low edge means sigma is set too high.",
         )
         self.sigma.valueChanged.connect(self._update_band_note)
-        self._preview_frame = _ispin(
-            0, 0, 1_000_000,
-            tooltip="Stack frame (0-based) to preview. Frame 0 isn't always the\n"
-            "best reference -- somewhere sparser or better-focused often is.",
-        )
-        self.preview_button = QPushButton("Preview frame")
-        self.preview_button.setToolTip(
-            "Localize this one frame at the current sigma with the chosen\n"
-            "detector below. For the multi-emitter detector its reporting band\n"
-            "is forced off, so every fit shows up -- including the ones a real\n"
-            "run would bin as out-of-band; Aguet has no band, so this changes\n"
-            "nothing for it. Nothing is saved and points from a previous Run\n"
-            "detect are left alone."
-        )
-        self.preview_button.clicked.connect(self.previewRequested.emit)
-        self.use_measured_button = QPushButton("Use")
-        self.use_measured_button.setEnabled(False)
-        self.use_measured_button.setToolTip(
-            "Adopt the previewed frame's median fit_sigma as sigma -- one\n"
-            "round of calibrate_sigma's fixed-point loop. Preview again to\n"
-            "take the next; it stops moving after two or three."
-        )
-        self.use_measured_button.clicked.connect(self._use_measured_sigma)
-        preview_row = QHBoxLayout()
-        preview_row.setContentsMargins(0, 0, 0, 0)
-        preview_row.addWidget(self.preview_button)
-        preview_row.addWidget(self._preview_frame)
-        preview_row.addWidget(self.use_measured_button)
-        preview_row.addStretch()
-
-        self.preview_status = wrapping_label("")
-        style_status_label(self.preview_status)
-
-        psf_form = _compact_form(QFormLayout())
-        psf_form.setContentsMargins(0, 0, 0, 0)
-        psf_form.addRow("sigma (px)", self.sigma)
-
-        psf_body = QWidget()
-        psf_layout = QVBoxLayout(psf_body)
-        psf_layout.setContentsMargins(0, 0, 0, 0)
-        psf_layout.setSpacing(2)
-        psf_layout.addLayout(psf_form)
-        psf_layout.addLayout(preview_row)
-        psf_layout.addWidget(self.preview_status)
 
         # --- detection knobs -------------------------------------------
         self.k_max = _ispin(
@@ -418,26 +341,18 @@ class _DetectTab(QWidget):
         # `DEFAULT_DETECT_KWARGS`) -- spotsolve used to split these into a
         # seed cut and a birth cut, but one number does the same job.
         self.threshold = _dspin(
-            spotsolve.PEAK_Z, 0.0, 1e9, 0.1, decimals=2,
+            0.0, 0.0, 1e9, 0.1, decimals=2,
             tooltip="The LoG cut, in sd of the frame's own noise, for both getting a\n"
-            "box searched and for trying another emitter inside one. Raise it\n"
+            "box searched and for trying another emitter inside one. 'auto'\n"
+            f"(recommended) uses spotsolve's default, {spotsolve.PEAK_Z}. Raise it\n"
             "for fewer false positives and speed; lower it toward 2.5 on faint,\n"
-            "sparse data. Leave 'use recommended' checked unless you have a reason.",
+            "sparse data.",
         )
-        self.derive_threshold = QCheckBox("use recommended")
-        self.derive_threshold.setToolTip(
-            "Let the detector use its own default cut, spotsolve's PEAK_Z\n"
-            "(threshold=None). Recommended."
-        )
-        self.derive_threshold.setChecked(d["threshold"] is None)
+        # The minimum is not a cut anyone would want, so it stands for
+        # "no explicit cut" (threshold=None): spotsolve's own PEAK_Z.
+        self.threshold.setSpecialValueText("auto")
         if d["threshold"] is not None:
             self.threshold.setValue(d["threshold"])
-        self.derive_threshold.toggled.connect(self._on_derive_threshold_toggled)
-        self._on_derive_threshold_toggled(self.derive_threshold.isChecked())
-        self._threshold_row = threshold_row = QHBoxLayout()
-        threshold_row.setContentsMargins(0, 0, 0, 0)
-        threshold_row.addWidget(self.threshold)
-        threshold_row.addWidget(self.derive_threshold)
 
         # spotsolve's per-emitter-count rule: "fixed" keeps the existing
         # greedy 10-nat cost (count_penalty=0 leaves that behavior exactly
@@ -466,11 +381,6 @@ class _DetectTab(QWidget):
             "false-positive budget in BIC mode is data-dependent -- see\n"
             "spotsolve's docs/COUNT_SELECTION.md before trusting one number.",
         )
-        self._selection_row = selection_row = QHBoxLayout()
-        selection_row.setContentsMargins(0, 0, 0, 0)
-        selection_row.addWidget(self.selection)
-        selection_row.addWidget(QLabel("penalty"))
-        selection_row.addWidget(self.count_penalty)
         self._selection_note = note_label("")
         self._on_selection_changed()
 
@@ -500,21 +410,21 @@ class _DetectTab(QWidget):
 
         self.core_form = core_form = _compact_form(QFormLayout())
         core_form.setContentsMargins(0, 0, 0, 0)
+        core_form.addRow("sigma (px)", self.sigma)
         core_form.addRow("detector", self.detector)
-        core_form.addRow("", self._detector_note)
         core_form.addRow("offset (ADU)", self.offset)
         core_form.addRow("k_max", self.k_max)
         # Row labels carry the unit the same way "offset (ADU)" and
-        # "sigma (px)" do: these three are a z-score, a p-value and a
-        # multiple of the frame's median flux, which is exactly the kind
-        # of thing a bare number invites getting wrong.
-        core_form.addRow("threshold (× noise sd)", threshold_row)
+        # "sigma (px)" do -- a z-score, a p-value and a multiple of the
+        # frame's median flux are exactly the kind of thing a bare number
+        # invites getting wrong -- kept short so the column stays narrow.
+        core_form.addRow("threshold (sd)", self.threshold)
         core_form.addRow("significance (p)", self.significance)
-        core_form.addRow("aggregate ratio (× median flux)", self.agg_ratio)
+        core_form.addRow("aggregate (× med)", self.agg_ratio)
 
         # What gets analyzed, not how -- kept in core (not expert) since
         # these are exactly the knobs that let one image be explored
-        # incrementally (a few frames, a drawn ROI) instead of always
+        # incrementally (a few frames, painted regions) instead of always
         # committing to the whole stack. `set_frame_bounds` is called by
         # `ExperimentListWidget` once an image's frame count is known;
         # 0/0 means "process everything" (the common case, and the only
@@ -531,7 +441,6 @@ class _DetectTab(QWidget):
         frame_row.addWidget(self.frame_start)
         frame_row.addWidget(QLabel("to"))
         frame_row.addWidget(self.frame_end)
-        frame_row.addStretch()
 
         # How many native threads the chosen detector's stack function
         # (`localize_stack` or `localize_aguet_stack`) hands frames to (both
@@ -546,56 +455,9 @@ class _DetectTab(QWidget):
             "Defaults to every core on this machine. Lower it to leave some\n"
             "cores free for other work while a long run is going.",
         )
-        cores_row = QHBoxLayout()
-        cores_row.setContentsMargins(0, 0, 0, 0)
-        cores_row.addWidget(QLabel("cores"))
-        cores_row.addWidget(self.n_threads)
-        cores_row.addStretch()
+        frame_row.addStretch()
 
-        self.use_roi_mask = QCheckBox("restrict to ROI")
-        self.use_roi_mask.setToolTip(
-            "Only place emitters inside the Shapes layers checked in the list\n"
-            "below (spotsolve's roi argument). Draw one with the button next to\n"
-            "it, or in napari, first."
-        )
-        # Which Shapes layers, chosen by name rather than by whatever
-        # happens to be selected in napari's layer list -- see this
-        # module's docstring. Kept in sync by `set_roi_choices`; each entry
-        # is the live layer name, so renaming a layer in napari renames it
-        # here (and that name is what the ROI is saved under and what its
-        # detections are labeled with).
-        self.roi_layers = QListWidget()
-        self.roi_layers.setToolTip(
-            "Which Shapes layers to use as ROIs -- each checked layer is one\n"
-            "region, named after the layer. Detections are labeled with the\n"
-            "region they fall in (the 'roi' column), and with more than one\n"
-            "region checked, tracking links each region separately, so no\n"
-            "track crosses a boundary and each gets its own fitted D.\n"
-            "Where regions overlap, the one higher in this list (and in\n"
-            "napari's layer list) wins."
-        )
-        # Compact: a few rows is plenty, and this sits in a tall tab.
-        self.roi_layers.setMaximumHeight(4 * self.roi_layers.fontMetrics().height() + 12)
-        self.roi_layers.itemChanged.connect(lambda _item: self.roiLayerChanged.emit())
-        self.new_roi_button = QPushButton("Draw ROI…")
-        self.new_roi_button.setToolTip(
-            "Add a new Shapes layer (transparent fill, polygon-lasso tool active)\n"
-            "for drawing the ROI -- 2D so it stays visible on every frame instead\n"
-            "of only the one it was drawn on. Each click adds another, so several\n"
-            "regions can be kept side by side and checked together."
-        )
-        self.new_roi_button.clicked.connect(self.newRoiRequested.emit)
-        roi_top = QHBoxLayout()
-        roi_top.setContentsMargins(0, 0, 0, 0)
-        roi_top.addWidget(self.use_roi_mask)
-        roi_top.addStretch()
-        roi_top.addWidget(self.new_roi_button)
-        roi_row = QVBoxLayout()
-        roi_row.setContentsMargins(0, 0, 0, 0)
-        roi_row.addLayout(roi_top)
-        roi_row.addWidget(self.roi_layers)
-        self._sync_roi_row()
-        self.use_roi_mask.toggled.connect(self._sync_roi_row)
+        self.regions_panel = RegionsPanel()
 
         # `slack` is the width range a fit may take; `band` the narrower
         # range actually reported as a detection. Both are multiples of
@@ -629,8 +491,9 @@ class _DetectTab(QWidget):
         self.no_band.setToolTip(
             "Report every fit regardless of width (spotsolve's band=None).\n"
             "A diagnostic: it puts out-of-focus and non-PSF-shaped fits into\n"
-            "points_df as if they were detections. Leave unchecked for analysis.\n"
-            "Preview frame always does this, whatever this box says."
+            "points_df as if they were detections. Use it for one few-frame run\n"
+            "when the fit_sigma histogram piles up at an edge; leave it\n"
+            "unchecked for analysis."
         )
         self.no_band.toggled.connect(self._on_no_band_toggled)
 
@@ -668,8 +531,10 @@ class _DetectTab(QWidget):
         expert_form.addRow("band (× sigma)", band_row)
         expert_form.addRow("", self._band_note)
         expert_form.addRow("", self.no_band)
-        expert_form.addRow("count selection", selection_row)
+        expert_form.addRow("count rule", self.selection)
+        expert_form.addRow("penalty", self.count_penalty)
         expert_form.addRow("", self._selection_note)
+        expert_form.addRow("cores", self.n_threads)
         expert_form.addRow("boxsize (px)", self.boxsize)
         expert_form.addRow("max iterations", self.itermax)
         self._update_band_note()
@@ -681,7 +546,8 @@ class _DetectTab(QWidget):
         # --- filter -----------------------------------------------------
         self.filters = FeatureFilterPanel(
             noun="points",
-            hint="Preview a frame or run detect first — then filter on what it found.",
+            hint="Run detect (a few frames is enough) — then filter on what it found. "
+            "fit_sigma's peak is the PSF width to set on the Detect page.",
         )
         self.filters.filtersChanged.connect(self.filtersChanged)
 
@@ -703,14 +569,12 @@ class _DetectTab(QWidget):
         detect_layout.addLayout(core_form)
         detect_layout.addWidget(hline())
         detect_layout.addLayout(frame_row)
-        detect_layout.addLayout(cores_row)
-        detect_layout.addLayout(roi_row)
+        detect_layout.addWidget(self.regions_panel)
         detect_layout.addWidget(_expert_section(expert_form))
         detect_layout.addWidget(hline())
         detect_layout.addLayout(run_row)
 
         self.pager = StepPager()
-        self.pager.add_page("PSF width", psf_body)
         self.pager.add_page("Detect", detect_body)
         self.pager.add_page("Filter", self.filters)
         self.pager.add_page("Save", save_body)
@@ -725,7 +589,7 @@ class _DetectTab(QWidget):
     def show_step(self, title: str) -> None:
         self.pager.show_step(title)
 
-    # -- PSF / preview ----------------------------------------------------
+    # -- PSF width ---------------------------------------------------------
 
     def _update_band_note(self) -> None:
         """Restate `slack`/`band` in pixels at the current `sigma`. They
@@ -743,46 +607,8 @@ class _DetectTab(QWidget):
             f"{self.slack_lo.value() * sigma:.2f}–{self.slack_hi.value() * sigma:.2f} px, {band}."
         )
 
-    def _use_measured_sigma(self) -> None:
-        if self._measured_sigma is not None:
-            self.sigma.setValue(self._measured_sigma)
-
-    def set_preview_result(self, summary: Optional[dict], level: str = "neutral") -> None:
-        """Report a `pipeline.run_preview_frame` summary -- the fit count,
-        the median fitted width that "Use" would adopt, and how many of
-        those fits the current band would actually have reported."""
-        self._measured_sigma = (summary or {}).get("fit_sigma_median")
-        self.use_measured_button.setEnabled(self._measured_sigma is not None)
-        if not summary:
-            self.use_measured_button.setText("Use")
-            self.set_preview_status("", level)
-            return
-        median = summary.get("fit_sigma_median")
-        self.use_measured_button.setText(
-            f"Use {median:.3f} px" if median is not None else "Use"
-        )
-        parts = [f"{summary.get('n_fits', 0)} fits"]
-        if median is not None:
-            mad = summary.get("fit_sigma_mad")
-            spread = f" ± {mad:.3f}" if mad is not None else ""
-            parts.append(f"median fit_sigma {median:.3f}{spread} px")
-        if summary.get("band") is not None:
-            parts.append(f"{summary.get('n_in_band', 0)} in band")
-        if summary.get("n_failed"):
-            parts.append(f"{summary['n_failed']} failed fits")
-        if summary.get("n_flagged"):
-            parts.append(f"{summary['n_flagged']} aggregate")
-        self.set_preview_status("  ·  ".join(parts), level)
-
-    def set_preview_status(self, text: str, level: str = "neutral") -> None:
-        style_status_label(self.preview_status, level)
-        self.preview_status.setText(text)
-
     def get_sigma(self) -> float:
         return self.sigma.value()
-
-    def get_preview_frame_index(self) -> int:
-        return self._preview_frame.value()
 
     # -- detect -----------------------------------------------------------
 
@@ -797,25 +623,19 @@ class _DetectTab(QWidget):
         setRowVisible` on whichever field object the row was built with."""
         sparse = self.get_detector() == "aguet"
         self.core_form.setRowVisible(self.k_max, not sparse)
-        self.core_form.setRowVisible(self._threshold_row, not sparse)
+        self.core_form.setRowVisible(self.threshold, not sparse)
         self.core_form.setRowVisible(self.significance, sparse)
         self.expert_form.setRowVisible(self._slack_row, not sparse)
         self.expert_form.setRowVisible(self._band_row, not sparse)
         self.expert_form.setRowVisible(self._band_note, not sparse)
         self.expert_form.setRowVisible(self.no_band, not sparse)
-        self.expert_form.setRowVisible(self._selection_row, not sparse)
-        self.expert_form.setRowVisible(self._selection_note, not sparse)
+        self.expert_form.setRowVisible(self.selection, not sparse)
+        self.expert_form.setRowVisible(self.count_penalty, not sparse)
         self.expert_form.setRowVisible(self.boxsize, sparse)
         self.expert_form.setRowVisible(self.itermax, sparse)
-        self._detector_note.setText(
-            "No width-band rejection: every screened fit is reported, so\n"
-            "frames_df's too_narrow/too_wide/edge counts stay 0."
-            if sparse
-            else ""
-        )
-
-    def _on_derive_threshold_toggled(self, checked: bool) -> None:
-        self.threshold.setEnabled(not checked)
+        # The count-rule note gets a row only while it has something to
+        # say: an empty label still takes a row's height and spacing.
+        self._sync_selection_note()
 
     def _on_no_band_toggled(self, checked: bool) -> None:
         self.band_lo.setEnabled(not checked)
@@ -830,6 +650,14 @@ class _DetectTab(QWidget):
             if self.selection.currentData() == "bic"
             else ""
         )
+        self._sync_selection_note()
+
+    def _sync_selection_note(self) -> None:
+        # Called from the selection combo during construction too, before
+        # the expert form (and the detector choice's rows) exist.
+        if hasattr(self, "expert_form"):
+            show = self.get_detector() != "aguet" and bool(self._selection_note.text())
+            self.expert_form.setRowVisible(self._selection_note, show)
 
     def _on_run_button_clicked(self) -> None:
         if self._running:
@@ -849,7 +677,6 @@ class _DetectTab(QWidget):
         self._running = running
         self.run_button.setText("Run detect" if not running else "Cancel")
         self.run_button.setEnabled(True)
-        self.preview_button.setEnabled(not running)
         if running:
             # A previous run may have left this label green/amber/red
             # (set_status's level) -- reset to neutral so in-flight
@@ -876,12 +703,11 @@ class _DetectTab(QWidget):
 
     def set_frame_bounds(self, n_frames: int) -> None:
         """Called once an image's frame count is known -- clamps the
-        frame-range and preview-frame spinboxes' maxima without disturbing
+        frame-range spinboxes' maxima without disturbing
         values the user already chose (Qt clamps the current value down
         automatically if it now exceeds the new maximum)."""
         self.frame_start.setMaximum(max(n_frames - 1, 0))
         self.frame_end.setMaximum(n_frames)
-        self._preview_frame.setMaximum(max(n_frames - 1, 0))
 
     def get_frame_range(self) -> Optional[tuple[int, int]]:
         """`(start, end)`, or `None` for "whole stack" (both spinboxes at
@@ -900,54 +726,6 @@ class _DetectTab(QWidget):
     def get_n_threads(self) -> int:
         return self.n_threads.value()
 
-    def get_use_roi_mask(self) -> bool:
-        return self.use_roi_mask.isChecked()
-
-    def set_use_roi_mask(self, enabled: bool) -> None:
-        self.use_roi_mask.setChecked(enabled)
-
-    def get_roi_layer_names(self) -> list[str]:
-        """Names of the checked Shapes layers, in list order (napari's
-        layer list, top first -- which is also overlap precedence, see
-        `spt_pipeline.rois.label_image`). Empty if none is checked."""
-        return [
-            self.roi_layers.item(i).text()
-            for i in range(self.roi_layers.count())
-            if self.roi_layers.item(i).checkState() == Qt.CheckState.Checked
-        ]
-
-    def set_roi_choices(self, names: list[str], checked: Optional[list[str]] = None) -> None:
-        """Replace the list's entries with the viewer's current Shapes
-        layer names, checking `checked` (the caller's own record of which
-        *layers* are targeted, which is how a rename keeps its check
-        instead of dropping it). With no record (`checked=None`: nothing
-        was ever picked) it keeps whichever checked names survived, else
-        checks the first entry -- the top of napari's layer list, which is
-        the order `ExperimentListWidget` passes them in.
-
-        Signals are blocked across the rebuild so this can't be mistaken
-        for the user picking something: `roiLayerChanged` is meant to fire
-        only when they actually change the targets."""
-        wanted = set(checked) if checked is not None else set(self.get_roi_layer_names())
-        wanted &= set(names)
-        if checked is None and not wanted and names:
-            wanted = {names[0]}
-        blocked = self.roi_layers.blockSignals(True)
-        self.roi_layers.clear()
-        for name in names:
-            item = QListWidgetItem(name)
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Checked if name in wanted else Qt.CheckState.Unchecked)
-            self.roi_layers.addItem(item)
-        self.roi_layers.blockSignals(blocked)
-        self._sync_roi_row()
-
-    def _sync_roi_row(self) -> None:
-        """Grey the list out unless the ROI checkbox is on and there is
-        something to pick, so an empty/irrelevant picker doesn't read as a
-        setting that is doing something."""
-        self.roi_layers.setEnabled(self.use_roi_mask.isChecked() and self.roi_layers.count() > 0)
-
     def get_agg_ratio(self) -> float:
         return self.agg_ratio.value()
 
@@ -963,7 +741,7 @@ class _DetectTab(QWidget):
             )
         return dict(
             k_max=self.k_max.value(),
-            threshold=None if self.derive_threshold.isChecked() else self.threshold.value(),
+            threshold=None if self.threshold.value() == self.threshold.minimum() else self.threshold.value(),
             slack=(self.slack_lo.value(), self.slack_hi.value()),
             band=None if self.no_band.isChecked() else (self.band_lo.value(), self.band_hi.value()),
             selection=self.selection.currentData(),
@@ -1452,7 +1230,7 @@ class _TrackingTab(QWidget):
             "Write the bundle: points.parquet (every detection, unfiltered),\n"
             "tracks.parquet (the tracks that pass the filters above),\n"
             "manifest.json (what every stage ran with, including both filter\n"
-            "specs) and rois.json if an ROI was used.\n\n"
+            "specs) and labels.tif + regions.json if regions were used.\n\n"
             "Nothing is written until you press this -- adjust the filters and\n"
             "press it again to rewrite the same bundle.",
         )
@@ -1498,9 +1276,8 @@ class PipelineParamsWidget(QWidget):
     """Tabbed `DetectTrackParams` form -- Detect / Track, each a
     detect -> filter -> finalize flow (see this module's docstring).
 
-    For the stepwise per-tab buttons: `previewRequested`/`detectRequested`/
-    `trackRequested`/`saveRequested` fire on click; `set_preview_result`/
-    `set_detect_status`/`set_track_status`/`set_save_status` report each
+    For the stepwise per-tab buttons: `detectRequested`/`trackRequested`/
+    `saveRequested` fire on click; `set_detect_status`/`set_track_status`/`set_save_status` report each
     step's result back once `ExperimentListWidget` has run it.
     `pointFiltersChanged`/`trackFiltersChanged` fire whenever a histogram
     handle moves, so the viewer overlay can follow the cut live.
@@ -1511,14 +1288,11 @@ class PipelineParamsWidget(QWidget):
     independent saves, since a linked track table only ever makes sense
     once there are detections to have linked, not the other way round."""
 
-    previewRequested = Signal()
     detectRequested = Signal()
     detectCancelRequested = Signal()
     trackRequested = Signal()
     saveRequested = Signal()
     saveDetectionsRequested = Signal()
-    newRoiRequested = Signal()
-    roiLayerChanged = Signal()
     pointFiltersChanged = Signal()
     trackFiltersChanged = Signal()
     # The pixel size / frame interval override was turned on, off or
@@ -1532,11 +1306,8 @@ class PipelineParamsWidget(QWidget):
         self._detect = _DetectTab()
         self._tracking = _TrackingTab()
 
-        self._detect.previewRequested.connect(self.previewRequested)
         self._detect.runRequested.connect(self.detectRequested)
         self._detect.cancelRequested.connect(self.detectCancelRequested)
-        self._detect.newRoiRequested.connect(self.newRoiRequested)
-        self._detect.roiLayerChanged.connect(self.roiLayerChanged)
         self._detect.filtersChanged.connect(self.pointFiltersChanged)
         self._detect.saveRequested.connect(self.saveDetectionsRequested)
         self._tracking.runRequested.connect(self.trackRequested)
@@ -1621,12 +1392,8 @@ class PipelineParamsWidget(QWidget):
     def get_sigma(self) -> float:
         return self._detect.get_sigma()
 
-    def get_preview_frame_index(self) -> int:
-        return self._detect.get_preview_frame_index()
-
     def get_camera_kwargs(self) -> dict:
-        """The one source of truth for `offset`, shared by preview, detect
-        and (headless) calibration."""
+        """The one source of truth for `offset`."""
         return self._detect.get_camera_kwargs()
 
     def get_detect_kwargs(self) -> dict:
@@ -1644,23 +1411,9 @@ class PipelineParamsWidget(QWidget):
     def get_n_threads(self) -> int:
         return self._detect.get_n_threads()
 
-    def get_use_roi_mask(self) -> bool:
-        return self._detect.get_use_roi_mask()
-
-    def set_use_roi_mask(self, enabled: bool) -> None:
-        self._detect.set_use_roi_mask(enabled)
-
-    def get_roi_layer_names(self) -> list[str]:
-        return self._detect.get_roi_layer_names()
-
-    def set_roi_choices(self, names: list[str], checked: Optional[list[str]] = None) -> None:
-        self._detect.set_roi_choices(names, checked)
-
-    def set_preview_result(self, summary: Optional[dict], level: str = "neutral") -> None:
-        self._detect.set_preview_result(summary, level)
-
-    def set_preview_status(self, text: str, level: str = "neutral") -> None:
-        self._detect.set_preview_status(text, level)
+    @property
+    def regions_panel(self) -> RegionsPanel:
+        return self._detect.regions_panel
 
     def set_detect_status(self, text: str, level: str = "neutral") -> None:
         self._detect.set_status(text, level)
@@ -1701,7 +1454,7 @@ class PipelineParamsWidget(QWidget):
 
     def set_point_filter_source(self, df: Optional[pl.DataFrame]) -> None:
         """Give the Detect tab's filter panel a detections table to draw
-        histograms from -- a preview frame's or a finished run's."""
+        histograms from -- a finished run's."""
         self._detect.filters.set_source(df)
 
     def set_track_filter_source(self, df: Optional[pl.DataFrame]) -> None:

@@ -16,7 +16,7 @@ seeing its result were two different screens, and "Fit selected track"
 pointed at a selection you could not see.
 
 - **Tracks pane** -- one row per track (`qtkit.ColumnTableModel` in
-  a `QTableView`), the single place all per-track numbers live (classical
+  a `QTableView`, folded away by default behind a "Table" header), the single place all per-track numbers live (classical
   MLE, bulk MAP, anisotropy, and any one-off per-track fit, each in its own
   column group), plus a `min_track_length` spinbox and a
   `FeatureFilterPanel` over whatever columns that table currently holds.
@@ -32,7 +32,8 @@ pointed at a selection you could not see.
   boxes that track in the viewer (`self._highlight_layer`, a `Shapes` layer
   holding one rectangle on the track's principal axes -- see
   `oriented_track_box` -- since Tracks layers have no selection-highlight
-  of their own).
+  of their own) and moves the time slider to the track's last frame, so
+  its tail is drawn in full inside the box.
 - **Classical** -- `diffusionkit.classic.analyze_tracks`: per track, the
   Brownian displacement MLE's D (with blur from the camera exposure
   modelled) and its upper limit, read as a log-D histogram; opt-in, the
@@ -394,7 +395,7 @@ class _ProgressRelay(QObject):
 # instead (guaranteed present there), and y/x become the centroid.
 # `loc_id` is a detection's serial number: its min/mean/max are three
 # columns of pure noise in a table that already runs past fifty.
-_QC_SKIP_COLUMNS = frozenset({"track_id", "loc_id", "frame", "y", "x", "track_length", "roi_index"})
+_QC_SKIP_COLUMNS = frozenset({"track_id", "loc_id", "frame", "y", "x", "track_length", "region", "cell"})
 
 # Per-track MLE results this widget broadcasts onto the viewer's Tracks
 # layer as properties, so the trajectories themselves can be colored by
@@ -483,11 +484,12 @@ def _base_track_table(
         .join(qc, on="track_id", how="left")
         .sort("track_id")
     )
-    if "roi" in tracks_df_px.columns:
-        # Which region the track was linked in (`rois.label_points`) --
-        # one per track, since tracking links each ROI on its own.
-        rois = tracks_df_px.group_by("track_id").agg(pl.col("roi").first())
-        table = table.join(rois, on="track_id", how="left")
+    region_cols = [c for c in ("region_class", "cell") if c in tracks_df_px.columns]
+    if region_cols:
+        # Which region the track was linked in (`regions.label_points`) --
+        # one per track, since tracking links each region on its own.
+        regions = tracks_df_px.group_by("track_id").agg(pl.col(c).first() for c in region_cols)
+        table = table.join(regions, on="track_id", how="left")
     # Only the tripled columns are the hideable group; the passed-through
     # per-track ones (duration_s, mean_step_um) are core context.
     hideable = [c for c in qc_columns if any(c.startswith(f"{col}_") for col in per_point)]
@@ -619,10 +621,10 @@ def _format_summary(summary: dict) -> str:
     lines = "\n".join(
         f"{key} = {units.fmt(value, key)}"
         for key, value in summary.items()
-        # Nested records (by_roi, filters, provenance) aren't one number.
+        # Nested records (by_region_class, filters, provenance) aren't one number.
         if not isinstance(value, dict)
     )
-    return lines + _format_mle_by_roi(summary.get("by_roi"))
+    return lines + _format_mle_by_group(summary.get("by_region_class"))
 
 
 _ANISOTROPY_DISPLAY_COLUMNS = [
@@ -651,6 +653,10 @@ def _normalize_anisotropy_table(per_track: pl.DataFrame) -> pl.DataFrame:
     a column doesn't break the table."""
     cols = [c for c in _ANISOTROPY_DISPLAY_COLUMNS if c in per_track.columns]
     return per_track.select(cols)
+
+
+# Qt's "no maximum" for widget sizes; not exported by every qtpy binding.
+_QWIDGETSIZE_MAX = (1 << 24) - 1
 
 
 class _TracksPane(QWidget):
@@ -709,6 +715,7 @@ class _TracksPane(QWidget):
         self._suppress_selection_signal = False
         self._qc_columns: list[str] = []
         self._displayed_df: Optional[pl.DataFrame] = None
+        self._total = 0
         self._joint_plot_window: Optional[PlotWindow] = None
 
         self._min_track_length = QSpinBox()
@@ -742,25 +749,26 @@ class _TracksPane(QWidget):
         # everything else in this widget put together. A FlowLayout wraps
         # to two lines only once the dock is actually too narrow for one.
         # Which region's tracks to show and fit -- only there when the
-        # layer's tracks were linked per ROI (`rois.label_points`), so a
-        # single-field run doesn't carry a control with one choice.
-        self._roi_label = QLabel("ROI:")
-        self._roi_picker = QComboBox()
-        self._roi_picker.setToolTip(
+        # layer's tracks span more than one region class
+        # (`regions.label_points`), so a single-field run doesn't carry a
+        # control with one choice.
+        self._region_label = QLabel("Region:")
+        self._region_picker = QComboBox()
+        self._region_picker.setToolTip(
             "Show (and, with \"restrict fits to filtered tracks\", fit) only the\n"
-            "tracks linked inside one ROI. Each ROI was linked on its own, so\n"
-            "no track spans two."
+            "tracks of one region class (nucleus, cytoplasm, ...). Each region\n"
+            "was linked on its own, so no track spans two."
         )
-        self._roi_picker.currentIndexChanged.connect(lambda _i: self.host.on_filters_changed())
-        self._roi_label.setVisible(False)
-        self._roi_picker.setVisible(False)
+        self._region_picker.currentIndexChanged.connect(lambda _i: self.host.on_filters_changed())
+        self._region_label.setVisible(False)
+        self._region_picker.setVisible(False)
 
         length_label = QLabel("min length:")
         control_row = flow_row(
             length_label,
             self._min_track_length,
-            self._roi_label,
-            self._roi_picker,
+            self._region_label,
+            self._region_picker,
             self._sync_display_checkbox,
             self._qc_columns_checkbox,
         )
@@ -788,6 +796,11 @@ class _TracksPane(QWidget):
         # height while giving all of it back on demand.
         self.table = table_view(self._model)
         self.table.selectionModel().selectionChanged.connect(self._on_selection_changed)
+        # Folded by default: the rows are for troubleshooting a run, not
+        # for reading every time, and unfolded they take most of the dock.
+        # Selection still works folded -- a track clicked in the viewer
+        # selects its row, and the count line below names it.
+        self._table_section = CollapsibleSection("Table", self.table, expanded=False)
 
         self._count_label = status_label("")
 
@@ -797,9 +810,26 @@ class _TracksPane(QWidget):
         layout.addWidget(control_row)
         layout.addWidget(self._filter_section)
         layout.addWidget(self._plot_section)
-        layout.addWidget(self.table, 1)
+        layout.addWidget(self._table_section, 1)
         layout.addWidget(self._count_label)
+        layout.addStretch(0)
         self.setLayout(layout)
+
+        for section in (self._table_section, self._filter_section, self._plot_section):
+            section.toggled.connect(lambda _expanded: QTimer.singleShot(0, self._fit_height))
+        self._fit_height()
+
+    def _fit_height(self) -> None:
+        """With the table folded, cap this pane at its natural height so the
+        splitter hands everything below it to the analysis tabs, rather
+        than leaving a table-sized gap; unfolded, the cap comes off and the
+        splitter is draggable again. Re-run whenever a section folds, since
+        the natural height changes with it."""
+        if self._table_section.is_expanded():
+            self.setMaximumHeight(_QWIDGETSIZE_MAX)
+        else:
+            self.layout().activate()
+            self.setMaximumHeight(self.sizeHint().height())
 
     def min_track_length(self) -> int:
         return self._min_track_length.value()
@@ -819,29 +849,29 @@ class _TracksPane(QWidget):
     def hidden_columns(self) -> list[str]:
         return [] if self.show_qc_columns() else self._qc_columns
 
-    _ALL_ROIS = "All"
+    _ALL_REGIONS = "All"
 
-    def set_roi_choices(self, names: list[str]) -> None:
-        """Offer `names` (the loaded tracks' ROIs) in the ROI picker,
+    def set_region_choices(self, names: list[str]) -> None:
+        """Offer `names` (the loaded tracks' region classes) in the picker,
         keeping the current pick if it survived; hidden with fewer than
         two, where there is nothing to choose between."""
-        current = self._roi_picker.currentText()
-        blocked = self._roi_picker.blockSignals(True)
-        self._roi_picker.clear()
-        self._roi_picker.addItems([self._ALL_ROIS, *names])
+        current = self._region_picker.currentText()
+        blocked = self._region_picker.blockSignals(True)
+        self._region_picker.clear()
+        self._region_picker.addItems([self._ALL_REGIONS, *names])
         if current in names:
-            self._roi_picker.setCurrentText(current)
-        self._roi_picker.blockSignals(blocked)
+            self._region_picker.setCurrentText(current)
+        self._region_picker.blockSignals(blocked)
         visible = len(names) > 1
-        self._roi_label.setVisible(visible)
-        self._roi_picker.setVisible(visible)
+        self._region_label.setVisible(visible)
+        self._region_picker.setVisible(visible)
 
-    def selected_roi(self) -> Optional[str]:
-        """The ROI picked, or None for all of them."""
-        if self._roi_picker.count() <= 2:  # "All" plus at most one ROI
+    def selected_region_class(self) -> Optional[str]:
+        """The region class picked, or None for all of them."""
+        if self._region_picker.count() <= 2:  # "All" plus at most one class
             return None
-        text = self._roi_picker.currentText()
-        return None if not text or text == self._ALL_ROIS else text
+        text = self._region_picker.currentText()
+        return None if not text or text == self._ALL_REGIONS else text
 
     def filtered_track_ids(self) -> Optional[set]:
         """Track ids passing this pane's histogram cuts, or `None` for no
@@ -873,7 +903,7 @@ class _TracksPane(QWidget):
         self._qc_columns_checkbox.setChecked(False)
         self._qc_columns_checkbox.blockSignals(False)
         self._qc_columns = []
-        self.set_roi_choices([])
+        self.set_region_choices([])
         self.filters.set_filters(None)
         self.filters.set_source(None)
         self._model.clear()
@@ -886,12 +916,27 @@ class _TracksPane(QWidget):
         hidden = set(self.hidden_columns())
         self._displayed_df = df
         self._model.set_frame(df.select([c for c in df.columns if c not in hidden]))
-        self._count_label.setText(f"{df.height} of {total} tracks")
+        self._total = total
         style_status_label(
             self._count_label, "ok" if df.height else "caution" if total else "neutral"
         )
         if current is not None:
             self.select_track_id(current)
+        self._update_count_label()
+
+    def _update_count_label(self) -> None:
+        """"n of N tracks", plus the selected track when there is one --
+        with the table folded, this line is the only place the selection
+        the Bayesian tab's per-track fit acts on is written down."""
+        if self._displayed_df is None:
+            return
+        text = f"{self._displayed_df.height} of {self._total} tracks"
+        rows = self.table.selectionModel().selectedRows()
+        if rows:
+            track_id = self._model.row_dict(rows[0].row()).get("track_id")
+            if track_id is not None:
+                text += f" · track {int(track_id)} selected"
+        self._count_label.setText(text)
 
     def set_plot_columns(
         self, df: pl.DataFrame, prefer_x: Optional[str] = None, prefer_y: Optional[str] = None
@@ -933,6 +978,7 @@ class _TracksPane(QWidget):
         self._joint_plot_window.show_figure(figure)
 
     def _on_selection_changed(self, *_args) -> None:
+        self._update_count_label()
         if self._suppress_selection_signal:
             return
         indexes = self.table.selectionModel().selectedRows()
@@ -1009,9 +1055,9 @@ class _ClassicalTab(QWidget):
         self._analysis: Optional[ClassicAnalysis] = None
         self._comparison: Optional[ClassicAnalysis] = None
         self._summary_values: Optional[dict] = None
-        # `summarize_mle` per ROI, when the analysed tracks span more than
+        # `summarize_mle` per region class, when the analysed tracks span more than
         # one -- shown under the pooled summary and saved beside it.
-        self._summary_by_roi: Optional[dict] = None
+        self._summary_by_group: Optional[dict] = None
         self._plot_window: Optional[PlotWindow] = None
         self._hist_window: Optional[PlotWindow] = None
         self._msd_plot_window: Optional[PlotWindow] = None
@@ -1134,14 +1180,14 @@ class _ClassicalTab(QWidget):
         return self._summary_values
 
     @property
-    def summary_by_roi(self) -> Optional[dict]:
-        return self._summary_by_roi
+    def summary_by_group(self) -> Optional[dict]:
+        return self._summary_by_group
 
     def reset(self) -> None:
         self._analysis = None
         self._comparison = None
         self._summary_values = None
-        self._summary_by_roi = None
+        self._summary_by_group = None
         self._status.setText("")
         style_status_label(self._status)
         self._summary.setText("")
@@ -1239,10 +1285,10 @@ class _ClassicalTab(QWidget):
         self._comparison = comparison
         summary = summarize_mle(analysis.fits)
         self._summary_values = summary
-        groups = self.host.track_rois()
+        groups = self.host.track_groups()
         if groups is not None:
             groups = groups.filter(pl.col("track_id").is_in(mle_rows(analysis.fits)["track_id"]))
-        self._summary_by_roi = (
+        self._summary_by_group = (
             summarize_mle_by_group(analysis.fits, groups)
             if groups is not None and groups["group"].n_unique() > 1
             else None
@@ -1254,7 +1300,7 @@ class _ClassicalTab(QWidget):
         self._status.setText(f"{n_ok} of {summary['n_tracks']} tracks resolved motion")
         style_status_label(self._status, "ok" if summary["median_D_um2_s"] is not None else "caution")
         self._summary.setText(
-            _format_mle_summary(summary, analysis) + _format_mle_by_roi(self._summary_by_roi)
+            _format_mle_summary(summary, analysis) + _format_mle_by_group(self._summary_by_group)
         )
 
         display = mle_track_table(analysis.fits)
@@ -1274,7 +1320,7 @@ class _ClassicalTab(QWidget):
         figure = plot_d_histogram(
             mle_rows(self._analysis.fits),
             self._summary_values,
-            groups=self.host.track_rois() if self._summary_by_roi else None,
+            groups=self.host.track_groups() if self._summary_by_group else None,
         )
         if self._hist_window is None:
             self._hist_window = PlotWindow("Brownian MLE: D histogram", parent=self)
@@ -1286,7 +1332,7 @@ class _ClassicalTab(QWidget):
         figure = plot_d_z_joint(
             mle_rows(self._analysis.fits),
             self._summary_values,
-            groups=self.host.track_rois() if self._summary_by_roi else None,
+            groups=self.host.track_groups() if self._summary_by_group else None,
         )
         if self._plot_window is None:
             self._plot_window = PlotWindow("Brownian MLE: D vs z", parent=self)
@@ -1321,14 +1367,14 @@ class _ClassicalTab(QWidget):
         style_status_label(self._status, "error")
 
 
-def _format_mle_by_roi(by_roi: Optional[dict]) -> str:
-    """One line per ROI under the pooled summary: each region was linked
+def _format_mle_by_group(by_group: Optional[dict]) -> str:
+    """One line per region class under the pooled summary: each region was linked
     on its own, and whether its motion differs from the others' is the
     reason it was drawn."""
-    if not by_roi:
+    if not by_group:
         return ""
-    lines = ["", "by ROI:"]
-    for name, summary in by_roi.items():
+    lines = ["", "by region class:"]
+    for name, summary in by_group.items():
         line = (
             f"  {name}: {summary['n_tracks']} tracks · median D = "
             f"{units.fmt(summary.get('median_D_um2_s'), 'D_um2_s')}"
@@ -2015,6 +2061,8 @@ class DiffusionAnalysisWidget(QWidget):
         # minute (scanning rows vs. reading a fit's output), so it is a
         # drag, not a fixed ratio. Neither pane is collapsible: dragging
         # either to zero would hide the selection the other one acts on.
+        # The table itself folds instead (`_TracksPane._fit_height`), and
+        # while it is folded the tracks pane is capped at its own height.
         splitter = QSplitter(Qt.Orientation.Vertical)
         splitter.addWidget(self._tracks_pane)
         splitter.addWidget(tabs)
@@ -2070,20 +2118,24 @@ class DiffusionAnalysisWidget(QWidget):
         (`_rebuild_track_table`) and what a fit run optionally restricts to
         (`diffkit_tracks_for_fit`)."""
         ids = self._passing_track_ids()
-        roi = self._tracks_pane.selected_roi()
-        if roi is not None and self._base_track_df is not None and "roi" in self._base_track_df.columns:
-            roi_ids = set(self._base_track_df.filter(pl.col("roi") == roi)["track_id"].to_list())
-            ids = roi_ids if ids is None else (ids & roi_ids)
+        region = self._tracks_pane.selected_region_class()
+        if region is not None and self._base_track_df is not None and "region_class" in self._base_track_df.columns:
+            region_ids = set(self._base_track_df.filter(pl.col("region_class") == region)["track_id"].to_list())
+            ids = region_ids if ids is None else (ids & region_ids)
         return ids
 
-    def track_rois(self) -> Optional[pl.DataFrame]:
-        """`(track_id, group)` naming each loaded track's ROI, or None when
-        the tracks weren't linked across more than one -- what per-ROI
+    def track_groups(self) -> Optional[pl.DataFrame]:
+        """`(track_id, group)` naming each loaded track's region class, or
+        None when the tracks don't span more than one -- what per-class
         summaries and plot colors are keyed on."""
         base = self._base_track_df
-        if base is None or "roi" not in base.columns or base["roi"].drop_nulls().n_unique() < 2:
+        if (
+            base is None
+            or "region_class" not in base.columns
+            or base["region_class"].drop_nulls().n_unique() < 2
+        ):
             return None
-        return base.select("track_id", pl.col("roi").alias("group"))
+        return base.select("track_id", pl.col("region_class").alias("group"))
 
     def on_filters_changed(self) -> None:
         self._rebuild_track_table()
@@ -2311,15 +2363,16 @@ class DiffusionAnalysisWidget(QWidget):
             if name != "track_id" and name not in _TRACK_COLOR_COLUMNS
         }
         table = pl.DataFrame({**base_cols, **extra_cols})
-        # The layer carries the ROI as a number (Tracks properties are
-        # numeric); its name comes from the layer's `roi_names` metadata.
-        roi_names = list(layer.metadata.get("roi_names") or [])
-        if "roi_index" in table.columns and roi_names:
+        # The layer carries the region as its label (Tracks properties are
+        # numeric); its class comes from the layer's `region_classes`
+        # metadata ({label: class}).
+        classes = dict(layer.metadata.get("region_classes") or {})
+        if "region" in table.columns and classes:
             lookup = pl.DataFrame(
-                {"roi_index": list(range(len(roi_names))), "roi": roi_names},
-                schema={"roi_index": table.schema["roi_index"], "roi": pl.Utf8},
+                {"region": [int(k) for k in classes], "region_class": list(classes.values())},
+                schema={"region": table.schema["region"], "region_class": pl.Utf8},
             )
-            table = table.join(lookup, on="roi_index", how="left")
+            table = table.join(lookup, on="region", how="left", maintain_order="left")
         return table
 
     def _adopt_track_table(self, layer: Tracks, track_points_df: pl.DataFrame) -> None:
@@ -2425,7 +2478,7 @@ class DiffusionAnalysisWidget(QWidget):
 
         self._tracks_pane.reset()
         self._tracks_pane.set_qc_columns(self._qc_columns)
-        self._tracks_pane.set_roi_choices(self._roi_names_loaded())
+        self._tracks_pane.set_region_choices(self._region_classes_loaded())
         self._classical.reset()
         self._bayesian.reset()
         self._anisotropy.reset()
@@ -2472,22 +2525,18 @@ class DiffusionAnalysisWidget(QWidget):
             return
         self._adopt_track_table(layer, track_points_df)
         self._tracks_pane.set_qc_columns(self._qc_columns)
-        self._tracks_pane.set_roi_choices(self._roi_names_loaded())
+        self._tracks_pane.set_region_choices(self._region_classes_loaded())
         self._rebuild_track_table()
         self._update_spatial_map_layer()
         self._bayesian.refresh_map_histogram()
         self._update_save_enabled()
 
-    def _roi_names_loaded(self) -> list[str]:
-        """The ROIs the loaded tracks were linked in, in the layer's own
-        order (its `roi_names` metadata) where that is known."""
+    def _region_classes_loaded(self) -> list[str]:
+        """The region classes the loaded tracks were linked in."""
         base = self._base_track_df
-        if base is None or "roi" not in base.columns:
+        if base is None or "region_class" not in base.columns:
             return []
-        present = set(base["roi"].drop_nulls().to_list())
-        layer = self._tracks_layer
-        ordered = list(layer.metadata.get("roi_names") or []) if layer is not None else []
-        return [n for n in ordered if n in present] + sorted(present - set(ordered))
+        return sorted(set(base["region_class"].drop_nulls().to_list()))
 
     def _update_save_enabled(self) -> None:
         has_results = (
@@ -2626,6 +2675,7 @@ class DiffusionAnalysisWidget(QWidget):
     def on_table_row_selected(self, track_id: int) -> None:
         self._current_track_id = track_id
         self._update_highlight_layer(track_id)
+        self._jump_to_track_end(track_id)
 
     def on_viewer_track_clicked(self, track_id: int) -> None:
         self._current_track_id = track_id
@@ -2678,6 +2728,21 @@ class DiffusionAnalysisWidget(QWidget):
             # default track_id of 0 whenever the box had been cleared.
             self._highlight_layer.data = [corners]
             self._highlight_layer.features = features
+
+    def _jump_to_track_end(self, track_id: int) -> None:
+        """Move the time slider to the track's last frame, where the Tracks
+        layer draws its tail in full, ending inside the box. Only for
+        table selections -- a track clicked in the viewer is already on
+        screen, and yanking the slider away from it would be jarring."""
+        layer = self._live(self._tracks_layer)
+        if layer is None or self._tracks_df_px is None:
+            return
+        last = self._tracks_df_px.filter(pl.col("track_id") == track_id)["frame"].max()
+        if last is None:
+            return
+        # Tracks data is [id, t, y, x]: time is the layer's first axis.
+        world_axis = self.viewer.dims.ndim - layer.ndim
+        self.viewer.dims.set_point(world_axis, last * layer.scale[0] + layer.translate[0])
 
     def _sync_tracks_layer_display(self, filtered_ids: Optional[set]) -> None:
         """When the tracks pane's "sync viewer" checkbox is on,
@@ -2808,8 +2873,8 @@ class DiffusionAnalysisWidget(QWidget):
 
     def _passing_track_ids(self) -> Optional[set]:
         """Tracks passing the pane's length and histogram cuts -- the
-        quality filters, as opposed to its ROI picker, which is a view
-        (every row carries its `roi`). None when no cut is set."""
+        quality filters, as opposed to its region picker, which is a view
+        (every row carries its `region_class`). None when no cut is set."""
         ids = None
         min_len = self._tracks_pane.min_track_length()
         if min_len > 1 and self._base_track_df is not None:
@@ -2907,12 +2972,12 @@ class DiffusionAnalysisWidget(QWidget):
         if not tables:
             return
         per_track_df = tables[0] if len(tables) == 1 else pl.concat(tables, how="diagonal_relaxed")
-        groups = self.track_rois()
+        groups = self.track_groups()
         if groups is not None and "track_id" in per_track_df.columns:
-            # Which ROI each fitted track was linked in, so the saved
-            # table can be split the same way without the tracks file.
+            # Which region class each fitted track was linked in, so the
+            # saved table can be split the same way without the tracks file.
             per_track_df = per_track_df.join(
-                groups.rename({"group": "roi"}).with_columns(
+                groups.rename({"group": "region_class"}).with_columns(
                     pl.col("track_id").cast(per_track_df.schema["track_id"])
                 ),
                 on="track_id",
@@ -2940,8 +3005,8 @@ class DiffusionAnalysisWidget(QWidget):
                 "msd_comparison_exposure_s": 0.0 if self._classical_comparison is not None else None,
                 **self._classical.summary_values,
             }
-            if self._classical.summary_by_roi:
-                summary["by_roi"] = self._classical.summary_by_roi
+            if self._classical.summary_by_group:
+                summary["by_region_class"] = self._classical.summary_by_group
 
         summary["tracks_summary_filters"] = self._summary_filter_record()
         summary["repo_shas"] = _analysis_repo_shas()

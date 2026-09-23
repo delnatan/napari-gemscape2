@@ -130,7 +130,7 @@ def plot_d_z_joint(
     `summary` is `diffusion.summarize_mle` over the same rows.
 
     `groups` (`track_id`, `group`), when it names more than one group --
-    the ROIs a run was split into -- colors the scatter and the D marginal
+    the region classes a run was split into -- colors the scatter and the D marginal
     by group, so whether the regions' populations separate is read off
     the same figure. The z marginal and its N(0,1) reference stay pooled:
     the reference is the same for every group.
@@ -172,7 +172,7 @@ def plot_d_z_joint(
         )
         g.ax_marg_x.set_xlabel("")
         g.ax_marg_x.set_ylabel("")
-        g.ax_joint.legend(title="ROI", fontsize=8, title_fontsize=8, loc="lower right")
+        g.ax_joint.legend(title="Region", fontsize=8, title_fontsize=8, loc="lower right")
 
     # z is shown whole (it is a score, not a quantity with outliers to
     # trim), with the axis never narrower than ±4 so the N(0,1) reference
@@ -236,7 +236,7 @@ def plot_d_histogram(
     the median of their upper limits instead of letting them vanish.
 
     `groups` (`track_id`, `group`), when it names more than one group --
-    the ROIs a run was split into -- draws one step histogram per group
+    the region classes a run was split into -- draws one step histogram per group
     on shared bins, so whether the regions' D distributions separate is
     read off the same axes.
     """
@@ -256,7 +256,7 @@ def plot_d_histogram(
             sns.histplot(data=pdf, x="x", hue="group", ax=ax, bins=bins, element="step", fill=False)
             legend = ax.get_legend()
             if legend is not None:
-                legend.set_title("ROI")
+                legend.set_title("Region")
     median = summary.get("median_D_um2_s")
     q25, q75 = summary.get("q25_D_um2_s"), summary.get("q75_D_um2_s")
     if q25 and q75:

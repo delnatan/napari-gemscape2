@@ -43,7 +43,8 @@ results/<result_id>/
     points.parquet
     tracks.parquet
     manifest.json
-    rois.json              (optional — only if an ROI was used)
+    labels.tif             (optional — only if regions were used)
+    regions.json           (alongside labels.tif)
 ```
 
 `points.parquet` is `spotsolve.loctable`'s localization table verbatim — one row
@@ -52,17 +53,22 @@ per detection, carrying `se_y`/`se_x` (per-detection CRLB), `flux`, `bg`,
 same table with a `track_id` column added, so every detector column survives
 linking and stays available for QC downstream.
 
-**Several ROIs** can be checked at once in the Detect tab — each Shapes layer is
-one region, named after the layer. Detections are then labeled with the region
-they fall in (`roi`/`roi_index` columns; where regions overlap, the one higher in
-napari's layer list wins), tracking links each region separately with its own
-fitted parameters (so no track crosses a boundary, and the manifest carries a
-`track_summary_by_roi`), and the Diffusion panel can filter to one ROI and
-reports the classical D summary (and z, when computed) per ROI.
+**Regions** are painted on a napari Labels layer (Detect tab → "New regions
+layer"). Each label value is one region, and each pixel belongs to exactly one
+label, so painting a nucleus over its cell cuts it out of the cell's cytoplasm.
+A table in the Detect tab gives each label a **class** (cytoplasm, nucleus, or
+any class you add) and a **cell** id; "New cell" and "Add nucleus" pick the next
+free label and fill these in. Only painted pixels are localized (label 0 is
+background). Detections are labeled with `region` (the label), `region_class`
+and `cell`. Tracking links each region separately, so no track crosses a
+boundary, with link parameters fitted per class (the manifest carries
+`track_summary_by_class`). The Diffusion panel can filter to one class and
+reports the classical D summary (and z, when computed) per class. Bundles from
+before this change keep their `rois.json`, but its polygons are no longer read.
 
 Reopening a row that already has a bundle resumes it: the saved points are the
 session's detections, so Track links them without re-running detect, and the
-saved ROIs come back checked.
+saved regions come back as the picked regions layer.
 
 Nothing a QC decision rejects is deleted. Over-bright detections are **flagged**
 (`is_aggregate`), and the histogram filters described below are recorded as
@@ -85,16 +91,15 @@ each handle moves, so a spot that fails a cut leaves the image while the cut is
 being made. Nothing is written to disk until *Save results*, so the cuts are
 chosen against a finished stage's real output rather than guessed at beforehand.
 
-This is also how the PSF width is measured, which is why there is no calibration
-step any more. **Preview frame** localizes one frame with the reporting band off
-— every fit, including the ones a real run would reject — and reports the median
-`fit_sigma`; **Use** adopts it. That is one round of what
-`spotsolve.calibrate_sigma` iterates internally, and it converges just as fast (on
-a synthetic field: 1.100 → 1.4208 → 1.4197 against a true 1.45), with the
-distribution on screen throughout. A bimodal or ragged `fit_sigma` — two focal
-planes, junk being fitted as signal — becomes something you see rather than
-something a median averages away. `calibrate_sigma` is still what the headless
-`spt detect-track` uses, where nobody is looking at a histogram.
+This is also how the PSF width is measured; there is no calibration or preview
+step. Set `sigma` on the Detect page, run detect on a few frames (the frame
+range), and read the `fit_sigma` histogram on the Filter page: its peak is the
+width to set. Run again and it should stop moving. A bimodal or ragged
+`fit_sigma` (two focal planes, junk being fitted as signal) is something you see
+rather than something a median averages away. One caveat: a run reports only fits
+inside the band (0.8–2.0 × sigma by default), so a sigma set far too high shows
+as a pile-up at the histogram's low edge rather than a peak. The expert
+"report every fit (no band)" box lifts that for one diagnostic run.
 
 One unit caveat, since two are in play: `sigma` is in **pixels**, while `slack`
 and `band` are **multiples of whatever sigma the search is running at**
@@ -199,11 +204,9 @@ spt detect-track config.toml
 results_root = "results"
 
 [params]
-# Give `sigma` (px) to use a measured width directly — e.g. one settled on
-# interactively with Preview frame. Omit it and each file is calibrated on its
-# own, with `sigma_init` as that fit's starting guess, which is usually what a
-# folder of separate acquisitions wants.
-sigma_init = 1.3
+# PSF width in px -- required. Read it off the fit_sigma histogram of a few
+# detected frames in the napari widget.
+sigma = 1.3
 min_track_length = 2
 # `offset` is the only camera fact spotsolve needs -- noise is measured
 # from each frame directly.
@@ -223,8 +226,9 @@ result_id = "beads_dense"   # optional, defaults to the stem
 ```
 
 Interactive: open napari and use the "Experiment list" dock widget to browse a
-folder of raw images and work one image through **Detect** (PSF width via
-Preview frame, detection knobs, then filters on what it found) and **Track**
+folder of raw images and work one image through **Detect** (PSF width and
+detection knobs, then filters on what it found, where `fit_sigma` settles the
+width) and **Track**
 (link, optionally with flux as a second link cue, then filters on the
 tracks), pressing *Save results* when the result is worth keeping. The "Diffusion analysis" widget then reads the tracks layer for
 the classical per-track Brownian MLE — by default just `D` (with its upper limit
@@ -236,7 +240,7 @@ experiment's tracks from and to pool across experiments (*Export CSV…* writes
 the same table as CSV). Every track is a row, filtered-out and unresolved ones
 included, with:
 
-- identity: `result_id` (the bundle), `track_id`, `roi`, and `passes_filters`
+- identity: `result_id` (the bundle), `track_id`, `region_class`, `cell`, and `passes_filters`
   (the tracks pane's length and histogram cuts, recorded in
   `diffusion_summary.json`);
 - size and position: `track_length`, `duration_s`, `mean_step_um`, mean

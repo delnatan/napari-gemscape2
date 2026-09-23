@@ -4,7 +4,8 @@ A results bundle is a directory:
     <result_dir>/points.parquet
     <result_dir>/tracks.parquet  (optional -- only once tracking has been saved)
     <result_dir>/manifest.json
-    <result_dir>/rois.json      (optional -- only if an ROI was used)
+    <result_dir>/labels.tif     (optional -- only if regions were used)
+    <result_dir>/regions.json   (alongside labels.tif)
 
 Detection and tracking are two files, saved by two different actions
 (`write_result` for both, `write_detection_result` for points alone) -- a
@@ -15,15 +16,10 @@ that: it returns an empty `tracks_df` rather than raising when
 
 The source image is referenced by path in the manifest, not copied.
 
-`rois.json`, when present, is a JSON list of `{"name": ..., "polygons":
-[[[y, x], ...], ...]}` records -- see `spt_pipeline.rois` for why every ROI
-shape is flattened to a polygon regardless of how it was drawn (rectangle/
-ellipse/polygon) and for the napari Shapes-layer <-> polygon conversion.
-`name` is the napari layer name the ROI was drawn on, so reloading a bundle
-(`viewer.add_result_layers`) recreates a Shapes layer under that same
-name -- both to reproduce the analysis (rebuild the same boolean mask) and
-to reproduce the visualization, without storing the image-sized mask array
-itself.
+`labels.tif` is the painted regions image (uint16, 0 = background) and
+`regions.json` names each of its labels (`regions.Regions.to_json`) -- see
+`spt_pipeline.regions`. Reloading a bundle (`viewer.show_result`) adds the
+image back as a Labels layer, so the same regions can be reused or edited.
 """
 
 from __future__ import annotations
@@ -33,12 +29,17 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import polars as pl
+import tifffile
+
+from spt_pipeline.regions import LABELS_DTYPE, Regions
 
 POINTS_FILENAME = "points.parquet"
 TRACKS_FILENAME = "tracks.parquet"
 MANIFEST_FILENAME = "manifest.json"
-ROIS_FILENAME = "rois.json"
+LABELS_FILENAME = "labels.tif"
+REGIONS_FILENAME = "regions.json"
 DIFFUSION_FITS_FILENAME = "diffusion_fits.parquet"
 DIFFUSION_SUMMARY_FILENAME = "diffusion_summary.json"
 # One row per track: identity, size, position, shape, mean detection QC
@@ -100,33 +101,28 @@ def write_result(
     points_df: pl.DataFrame,
     tracks_df: pl.DataFrame,
     manifest: dict,
-    rois: list[dict] | None = None,
+    labels: np.ndarray | None = None,
+    regions: Regions | None = None,
 ) -> None:
-    """`rois`, if given and non-empty, is written to `rois.json` (see
-    `spt_pipeline.rois.shapes_layer_to_roi` for how to build one from a
-    napari Shapes layer). A stale `rois.json` from a previous run of this
-    same bundle is removed when `rois` is `None`/empty, so a re-run without
-    an ROI doesn't leave behind a region that no longer applies."""
+    """`labels`/`regions`, if given, are written to `labels.tif` and
+    `regions.json` (see `_write_regions`)."""
     result_dir = Path(result_dir)
     result_dir.mkdir(parents=True, exist_ok=True)
     points_df.write_parquet(result_dir / POINTS_FILENAME)
     tracks_df.write_parquet(result_dir / TRACKS_FILENAME)
     (result_dir / MANIFEST_FILENAME).write_text(json.dumps(manifest, indent=2))
-    rois_path = result_dir / ROIS_FILENAME
-    if rois:
-        rois_path.write_text(json.dumps(rois, indent=2))
-    else:
-        rois_path.unlink(missing_ok=True)
+    _write_regions(result_dir, labels, regions)
 
 
 def write_detection_result(
     result_dir: str | Path,
     points_df: pl.DataFrame,
     manifest: dict,
-    rois: list[dict] | None = None,
+    labels: np.ndarray | None = None,
+    regions: Regions | None = None,
 ) -> None:
     """The Detect stage's own save: `points.parquet` and `manifest.json`
-    (plus `rois.json`) alone, usable before tracking has run at all.
+    (plus the regions) alone, usable before tracking has run at all.
 
     Removes a stale `tracks.parquet`: whatever tracks it held were linked
     from a `points.parquet` that this call just replaced, so keeping it
@@ -137,27 +133,43 @@ def write_detection_result(
     result_dir.mkdir(parents=True, exist_ok=True)
     points_df.write_parquet(result_dir / POINTS_FILENAME)
     (result_dir / MANIFEST_FILENAME).write_text(json.dumps(manifest, indent=2))
-    rois_path = result_dir / ROIS_FILENAME
-    if rois:
-        rois_path.write_text(json.dumps(rois, indent=2))
-    else:
-        rois_path.unlink(missing_ok=True)
+    _write_regions(result_dir, labels, regions)
     (result_dir / TRACKS_FILENAME).unlink(missing_ok=True)
 
 
-def load_result(result_dir: str | Path) -> tuple[pl.DataFrame, pl.DataFrame, dict, list[dict]]:
-    """Returns `(points_df, tracks_df, manifest, rois)` -- `rois` is `[]`
-    for a bundle written before ROI persistence, or one that simply never
-    used one; `tracks_df` is an empty `DataFrame` (rather than raising) for
-    a detections-only bundle written by `write_detection_result`."""
+def _write_regions(result_dir: Path, labels: np.ndarray | None, regions: Regions | None) -> None:
+    """`labels.tif` + `regions.json`, or -- with no labels -- remove any
+    stale pair from a previous run of this bundle, so a re-run without
+    regions doesn't leave behind ones that no longer apply."""
+    labels_path = result_dir / LABELS_FILENAME
+    regions_path = result_dir / REGIONS_FILENAME
+    if labels is not None and regions is not None:
+        tifffile.imwrite(labels_path, np.asarray(labels, dtype=LABELS_DTYPE), compression="zlib")
+        regions_path.write_text(json.dumps(regions.to_json(), indent=2))
+    else:
+        labels_path.unlink(missing_ok=True)
+        regions_path.unlink(missing_ok=True)
+
+
+def load_result(
+    result_dir: str | Path,
+) -> tuple[pl.DataFrame, pl.DataFrame, dict, np.ndarray | None, Regions | None]:
+    """Returns `(points_df, tracks_df, manifest, labels, regions)` --
+    `labels`/`regions` are None for a bundle that never used regions;
+    `tracks_df` is an empty `DataFrame` (rather than raising) for a
+    detections-only bundle written by `write_detection_result`."""
     result_dir = Path(result_dir)
     points_df = pl.read_parquet(result_dir / POINTS_FILENAME)
     tracks_path = result_dir / TRACKS_FILENAME
     tracks_df = pl.read_parquet(tracks_path) if tracks_path.exists() else pl.DataFrame()
     manifest = json.loads((result_dir / MANIFEST_FILENAME).read_text())
-    rois_path = result_dir / ROIS_FILENAME
-    rois = json.loads(rois_path.read_text()) if rois_path.exists() else []
-    return points_df, tracks_df, manifest, rois
+    labels = regions = None
+    labels_path = result_dir / LABELS_FILENAME
+    regions_path = result_dir / REGIONS_FILENAME
+    if labels_path.exists() and regions_path.exists():
+        labels = tifffile.imread(labels_path).astype(LABELS_DTYPE, copy=False)
+        regions = Regions.from_json(json.loads(regions_path.read_text()))
+    return points_df, tracks_df, manifest, labels, regions
 
 
 def write_diffusion_results(
@@ -166,7 +178,7 @@ def write_diffusion_results(
     summary: dict,
     tracks_summary_df: pl.DataFrame | None = None,
 ) -> None:
-    """Diffusion-widget results, written like `rois.json`: an optional
+    """Diffusion-widget results, written like the regions: an optional
     extra on top of the core points/tracks/manifest bundle, not every
     bundle has one. `per_track_df` holds one row per (track_id, method) --
     the classical run's fits and any Bayesian per-track fits the user has
