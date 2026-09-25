@@ -353,10 +353,12 @@ class _ProgressRelay(QObject):
 # Tracks layer as properties, so the trajectories themselves can be
 # colored by them (layer controls -> color by). `log10_D_median` rather
 # than D itself: a Tracks layer colormap spans min..max linearly, and D
-# spans decades. Written by this widget, so they are dropped again
-# whenever it reads the layer back (`_layer_track_table`) -- otherwise
-# they would come back as "detection QC" columns.
-_TRACK_COLOR_COLUMNS = ("log10_D_median", "alpha_median")
+# spans decades. `D_info_bits` is already on a log scale; `D_motion_lrt`
+# spans decades and is left to the spatial map's log-scale option. Written
+# by this widget, so they are dropped again whenever it reads the layer
+# back (`_layer_track_table`) -- otherwise they would come back as
+# "detection QC" columns.
+_TRACK_COLOR_COLUMNS = ("log10_D_median", "D_info_bits", "alpha_median")
 
 # "No exposure seen yet" for `DiffusionAnalysisWidget._layer_exposure_s`,
 # distinct from None ("the layer records none").

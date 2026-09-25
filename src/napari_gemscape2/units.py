@@ -58,6 +58,7 @@ ADU = "ADU"
 RAD = "rad"
 FRAMES = "frames"
 POINTS = "points"
+BITS = "bits"
 
 # The same units as matplotlib mathtext. Keyed by the Unicode form above so
 # there is one unit registry rather than two that can drift apart.
@@ -150,6 +151,10 @@ _EXACT: dict[str, Optional[str]] = {
     "posterior_status": None,
     "alpha_status": None,
     "D_at_grid_edge": None,
+    # What a track's D posterior gained over the flat prior, and the
+    # motion-vs-noise likelihood ratio (2 ln LR, dimensionless).
+    "D_info_bits": BITS,
+    "D_motion_lrt": None,
     "log_posterior": None,
     "posterior": None,
     "weight": None,

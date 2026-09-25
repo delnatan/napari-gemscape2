@@ -275,6 +275,11 @@ FIT_SCHEMA = {
     "D_low_um2_s": pl.Float64,
     "D_high_um2_s": pl.Float64,
     "D_at_grid_edge": pl.Boolean,
+    # What the track taught about D (KL from the flat prior, in bits --
+    # relative to the grid's range, so comparable only on one grid), and
+    # twice the log likelihood ratio of motion + noise over noise alone.
+    "D_info_bits": pl.Float64,
+    "D_motion_lrt": pl.Float64,
     "alpha_status": pl.String,
     "alpha_median": pl.Float64,
     "alpha_low": pl.Float64,
@@ -358,6 +363,13 @@ def _at_grid_edge(log_post_D: np.ndarray) -> np.ndarray:
     )
 
 
+def _info_bits(log_post_D: np.ndarray, u_D: np.ndarray) -> np.ndarray:
+    """Per row of `log_post_D`: diffusionkit's `posterior.information_bits`
+    against the flat prior `analyze_posteriors` runs with."""
+    prior = dk_post.flat(u_D)
+    return np.array([dk_post.information_bits(lp, prior) for lp in log_post_D], dtype=float)
+
+
 def analyze_posteriors(
     tracks: pl.DataFrame,
     acquisition: Acquisition,
@@ -389,6 +401,8 @@ def analyze_posteriors(
         pl.col("D_post_median_um2_s").alias("D_median_um2_s"),
         pl.col("D_post_lo_um2_s").alias("D_low_um2_s"),
         pl.col("D_post_hi_um2_s").alias("D_high_um2_s"),
+        pl.col("D_post_info_bits").alias("D_info_bits"),
+        "D_motion_lrt",
     )
     alpha = by_model["posterior_alpha"].select(
         "track_id",
@@ -1082,17 +1096,23 @@ def restore_analysis(
         else:  # alpha ran, and no track got one
             alpha_ids, log_post_alpha = np.empty(0, dtype=np.int64), np.empty((0, options.n_alpha))
 
-    # `D_at_grid_edge` from the posteriors themselves -- a bundle saved
-    # before the column existed gets it too.
+    # `D_at_grid_edge` and `D_info_bits` from the posteriors themselves --
+    # a bundle saved before either column existed gets them too.
+    # `D_motion_lrt` needs the track, not its posterior: an older bundle
+    # restores it as null.
     edge = pl.DataFrame(
-        {"track_id": fitted_ids, "D_at_grid_edge": _at_grid_edge(log_post_D)},
-        schema={"track_id": pl.Int64, "D_at_grid_edge": pl.Boolean},
+        {
+            "track_id": fitted_ids,
+            "D_at_grid_edge": _at_grid_edge(log_post_D),
+            "D_info_bits": _info_bits(log_post_D, options.u_D()),
+        },
+        schema={"track_id": pl.Int64, "D_at_grid_edge": pl.Boolean, "D_info_bits": pl.Float64},
     )
     fits = (
         ran.select(
             pl.col(c).cast(dtype) if c in ran.columns else pl.lit(None, dtype=dtype).alias(c)
             for c, dtype in FIT_SCHEMA.items()
-            if c not in ("n_frames", "message", "D_at_grid_edge")
+            if c not in ("n_frames", "message", "D_at_grid_edge", "D_info_bits")
         )
         .with_columns(
             ran["track_length"].cast(pl.Int64).alias("n_frames"), pl.lit("", dtype=pl.String).alias("message")
