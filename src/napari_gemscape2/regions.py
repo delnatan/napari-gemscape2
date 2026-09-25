@@ -4,15 +4,15 @@
 background: nothing is localized there. Every other value is one region
 *instance*, and each pixel belongs to exactly one of them, so cutting a
 nucleus out of its cell is just painting the nucleus over the cell: the
-pixels change owner, and the cell's label is left as the cytoplasm. No
-drawing order or overlap rule is involved.
+pixels change owner, and the cell keeps the rest. No drawing order or
+overlap rule is involved.
 
-The image carries no meaning by itself, so `Regions` records, per label
-value, its *class* (from a user-editable list, "cytoplasm"/"nucleus" by
-default) and the *cell* it belongs to -- a cell's cytoplasm and its
-nucleus are two labels sharing one cell id. Detections are stamped with
-all three (`label_points`: `region`, `region_class`, `cell`), so pooling
-by class is a `group_by("region_class")` and per-cell work stays possible.
+The image carries no meaning by itself, so `Regions` records a *class*
+name per label value ("cytoplasm", "nucleus", anything). Names may
+repeat: two cells painted as labels 1 and 2, both "cytoplasm", stay two
+instances -- tracking links each label on its own -- and pool as one
+class. Detections are stamped with both (`label_points`: `region`,
+`region_class`), so pooling by class is a `group_by("region_class")`.
 
 A bundle stores these as `labels.tif` and `regions.json` (see
 `napari_gemscape2.results`).
@@ -26,44 +26,35 @@ import numpy as np
 import polars as pl
 
 LABELS_DTYPE = np.uint16
-DEFAULT_CLASSES = ("cytoplasm", "nucleus")
 
 
 @dataclass
 class Region:
     class_: str
-    cell: int
+
+
+def default_class(label: int) -> str:
+    """The name a label gets until it is renamed."""
+    return f"region {label}"
 
 
 @dataclass
 class Regions:
-    """What each label value in a labels image means. `classes` is the
-    list offered for assignment (its order is the display order); `table`
-    maps label value -> `Region`."""
+    """What each label value in a labels image means: `table` maps label
+    value -> `Region`."""
 
-    classes: list[str] = field(default_factory=lambda: list(DEFAULT_CLASSES))
     table: dict[int, Region] = field(default_factory=dict)
 
     def to_json(self) -> dict:
         return {
-            "classes": list(self.classes),
-            "regions": [
-                {"label": label, "class": region.class_, "cell": region.cell}
-                for label, region in sorted(self.table.items())
-            ],
+            "regions": [{"label": label, "class": region.class_} for label, region in sorted(self.table.items())],
         }
 
     @classmethod
     def from_json(cls, data: dict) -> "Regions":
-        table = {
-            int(row["label"]): Region(str(row["class"]), int(row["cell"]))
-            for row in data.get("regions", [])
-        }
-        classes = list(data.get("classes") or DEFAULT_CLASSES)
-        # A class named in the table but missing from the list (hand-edited
-        # JSON) is still a class.
-        classes += [c for c in dict.fromkeys(r.class_ for r in table.values()) if c not in classes]
-        return cls(classes=classes, table=table)
+        # Older bundles also carry a "classes" list and a "cell" per region;
+        # neither means anything now.
+        return cls(table={int(row["label"]): Region(str(row["class"])) for row in data.get("regions", [])})
 
     def next_label(self, labels: np.ndarray | None = None) -> int:
         """The smallest label value above everything in the table and in
@@ -73,13 +64,9 @@ class Regions:
             top = max(top, int(labels.max()))
         return top + 1
 
-    def next_cell(self) -> int:
-        return max((r.cell for r in self.table.values()), default=0) + 1
-
     def class_names(self) -> list[str]:
-        """Classes that some region actually uses, in `classes` order."""
-        used = {r.class_ for r in self.table.values()}
-        return [c for c in self.classes if c in used]
+        """Distinct class names, in label order."""
+        return list(dict.fromkeys(r.class_ for _, r in sorted(self.table.items())))
 
 
 def present_labels(labels: np.ndarray) -> list[int]:
@@ -90,15 +77,15 @@ def present_labels(labels: np.ndarray) -> list[int]:
 
 def sync_table(labels: np.ndarray, regions: Regions) -> Regions:
     """`regions` with its table matched to what `labels` actually holds:
-    a label painted but never assigned gets the first class and a cell id
-    of its own (a new cell); an entry whose pixels were all painted over
-    or erased is dropped. Modifies and returns `regions`."""
+    a label painted but never named gets `default_class`; an entry whose
+    pixels were all painted over or erased is dropped. Modifies and
+    returns `regions`."""
     present = present_labels(labels)
     for label in [k for k in regions.table if k not in set(present)]:
         del regions.table[label]
     for label in present:
         if label not in regions.table:
-            regions.table[label] = Region(regions.classes[0], regions.next_cell())
+            regions.table[label] = Region(default_class(label))
     return regions
 
 
@@ -118,13 +105,12 @@ def class_areas_px(labels: np.ndarray, regions: Regions) -> dict[str, int]:
     return areas
 
 
-REGION_COLUMNS = ("region", "region_class", "cell")
+REGION_COLUMNS = ("region", "region_class")
 
 
 def label_points(points_df: pl.DataFrame, labels: np.ndarray, regions: Regions) -> pl.DataFrame:
     """`points_df` plus `region` (Int32 label value, 0 outside every
-    region), `region_class` (Utf8, null outside or unassigned) and `cell`
-    (Int32, null likewise), read off `labels` at each detection's rounded
+    region) and `region_class` (Utf8, null outside or unassigned), read off `labels` at each detection's rounded
     `(y, x)`. Existing region columns are replaced, so re-labeling a
     loaded table is safe."""
     points_df = points_df.drop([c for c in REGION_COLUMNS if c in points_df.columns])
@@ -132,7 +118,6 @@ def label_points(points_df: pl.DataFrame, labels: np.ndarray, regions: Regions) 
         return points_df.with_columns(
             pl.lit(None, dtype=pl.Int32).alias("region"),
             pl.lit(None, dtype=pl.Utf8).alias("region_class"),
-            pl.lit(None, dtype=pl.Int32).alias("cell"),
         )
     h, w = labels.shape
     yi = np.clip(np.rint(points_df["y"].to_numpy()).astype(np.int64), 0, h - 1)
@@ -142,9 +127,8 @@ def label_points(points_df: pl.DataFrame, labels: np.ndarray, regions: Regions) 
         {
             "region": [int(k) for k in regions.table],
             "region_class": [r.class_ for r in regions.table.values()],
-            "cell": [int(r.cell) for r in regions.table.values()],
         },
-        schema={"region": pl.Int32, "region_class": pl.Utf8, "cell": pl.Int32},
+        schema={"region": pl.Int32, "region_class": pl.Utf8},
     )
     return points_df.with_columns(pl.Series("region", region, dtype=pl.Int32)).join(
         lookup, on="region", how="left", maintain_order="left"

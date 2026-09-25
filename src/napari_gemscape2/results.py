@@ -7,6 +7,11 @@ A results bundle is a directory:
     <result_dir>/labels.tif     (optional -- only if regions were used)
     <result_dir>/regions.json   (alongside labels.tif)
 
+The regions pair can also sit in a result dir on its own, with no
+manifest: a movie's mask painted ahead of analysis (`save_regions`). Any
+run of that movie -- the GUI's, a batch's, the CLI's -- is restricted to
+it, and a movie without one is analyzed over the whole field.
+
 and, once the diffusion widget has saved an analysis of it
 (`write_diffusion_results`):
     <result_dir>/tracks_summary.csv       one row per track
@@ -161,6 +166,29 @@ def write_detection_result(
     (result_dir / TRACKS_FILENAME).unlink(missing_ok=True)
 
 
+def save_regions(result_dir: str | Path, labels: np.ndarray | None, regions: Regions | None) -> None:
+    """A movie's mask on its own, ahead of any results: `labels.tif` +
+    `regions.json`, or -- with no labels -- neither."""
+    result_dir = Path(result_dir)
+    if labels is not None:
+        result_dir.mkdir(parents=True, exist_ok=True)
+    _write_regions(result_dir, labels, regions)
+
+
+def has_regions(result_dir: str | Path) -> bool:
+    return (Path(result_dir) / LABELS_FILENAME).exists() and (Path(result_dir) / REGIONS_FILENAME).exists()
+
+
+def load_regions(result_dir: str | Path) -> tuple[np.ndarray | None, Regions | None]:
+    """`(labels, regions)` saved in `result_dir`, or `(None, None)`."""
+    result_dir = Path(result_dir)
+    if not has_regions(result_dir):
+        return None, None
+    labels = tifffile.imread(result_dir / LABELS_FILENAME).astype(LABELS_DTYPE, copy=False)
+    regions = Regions.from_json(json.loads((result_dir / REGIONS_FILENAME).read_text()))
+    return labels, regions
+
+
 def _write_regions(result_dir: Path, labels: np.ndarray | None, regions: Regions | None) -> None:
     """`labels.tif` + `regions.json`, or -- with no labels -- remove any
     stale pair from a previous run of this bundle, so a re-run without
@@ -187,12 +215,7 @@ def load_result(
     tracks_path = result_dir / TRACKS_FILENAME
     tracks_df = pl.read_parquet(tracks_path) if tracks_path.exists() else pl.DataFrame()
     manifest = json.loads((result_dir / MANIFEST_FILENAME).read_text())
-    labels = regions = None
-    labels_path = result_dir / LABELS_FILENAME
-    regions_path = result_dir / REGIONS_FILENAME
-    if labels_path.exists() and regions_path.exists():
-        labels = tifffile.imread(labels_path).astype(LABELS_DTYPE, copy=False)
-        regions = Regions.from_json(json.loads(regions_path.read_text()))
+    labels, regions = load_regions(result_dir)
     return points_df, tracks_df, manifest, labels, regions
 
 

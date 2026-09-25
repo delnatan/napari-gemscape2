@@ -11,8 +11,10 @@ the CLI would write from the config `batch.write_batch_config` records.
 Only what the template *saved* is reused: detection, linking and
 point/track filters from its manifest, and the diffusion analysis
 settings from its `diffusion_summary.json` (written by the Diffusion
-analysis widget's "Save analysis"). Painted regions are not carried
-over -- every batch movie uses the whole field, as in the CLI.
+analysis widget's "Save analysis"). Regions are per movie, not the
+template's: a movie with a mask saved in its result dir (painted in the
+widget, see `results.save_regions`) is restricted to it, and one without
+is analyzed over the whole field -- the movie list marks which is which.
 """
 
 from __future__ import annotations
@@ -41,7 +43,7 @@ from napari_gemscape2.pipeline import (
     detect_track_params_from_manifest,
 )
 from napari_gemscape2.results import (
-    LABELS_FILENAME,
+    has_regions,
     has_result,
     load_diffusion_summary,
     load_manifest,
@@ -128,11 +130,7 @@ class BatchDialog(QDialog):
         title.setWordWrap(True)
         note = QLabel(
             "Runs this movie's <i>saved</i> settings -- save it first if you changed anything. "
-            + (
-                "Its painted regions are not carried over: batch movies use the whole field."
-                if (template / LABELS_FILENAME).exists()
-                else ""
-            )
+            "Each movie uses its own painted mask, if it has one, and the whole field otherwise."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color: gray;")
@@ -162,7 +160,8 @@ class BatchDialog(QDialog):
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, (image_path, result_dir))
             has_bundle = has_result(result_dir)
-            item.setText(image_path.name + ("   (has results)" if has_bundle else ""))
+            tags = [tag for tag, on in (("masked", has_regions(result_dir)), ("has results", has_bundle)) if on]
+            item.setText(image_path.name + (f"   ({', '.join(tags)})" if tags else ""))
             item.setToolTip(str(image_path))
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             # Unanalyzed, unskipped movies are the usual batch; re-running

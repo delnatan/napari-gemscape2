@@ -253,11 +253,10 @@ def base_track_table(
         .join(qc, on="track_id", how="left")
         .sort("track_id")
     )
-    region_cols = [c for c in ("region_class", "cell") if c in tracks_df_px.columns]
-    if region_cols:
+    if "region_class" in tracks_df_px.columns:
         # Which region the track was linked in (`regions.label_points`) --
         # one per track, since tracking links each region on its own.
-        regions = tracks_df_px.group_by("track_id").agg(pl.col(c).first() for c in region_cols)
+        regions = tracks_df_px.group_by("track_id").agg(pl.col("region_class").first())
         table = table.join(regions, on="track_id", how="left")
     # Only the tripled columns are the hideable group; the passed-through
     # per-track ones (duration_s, mean_step_um) are core context.
@@ -817,7 +816,7 @@ def tracks_summary_table(
     to read an experiment's tracks from, and to pool across experiments.
 
     `base` is the diffusion widget's per-track table (length, centroid in
-    px, shape, `region_class`/`cell`, per-point detection QC aggregated per
+    px, shape, `region_class`, per-point detection QC aggregated per
     track); `results` the per-track analysis columns (posterior medians and
     bounds, and any MSD or NUTS columns), or None before a run. Kept from
     `base`: every column except the per-point min/max. Added: `result_id`
@@ -847,7 +846,7 @@ def tracks_summary_table(
     lead = [
         c
         for c in (
-            "result_id", "track_id", "region_class", "cell", "passes_filters", "track_length",
+            "result_id", "track_id", "region_class", "passes_filters", "track_length",
             "duration_s", "mean_step_um", "x_um", "y_um", "x_px", "y_px",
         )
         if c in table.columns

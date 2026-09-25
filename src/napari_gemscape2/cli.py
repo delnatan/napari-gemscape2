@@ -16,7 +16,7 @@ import typer
 from napari_gemscape2 import units
 from napari_gemscape2.batch import detect_track_bundle
 from napari_gemscape2.results import (
-    LABELS_FILENAME,
+    has_regions,
     has_result,
     load_diffusion_summary,
     load_manifest,
@@ -100,8 +100,6 @@ def detect_track(
     if template is not None:
         inherited = detect_track_params_from_manifest(load_manifest(template))
         _describe_template(template, inherited, param_cfg)
-        if (template / LABELS_FILENAME).exists():
-            typer.echo("  (not carried over: its painted regions -- batch runs use the whole field)")
     param_cfg = {**inherited, **param_cfg}
     if param_cfg.get("sigma") is None:
         raise typer.BadParameter(
@@ -128,6 +126,8 @@ def detect_track(
 
         typer.echo(f"[{result_id}] {image_path}")
         result_dir = results_root / result_id
+        if has_regions(result_dir):
+            typer.echo("  restricted to its saved regions mask (labels.tif)")
         manifest_extra = detect_track_bundle(
             image_path,
             result_dir,

@@ -1166,6 +1166,8 @@ def run_detect_track(
     progress_callback: Optional[ProgressCallback] = None,
     cancel_event: Optional[threading.Event] = None,
     exposure_s: Optional[float] = None,
+    labels: Optional[np.ndarray] = None,
+    regions: Optional[Regions] = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame, dict]:
     """Run the full detect+track pipeline on one timelapse in one call,
     composing `load_session`/`run_detect_step`/`run_track_step` -- for
@@ -1182,6 +1184,11 @@ def run_detect_track(
     `PipelineCancelled`'s docstring for what "cancelled" actually means per
     stage (cooperative, frame-granular for detect, stage-boundary-only for
     track).
+
+    `labels`/`regions`, if given, are the movie's painted regions (see
+    `napari_gemscape2.regions`): only painted pixels are localized, each
+    detection is stamped with its region, and each region is linked on
+    its own -- what the widget does with "restrict to regions" on.
 
     Returns (points_df, tracks_df, manifest_extra) -- `manifest_extra` is
     meant to be passed as `results.build_manifest`'s `params`.
@@ -1203,6 +1210,14 @@ def run_detect_track(
             progress_callback(done, total, stage)
 
     session.sigma = params.sigma
+    mask = None
+    if labels is not None:
+        if labels.shape != session.image.shape[-2:]:
+            raise ValueError(
+                f"its regions mask is {labels.shape}, but a frame is {session.image.shape[-2:]}"
+            )
+        session.labels, session.regions = labels, regions
+        mask = labels > 0
 
     detect_progress = (
         (lambda done, total, stage: report(done, total_steps, stage))
@@ -1218,7 +1233,10 @@ def run_detect_track(
         cancel_event=cancel_event,
         n_threads=params.n_threads,
         detector=params.detector,
+        mask=mask,
     )
+    if session.labels is not None:
+        session.points_df = region_tools.label_points(session.points_df, session.labels, session.regions)
 
     def track_progress(done: int, total: int, stage: str) -> None:
         report(n_frames + done, total_steps, stage)

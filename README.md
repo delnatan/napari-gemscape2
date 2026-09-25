@@ -58,15 +58,22 @@ column survives linking and stays available for QC downstream.
 **Regions** are painted on a napari Labels layer (Detect tab → "New regions
 layer"). Each label value is one region, and each pixel belongs to exactly one
 label, so painting a nucleus over its cell cuts it out of the cell's cytoplasm.
-A table in the Detect tab gives each label a **class** (cytoplasm, nucleus, or
-any class you add) and a **cell** id; "New cell" and "Add nucleus" pick the next
-free label and fill these in. Only painted pixels are localized (label 0 is
-background). Detections are labeled with `region` (the label), `region_class`
-and `cell`. Tracking links each region separately, so no track crosses a
-boundary, with link parameters fitted per class (the manifest carries
-`track_summary_by_class`). The Diffusion panel can filter to one class and
+A table in the Detect tab lists the layer's labels, each with a **name** (its
+class: cytoplasm, nucleus, anything): "+" paints with the next free label, "−"
+(or Delete) erases the selected one, and a row is renamed in place. Names may
+repeat -- two cells both named "cytoplasm" are two regions of one class. Only
+painted pixels are localized (label 0 is background). Detections are labeled
+with `region` (the label) and `region_class` (its name). Tracking links each
+region separately, so no track crosses a boundary, with link parameters fitted
+per class (the manifest carries `track_summary_by_class`). The Diffusion panel can filter to one class and
 reports the classical D summary (and z, when computed) per class. Bundles from
 before this change keep their `rois.json`, but its polygons are no longer read.
+
+A movie's mask is saved to its result folder when you move to another movie
+(until it has results, after which the mask is saved with them), and its row in
+the list is marked with a mask glyph. So you can paint masks across a whole
+folder first, then batch it: masked movies are restricted to their regions, and
+the rest are analyzed over the whole field.
 
 Reopening a row that already has a bundle resumes it: the saved points are the
 session's detections, so Track links them without re-running detect, and the
@@ -244,8 +251,10 @@ save it (*Save results*, then *Save analysis*), and name that bundle as the
 `template`. `detect-track` then reuses the settings in its `manifest.json`
 and `diffusion` reuses those in its `diffusion_summary.json`, with nothing
 copied by hand. Any key written under `[params]` or `[diffusion]` overrides
-the template's. Painted regions are not carried over, because a batch run uses the
-whole field.
+the template's. Regions are per movie, not the template's: an input whose result
+folder already holds a painted mask (`labels.tif` + `regions.json`, saved when
+you leave the movie in the widget) is restricted to it, and one without is
+analyzed over the whole field.
 
 ```toml
 results_root = "results"

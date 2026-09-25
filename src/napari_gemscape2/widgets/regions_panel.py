@@ -4,7 +4,7 @@ and labels a run, and what each of its labels means.
 A region is one label value on a napari Labels layer (see
 `napari_gemscape2.regions`). Painting is napari's own job -- brush, fill,
 polygon and eraser on the layer -- and this panel adds what the image
-can't hold by itself: a class and a cell id per label, edited in a small
+can't hold by itself: a name per label (its class), edited in a small
 table that follows the layer as it is painted (`_on_layer_painted`,
 debounced). Every pixel belongs to one label, so a nucleus painted over
 its cell is cut out of that cell without anything else to do.
@@ -14,11 +14,13 @@ The `Regions` table is kept on the layer itself
 switching layers in the picker, and a bundle reload (`viewer.show_result`
 puts it back there).
 
-"New cell" and "Add nucleus" are shortcuts for the usual workflow: pick
-the next free label, record its class and cell up front, and switch the
-layer to the paint tool. A label painted any other way (napari's own
-label spinbox, say) turns up in the table as a new cell of the first
-class, to be corrected there.
+The table is the layer's label list: selecting a row paints with that
+label, "+" reserves the next free label and switches to the paint tool,
+and "-" (or Delete) erases the selected label's pixels -- through the
+layer's undo history -- and drops its row. A label painted any other way
+(napari's own label spinbox, say) turns up as `region <label>`, to be
+renamed in its row. Names may repeat: each label is still its own
+region, and a name pools them as one class.
 
 Like `params_panel`, this stays viewer-agnostic: `ExperimentListWidget`
 fills the layer picker (`set_layer_choices`), creates new layers on
@@ -38,19 +40,16 @@ from qtpy.QtWidgets import (
     QComboBox,
     QHBoxLayout,
     QHeaderView,
-    QInputDialog,
     QPushButton,
-    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from napari_gemscape2.regions import Region, Regions, present_labels, sync_table
+from napari_gemscape2.regions import Region, Regions, default_class, present_labels, sync_table
 
 METADATA_KEY = "regions"
-_NUCLEUS = "nucleus"
 
 
 def layer_regions(layer) -> Regions:
@@ -60,6 +59,19 @@ def layer_regions(layer) -> Regions:
         regions = Regions()
         layer.metadata[METADATA_KEY] = regions
     return regions
+
+
+class _RegionsTable(QTableWidget):
+    """The label table, with Delete/Backspace asking to remove the
+    selected row."""
+
+    removeRequested = Signal()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self.removeRequested.emit()
+            return
+        super().keyPressEvent(event)
 
 
 class RegionsPanel(QWidget):
@@ -79,7 +91,7 @@ class RegionsPanel(QWidget):
         self.use_mask.setToolTip(
             "Only place emitters on painted pixels of the regions layer\n"
             "(spotsolve's roi argument), and label each detection with the\n"
-            "region it fell in (region, region_class and cell columns).\n"
+            "region it fell in (region and region_class columns).\n"
             "Tracking links each region on its own, so no track crosses a\n"
             "boundary, with link parameters fitted per class. Check it to show\n"
             "the regions layer picker and table."
@@ -94,25 +106,18 @@ class RegionsPanel(QWidget):
         )
         self.new_layer_button.clicked.connect(self.newLayerRequested.emit)
 
-        self.new_cell_button = QPushButton("New cell")
-        self.new_cell_button.setToolTip(
-            "Paint with the next free label, recorded as a new cell of the\n"
-            "first class (cytoplasm by default). Paint the whole cell."
+        self.add_button = QPushButton("+")
+        self.add_button.setToolTip("Paint with the next free label, as a new region to name in its row.")
+        self.add_button.clicked.connect(self._add_region)
+        self.remove_button = QPushButton("\u2212")
+        self.remove_button.setToolTip(
+            "Erase the selected label's pixels and drop its row (Delete in\n"
+            "the table does the same; Ctrl-Z on the layer brings the pixels back)."
         )
-        self.new_cell_button.clicked.connect(self._new_cell)
-        self.add_nucleus_button = QPushButton("Add nucleus")
-        self.add_nucleus_button.setToolTip(
-            "Paint with the next free label, recorded as the nucleus of the\n"
-            "cell selected in the table. Painting it over the cell cuts it\n"
-            "out of the cell's cytoplasm."
-        )
-        self.add_nucleus_button.clicked.connect(self._add_nucleus)
-        self.classes_button = QPushButton("Classes")
-        self.classes_button.setToolTip("Edit the list of region classes (comma-separated).")
-        self.classes_button.clicked.connect(self._edit_classes)
+        self.remove_button.clicked.connect(self._remove_selected)
 
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["", "label", "class", "cell"])
+        self.table = _RegionsTable(0, 3)
+        self.table.setHorizontalHeaderLabels(["", "label", "name"])
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -121,9 +126,9 @@ class RegionsPanel(QWidget):
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.table.setMaximumHeight(8 * self.table.fontMetrics().height() + 24)
         self.table.itemSelectionChanged.connect(self._on_row_selected)
+        self.table.removeRequested.connect(self._remove_selected)
 
         # Two short rows rather than one: checkbox + picker + button side
         # by side set the whole Detect page's minimum width.
@@ -133,10 +138,9 @@ class RegionsPanel(QWidget):
         top.addWidget(self.new_layer_button)
         buttons = QHBoxLayout()
         buttons.setContentsMargins(0, 0, 0, 0)
-        buttons.addWidget(self.new_cell_button)
-        buttons.addWidget(self.add_nucleus_button)
+        buttons.addWidget(self.add_button)
+        buttons.addWidget(self.remove_button)
         buttons.addStretch()
-        buttons.addWidget(self.classes_button)
         # Everything under the checkbox folds away while it is off: a run
         # without regions has no use for the picker or the table.
         self._body = QWidget()
@@ -201,8 +205,7 @@ class RegionsPanel(QWidget):
             layer_regions(layer)
             for emitter in self._layer_emitters(layer):
                 emitter.connect(self._on_layer_painted)
-        self._shown_labels = []
-        self.refresh()
+        self.refresh(force=True)
 
     @staticmethod
     def _layer_emitters(layer) -> list:
@@ -213,9 +216,10 @@ class RegionsPanel(QWidget):
     def _on_layer_painted(self, event=None) -> None:
         self._refresh_timer.start()
 
-    def refresh(self) -> None:
+    def refresh(self, force: bool = False) -> None:
         """Rebuild the table from the layer: one row per painted label,
-        plus the label about to be painted if the buttons reserved it."""
+        plus the label about to be painted if "+" reserved it. Skipped
+        when those labels are unchanged, unless `force`."""
         self._sync_enabled()
         layer = self._layer
         if layer is None:
@@ -230,7 +234,7 @@ class RegionsPanel(QWidget):
         if reserved is not None and pending not in regions.table:
             regions.table[pending] = reserved  # reserved, not painted yet
         shown = sorted(set(present_labels(data)) | ({pending} if reserved else set()))
-        if shown == self._shown_labels:
+        if shown == self._shown_labels and not force:
             return
         self._shown_labels = shown
         blocked = self.table.blockSignals(True)
@@ -241,16 +245,16 @@ class RegionsPanel(QWidget):
             swatch.setBackground(self._label_color(label))
             self.table.setItem(row, 0, swatch)
             self.table.setItem(row, 1, QTableWidgetItem(str(label)))
+            # Editable, offering the names already in use, so a repeated
+            # name is picked rather than retyped.
             combo = QComboBox()
-            combo.addItems(regions.classes)
+            combo.setEditable(True)
+            combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+            combo.addItems(regions.class_names())
             combo.setCurrentText(region.class_)
             combo.currentTextChanged.connect(lambda text, label=label: self._set_class(label, text))
+            combo.lineEdit().editingFinished.connect(self._refresh_name_choices)
             self.table.setCellWidget(row, 2, combo)
-            spin = QSpinBox()
-            spin.setRange(1, 65535)
-            spin.setValue(region.cell)
-            spin.valueChanged.connect(lambda value, label=label: self._set_cell(label, value))
-            self.table.setCellWidget(row, 3, spin)
             if label == pending:
                 self.table.selectRow(row)
         self.table.blockSignals(blocked)
@@ -274,58 +278,59 @@ class RegionsPanel(QWidget):
             self._layer.selected_label = label
 
     def _set_class(self, label: int, name: str) -> None:
-        if self._layer is not None and label in layer_regions(self._layer).table:
+        name = name.strip()
+        if name and self._layer is not None and label in layer_regions(self._layer).table:
             layer_regions(self._layer).table[label].class_ = name
 
-    def _set_cell(self, label: int, cell: int) -> None:
-        if self._layer is not None and label in layer_regions(self._layer).table:
-            layer_regions(self._layer).table[label].cell = cell
+    def _refresh_name_choices(self) -> None:
+        """Offer every row the names in use now, after one was edited."""
+        if self._layer is None:
+            return
+        names = layer_regions(self._layer).class_names()
+        for row in range(self.table.rowCount()):
+            combo = self.table.cellWidget(row, 2)
+            if combo is None:
+                continue
+            blocked = combo.blockSignals(True)
+            current = combo.currentText()
+            combo.clear()
+            combo.addItems(names)
+            combo.setCurrentText(current)
+            combo.blockSignals(blocked)
 
     # -- buttons --
 
-    def _reserve(self, region: Region) -> None:
+    def _add_region(self) -> None:
         layer = self._layer
+        if layer is None:
+            return
         regions = layer_regions(layer)
         label = regions.next_label(np.asarray(layer.data))
-        regions.table[label] = region
+        regions.table[label] = Region(default_class(label))
         layer.selected_label = label
         layer.mode = "paint"
-        self._shown_labels = []
-        self.refresh()
+        self.refresh(force=True)
 
-    def _new_cell(self) -> None:
-        if self._layer is None:
-            return
-        regions = layer_regions(self._layer)
-        self._reserve(Region(regions.classes[0], regions.next_cell()))
-
-    def _add_nucleus(self) -> None:
-        if self._layer is None:
-            return
-        regions = layer_regions(self._layer)
+    def _remove_selected(self) -> None:
+        layer = self._layer
         label = self._selected_label()
-        if label is None or label not in regions.table:
+        if layer is None or label is None:
             return
-        if _NUCLEUS not in regions.classes:
-            regions.classes.append(_NUCLEUS)
-        self._reserve(Region(_NUCLEUS, regions.table[label].cell))
-
-    def _edit_classes(self) -> None:
-        if self._layer is None:
-            return
-        regions = layer_regions(self._layer)
-        text, ok = QInputDialog.getText(
-            self, "Region classes", "Classes (comma-separated):", text=", ".join(regions.classes)
-        )
-        if not ok:
-            return
-        classes = [c.strip() for c in text.split(",") if c.strip()]
-        # A class still assigned to a region can't disappear from the list.
-        classes += [c for c in dict.fromkeys(r.class_ for r in regions.table.values()) if c not in classes]
-        if classes:
-            regions.classes = classes
-            self._shown_labels = []
-            self.refresh()
+        row = self._shown_labels.index(label)
+        layer_regions(layer).table.pop(label, None)
+        # data_setitem, not a plain assignment: it goes on the layer's undo
+        # history, and its paint event refreshes whatever else follows it.
+        indices = np.nonzero(np.asarray(layer.data) == label)
+        if indices[0].size:
+            layer.data_setitem(indices, 0)
+        self.refresh(force=True)
+        # Stay put, so repeated Deletes walk down the list. The rebuild may
+        # already have moved the selection there with signals blocked, so
+        # the layer is told directly rather than through _on_row_selected.
+        if self._shown_labels:
+            row = min(row, len(self._shown_labels) - 1)
+            self.table.selectRow(row)
+            layer.selected_label = self._shown_labels[row]
 
     def _on_picker_changed(self, name: str) -> None:
         if name:
@@ -335,5 +340,5 @@ class RegionsPanel(QWidget):
         self._body.setVisible(self.use_mask.isChecked())
         has_layer = self._layer is not None
         self.layer_picker.setEnabled(self.layer_picker.count() > 0)
-        for widget in (self.new_cell_button, self.add_nucleus_button, self.classes_button, self.table):
+        for widget in (self.add_button, self.remove_button, self.table):
             widget.setEnabled(has_layer)
