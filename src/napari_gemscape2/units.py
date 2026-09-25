@@ -105,16 +105,17 @@ _EXACT: dict[str, Optional[str]] = {
     "frame": None,
     "track_length": POINTS,
     "n_linked_steps": "steps",
-    # Named for the area they are per, not for their own unit -- the one
-    # place a suffix rule would get the wrong answer (`density_um2` is a
-    # count per µm², and `lam_birth_per_px2` a rate per px²).
+    # Named for the area it is per, not for its own unit -- the one place
+    # a suffix rule would get the wrong answer (`density_um2` is a count
+    # per µm²).
     "density_um2": PER_UM2,
-    "lam_birth_per_px2": PER_PX2,
     # Physical scalars carried on the manifest / session.
     "pixel_size_um": "µm/px",
     "dt_s": "s/frame",
     "dt_spread_s": "s",
     "sigma_px": PX,
+    "max_step_px": PX,
+    "rms_step_px": PX,
     "sigma_ci_px": PX,
     "mean_localization_offset_um2": UM2,
     # Dimensionless by construction, listed so they read as "known with no
@@ -125,10 +126,6 @@ _EXACT: dict[str, Optional[str]] = {
     "flux_snr": None,
     "straightness": None,
     "gyration_asymmetry": None,
-    "immobile_fraction": None,
-    "link_margin": "nats",
-    "min_link_margin": "nats",
-    "link_rejected": None,
     # spotsolve's per-fit diagnostics: a `FitFlag` bitmask, and the
     # conditional/marginal Fisher variance ratio per parameter (a pure
     # number; small means strongly coupled to another fitted parameter).
@@ -140,8 +137,6 @@ _EXACT: dict[str, Optional[str]] = {
     "n_locs": None,
     "n_flagged": None,
     "crowding_ratio": None,
-    "p_cont": None,
-    "se_inflate": None,
     # Variance per unit signal, which spotsolve's own schema labels ADU
     # (it is gain-like: ADU² per ADU). Taken from there rather than
     # re-derived, on the principle that this table states what upstream

@@ -774,6 +774,7 @@ class ExperimentListWidget(QWidget):
         # that will fill it in is debounced, and a stale pixel size on
         # screen is worse than none.
         self.params_panel.set_image_metadata(None)
+        self.params_panel.set_stack_shape(None)
         self.list_view.viewport().update()
 
         # Blank the viewer now rather than when the load lands: until then
@@ -884,7 +885,7 @@ class ExperimentListWidget(QWidget):
         self._clear_loading_text()
         image = loaded.image if isinstance(loaded, ResultDisplay) else loaded
         self._loaded = (item, image)
-        self.params_panel.set_frame_bounds(image.image.shape[0])
+        self.params_panel.set_stack_shape(image.image.shape)
         # What the file says about itself, shown on selection rather than
         # only discovered when a run fails on it -- see
         # `PipelineParamsWidget.set_image_metadata`.
@@ -1136,7 +1137,7 @@ class ExperimentListWidget(QWidget):
         except Exception as exc:
             self.params_panel.set_detect_status(f"error: {exc}", level="error")
             return
-        self.params_panel.set_frame_bounds(session.image.shape[0])
+        self.params_panel.set_stack_shape(session.image.shape)
 
         mask = None
         session.labels = session.regions = None
@@ -1240,8 +1241,7 @@ class ExperimentListWidget(QWidget):
     @staticmethod
     def _region_track_text(session: PipelineSession) -> str:
         """One short line per region class for the Track status -- each
-        class was linked with its own fitted parameters (`run_track_step`),
-        so its own D is the number worth reading, not only the pooled one."""
+        class's own D is the number worth reading, not only the pooled one."""
         by_class = (session.track_summary or {}).get("by_class")
         if not by_class:
             return ""
@@ -1251,8 +1251,6 @@ class ExperimentListWidget(QWidget):
                 f"{name}: {row.get('n_tracks', 0)} tracks  "
                 f"D ≈ {units.fmt(row.get('D_est_um2_s'), 'D_est_um2_s')}"
             )
-            if row.get("fell_back_to_pooled"):
-                line += " (too few points to fit alone — pooled link params)"
             lines.append(line)
         return "\n" + "\n".join(lines)
 
@@ -1281,10 +1279,9 @@ class ExperimentListWidget(QWidget):
         emitter.updated.connect(self._on_progress)
         worker = _run_track_worker(
             session,
+            self.params_panel.get_max_step(),
             self.params_panel.get_min_track_length(),
             self.params_panel.get_exclude_flags(),
-            self.params_panel.get_link_with_flux(),
-            self.params_panel.get_min_link_margin(),
             # The Detect tab's cuts decide what the linker sees -- applied
             # here rather than to `points_df`, which keeps every detection
             # (see run_track_step's docstring).
@@ -1306,17 +1303,12 @@ class ExperimentListWidget(QWidget):
         verdict = summary.get("resolvability_verdict", "ok")
         level = {"ok": "ok", "caution": "caution", "unresolvable": "error"}.get(verdict, "neutral")
         message = summary.get("resolvability_message", "")
-        # Both D estimates, because they answer the question two ways: the
-        # MSD moment of the finished tracks, and the linker's own fitted
-        # population mean. Agreement is reassuring; a large gap means the
-        # linking is suspect, and neither number alone would show it.
         cuts = [
             f"{n} {what}"
             for n, what in (
                 (summary.get("n_points_dropped_invalid"), "points without a usable error"),
                 (summary.get("n_points_dropped_flagged"), "flagged points"),
                 (summary.get("n_points_dropped_by_filter"), "points cut by filters"),
-                (summary.get("n_links_rejected"), "links under the margin"),
             )
             if n
         ]
@@ -1324,10 +1316,18 @@ class ExperimentListWidget(QWidget):
         # Units from `napari_gemscape2.units` rather than spelled out here, so
         # this line, the diffusion panel's fit summaries and every plot
         # axis say µm²/s the same way.
+        # The linked steps' rms beside max_step, since "about 3x the rms
+        # step" is the rule max_step is set by -- this is the one place
+        # that rule can be checked against the movie.
+        rms = summary.get("rms_step_px")
+        step_check = (
+            f"  rms step {rms:.2f} px (max step = {session.max_step_used / rms:.1f}×)"
+            if rms
+            else ""
+        )
         self.params_panel.set_track_status(
-            f"{n_tracks} tracks  D ≈ {units.fmt(summary.get('D_est_um2_s'), 'D_est_um2_s')} "
-            f"(linker fit {units.fmt(summary.get('D_link_um2_s'), 'D_link_um2_s')}, "
-            f"immobile {summary.get('immobile_fraction', 0.0):.0%}){filtered}"
+            f"{n_tracks} tracks  D ≈ {units.fmt(summary.get('D_est_um2_s'), 'D_est_um2_s')}"
+            f"{step_check}{filtered}"
             f"{self._region_track_text(session)}\n{message}",
             level=level,
         )
@@ -1852,10 +1852,9 @@ def _run_detect_worker(
 @thread_worker(start_thread=False)
 def _run_track_worker(
     session: PipelineSession,
+    max_step: float,
     min_track_length: int,
     exclude_flags: int,
-    link_with_flux: bool,
-    min_link_margin: float,
     point_filters: dict,
     emitter: _ProgressEmitter,
 ) -> PipelineSession:
@@ -1864,10 +1863,9 @@ def _run_track_worker(
 
     return run_track_step(
         session,
-        min_track_length,
+        max_step,
+        min_track_length=min_track_length,
         exclude_flags=exclude_flags,
-        link_with_flux=link_with_flux,
-        min_link_margin=min_link_margin,
         point_filters=point_filters,
         progress_callback=progress_cb,
     )

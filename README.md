@@ -3,7 +3,7 @@
 Batch orchestration and napari visualization for single-particle tracking, connecting:
 
 - [`spotsolve`](https://github.com/delnatan/spotsolve) — multi-emitter 2D localization
-  by Bayesian model selection, plus frame-to-frame linking. Runs in Rust.
+  as one joint Poisson model per frame, plus frame-to-frame linking. Runs in Rust.
 - [`diffusionkit`](https://github.com/delnatan/diffusionkit) — per-track grid posteriors over D and α, their
   ensemble (summed and deconvolved), classic MSD fits, and per-track NUTS.
 
@@ -12,17 +12,18 @@ Batch orchestration and napari visualization for single-particle tracking, conne
 Both halves of the problem are handled by `spotsolve` rather than tuned around:
 
 - **Detection** asks "how many emitters are here, and where?" as one estimation
-  problem. In each small box an emitter exists iff it lowers that box's Poisson
-  deviance by a fixed number of nats, and the box is fitted jointly with every
-  emitter it needs at each one's own width — so overlapping spots are resolved
-  instead of being merged into one bright centroid. There is one detector, not a
-  sparse/dense choice, and no sparsity weight or iteration budget to tune.
-- **Linking** scores each candidate link as a likelihood ratio under a per-track
-  posterior over the diffusion coefficient, using each detection's own CRLB
-  (`se_y`/`se_x`). A dim spot therefore carries a genuinely wider gate than a
-  bright one, which is what decides assignments when the field is crowded. Every
-  parameter is measured from the movie by `fit_link_params`, so there is no gate
-  or search radius to set.
+  problem. Each frame is fitted as one joint Poisson model, every emitter at its
+  own width, and emitters are added or removed by likelihood ratio — so
+  overlapping spots are resolved instead of being merged into one bright
+  centroid. There is one detector, not a sparse/dense choice, and one knob:
+  `fp_per_mpx`, the false spots it admits per 10⁶ pixels of pure noise (default
+  16; the Detect tab restates it per frame of the image at hand).
+- **Linking** is Crocker–Grier: between consecutive frames it picks the
+  assignment with the least summed squared displacement, and no step longer than
+  `max_step` (px) is linked. `max_step` is the one setting and is not estimated
+  from the movie: about 3× the rms step of the fastest particles of interest.
+  The Track tab restates it in µm and as the fastest D it admits, and the status
+  line after a run reports the linked steps' rms to check it against.
 
 Linking is frame-to-frame only: a missed detection **ends** a track rather than
 being bridged across the gap. Fragmenting a trajectory is a safe failure and
@@ -32,8 +33,8 @@ and `min_track_length` is the knob that matters afterwards.
 `napari_gemscape2.tracking_diagnostics.check_resolvability` reports whether a given
 (D, dt, density) is trackable at all — the frame-to-frame step against the mean
 nearest-neighbor spacing. Read its verdict as an advisory: the closed forms are
-sample physics, but its thresholds were calibrated against the older LAP linker
-and are conservative for this one (see that module's docstring).
+sample physics, but its thresholds were measured on sfwloc's LAP linker and have
+not been re-measured on spotsolve's (see that module's docstring).
 
 ## Reproducible results bundles
 
@@ -51,9 +52,8 @@ results/<result_id>/
 `points.parquet` is `spotsolve.loctable`'s localization table verbatim — one row
 per detection, carrying `se_y`/`se_x` (per-detection CRLB), `flux`, `bg`,
 `fit_sigma`/`sigma_ratio` and `flags` (spotsolve's `FitFlag` diagnostics).
-`tracks.parquet` is that same table with `track_id` added (plus the linker's
-`link_margin`/`link_rejected`), so every detector column survives linking and
-stays available for QC downstream.
+`tracks.parquet` is that same table with `track_id` added, so every detector
+column survives linking and stays available for QC downstream.
 
 **Regions** are painted on a napari Labels layer (Detect tab → "New regions
 layer"). Each label value is one region, and each pixel belongs to exactly one
@@ -81,8 +81,8 @@ stays an auditable fact about the run instead of a silent subtraction. What thos
 judgements change is what the *linker* sees and which tracks the bundle keeps.
 
 `manifest.json` records the source image path, the camera and detection
-parameters, both filter specs, what the linker actually measured (PSF sigma, both
-diffusion-coefficient estimates, the fitted linking parameters), and the git SHA
+parameters, both filter specs, the linking settings (`max_step_px`) and what the
+run measured (PSF sigma, the linked steps' rms, the MSD estimate of D), and the git SHA
 of `spotsolve` and `napari-gemscape2` at run time.
 
 ## Detect, then filter, then finalize
@@ -110,10 +110,7 @@ fit_sigma / sigma`). It is not a multiple of the initial guess and not absolute
 pixels, so changing `sigma` moves the window with it — the Detect tab prints the
 resulting px window underneath it for that reason.
 
-Linking has one optional cutoff, `min_link_margin` (nats): a link that beats the
-best assignment without it by less than that is cut, ending the track rather than
-risking an identity swap. Read the `link_margin` distribution of a run at 0 before
-choosing one.
+`max_step` is in **pixels** too, like `sigma` and like spotsolve takes it.
 
 ## Units, and where they come from
 
@@ -267,13 +264,17 @@ Without a template, or to override it:
 # PSF width in px -- required. Read it off the fit_sigma histogram of a few
 # detected frames in the napari widget.
 sigma = 1.3
+# Largest step linked between consecutive frames, px -- required too
+# (a template linked before spotsolve 0.2 has none). About 3x the rms step
+# of the fastest particles of interest.
+max_step = 5.0
 min_track_length = 2
 # `offset` is the only camera fact spotsolve needs -- noise is measured
 # from each frame directly.
 camera_kwargs = { offset = 100.0 }
-# Score candidate links by brightness continuity (flux/se_flux) as well as
-# position and CRLB -- an extra cue for a crowded field. Off by default.
-link_with_flux = false
+# The multi-emitter detector's one knob: expected false spots per 10^6
+# pixels of pure noise. Lower is stricter.
+detect_kwargs = { fp_per_mpx = 16.0 }
 # The same QC cuts the UI's histogram filters produce, as {column = [lo, hi]}.
 # Applied to what the linker sees and to which tracks are kept -- never to
 # points.parquet, which holds every detection either way. TOML has no null:
@@ -375,7 +376,7 @@ anywhere) — has every track as a row, filtered-out and excluded ones included:
   `gyration_asymmetry`;
 - track quality, as the mean over the track's detections of each detector
   column: `flux_mean`, `bg_mean`, `fit_sigma_mean`, `se_x_mean`/`se_y_mean`,
-  `link_margin_mean`, ... — in the detector's units (`fit_sigma`, `se_x` in px;
+  ... — in the detector's units (`fit_sigma`, `se_x` in px;
   the `_um` variants in µm).
 
 The tracks pane's histogram filters cover per-track results too — so a

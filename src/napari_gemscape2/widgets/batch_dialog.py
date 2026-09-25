@@ -68,7 +68,16 @@ class BatchPlan:
 def _detect_track_summary(params: dict) -> str:
     if params.get("sigma") is None:
         return "no PSF width (sigma) saved -- detect+track can't be batched from it"
-    parts = [f"σ {params['sigma']:g} px", params.get("detector", "multi_emitter")]
+    if params.get("max_step") is None:
+        return (
+            "no max step saved (linked before spotsolve 0.2) -- re-run tracking on it "
+            "and save, then batch from it"
+        )
+    parts = [
+        f"σ {params['sigma']:g} px",
+        params.get("detector", "multi_emitter"),
+        f"max step {params['max_step']:g} px",
+    ]
     if params.get("min_track_length"):
         parts.append(f"tracks ≥ {params['min_track_length']} frames")
     for key, label in (("point_filters", "point"), ("track_filters", "track")):
@@ -113,7 +122,7 @@ class BatchDialog(QDialog):
         self._detect_params = detect_track_params_from_manifest(load_manifest(template))
         saved = load_diffusion_summary(template)
         self._diffusion_settings = settings_from_summary(saved) if saved is not None else None
-        can_detect = self._detect_params.get("sigma") is not None
+        can_detect = all(self._detect_params.get(key) is not None for key in ("sigma", "max_step"))
 
         title = QLabel(f"<b>Template:</b> {template.name}")
         title.setWordWrap(True)

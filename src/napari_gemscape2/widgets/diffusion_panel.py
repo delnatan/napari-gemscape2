@@ -2191,7 +2191,7 @@ class DiffusionAnalysisWidget(QWidget):
             if name != "track_id" and name not in _TRACK_COLOR_COLUMNS
         }
         table = pl.DataFrame({**base_cols, **extra_cols})
-        # A missing value (a track's first `link_margin`, say) crossed into
+        # A missing value (a NaN `se_flux`, say) crossed into
         # the layer as NaN; back to null, or every per-track mean over the
         # column is NaN too (`diffusion.qc_aggregate_table`).
         table = table.with_columns(

@@ -80,9 +80,9 @@ def detect_track(
         template = "results/beads_dense"
 
         [params]
-        sigma = 1.3   # PSF width, px (required unless the template has it)
+        sigma = 1.3      # PSF width, px (required unless the template has it)
+        max_step = 5.0   # largest linked step, px (likewise required)
         exclude_flags = ["STALLED"]   # optional: spotsolve FitFlag names
-        min_link_margin = 0.0         # optional, nats
 
         [[inputs]]
         path = "data/beads_timelapse_dense.tif"
@@ -107,6 +107,12 @@ def detect_track(
         raise typer.BadParameter(
             "[params] needs `sigma` (PSF width, px). Detect a few frames in the napari "
             "widget and read it off the fit_sigma histogram.",
+            param_hint="CONFIG",
+        )
+    if param_cfg.get("max_step") is None:
+        raise typer.BadParameter(
+            "[params] needs `max_step` (largest linked step, px) -- about 3x the rms step "
+            "of the fastest particles. A template linked before spotsolve 0.2 has none.",
             param_hint="CONFIG",
         )
     params = DetectTrackParams(**param_cfg)

@@ -67,17 +67,16 @@ rather than to the whole form.
 Why this form is so much smaller than the sfwloc-era one it replaces: that
 pipeline offered three detectors, each with its own ~20-key solver-kwargs
 dict, and a linker with a hand-tuned bootstrap gate. `spotsolve`'s default
-detector has a fixed decision rule (an emitter exists iff it lowers the
-box's Poisson deviance by a set number of nats) and the linker has no dials
-at all, so what's left to expose there is genuinely the camera and the PSF
-width -- physical facts about the instrument rather
-than solver tuning. A knob that isn't here is not hidden; it doesn't exist.
+detector has one threshold, stated as the false positives it admits
+(`fp_per_mpx`), and its linker one distance (`max_step`), so what's left to
+expose is the camera, the PSF width, and those two numbers. A knob that
+isn't here is not hidden; it doesn't exist.
 
-`spotsolve` now also ships a second detector, Aguet -- LoG-screened
+`spotsolve` also ships a second detector, Aguet -- LoG-screened
 candidates fitted one at a time, with no multi-emitter search (the
 spotfitlm-compatible sparse baseline). The "detector" dropdown at the top
 of the Detect tab's core section picks between them; the knobs beneath it
-swap to match (`k_max`/`threshold`/`slack`/count rule for the default,
+swap to match (`fp_per_mpx`/`slack` for the default,
 `significance`/`boxsize`/`itermax` for Aguet) rather than showing both detectors' settings at once.
 
 Each tab owns its stage's "Run" button and a one-line status label, wired
@@ -256,20 +255,19 @@ class _DetectTab(QWidget):
     dropdown's choice sets which rows `_on_detector_changed` shows:
 
       - `multi_emitter` (default, `spotsolve.localize`/`localize_stack`):
-        `k_max` (most emitters one box may be fitted with jointly -- the
-        crowding ceiling) and the LoG `threshold` (one cut, used both for
-        seeding a box and for trying another emitter inside one) in core;
-        `slack` and the count rule (expert) -- `slack` is the width range a
-        fit may take, as a multiple of `sigma`, echoed in px. There is
-        no sparsity weight, iteration budget or refinement schedule to set:
-        the search's accept/reject rule is a fixed deviance improvement, and
-        it runs to its own convergence.
+        `fp_per_mpx` in core -- the one threshold, as the false emitters it
+        admits per 10^6 pixels of pure noise, restated per frame of the
+        current image underneath; `slack` (expert) -- the width range a fit
+        may take, as a multiple of `sigma`, echoed in px. There is no
+        emitter cap, iteration budget or count rule to set: the joint model
+        adds and removes emitters by likelihood ratio at that one
+        threshold, and runs to its own convergence.
       - `aguet` (`spotsolve.localize_aguet`/`localize_aguet_stack`, the
         spotfitlm-compatible sparse baseline): `significance` (the LoG
-        screening cut, a per-pixel level rather than a z-score) in core;
-        `boxsize`/`itermax` (expert) -- the fit-crop size and this
-        detector's own iteration budget. No `k_max` (fits are independent,
-        never joint) and no `slack` (its width is fitted free)."""
+        screening cut, a per-pixel level rather than a frame-wide rate)
+        in core; `boxsize`/`itermax` (expert) -- the fit-crop size and this
+        detector's own iteration budget. No `slack` (its width is fitted
+        free)."""
 
     runRequested = Signal()
     cancelRequested = Signal()
@@ -299,9 +297,9 @@ class _DetectTab(QWidget):
         self.detector.addItem("Multi-emitter", "multi_emitter")
         self.detector.addItem("Sparse (Aguet)", "aguet")
         self.detector.setToolTip(
-            "Multi-emitter (default): fits each box jointly, deciding how many\n"
-            "emitters it holds by Bayesian model selection -- one rule for both\n"
-            "crowded and sparse fields.\n\n"
+            "Multi-emitter (default): fits each frame as one joint model,\n"
+            "adding and removing emitters by likelihood ratio -- one rule for\n"
+            "both crowded and sparse fields.\n\n"
             "Sparse (Aguet): the spotfitlm-compatible baseline. LoG-screens\n"
             "candidates, then fits each one independently -- no multi-emitter\n"
             "search. For genuinely sparse fields where the joint search is\n"
@@ -323,64 +321,27 @@ class _DetectTab(QWidget):
         )
         self.sigma.valueChanged.connect(self._update_slack_note)
 
-        # --- detection knobs -------------------------------------------
-        self.k_max = _ispin(
-            d["k_max"], 1, 64,
-            tooltip="Most emitters one box may be fitted with jointly. The\n"
-            "crowding ceiling: raise it for very dense fields, at some cost.",
+        # --- detection knob --------------------------------------------
+        # The multi-emitter detector's one threshold, in the currency it
+        # costs: false emitters per 10^6 pixels of pure noise. A rate per
+        # megapixel is hard to feel, so `_update_fp_note` restates it per
+        # frame of the image at hand.
+        self.fp_per_mpx = _dspin(
+            d["fp_per_mpx"], 0.1, 10_000.0, 1.0, decimals=1,
+            tooltip="Expected false spots per million pixels of pure noise -- the\n"
+            "detector's one threshold. Lower it for fewer false positives\n"
+            "(e.g. 4), raise it for dim data. Calibrated on simulated noise for\n"
+            "sigma 1.0-1.45 px; wide PSFs at strict values overshoot it.\n\n"
+            f"spotsolve's default: {spotsolve.FP_PER_MPX:g}.",
         )
-        # One cut on the LoG z-statistic, used both for which peaks get a
-        # box searched around them and for whether a leftover residual
-        # peak inside a box gets tried as another emitter (see
-        # `DEFAULT_DETECT_KWARGS`) -- spotsolve used to split these into a
-        # seed cut and a birth cut, but one number does the same job.
-        self.threshold = _dspin(
-            0.0, 0.0, 1e9, 0.1, decimals=2,
-            tooltip="The LoG cut, in sd of the frame's own noise, for both getting a\n"
-            "box searched and for trying another emitter inside one. 'auto'\n"
-            f"(recommended) uses spotsolve's default, {spotsolve.PEAK_Z}. Raise it\n"
-            "for fewer false positives and speed; lower it toward 2.5 on faint,\n"
-            "sparse data.",
-        )
-        # The minimum is not a cut anyone would want, so it stands for
-        # "no explicit cut" (threshold=None): spotsolve's own PEAK_Z.
-        self.threshold.setSpecialValueText("auto")
-        if d["threshold"] is not None:
-            self.threshold.setValue(d["threshold"])
-
-        # spotsolve's per-emitter-count rule: "fixed" keeps the existing
-        # greedy 10-nat cost (count_penalty=0 leaves that behavior exactly
-        # as it was); "bic" compares background-only and multi-emitter fits
-        # with an experimental BIC-inspired score instead (spotsolve's
-        # docs/COUNT_SELECTION.md). Multi-emitter only -- Aguet fits one
-        # screened candidate at a time, so there is no count to select.
-        self.selection = QComboBox()
-        self.selection.addItem("Fixed (default)", "fixed")
-        self.selection.addItem("BIC (experimental)", "bic")
-        self.selection.setToolTip(
-            "How the detector decides how many emitters one box holds.\n\n"
-            "Fixed: the existing greedy 10-nat rule.\n"
-            "BIC (experimental): compares background-only and multi-emitter\n"
-            "fits by an information-criterion-style score instead of a fixed\n"
-            "cost. Not calibrated evidence or a false-positive rate -- slower,\n"
-            "and still being evaluated on faint/blurred data."
-        )
-        self.selection.currentIndexChanged.connect(self._on_selection_changed)
-        self.count_penalty = _dspin(
-            0.0, 0.0, 1e6, 0.5, decimals=2,
-            tooltip="Extra cost per emitter added to the count rule above --\n"
-            "must be finite and non-negative. Higher values favor fewer\n"
-            "emitters. Adds to the 10-nat cost in Fixed mode too (0 leaves\n"
-            "Fixed at its original behavior); the value that meets a given\n"
-            "false-positive budget in BIC mode is data-dependent -- see\n"
-            "spotsolve's docs/COUNT_SELECTION.md before trusting one number.",
-        )
-        self._selection_note = note_label("")
-        self._on_selection_changed()
+        self._frame_px: Optional[int] = None
+        self._fp_note = note_label("")
+        self.fp_per_mpx.valueChanged.connect(self._update_fp_note)
+        self._update_fp_note()
 
         # Aguet's one core tuning knob: the per-pixel LoG screening level
         # (not a frame-wide false discovery rate -- see spotsolve.aguet).
-        # Plays the same "main cut" role `threshold` plays for the
+        # Plays the same "main cut" role `fp_per_mpx` plays for the
         # multi-emitter detector, so it sits in the same row position.
         self.significance = _dspin(
             s["significance"], 1e-6, 0.5, 0.01, decimals=4,
@@ -395,12 +356,12 @@ class _DetectTab(QWidget):
         core_form.addRow("sigma (px)", self.sigma)
         core_form.addRow("detector", self.detector)
         core_form.addRow("offset (ADU)", self.offset)
-        core_form.addRow("k_max", self.k_max)
         # Row labels carry the unit the same way "offset (ADU)" and
-        # "sigma (px)" do -- a z-score and a p-value are exactly the kind
-        # of thing a bare number invites getting wrong -- kept short so the
+        # "sigma (px)" do -- a rate and a p-value are exactly the kind of
+        # thing a bare number invites getting wrong -- kept short so the
         # column stays narrow.
-        core_form.addRow("threshold (sd)", self.threshold)
+        core_form.addRow("false spots / Mpx", self.fp_per_mpx)
+        core_form.addRow(self._fp_note)
         core_form.addRow("significance (p)", self.significance)
 
         # What gets analyzed, not how -- kept in core (not expert) since
@@ -481,10 +442,7 @@ class _DetectTab(QWidget):
         self.expert_form = expert_form = _compact_form(QFormLayout())
         expert_form.setContentsMargins(0, 0, 0, 0)
         expert_form.addRow("slack (× sigma)", slack_row)
-        expert_form.addRow("", self._slack_note)
-        expert_form.addRow("count rule", self.selection)
-        expert_form.addRow("penalty", self.count_penalty)
-        expert_form.addRow("", self._selection_note)
+        expert_form.addRow(self._slack_note)
         expert_form.addRow("cores", self.n_threads)
         expert_form.addRow("boxsize (px)", self.boxsize)
         expert_form.addRow("max iterations", self.itermax)
@@ -568,35 +526,34 @@ class _DetectTab(QWidget):
         across a switch); only visibility changes, via `QFormLayout.
         setRowVisible` on whichever field object the row was built with."""
         sparse = self.get_detector() == "aguet"
-        self.core_form.setRowVisible(self.k_max, not sparse)
-        self.core_form.setRowVisible(self.threshold, not sparse)
+        self.core_form.setRowVisible(self.fp_per_mpx, not sparse)
+        self.core_form.setRowVisible(self._fp_note, not sparse)
         self.core_form.setRowVisible(self.significance, sparse)
         self.expert_form.setRowVisible(self._slack_row, not sparse)
         self.expert_form.setRowVisible(self._slack_note, not sparse)
-        self.expert_form.setRowVisible(self.selection, not sparse)
-        self.expert_form.setRowVisible(self.count_penalty, not sparse)
         self.expert_form.setRowVisible(self.boxsize, sparse)
         self.expert_form.setRowVisible(self.itermax, sparse)
-        # The count-rule note gets a row only while it has something to
-        # say: an empty label still takes a row's height and spacing.
-        self._sync_selection_note()
 
-    def _on_selection_changed(self) -> None:
-        """BIC is still experimental (spotsolve's docs/COUNT_SELECTION.md)
-        -- say so right under the control, not only in its tooltip."""
-        self._selection_note.setText(
-            "Experimental: not calibrated evidence or a false-positive rate."
-            if self.selection.currentData() == "bic"
-            else ""
+    def _update_fp_note(self) -> None:
+        """Restate `fp_per_mpx` per frame of the current image -- the
+        scale a person actually reads a detection count at."""
+        rate = self.fp_per_mpx.value()
+        if self._frame_px is None:
+            self._fp_note.setText("in pure noise; lower is stricter.")
+            return
+        self._fp_note.setText(
+            f"≈ {rate * self._frame_px / 1e6:.2g} per {self._frame_shape_text} frame "
+            "of pure noise."
         )
-        self._sync_selection_note()
 
-    def _sync_selection_note(self) -> None:
-        # Called from the selection combo during construction too, before
-        # the expert form (and the detector choice's rows) exist.
-        if hasattr(self, "expert_form"):
-            show = self.get_detector() != "aguet" and bool(self._selection_note.text())
-            self.expert_form.setRowVisible(self._selection_note, show)
+    def set_frame_shape(self, shape: Optional[tuple[int, int]]) -> None:
+        """The current image's `(H, W)`, or None -- for `_update_fp_note`."""
+        if shape is None:
+            self._frame_px = None
+        else:
+            self._frame_px = int(shape[0]) * int(shape[1])
+            self._frame_shape_text = f"{shape[1]} × {shape[0]}"
+        self._update_fp_note()
 
     def _on_run_button_clicked(self) -> None:
         if self._running:
@@ -676,11 +633,8 @@ class _DetectTab(QWidget):
                 itermax=self.itermax.value(),
             )
         return dict(
-            k_max=self.k_max.value(),
-            threshold=None if self.threshold.value() == self.threshold.minimum() else self.threshold.value(),
+            fp_per_mpx=self.fp_per_mpx.value(),
             slack=(self.slack_lo.value(), self.slack_hi.value()),
-            selection=self.selection.currentData(),
-            count_penalty=self.count_penalty.value(),
         )
 
 
@@ -1083,33 +1037,25 @@ _FLAG_TOOLTIPS = {
 
 
 class _TrackingTab(QWidget):
-    """Three pages -- Link, Filter, Save: what little the linker leaves to
-    the caller, then a filter stack over the tracks it produced, then the
-    save that finalizes the bundle.
+    """Three pages -- Link, Filter, Save: the linker's one setting and
+    what to feed it, then a filter stack over the tracks it produced, then
+    the save that finalizes the bundle.
 
-    `spotsolve.tracking.fit_link_params` measures the population
-    distribution over D, the per-frame detection continuity and the CRLB
-    inflation factor from this movie's own displacements, and `link`
-    scores each candidate link as a likelihood ratio under that fit using
-    each detection's own `se_y`/`se_x`. So there is no gate, no search
-    radius and no cost weighting to set here -- only what to feed it and
-    what to keep afterwards.
-
-    `link_with_flux` is the one optional extra: it adds each detection's
-    `flux`/`se_flux` as a second scoring cue (brightness continuity),
-    alongside position and CRLB. Off by default -- position/CRLB alone is
-    the well-tested path; flux helps most in a crowded field where two
-    candidates sit at nearly the same distance but different brightness.
+    `spotsolve.link` is Crocker-Grier: between consecutive frames it
+    minimizes the summed squared displacement, and ending a track costs
+    `max_step`^2. So `max_step` (px) is the whole linker -- no step longer
+    is linked, and within it the nearer assignment wins. spotsolve's advice
+    is about three times the rms step of the fastest particles of
+    interest: smaller breaks their tracks, larger admits identity switches
+    where particles are dense. The note under it restates the value in µm
+    and as the fastest D it admits at that rule, at the current image's
+    pixel size and frame interval, and the status line after a run reports
+    the linked steps' own rms to check it against.
 
     What the linker is fed: one checkbox per `spotsolve.FitFlag`, each
     excluding the fits carrying it (all off by default -- spotsolve's
     flags are diagnostics, not verdicts; `pipeline.run_track_step` always
-    drops fits with no usable position error regardless). And one knob on
-    what it may do: `min_link_margin` (nats), which cuts a link that beats
-    the best alternative assignment by less than that, ending the track
-    instead of risking a swap. Every linked row carries its `link_margin`
-    (in tracks.parquet, and per track in the diffusion panel's QC
-    columns) -- the distribution to read before choosing a cutoff.
+    drops fits with no usable position error regardless).
 
     `min_track_length` filters the final `tracks_df` (see
     `pipeline.run_track_step`) -- default 2 drops bare singletons (a
@@ -1142,14 +1088,22 @@ class _TrackingTab(QWidget):
             "so an n-point track spans n-1 intervals and its duration_s is\n"
             "(n-1) x dt. 1 = keep everything, including singletons.",
         )
-        self.min_link_margin = _dspin(
-            0.0, 0.0, 1e3, 0.5, decimals=2,
-            tooltip="Cut a link whose score beats the best assignment without it\n"
-            "by less than this many nats: the track ends there instead of\n"
-            "risking an identity swap. 0 keeps every link (spotsolve's\n"
-            "default). Not a probability; read the link_margin column of a\n"
-            "run at 0 before choosing one.",
+        # Required by spotsolve and not estimated from the movie. 5 px sits
+        # inside the 3.8-6.5 px spotsolve's docs/TRACKING.md validated on
+        # beads and GEM movies (3x their rms step).
+        self.max_step = _dspin(
+            5.0, 0.1, 1000.0, 0.5, decimals=1,
+            tooltip="Largest distance, in PIXELS, a particle may move between\n"
+            "consecutive frames. Within it the linker picks the assignment with\n"
+            "the least summed squared displacement; a longer step ends the track.\n\n"
+            "About 3x the rms step of the fastest particles of interest: smaller\n"
+            "breaks their tracks, larger admits identity switches where particles\n"
+            "are dense. The status line reports the linked steps' rms after a run.",
         )
+        self._scale: tuple[Optional[float], Optional[float]] = (None, None)
+        self._max_step_note = note_label("")
+        self.max_step.valueChanged.connect(self._update_max_step_note)
+        self._update_max_step_note()
         # One box per FitFlag, laid out two to a row. Checked = linking
         # does not see fits carrying that flag.
         self._flag_boxes: dict[spotsolve.FitFlag, QCheckBox] = {}
@@ -1165,17 +1119,11 @@ class _TrackingTab(QWidget):
         flags_body = QWidget()
         flags_body.setLayout(flag_grid)
         self._flags_section = CollapsibleSection("Exclude fits flagged", flags_body)
-        self.link_with_flux = QCheckBox("use flux as a link cue")
-        self.link_with_flux.setToolTip(
-            "Also score candidate links by brightness continuity (each\n"
-            "detection's flux/se_flux), alongside position and CRLB. Off by\n"
-            "default -- an extra cue for a crowded field where two candidates\n"
-            "sit at nearly the same distance but different brightness."
-        )
         form = _compact_form(QFormLayout())
         form.setContentsMargins(0, 0, 0, 0)
+        form.addRow("max step (px)", self.max_step)
+        form.addRow(self._max_step_note)
         form.addRow("min track length (points)", self.min_track_length)
-        form.addRow("min link margin (nats)", self.min_link_margin)
 
         self.run_button, self.status_label, run_row = _run_row("Run tracking")
         self.run_button.clicked.connect(self.runRequested.emit)
@@ -1185,12 +1133,10 @@ class _TrackingTab(QWidget):
         link_layout.setContentsMargins(0, 0, 0, 0)
         link_layout.setSpacing(2)
         link_layout.addLayout(form)
-        link_layout.addWidget(self.link_with_flux)
         link_layout.addWidget(self._flags_section)
         link_layout.addWidget(
             _allow_wrapped_height(
                 note_label(
-                    "No gate to set: linking parameters are measured from the movie. "
                     "The Detect tab's filters and the flags above decide which "
                     "detections the linker sees."
                 )
@@ -1249,11 +1195,29 @@ class _TrackingTab(QWidget):
         """The checked `FitFlag`s, as the bitmask `run_track_step` takes."""
         return sum(int(flag) for flag, box in self._flag_boxes.items() if box.isChecked())
 
-    def get_link_with_flux(self) -> bool:
-        return self.link_with_flux.isChecked()
+    def get_max_step(self) -> float:
+        return self.max_step.value()
 
-    def get_min_link_margin(self) -> float:
-        return self.min_link_margin.value()
+    def set_image_scale(self, pixel_size_um: Optional[float], dt_s: Optional[float]) -> None:
+        """The pixel size and frame interval a run would use -- for
+        `_update_max_step_note`."""
+        self._scale = (pixel_size_um, dt_s)
+        self._update_max_step_note()
+
+    def _update_max_step_note(self) -> None:
+        """`max_step` in µm, and the fastest D it admits under the 3-rms
+        rule: rms step = max_step / 3 = sqrt(4 D dt), localization error
+        neglected (which makes that D an upper estimate)."""
+        pixel_size_um, dt_s = self._scale
+        if pixel_size_um is None or dt_s is None:
+            self._max_step_note.setText("≈ 3× the fastest particles' rms step.")
+            return
+        step_um = self.max_step.value() * pixel_size_um
+        d_max = (step_um / 3.0) ** 2 / (4.0 * dt_s)
+        self._max_step_note.setText(
+            f"= {units.fmt_unit(step_um, units.UM)}/frame: at 3 rms steps, "
+            f"D up to ≈ {units.fmt(d_max, 'D_est_um2_s')}."
+        )
 
 
 class PipelineParamsWidget(QWidget):
@@ -1312,6 +1276,7 @@ class PipelineParamsWidget(QWidget):
         # metadata is missing or wrong.
         self._image_info = _ImageInfoPanel()
         self._image_info.changed.connect(self.imageScaleChanged)
+        self._image_info.changed.connect(self._sync_image_scale)
 
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1331,6 +1296,10 @@ class PipelineParamsWidget(QWidget):
         """Show what the image now being worked on says about itself --
         see `_ImageInfoPanel.set_metadata`."""
         self._image_info.set_metadata(metadata, source, pixel_size_um, dt_s, exposure_s)
+        self._sync_image_scale()
+
+    def _sync_image_scale(self) -> None:
+        self._tracking.set_image_scale(*self._image_info.effective())
 
     def get_pixel_size_um(self) -> Optional[float]:
         """The pixel size a run should use, or None to take the file's.
@@ -1419,11 +1388,8 @@ class PipelineParamsWidget(QWidget):
     def get_exclude_flags(self) -> int:
         return self._tracking.get_exclude_flags()
 
-    def get_link_with_flux(self) -> bool:
-        return self._tracking.get_link_with_flux()
-
-    def get_min_link_margin(self) -> float:
-        return self._tracking.get_min_link_margin()
+    def get_max_step(self) -> float:
+        return self._tracking.get_max_step()
 
     def set_track_status(self, text: str, level: str = "neutral") -> None:
         self._tracking.set_status(text, level)
@@ -1466,5 +1432,12 @@ class PipelineParamsWidget(QWidget):
         self._detect.filters.set_filters(None)
         self._tracking.filters.set_filters(None)
 
-    def set_frame_bounds(self, n_frames: int) -> None:
-        self._detect.set_frame_bounds(n_frames)
+    def set_stack_shape(self, shape: Optional[tuple[int, int, int]]) -> None:
+        """The current image's `(T, H, W)`, or None between images: `T`
+        bounds the frame range, `(H, W)` is what the Detect tab states its
+        false-positive rate per."""
+        if shape is None:
+            self._detect.set_frame_shape(None)
+            return
+        self._detect.set_frame_bounds(shape[0])
+        self._detect.set_frame_shape(shape[1:])

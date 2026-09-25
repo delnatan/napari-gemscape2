@@ -25,16 +25,13 @@ linker's internals, so it stays meaningful as one.
 
 Ported from `sfwloc.tracking_diagnostics` (same author) when the pipeline
 moved off sfwloc onto `spotsolve`. The two closed forms above are sample
-physics and carry over unchanged. THE THRESHOLDS DO NOT, and this is the one
-thing to know before reading a verdict: `RATIO_CAUTION`/`RATIO_UNRESOLVABLE`
-below were read off a recall-vs-ratio sweep of sfwloc's Stage-1 LAP linker,
-which gated on a single flat distance. `spotsolve.tracking.link` scores a
-link by likelihood ratio under a per-track posterior over D, using each
-detection's own CRLB -- so it is expected to degrade *later* than the LAP
-linker did, and these cutoffs are conservative rather than calibrated for it.
-Treat the verdict as an advisory ordering ("this movie is crowded relative to
-its step size"), not a measured error rate, until the sweep is rerun against
-the new linker.
+physics and carry over unchanged. The thresholds are the one thing to know
+before reading a verdict: `RATIO_CAUTION`/`RATIO_UNRESOLVABLE` below were read
+off a recall-vs-ratio sweep of sfwloc's Stage-1 LAP linker, which gated on a
+single flat distance. `spotsolve.link` is the same kind of linker (least
+summed squared displacement within one `max_step`), but the sweep has not
+been rerun against it. Treat the verdict as an advisory ordering ("this
+movie is crowded relative to its step size"), not a measured error rate.
 """
 
 from __future__ import annotations
@@ -85,14 +82,13 @@ def crowding_ratio(D_um2_s: float, dt_s: float, density_um2: float) -> float:
 #   1.56       0.54          0.46
 # Recall crosses 0.95 around ratio ~0.4 and 0.8 around ratio ~0.9. See this
 # module's docstring for why these are advisory, not calibrated, now that
-# `spotsolve.tracking.link` does the linking.
+# `spotsolve.link` does the linking.
 RATIO_CAUTION = 0.4
 RATIO_UNRESOLVABLE = 0.9
 
 _LINKER_CAVEAT = (
-    "Thresholds are inherited from sfwloc's LAP linker and are conservative "
-    "for spotsolve's likelihood-ratio linker -- read as an advisory, not a "
-    "measured error rate."
+    "Thresholds were measured on sfwloc's LAP linker, not re-measured on "
+    "spotsolve's -- read as an advisory, not a measured error rate."
 )
 
 
