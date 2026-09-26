@@ -49,8 +49,8 @@ uv tool upgrade napari-gemscape2   # to update
 
 For the NUTS tab, write `"napari-gemscape2[bayes] @ git+…"` instead. This route
 ignores `uv.lock`: it resolves everything fresh and takes the latest diffusionkit
-and qtkit. Its results bundles also have no git SHA for napari-gemscape2, because
-nothing is a checkout. For analyses you'll publish, use the clone.
+and qtkit, so two machines installed on different days can differ. For analyses
+you'll publish, use the clone.
 
 ## Particle tracking in the dense regime
 
@@ -134,8 +134,11 @@ judgements change is what the *linker* sees and which tracks the bundle keeps.
 
 `manifest.json` records the source image path, the camera and detection
 parameters, both filter specs, the linking settings (`max_step_px`) and what the
-run measured (PSF sigma, the linked steps' rms, the MSD estimate of D), and the git SHA
-of `spotsolve` and `napari-gemscape2` at run time.
+run measured (PSF sigma, the linked steps' rms, the MSD estimate of D). Under
+`packages` it records the `version` and `git_sha` of `spotsolve` and
+`napari-gemscape2` at run time. The SHA comes from the source checkout, or else
+from the commit recorded when the package was installed from git. It is `null`
+for a release wheel (spotsolve's), whose version says which release it is.
 
 ## Detect, then filter, then finalize
 
@@ -408,7 +411,8 @@ distributions_alpha.csv   likewise on the α grid (summed only)
 diffusion_summary.json    settings (dt, exposure, grid -- GridPostOptions' fields --,
                           level, deconvolution),
                           population numbers per group, the tracks-pane filters,
-                          the fitted tracks' fingerprint (tracks_sha256), and repo SHAs
+                          the fitted tracks' fingerprint (tracks_sha256), and packages
+                          (diffusionkit's and napari-gemscape2's version and git SHA)
 ```
 
 Points and tracks stay parquet (the atomic data); the tables people open in a

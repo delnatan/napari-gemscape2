@@ -138,7 +138,7 @@ from napari_gemscape2.results import (
     has_regions,
     has_result,
     load_regions,
-    repo_shas,
+    package_provenance,
     load_manifest,
     save_regions,
     write_detection_result,
@@ -187,12 +187,13 @@ from napari_gemscape2.widgets.batch_dialog import (
 from napari_gemscape2.widgets.params_panel import PipelineParamsWidget
 
 
-def _repo_shas() -> dict:
-    """Provenance for a bundle's manifest: the checkouts that produced it."""
+def _package_provenance() -> dict:
+    """Provenance for a bundle's manifest: the versions and commits of the
+    packages that produced it."""
     import spotsolve
     import napari_gemscape2
 
-    return repo_shas(spotsolve, napari_gemscape2)
+    return package_provenance(spotsolve, napari_gemscape2)
 
 
 def _dropped_folder(event) -> Optional[Path]:
@@ -1694,7 +1695,7 @@ class ExperimentListWidget(QWidget):
             result_id=entry.result_dir.name,
             source_image_path=entry.image_path,
             params=manifest_params,
-            repo_shas=_repo_shas(),
+            packages=_package_provenance(),
         )
         try:
             write_result(
@@ -1754,7 +1755,7 @@ class ExperimentListWidget(QWidget):
             result_id=entry.result_dir.name,
             source_image_path=entry.image_path,
             params=manifest_params,
-            repo_shas=_repo_shas(),
+            packages=_package_provenance(),
         )
         try:
             write_detection_result(

@@ -37,7 +37,7 @@ from napari_gemscape2.diffusion import (
 )
 from napari_gemscape2.pipeline import FilterSpec, track_features_df
 from napari_gemscape2.regions import Regions
-from napari_gemscape2.results import load_result, repo_shas, write_diffusion_results
+from napari_gemscape2.results import load_result, package_provenance, write_diffusion_results
 from napari_gemscape2.viewer import layer_units_metadata, region_classes
 
 
@@ -207,7 +207,7 @@ def analyze_bundle(
     import diffusionkit
     import napari_gemscape2
 
-    summary["repo_shas"] = repo_shas(diffusionkit, napari_gemscape2)
+    summary["packages"] = package_provenance(diffusionkit, napari_gemscape2)
     write_diffusion_results(
         result_dir, tracks_summary=table, summary=summary, **analysis_tables(analysis, ids, by_class, settings.deconvolution)
     )

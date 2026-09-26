@@ -182,7 +182,7 @@ from napari_gemscape2.results import (
     TRACKS_SUMMARY_FILENAME,
     load_diffusion_results,
     load_diffusion_summary,
-    repo_shas,
+    package_provenance,
     write_diffusion_results,
 )
 from napari_gemscape2.joint_plot import (
@@ -396,14 +396,14 @@ _PARAM_COLUMNS = {
 }
 
 
-def _analysis_repo_shas() -> dict:
+def _analysis_packages() -> dict:
     """Provenance for saved diffusion results: the diffusionkit and
-    napari_gemscape2 checkouts that computed them (the bundle's manifest
+    napari_gemscape2 versions and commits that computed them (the bundle's manifest
     already records what produced the tracks)."""
     import diffusionkit
     import napari_gemscape2
 
-    return repo_shas(diffusionkit, napari_gemscape2)
+    return package_provenance(diffusionkit, napari_gemscape2)
 
 
 def _label_corner_axes(figure, param_names: list[str]) -> None:
@@ -2781,6 +2781,6 @@ class DiffusionAnalysisWidget(QWidget):
                 deconvolution=deconvolution,
             )
         summary["tracks_summary_filters"] = self._summary_filter_record()
-        summary["repo_shas"] = _analysis_repo_shas()
+        summary["packages"] = _analysis_packages()
         write_diffusion_results(self._result_dir, tracks_summary=table, summary=summary, **tables)
         self._posterior_tab.report_saved(f"saved {table.height} tracks' analysis to {self._result_dir.name}/")

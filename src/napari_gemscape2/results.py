@@ -45,6 +45,7 @@ image back as a Labels layer, so the same regions can be reused or edited.
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import subprocess
 from datetime import datetime, timezone
@@ -93,20 +94,44 @@ def git_sha(repo_path: str | Path) -> str | None:
         return None
 
 
-def repo_shas(*modules) -> dict[str, str | None]:
-    """`{package: git SHA}` for each module's source checkout, asked from
-    the package's own directory -- so it holds for a `src/` layout
-    (spotsolve, this package) and a flat one (diffusionkit) alike. None
-    for a package installed into site-packages, which has no checkout of
-    its own (and whose enclosing repo, if the venv sits in one, would be
-    the wrong answer)."""
-    shas = {}
+def _installed_commit(dist: importlib.metadata.Distribution) -> str | None:
+    """The commit an installer recorded for a package installed from git
+    (PEP 610's `direct_url.json`), or None -- a release wheel or a PyPI
+    install has none, and its version alone says what it is."""
+    try:
+        direct_url = json.loads(dist.read_text("direct_url.json") or "null")
+    except json.JSONDecodeError:
+        return None
+    return ((direct_url or {}).get("vcs_info") or {}).get("commit_id")
+
+
+def package_provenance(*modules) -> dict[str, dict[str, str | None]]:
+    """`{package: {"version", "git_sha"}}` for each module.
+
+    `git_sha` is the module's source checkout's HEAD when it runs from one
+    (an editable install -- asked from the package's own directory, so it
+    holds for a `src/` layout and a flat one alike), else the commit
+    recorded at install time for a package installed from git (diffusionkit
+    and qtkit in the standard install, everything in `uv tool install`).
+    A site-packages install is never asked of git directly: the repo
+    enclosing it, if the venv sits in one, would be the wrong answer. None
+    for a release wheel (spotsolve's), where `version` identifies it."""
+    packages = {}
     for module in modules:
         package_dir = Path(module.__file__).resolve().parent
-        shas[module.__name__] = (
-            None if "site-packages" in package_dir.parts else git_sha(package_dir)
-        )
-    return shas
+        try:
+            dist = importlib.metadata.distribution(module.__name__)
+        except importlib.metadata.PackageNotFoundError:
+            dist = None
+        if "site-packages" not in package_dir.parts:
+            sha = git_sha(package_dir)
+        else:
+            sha = _installed_commit(dist) if dist is not None else None
+        packages[module.__name__] = {
+            "version": dist.version if dist is not None else None,
+            "git_sha": sha,
+        }
+    return packages
 
 
 def build_manifest(
@@ -114,14 +139,14 @@ def build_manifest(
     result_id: str,
     source_image_path: str | Path,
     params: dict,
-    repo_shas: dict[str, str | None] | None = None,
+    packages: dict[str, dict[str, str | None]] | None = None,
 ) -> dict:
     return {
         "result_id": result_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source_image_path": str(Path(source_image_path).resolve()),
         "params": params,
-        "repo_shas": repo_shas or {},
+        "packages": packages or {},
     }
 
 

@@ -20,7 +20,7 @@ from napari_gemscape2.results import (
     has_result,
     load_diffusion_summary,
     load_manifest,
-    repo_shas,
+    package_provenance,
 )
 from napari_gemscape2.pipeline import (
     DetectTrackParams,
@@ -118,7 +118,7 @@ def detect_track(
     import spotsolve
     import napari_gemscape2
 
-    shas = repo_shas(spotsolve, napari_gemscape2)
+    packages = package_provenance(spotsolve, napari_gemscape2)
 
     for entry in cfg["inputs"]:
         image_path = _resolve(base, entry["path"])
@@ -132,7 +132,7 @@ def detect_track(
             image_path,
             result_dir,
             params,
-            repo_shas=shas,
+            packages=packages,
             pixel_size_um=entry.get("pixel_size_um"),
             dt_s=entry.get("dt_s"),
             exposure_s=entry.get("exposure_s"),

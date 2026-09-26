@@ -47,7 +47,7 @@ from napari_gemscape2.results import (
     has_result,
     load_diffusion_summary,
     load_manifest,
-    repo_shas,
+    package_provenance,
 )
 
 
@@ -305,9 +305,9 @@ def run_batch_worker(plan: BatchPlan, cancel_event: threading.Event, emitter: Ba
         import spotsolve
         import napari_gemscape2
 
-        shas = repo_shas(spotsolve, napari_gemscape2)
+        packages = package_provenance(spotsolve, napari_gemscape2)
     else:
-        shas = {}
+        packages = {}
 
     def detect_progress(done: int, total: int, stage: str) -> None:
         emitter.progress.emit(done, total, stage)
@@ -330,7 +330,7 @@ def run_batch_worker(plan: BatchPlan, cancel_event: threading.Event, emitter: Ba
                     job.image_path,
                     job.result_dir,
                     detect_params,
-                    repo_shas=shas,
+                    packages=packages,
                     progress_callback=detect_progress,
                     cancel_event=cancel_event,
                 )

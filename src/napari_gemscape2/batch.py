@@ -26,7 +26,7 @@ def detect_track_bundle(
     result_dir: Path,
     params: DetectTrackParams,
     *,
-    repo_shas: dict,
+    packages: dict,
     pixel_size_um: Optional[float] = None,
     dt_s: Optional[float] = None,
     exposure_s: Optional[float] = None,
@@ -55,7 +55,7 @@ def detect_track_bundle(
         result_id=result_dir.name,
         source_image_path=image_path,
         params=manifest_extra,
-        repo_shas=repo_shas,
+        packages=packages,
     )
     write_result(result_dir, points_df, tracks_df, manifest, labels=labels, regions=regions)
     return manifest_extra
