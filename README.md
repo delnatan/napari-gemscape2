@@ -7,6 +7,51 @@ Batch orchestration and napari visualization for single-particle tracking, conne
 - [`diffusionkit`](https://github.com/delnatan/diffusionkit) — per-track grid posteriors over D and α, their
   ensemble (summed and deconvolved), classic MSD fits, and per-track NUTS.
 
+## Install
+
+All you need is [uv](https://docs.astral.sh/uv/) and git. uv fetches Python
+3.13 itself. You don't need Rust or a checkout of spotsolve or diffusionkit.
+
+```sh
+# 1. Install uv (once per machine)
+curl -LsSf https://astral.sh/uv/install.sh | sh                                    # macOS / Linux
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex" # Windows
+
+# 2. Get napari-gemscape2 and its environment
+git clone https://github.com/delnatan/napari-gemscape2.git
+cd napari-gemscape2
+uv sync                 # or `uv sync --extra bayes` for the NUTS tab (JAX, NumPyro)
+
+# 3. Run it, from this folder
+uv run napari           # widgets: Plugins → GEMscape2
+uv run gemscape2 --help # headless batch runs (see Usage)
+```
+
+To update, run `git pull && uv sync`.
+
+`uv sync` installs exactly what `uv.lock` pins, so every machine gets the same
+spotsolve, diffusionkit and qtkit. spotsolve arrives as a prebuilt wheel from
+its GitHub release for macOS (Apple silicon and Intel), Linux (x86-64 and
+aarch64) and Windows (x86-64). On any other platform, uv builds it from source,
+which needs [Rust](https://rustup.rs).
+
+Don't `pip install spotsolve` or `pip install diffusionkit`. On PyPI those names
+belong to unrelated packages. The commands above get ours.
+
+**Without cloning.** This puts `napari` and `gemscape2` on your PATH, so they
+run from any folder:
+
+```sh
+uv tool install "napari-gemscape2 @ git+https://github.com/delnatan/napari-gemscape2" \
+    --with-executables-from napari
+uv tool upgrade napari-gemscape2   # to update
+```
+
+For the NUTS tab, write `"napari-gemscape2[bayes] @ git+…"` instead. This route
+ignores `uv.lock`: it resolves everything fresh and takes the latest diffusionkit
+and qtkit. Its results bundles also have no git SHA for napari-gemscape2, because
+nothing is a checkout. For analyses you'll publish, use the clone.
+
 ## Particle tracking in the dense regime
 
 Both halves of the problem are handled by `spotsolve` rather than tuned around:
@@ -190,40 +235,40 @@ mathtext style diffusionkit's own figures use, so a joint plot and an MSD plot
 label the same quantity the same way. A column whose unit isn't registered is
 shown bare rather than guessed at.
 
-## Setup
+## Development setup
 
-Two ways to install, each its own `uv` environment.
-
-**Standard** — on any machine with [uv](https://docs.astral.sh/uv/), no Rust
-toolchain and no other checkouts:
-
-```
-git clone https://github.com/delnatan/napari-gemscape2.git
-cd napari-gemscape2
-uv sync                  # add --extra bayes for the NUTS tab (JAX, NumPyro)
-uv run napari
-```
-
-`spotsolve` comes from its GitHub release wheel for your platform (macOS arm64
-and x86-64, Linux x86-64 and aarch64, Windows x86-64; anywhere else its sdist,
-which needs Rust), `diffusionkit` and `qtkit` from git. `uv.lock` pins all of
-them; `uv lock --upgrade-package diffusionkit` (or `qtkit`) moves to the latest
-commit, and a new spotsolve release means editing the version in
-`pyproject.toml`'s URLs.
-
-**Development** — `dev/` is a uv workspace over local checkouts of
-`spotsolve`, `diffusionkit` and `qtkit` next to this repo, all editable, with
-spotsolve's Rust extension built from source (needs [Rust](https://rustup.rs)):
+To use the package, see [Install](#install). To change spotsolve, diffusionkit
+or qtkit along with it, use the development environment. `dev/` is a uv
+workspace over local checkouts of those three, placed next to this repo:
 
 ```
-./dev/bootstrap.sh       # clones whichever of the three is missing, then syncs
+<parent>/napari-gemscape2/   this repo
+<parent>/spotsolve/
+<parent>/diffusionkit/
+<parent>/qtkit/
+```
+
+All four packages are editable, and spotsolve's Rust extension is built from
+source, which needs [Rust](https://rustup.rs):
+
+```sh
+./dev/bootstrap.sh                                   # clones whichever of the three is missing, then syncs
 uv run --project dev napari
-uv run --project dev --package spotsolve pytest     # a library's own tests
+uv run --project dev pytest                          # this repo's tests
+uv run --project dev --package spotsolve pytest      # a library's own tests, same env
 ```
 
-It includes the `[bayes]` extra plus maturin, pytest and ruff. Python edits in
-any of the four packages take effect on restart; after changing spotsolve's
-Rust code, rebuild with `uv sync --project dev --reinstall-package spotsolve`.
+The environment includes the `[bayes]` extra plus maturin, pytest and ruff.
+It lives in `dev/.venv`, separate from the standard `.venv`. Python edits in
+any of the four packages take effect when you restart. After changing
+spotsolve's Rust code, rebuild it with
+`uv sync --project dev --reinstall-package spotsolve`.
+
+**Moving the standard install's pins.** Run
+`uv lock --upgrade-package diffusionkit` (or `qtkit`) to move to that repo's
+latest `main`. For a new spotsolve release, change the version in every URL
+under `[tool.uv.sources]` in `pyproject.toml`, then run `uv lock`. Either way,
+commit `uv.lock`. That file is what users' `uv sync` installs.
 
 ## Usage
 
