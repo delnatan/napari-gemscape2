@@ -155,6 +155,12 @@ _EXACT: dict[str, Optional[str]] = {
     # motion-vs-noise likelihood ratio (2 ln LR, dimensionless).
     "D_info_bits": BITS,
     "D_motion_lrt": None,
+    # D at the longer timescale over D at one frame (its `_median`/`_low`/
+    # `_high`), its log for coloring tracks, and the posterior probability
+    # that it is below 1. (D_long itself is `_um2_s`, by suffix.)
+    "D_ratio": None,
+    "log10_D_ratio": None,
+    "P_D_decrease": None,
     "log_posterior": None,
     "posterior": None,
     "weight": None,

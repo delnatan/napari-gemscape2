@@ -175,7 +175,8 @@ def diffusion(
     `template` is set and it has one, overridden by [diffusion]:
         [diffusion]
         min_frames = 3          # shortest track fitted
-        alpha = false           # α posterior (needs exposure 0; ~30x slower)
+        alpha = false           # α posterior (blur modelled; ~2x the cost of D)
+        D_long_stride = 5       # also D at 5 frames, and its ratio to D (omit: off)
         # the posterior grids (diffusionkit's GridPostOptions); D's range is
         # the flat prior's support. Any key left out keeps the template's,
         # else diffusionkit's default (shown).
@@ -248,7 +249,7 @@ def diffusion(
         if not report.units_known:
             typer.echo("  ! the bundle records no pixel size / frame interval: every µm and s is px and frames")
         if settings.alpha and not report.alpha:
-            typer.echo("  ! α not computed: it needs exposure 0 (no blur model)")
+            typer.echo("  ! α computed for no track")
         typer.echo(
             f"  {units.fmt(report.pixel_size_um, 'pixel_size_um')} · {units.fmt(report.dt_s, 'dt_s')} · "
             f"exposure {units.fmt(report.exposure_s, 'exposure_s')}"

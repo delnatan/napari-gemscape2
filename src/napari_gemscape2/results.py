@@ -16,7 +16,7 @@ and, once the diffusion widget has saved an analysis of it
 (`write_diffusion_results`):
     <result_dir>/tracks_summary.csv       one row per track
     <result_dir>/posterior_D.parquet      every track's log posterior over D
-    <result_dir>/posterior_alpha.parquet  likewise over alpha (exposure 0 only)
+    <result_dir>/posterior_alpha.parquet  likewise over alpha, when it was run
     <result_dir>/distributions_D.csv      the ensemble on the D grid
     <result_dir>/distributions_alpha.csv  likewise on the alpha grid
     <result_dir>/diffusion_summary.json   settings + population numbers
@@ -257,8 +257,8 @@ def write_diffusion_results(
     """The diffusion widget's analysis of this bundle's tracks (see this
     module's docstring for the files). An optional table left as None has
     its file removed rather than kept, so what is on disk is always one
-    analysis -- an alpha posterior from an earlier run at exposure 0 never
-    sits beside a D posterior from a later one at 20 ms."""
+    analysis -- an alpha posterior from an earlier run never sits beside a
+    D posterior from a later one that skipped alpha."""
     result_dir = Path(result_dir)
     result_dir.mkdir(parents=True, exist_ok=True)
     tracks_summary.write_csv(result_dir / TRACKS_SUMMARY_FILENAME)

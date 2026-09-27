@@ -224,8 +224,8 @@ camera's `ExposureTime` in an Andor Fusion `.ims`'s acquisition protocol, OME
 `exposure_s_source`. Detection and linking never use it; the diffusion
 analysis does, because its D likelihood models the motion blur of a
 continuous exposure. It is **never defaulted to 0**: 0 means "instantaneous",
-and on real data that biases `D` low. (Exposure 0 is also the only case where
-the α posterior is available: it has no blur model.) A file that doesn't record it shows `exposure ?` in amber. You type it into "Image metadata" (the exposure box is
+and on real data that biases `D` low (and, through the same blur, `α` high).
+A file that doesn't record it shows `exposure ?` in amber. You type it into "Image metadata" (the exposure box is
 not behind the override switch, so supplying it doesn't replace the file's
 pixel size or frame interval). The Diffusion panel's own exposure box is
 pre-filled from the layer, and it won't run until it has a value.
@@ -341,7 +341,8 @@ track_filters = { track_length = [5.0, 1e9] }
 
 [diffusion]
 min_frames = 3          # shortest track fitted
-alpha = false           # the alpha posterior: needs exposure 0, ~30x slower
+alpha = false           # the alpha posterior (blur modelled; ~2x the cost of D)
+D_long_stride = 5       # also D at 5 frames, and its ratio to D (omit: off)
 # The posterior grids -- diffusionkit's GridPostOptions fields (also alpha_min,
 # alpha_max, n_alpha, n_K). D's range is the flat prior's support, so it is
 # part of the analysis. Keys left out keep the template's (or diffusionkit's
@@ -369,16 +370,23 @@ width) and **Track**
 tracks), pressing *Save results* when the result is worth keeping. The "Diffusion analysis" widget then reads the tracks layer for
 diffusionkit's grid posteriors: for each track, the posterior over D (flat
 prior in ln D, the exposure's blur modelled) summarized as its median and 5%/95%
-quantiles, and — with exposure 0, as an opt-in that costs ~30× more — the same
-for the fBm exponent α. The run is diffusionkit's own `gridpost.analyze_tracks`
+quantiles, and the same for the fBm exponent α (its blur modelled too; tracks of
+40+ frames use a fast debiased-Whittle likelihood). **D also at** *k frames*
+refits D to each track thinned to every k-th frame and reports `D_ratio` =
+D(k·dt)/D(dt) with `P_D_decrease`: 1 for Brownian motion, below 1 when the
+motion slows at longer times (confinement, crowding, α < 1), without committing
+to a model of why; k sets the longer timescale (the box shows it in ms) and a
+track needs 2k+1 frames. The run is diffusionkit's own `gridpost.analyze_tracks`
 with the `GridPostOptions` the Posterior tab shows: *D min*/*D max* (µm²/s) and
 *D points* set the D grid, whose range is the flat prior's support, and the
 folded *α / K grid* section the rest. A track whose posterior is cut by an edge
 is marked `D_at_grid_edge` (its numbers move with the edge — near-immobile
 tracks reach *D min* this way), and the summary counts them. The grids are
 saved with the analysis, so `GridPostOptions(**summary["grid"])` in a
-diffusionkit script reproduces the widget's numbers exactly. About 1 s for ~500 tracks without α. The **Ensemble**
-plot reads them across the tracks the filters pass, per region class: the
+diffusionkit script reproduces the widget's numbers exactly. Tracks are fitted on
+a thread pool: about 3 s for ~500 tracks with α and the D ratio. The **Ensemble**
+plot reads them across the tracks the filters pass, per region class (with a
+column for α and one for the D ratio when they ran): the
 per-track medians, the *deconvolved* distribution of D (each track's own
 uncertainty removed; peak positions and masses are robust, widths are
 resolution-limited), and the *summed* posterior (one D shared by every track).
@@ -388,8 +396,8 @@ averaged), the histogram of medians and the deconvolved distribution. The
 *Deconvolution* section sets its iterations and smoothing (it spreads D over
 the run's D grid); the plots and summary follow without a re-run. MSD fits are a labelled opt-in comparison; the **Track** plot shows the
 selected track's posterior; the **Map** tab colors each track's centroid by any
-result; the **NUTS** tab fits the selected track's full posterior (needs
-`--extra bayes`).
+result; the **NUTS** tab fits the selected track's full posterior with the same
+exposure (needs `--extra bayes`).
 
 Opening a bundle with a saved analysis — saved from the widget, a batch, or
 `gemscape2 diffusion` — restores it: plots, per-track columns, filters and
@@ -403,13 +411,13 @@ re-fits. Analyses saved before the fingerprint existed need one re-run.
 ```
 tracks_summary.csv        one row per track (below)
 posterior_D.parquet       every fitted track's log posterior: track_id, D_um2_s, log_posterior
-posterior_alpha.parquet   likewise over alpha (exposure 0 runs with α only)
+posterior_alpha.parquet   likewise over alpha, when it ran
 distributions_D.csv       the ensemble on the D grid, long by group ("all", then each
                           region class): summed_log_posterior, summed_posterior,
                           pooled_posterior, deconvolved
 distributions_alpha.csv   likewise on the α grid (summed only)
 diffusion_summary.json    settings (dt, exposure, grid -- GridPostOptions' fields --,
-                          level, deconvolution),
+                          level, alpha's likelihood, D_long_stride, deconvolution),
                           population numbers per group, the tracks-pane filters,
                           the fitted tracks' fingerprint (tracks_sha256), and packages
                           (diffusionkit's and napari-gemscape2's version and git SHA)
@@ -428,7 +436,9 @@ anywhere) — has every track as a row, filtered-out and excluded ones included:
 - the posterior: `posterior_status`, `D_median_um2_s`, `D_low_um2_s`,
   `D_high_um2_s` (5% and 95% quantiles), `D_at_grid_edge` (the posterior is
   cut by the D grid's range), and with α: `alpha_status`,
-  `alpha_median`, `alpha_low`, `alpha_high`; `D_msd_um2_s`/`alpha_msd` when the
+  `alpha_median`, `alpha_low`, `alpha_high`; with a D ratio: `D_long_median_um2_s`
+  (and `_low`/`_high`), `D_ratio_median` (and `_low`/`_high`), `P_D_decrease`;
+  `D_msd_um2_s`/`alpha_msd` when the
   MSD comparison ran, `*_nuts*` for tracks fitted with NUTS;
 - shape: `radius_of_gyration_um`, `net_displacement_um`, `straightness`,
   `gyration_asymmetry`;

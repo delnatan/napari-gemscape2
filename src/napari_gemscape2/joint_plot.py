@@ -7,7 +7,8 @@ scaling so any two trajectory properties (classical vs Bayesian D, alpha,
 r2, track length, ...) can be compared the same way.
 
 The posterior figures (`plot_d_ensemble`, `plot_track_posterior`) follow
-one color assignment by role, not by series: per-track medians are a
+one color assignment by role, not by series (per-track medians of alpha and
+of the D ratio are the same neutral histogram): per-track medians are a
 neutral histogram, the deconvolved distribution is blue, the summed
 (shared-value) posterior is orange, the pooled (averaged) posterior is aqua,
 and the per-track heat map is one blue ramp. Region classes are separate panels
@@ -172,10 +173,12 @@ def plot_d_ensemble(
     panels: list[dict],
     alpha_grid: np.ndarray | None = None,
     title: str | None = None,
+    ratio_label: str | None = None,
 ) -> Figure:
     """The population read of a posterior run: one row per panel (a region
-    class, or "all"), with log10 D on the left and alpha on the right when
-    alpha was computed.
+    class, or "all"), with log10 D on the left, then alpha when alpha was
+    computed, then how D changes with timescale when that was (panels with
+    `ratio_medians`; `ratio_label` names the two timescales on its axis).
 
     Each panel dict holds `name`, `n_tracks`, `medians` (per-track D
     posterior medians), `deconvolved` and `summed` (weights on `d_grid`),
@@ -191,9 +194,11 @@ def plot_d_ensemble(
     above them.
     """
     has_alpha = alpha_grid is not None and any(p.get("alpha_medians") is not None for p in panels)
-    n = len(panels)
-    fig = Figure(figsize=(8.5 if has_alpha else 6.0, 1.2 + 2.3 * n), layout="constrained")
-    axes = fig.subplots(n, 2 if has_alpha else 1, squeeze=False, sharex="col")
+    has_ratio = any(p.get("ratio_medians") is not None for p in panels)
+    n, n_cols = len(panels), 1 + has_alpha + has_ratio
+    fig = Figure(figsize=(6.0 + 2.6 * (n_cols - 1), 1.2 + 2.3 * n), layout="constrained")
+    axes = fig.subplots(n, n_cols, squeeze=False, sharex="col")
+    ratio_col = n_cols - 1
     x = np.log10(d_grid)
     x_lo, x_hi = _log_d_range(panels, x)
     bins = np.arange(x_lo, x_hi + _LOG_D_BIN, _LOG_D_BIN)
@@ -235,12 +240,47 @@ def plot_d_ensemble(
                 ax_a.set_ylim(0, a_top * 1.18)
                 ax_a.set_title(f"shared α = {a_med:.2f}", fontsize=9, loc="left", color=_INK)
             ax_a.set_xlim(0, 2)
+        if has_ratio:
+            _ratio_panel(axes[row][ratio_col], panel)
     axes[-1][0].set_xlabel(units.mpl_log_label("D_um2_s"), fontsize=9)
     if has_alpha:
         axes[-1][1].set_xlabel(r"$\alpha$ (1 = Brownian, dashed)", fontsize=9)
+    if has_ratio:
+        axes[-1][ratio_col].set_xlabel(ratio_label or "D ratio", fontsize=9)
     if title:
         fig.suptitle(title, fontsize=10, x=0.01, ha="left")
     return fig
+
+
+# The ratio panel's range: a tenth to ten times, log-spaced.
+_RATIO_BINS = np.logspace(-1, 1, 41)
+_RATIO_TICKS = (.25, .5, 1, 2, 4)
+
+
+def _ratio_panel(ax, panel: dict) -> None:
+    """Per-track D(long) / D(short) medians on a log axis, with how many
+    tracks are confidently slower or faster at the longer timescale."""
+    _style_axis(ax)
+    ratios = np.asarray(panel.get("ratio_medians", []), dtype=float)
+    ratios = ratios[ratios > 0]
+    if len(ratios):
+        ax.hist(np.clip(ratios, _RATIO_BINS[0], _RATIO_BINS[-1]), bins=_RATIO_BINS, color=_HIST_COLOR,
+                edgecolor="white", lw=0.5)
+        ax.set_title(f"median ratio {np.median(ratios):.2f}", fontsize=9, loc="left", color=_INK)
+        evidence = panel.get("evidence")
+        ax.text(
+            0.98, 0.97,
+            f"{panel.get('n_slower', 0)} slower\n{panel.get('n_faster', 0)} faster\nof {len(ratios)}"
+            + (f"\n(P > {evidence:g})" if evidence else ""),
+            transform=ax.transAxes, ha="right", va="top", fontsize=7, color=_MUTED_INK,
+        )
+    else:
+        ax.set_title("no track long enough", fontsize=9, loc="left", color=_MUTED_INK)
+    ax.axvline(1.0, color=_MUTED_INK, lw=0.8, ls="--", zorder=0)
+    ax.set_xscale("log")
+    ax.set_xlim(_RATIO_BINS[0], _RATIO_BINS[-1])
+    ax.set_xticks(_RATIO_TICKS, [f"{t:g}" for t in _RATIO_TICKS])
+    ax.minorticks_off()
 
 
 def plot_d_posteriors(d_grid: np.ndarray, panels: list[dict], title: str | None = None) -> Figure:

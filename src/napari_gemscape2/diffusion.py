@@ -8,8 +8,9 @@ information); diffusionkit calls the same quantity `sigma_x_um`/
 scaled here rather than duplicated upstream.
 
 The analysis is `diffusionkit.gridpost`: for each track, the exact Gaussian
-displacement likelihood evaluated on a grid in ln D (and, with no exposure
-blur, the fBm exponent alpha with K integrated out). `analyze_posteriors`
+displacement likelihood evaluated on a grid in ln D (and the fBm exponent
+alpha with K integrated out), both with the camera exposure's motion blur
+modelled. `analyze_posteriors`
 is diffusionkit's own `gridpost.analyze_tracks`, asked to keep each track's
 posterior vector (what the ensemble is built from and what the bundle
 saves), and every grid comes from the one `GridPostOptions` the run is
@@ -19,6 +20,11 @@ posterior cut by an edge is flagged in `D_at_grid_edge`.
 
   - **per track**: the posterior median of D and its equal-tailed 90%
     interval (`D_low`/`D_high` = the 5% and 95% quantiles), likewise alpha;
+  - **D at a second timescale** (`D_long_stride` frames, optional): D
+    refitted to the track thinned to every k-th frame, and its ratio to D
+    at one frame -- how the apparent diffusivity changes with timescale
+    (below 1: motion slows, as with confinement or alpha < 1), with no
+    model of why (`diffusionkit.gridpost.timescale`);
   - **summed**: the per-track log posteriors added up -- the posterior of
     one D shared by every track. Sharp, but only honest when the tracks
     really do share a D;
@@ -34,6 +40,8 @@ shape, ported from diffusionkit when that package narrowed to analysis.
 from __future__ import annotations
 
 import hashlib
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Optional
 
@@ -67,14 +75,24 @@ DECONVOLVE_SMOOTH = 0.5
 GRID_FIELDS = ("D_min_um2_s", "D_max_um2_s", "n_D", "alpha_min", "alpha_max", "n_alpha", "n_K")
 
 
-def posterior_options(min_frames: int = MIN_FRAMES, alpha: bool = True, grid: Optional[dict] = None) -> GridPostOptions:
+def posterior_options(
+    min_frames: int = MIN_FRAMES,
+    alpha: bool = True,
+    grid: Optional[dict] = None,
+    D_long_stride: Optional[int] = None,
+) -> GridPostOptions:
     """The `GridPostOptions` a run here uses: `grid` holds any of
-    `GRID_FIELDS`; the credible level is fixed at `LEVEL`. Raises
-    ValueError for an unknown key or an invalid grid."""
+    `GRID_FIELDS`; the credible level is fixed at `LEVEL`, and alpha's
+    likelihood is diffusionkit's default ("auto": exact for short tracks,
+    debiased Whittle for long ones). `D_long_stride` (frames, >= 2) adds D
+    at that longer timescale; None skips it. Raises ValueError for an
+    unknown key or an invalid grid."""
     unknown = set(grid or {}) - set(GRID_FIELDS)
     if unknown:
         raise ValueError(f"unknown grid settings: {', '.join(sorted(unknown))}")
-    return GridPostOptions(min_frames=min_frames, level=LEVEL, compute_alpha=alpha, **(grid or {}))
+    return GridPostOptions(
+        min_frames=min_frames, level=LEVEL, compute_alpha=alpha, D_long_stride=D_long_stride, **(grid or {})
+    )
 
 
 def grid_record(options: GridPostOptions) -> dict:
@@ -284,7 +302,27 @@ FIT_SCHEMA = {
     "alpha_median": pl.Float64,
     "alpha_low": pl.Float64,
     "alpha_high": pl.Float64,
+    # D at tau = D_long_stride frames, its ratio to D at one frame, and the
+    # posterior probability that it is lower (null when not run, or the
+    # track is too short to thin).
+    "D_long_median_um2_s": pl.Float64,
+    "D_long_low_um2_s": pl.Float64,
+    "D_long_high_um2_s": pl.Float64,
+    "D_ratio_median": pl.Float64,
+    "D_ratio_low": pl.Float64,
+    "D_ratio_high": pl.Float64,
+    "P_D_decrease": pl.Float64,
 }
+
+_ALPHA_COLUMNS = ("alpha_status", "alpha_median", "alpha_low", "alpha_high")
+_TIMESCALE_COLUMNS = (
+    "D_long_median_um2_s", "D_long_low_um2_s", "D_long_high_um2_s",
+    "D_ratio_median", "D_ratio_low", "D_ratio_high", "P_D_decrease",
+)
+
+# A track "slows" between the two timescales when P_D_decrease is above
+# this, and "speeds up" when it is below 1 minus it.
+SLOWDOWN_EVIDENCE = 0.95
 
 # The per-track columns the widget shows and the summary saves.
 POSTERIOR_COLUMNS = tuple(c for c in FIT_SCHEMA if c not in ("n_frames", "message"))
@@ -342,6 +380,15 @@ class PosteriorAnalysis:
     def has_alpha(self) -> bool:
         return self.log_post_alpha is not None and len(self.alpha_ids) > 0
 
+    @property
+    def D_long_stride(self) -> Optional[int]:
+        return self.options.D_long_stride
+
+    @property
+    def tau_long_s(self) -> Optional[float]:
+        """The longer timescale D was refitted at, or None."""
+        return None if self.D_long_stride is None else self.D_long_stride * self.acquisition.dt_s
+
     def rows_for(self, track_ids: Optional[set], *, alpha: bool = False) -> np.ndarray:
         """Row indices into the D (or alpha) arrays for `track_ids`, or all
         rows for None."""
@@ -376,23 +423,30 @@ def analyze_posteriors(
     options: GridPostOptions,
     *,
     progress: Optional[Callable[[int, int], None]] = None,
+    threads: Optional[int] = None,
 ) -> PosteriorAnalysis:
-    """Grid posteriors over D (and alpha) for every track in `tracks`, on
-    `options`' grids (`posterior_options`).
+    """Grid posteriors over D (and alpha, and D at `options.D_long_stride`)
+    for every track in `tracks`, on `options`' grids (`posterior_options`).
 
     `tracks` is `tracks_to_diffusionkit_df`'s table. This is
     `diffusionkit.gridpost.analyze_tracks` itself -- same statuses, same
     numbers -- reshaped to one row per track, with each fitted track's
-    posterior vector kept. The alpha posterior has no exposure-blur model,
-    so it is computed only when `options.compute_alpha` and
-    `acquisition.exposure_s == 0`; otherwise every row's `alpha_status`
-    says why not. `progress(done, total)` is called from the calling
-    thread."""
-    result = dk_analyze_tracks(tracks, acquisition, options, progress=progress, keep_posteriors=True)
+    posterior vector kept. Tracks are fitted on a pool of `threads`
+    (default: one per CPU; diffusionkit's linear algebra releases the GIL),
+    with the result identical to a serial run. `progress(done, total)` is
+    called from the calling thread."""
+    threads = threads or os.cpu_count() or 1
+    if threads > 1:
+        with ThreadPoolExecutor(threads) as pool:
+            result = dk_analyze_tracks(
+                tracks, acquisition, options, progress=progress, keep_posteriors=True, map_fn=pool.map
+            )
+    else:
+        result = dk_analyze_tracks(tracks, acquisition, options, progress=progress, keep_posteriors=True)
     post = result.posteriors
     by_model = {
         model: result.fits.filter(pl.col("model") == model).drop("model", "n_frames")
-        for model in ("posterior_D", "posterior_alpha")
+        for model in ("posterior_D", "posterior_alpha", "posterior_D_timescale")
     }
     D = by_model["posterior_D"].select(
         "track_id",
@@ -412,6 +466,16 @@ def analyze_posteriors(
         pl.col("alpha_post_lo").alias("alpha_low"),
         pl.col("alpha_post_hi").alias("alpha_high"),
     )
+    timescale = by_model["posterior_D_timescale"].select(
+        "track_id",
+        pl.col("D_long_post_median_um2_s").alias("D_long_median_um2_s"),
+        pl.col("D_long_post_lo_um2_s").alias("D_long_low_um2_s"),
+        pl.col("D_long_post_hi_um2_s").alias("D_long_high_um2_s"),
+        pl.col("D_ratio_post_median").alias("D_ratio_median"),
+        pl.col("D_ratio_post_lo").alias("D_ratio_low"),
+        pl.col("D_ratio_post_hi").alias("D_ratio_high"),
+        "P_D_decrease",
+    )
     edge = pl.DataFrame(
         {"track_id": post.D_track_ids, "D_at_grid_edge": _at_grid_edge(post.log_post_D)},
         schema={"track_id": pl.Int64, "D_at_grid_edge": pl.Boolean},
@@ -420,6 +484,7 @@ def analyze_posteriors(
     fits = (
         n_frames.join(D, on="track_id", how="left")
         .join(alpha, on="track_id", how="left")
+        .join(timescale, on="track_id", how="left")
         .join(edge, on="track_id", how="left")
         .with_columns(
             # One message per track: the D posterior's, then the alpha
@@ -432,7 +497,7 @@ def analyze_posteriors(
         .select(FIT_SCHEMA.keys())
         .cast(FIT_SCHEMA)
     )
-    alpha_ran = options.compute_alpha and acquisition.exposure_s == 0
+    alpha_ran = options.compute_alpha
     return PosteriorAnalysis(
         fits=fits,
         acquisition=acquisition,
@@ -577,7 +642,11 @@ def summarize(
     posterior medians -- the typical track. `summed_D_*` is the shared-D
     posterior's median and 90% interval, and `deconvolved_D_*` the
     deconvolved distribution's median and 90% range (a spread across
-    tracks, not an uncertainty) plus its mode."""
+    tracks, not an uncertainty) plus its mode. With D at a second
+    timescale, `median_D_ratio`/`q25`/`q75` are over the per-track ratio
+    medians, and `n_D_slower`/`n_D_faster` count the tracks whose D is
+    lower/higher at `tau_long_s` with probability above
+    `SLOWDOWN_EVIDENCE`."""
     fits = analysis.fits
     if track_ids is not None:
         fits = fits.filter(pl.col("track_id").is_in(list(track_ids)))
@@ -601,6 +670,17 @@ def summarize(
             median_alpha=_scalar(alpha_ok["alpha_median"].median()),
             q25_alpha=_scalar(alpha_ok["alpha_median"].quantile(0.25)),
             q75_alpha=_scalar(alpha_ok["alpha_median"].quantile(0.75)),
+        )
+    ratio_ok = fits.filter(pl.col("D_ratio_median").is_not_null())
+    if ratio_ok.height:
+        out.update(
+            tau_long_s=analysis.tau_long_s,
+            n_D_ratio=ratio_ok.height,
+            median_D_ratio=_scalar(ratio_ok["D_ratio_median"].median()),
+            q25_D_ratio=_scalar(ratio_ok["D_ratio_median"].quantile(0.25)),
+            q75_D_ratio=_scalar(ratio_ok["D_ratio_median"].quantile(0.75)),
+            n_D_slower=int((ratio_ok["P_D_decrease"] > SLOWDOWN_EVIDENCE).sum()),
+            n_D_faster=int((ratio_ok["P_D_decrease"] < 1 - SLOWDOWN_EVIDENCE).sum()),
         )
     ens = ensemble(analysis, track_ids, deconvolution)
     if ens is not None:
@@ -673,6 +753,12 @@ def ensemble_panels(
             summed_a = _grid_summary(ens.summed_alpha, analysis.alpha_grid, analysis.level, log_grid=False)
             panel["alpha_medians"] = rows["alpha_median"].drop_nulls().to_numpy()
             panel["alpha_summed_interval"] = (summed_a["low"], summed_a["median"], summed_a["high"])
+        if analysis.D_long_stride is not None:
+            ratios = rows.filter(pl.col("D_ratio_median").is_not_null())
+            panel["ratio_medians"] = ratios["D_ratio_median"].to_numpy()
+            panel["n_slower"] = int((ratios["P_D_decrease"] > SLOWDOWN_EVIDENCE).sum())
+            panel["n_faster"] = int((ratios["P_D_decrease"] < 1 - SLOWDOWN_EVIDENCE).sum())
+            panel["evidence"] = SLOWDOWN_EVIDENCE
         panels.append(panel)
     return panels
 
@@ -972,6 +1058,14 @@ def analysis_summary(
             if analysis.has_alpha
             else None
         ),
+        # alpha's likelihood: exact below `whittle_min_frames`, debiased
+        # Whittle from there on (diffusionkit's `alpha_method`).
+        "alpha_likelihood": (
+            {"method": analysis.options.alpha_method, "whittle_min_frames": analysis.options.alpha_whittle_min_frames}
+            if analysis.has_alpha
+            else None
+        ),
+        "D_long_stride": analysis.D_long_stride,
         "msd_comparison": msd_comparison,
         "tracks_sha256": analysis.tracks_sha256,
         "deconvolution": deconvolution.record(),
@@ -991,7 +1085,9 @@ def posterior_results_table(analysis: PosteriorAnalysis, msd: Optional[pl.DataFr
     MSD comparison ran."""
     display = analysis.fits.select(POSTERIOR_COLUMNS)
     if not analysis.has_alpha:
-        display = display.drop("alpha_status", "alpha_median", "alpha_low", "alpha_high")
+        display = display.drop(_ALPHA_COLUMNS)
+    if analysis.D_long_stride is None:
+        display = display.drop(_TIMESCALE_COLUMNS)
     if msd is not None:
         display = display.join(msd, on="track_id", how="left")
     return display
@@ -1052,10 +1148,15 @@ def _saved_options(summary: dict) -> GridPostOptions:
         if summary.get("alpha_grid"):
             lo, hi, n = summary["alpha_grid"]
             grid.update(alpha_min=lo, alpha_max=hi, n_alpha=int(n))
+    # A summary from before alpha had a Whittle likelihood ran it exactly.
+    alpha_likelihood = summary.get("alpha_likelihood") or {"method": "exact"}
     return GridPostOptions(
         min_frames=summary["min_frames"],
         level=summary["credible_level"],
         compute_alpha=summary.get("alpha_grid") is not None,
+        alpha_method=alpha_likelihood.get("method", "exact"),
+        alpha_whittle_min_frames=alpha_likelihood.get("whittle_min_frames", GridPostOptions.alpha_whittle_min_frames),
+        D_long_stride=summary.get("D_long_stride"),
         **{k: v for k, v in grid.items() if k in GRID_FIELDS},
     )
 

@@ -95,6 +95,8 @@ def _diffusion_summary_text(settings: dict) -> str:
         parts.append(f"D grid {grid['D_min_um2_s']:g}–{grid['D_max_um2_s']:g} µm²/s")
     if settings.get("alpha"):
         parts.append("α")
+    if settings.get("D_long_stride"):
+        parts.append(f"D also at {settings['D_long_stride']} frames")
     if settings.get("msd_comparison"):
         parts.append("MSD comparison")
     if settings.get("filters"):
@@ -348,7 +350,7 @@ def run_batch_worker(plan: BatchPlan, cancel_event: threading.Event, emitter: Ba
                 if not report.units_known:
                     notes.append("! no pixel size / frame interval recorded: units are px and frames")
                 if diffusion_settings.alpha and not report.alpha:
-                    notes.append("! α not computed: it needs exposure 0")
+                    notes.append("! α computed for no track")
         except PipelineCancelled:
             emitter.job_finished.emit(index, False, "cancelled")
             return False

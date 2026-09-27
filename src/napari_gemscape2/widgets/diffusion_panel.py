@@ -33,12 +33,12 @@ pointed at a selection you could not see.
   of their own) and moves the time slider to the track's last frame, so
   its tail is drawn in full inside the box.
 - **Posterior** -- `diffusion.analyze_posteriors` (diffusionkit.gridpost):
-  per track, the posterior median of D and its 5%/95% quantiles (with
-  the camera exposure's blur modelled), alpha when exposure is 0, and the
-  ensemble -- the summed (shared-D) posterior and the deconvolved
-  distribution of D across tracks -- over whatever the tracks pane
-  passes, per region class. The MSD fits are a labelled opt-in
-  comparison. See `_PosteriorTab`.
+  per track, the posterior median of D and its 5%/95% quantiles, alpha
+  likewise, and optionally D at a longer timescale with its ratio to D
+  (how the motion changes with timescale, without a model of why) -- all
+  with the camera exposure's blur modelled -- and the ensemble over
+  whatever the tracks pane passes, per region class. The MSD fits are a
+  labelled opt-in comparison. See `_PosteriorTab`.
 - **Map** -- a `Points` layer in the viewer (`self._spatial_map_layer`,
   one point per track centroid) colored by any per-track result: the
   spatial map, and the reason this analysis stays inside napari next to
@@ -132,6 +132,7 @@ from qtkit.napari import live_layer, tabify_with_open_widget
 from qtkit.plot import AxisPicker, PlotWindow
 from qtpy.QtGui import QValidator
 from qtpy.QtWidgets import (
+    QApplication,
     QCheckBox,
     QDoubleSpinBox,
     QComboBox,
@@ -155,6 +156,7 @@ from diffusionkit.gridpost import GridPostOptions
 from napari_gemscape2.diffusion import (
     EXPOSURE_CLAMP_FRACTION,
     MIN_FRAMES,
+    SLOWDOWN_EVIDENCE,
     Deconvolution,
     PosteriorAnalysis,
     SavedAnalysis,
@@ -293,10 +295,10 @@ def _run_posterior_worker(
 
 
 @thread_worker(start_thread=False)
-def _run_nuts_worker(track_df: pl.DataFrame, dt_s: float, model: str):
+def _run_nuts_worker(track_df: pl.DataFrame, dt_s: float, exposure_s: float, model: str):
     from diffusionkit import bayes as dk_bayes
 
-    return dk_bayes.fit_track(track_df, dt_s, model=model)
+    return dk_bayes.fit_track(track_df, dt_s, model=model, exposure_s=exposure_s)
 
 
 class _UnitHeaderModel(ColumnTableModel):
@@ -351,14 +353,23 @@ class _ProgressRelay(QObject):
 
 # Per-track posterior results this widget broadcasts onto the viewer's
 # Tracks layer as properties, so the trajectories themselves can be
-# colored by them (layer controls -> color by). `log10_D_median` rather
-# than D itself: a Tracks layer colormap spans min..max linearly, and D
-# spans decades. `D_info_bits` is already on a log scale; `D_motion_lrt`
-# spans decades and is left to the spatial map's log-scale option. Written
-# by this widget, so they are dropped again whenever it reads the layer
-# back (`_layer_track_table`) -- otherwise they would come back as
-# "detection QC" columns.
-_TRACK_COLOR_COLUMNS = ("log10_D_median", "D_info_bits", "alpha_median")
+# colored by them (layer controls -> color by): name -> how it is computed
+# from the run's per-track columns. Logs rather than D and the D ratio
+# themselves: a Tracks layer colormap spans min..max linearly, and both
+# span decades (a ratio of 2 and of 1/2 then sit equally far from 0).
+# `D_info_bits` is already on a log scale; `D_motion_lrt` spans decades and
+# is left to the spatial map's log-scale option. Written by this widget, so
+# they are dropped again whenever it reads the layer back
+# (`_layer_track_table`) -- otherwise they would come back as "detection
+# QC" columns.
+_TRACK_COLOR_EXPRESSIONS = {
+    "log10_D_median": pl.col("D_median_um2_s").log10(),
+    "D_info_bits": pl.col("D_info_bits"),
+    "alpha_median": pl.col("alpha_median"),
+    "log10_D_ratio": pl.col("D_ratio_median").log10(),
+    "P_D_decrease": pl.col("P_D_decrease"),
+}
+_TRACK_COLOR_COLUMNS = tuple(_TRACK_COLOR_EXPRESSIONS)
 
 # "No exposure seen yet" for `DiffusionAnalysisWidget._layer_exposure_s`,
 # distinct from None ("the layer records none").
@@ -849,8 +860,17 @@ _POSTERIOR_HELP = (
     "<i>smoothing</i> (grid cells) keeps peaks from collapsing into "
     "spikes &mdash; less sharpens them, more widens them. D is spread over the D grid, "
     "the same range every track's prior has."
-    "<br><br><b>α</b> (fBm exponent, K integrated out) has no motion-blur model, so "
-    "it is only available for exposure 0. It costs ~30x D."
+    "<br><br><b>α</b> (fBm exponent, K integrated out) is fitted to the same blurred "
+    "displacements as D, independently of it. Tracks of 40 frames or more use a fast "
+    "approximate likelihood (debiased Whittle): as well calibrated, a few percent less "
+    "precise. It costs ~2x D."
+    "<br><br><b>D also at k frames</b> refits D to the track thinned to every k-th frame, "
+    "and reports <i>D_ratio</i> = D(k&middot;dt) / D(dt) with <i>P_D_decrease</i>, the "
+    "probability that it is below 1. For Brownian motion the ratio is 1; below 1 the "
+    "motion slows at longer times (confinement, crowding, α &lt; 1), above 1 it is "
+    "persistent -- without committing to a model of why. k sets the longer timescale; a "
+    "track needs 2k+1 frames. Its intervals err wide, so a slowdown shows up per track "
+    "only on long tracks."
 )
 
 
@@ -901,8 +921,8 @@ class _PosteriorTab(QWidget):
     likelihood models the blur of a continuous exposure, so treating 20 ms
     as instantaneous biases D low. It is pre-filled from the layer's
     metadata and otherwise has to be typed -- the box starts at "not set",
-    never at 0, and Run stays off until it has a value. Exposure 0 is also
-    what makes the alpha posterior available (it has no blur model).
+    never at 0, and Run stays off until it has a value. D, alpha and D at
+    the longer timescale all model that blur.
 
     The summary and the Ensemble and Posteriors figures are read over the
     tracks the tracks pane currently passes (and grouped by region class
@@ -953,12 +973,27 @@ class _PosteriorTab(QWidget):
             "just gets a wide posterior, so there is no need to raise it for accuracy."
         )
 
-        self._alpha = QCheckBox("α (slow)")
+        self._alpha = QCheckBox("α")
+        self._alpha.setChecked(True)
         self._alpha.setToolTip(
             "Also compute the posterior over the fBm exponent α, with K\n"
-            "integrated out. No motion-blur model exists for it, so it needs\n"
-            "exposure = 0. About 30x the cost of D (~50 ms per track)."
+            "integrated out and the exposure's blur modelled. About twice the\n"
+            "cost of D; tracks of 40+ frames use a fast approximate likelihood."
         )
+        # D at a second, longer timescale: its gap in frames, "off" at 1.
+        self._long_stride = QSpinBox()
+        self._long_stride.setRange(1, 100)
+        self._long_stride.setValue(5)
+        # "off" at 1; otherwise the suffix says the gap in time too
+        # (`_update_long_note`), at the loaded layer's frame interval.
+        self._long_stride.setSpecialValueText("off")
+        self._long_stride.setToolTip(
+            "Also refit D to each track thinned to every k-th frame, and report\n"
+            "D_ratio = D(k·dt) / D(dt) and P_D_decrease. 1 for Brownian motion;\n"
+            "below 1 when motion slows at longer times (confinement, crowding,\n"
+            "α < 1). A track needs 2k+1 frames. \"off\" skips it."
+        )
+        self._long_stride.valueChanged.connect(lambda _v: self._update_long_note())
         self._msd_comparison = QCheckBox("MSD")
         self._msd_comparison.setToolTip(
             "Also fit the classic 3-lag MSD models (Brownian D; power-law K and α)\n"
@@ -971,6 +1006,7 @@ class _PosteriorTab(QWidget):
         # in a dock for three controls, and clipped them.
         exposure_row = flow_row(QLabel("exposure"), self._exposure)
         options_row = flow_row(QLabel("min points"), self._min_frames, self._alpha, self._msd_comparison)
+        long_row = flow_row(QLabel("D also at"), self._long_stride)
 
         # The posterior grids -- diffusionkit's `GridPostOptions` fields,
         # read when Run is pressed. D's range is the flat prior's support,
@@ -1028,8 +1064,8 @@ class _PosteriorTab(QWidget):
         self._ensemble_button = QPushButton("Ensemble")
         self._ensemble_button.setToolTip(
             "Per-track medians, the deconvolved distribution and the summed\n"
-            "(shared-D) posterior, over the tracks the filters pass -- one\n"
-            "panel per region class when there are several."
+            "(shared-D) posterior -- and α and the D ratio when they were run --\n"
+            "over the tracks the filters pass, one row per region class."
         )
         self._ensemble_button.clicked.connect(self._show_ensemble)
         self._track_button = QPushButton("Track")
@@ -1101,6 +1137,7 @@ class _PosteriorTab(QWidget):
         layout.addWidget(exposure_row)
         layout.addWidget(self._exposure_note)
         layout.addWidget(options_row)
+        layout.addWidget(long_row)
         layout.addLayout(grid_form)
         layout.addWidget(self._alpha_grid_section)
         layout.addWidget(self._grid_reset, alignment=Qt.AlignmentFlag.AlignLeft)
@@ -1171,7 +1208,18 @@ class _PosteriorTab(QWidget):
             n_alpha=self._grid_n_alpha.value(),
             n_K=self._grid_n_K.value(),
         )
-        return posterior_options(self._min_frames.value(), self._alpha.isChecked(), grid)
+        return posterior_options(
+            self._min_frames.value(), self._alpha.isChecked(), grid, D_long_stride=self.long_stride()
+        )
+
+    def long_stride(self) -> Optional[int]:
+        """The longer timescale's gap in frames, or None when "off"."""
+        stride = self._long_stride.value()
+        return stride if stride > 1 else None
+
+    def _update_long_note(self) -> None:
+        """Say what the gap is in time too: "5 frames · 175 ms"."""
+        self._long_stride.setSuffix(f" frames · {_fmt_time(self._long_stride.value() * self.host.dt_s)}")
 
     def set_grid(self, options: GridPostOptions) -> None:
         values = (
@@ -1230,6 +1278,11 @@ class _PosteriorTab(QWidget):
         value = self._exposure.value()
         return value if value >= 0 else None
 
+    def run_exposure_s(self) -> Optional[float]:
+        """`exposure_s` as a run uses it (clamped to the frame interval), or
+        None when a run is not possible."""
+        return self._exposure_for_run()[0]
+
     def _exposure_for_run(self) -> tuple[Optional[float], str, str]:
         """`(exposure to run with, note, level)`. None when the run can't
         go ahead, with the note saying why."""
@@ -1256,7 +1309,7 @@ class _PosteriorTab(QWidget):
             return exposure, "0 = instantaneous (stroboscopic) — no blur modelled", "caution"
         else:
             note = "entered here — not recorded on the layer"
-        return exposure, note + (" · α needs 0" if exposure > 0 else ""), "neutral"
+        return exposure, note, "neutral"
 
     def refresh_inputs(self) -> None:
         exposure, note, level = self._exposure_for_run()
@@ -1268,10 +1321,7 @@ class _PosteriorTab(QWidget):
         except ValueError:
             grid_ok = False
         self._run_button.setEnabled(exposure is not None and grid_ok and self.host.has_tracks)
-        alpha_possible = exposure == 0
-        self._alpha.setEnabled(alpha_possible)
-        if not alpha_possible:
-            self._alpha.setChecked(False)
+        self._update_long_note()
 
     def _refresh_plot_buttons(self) -> None:
         has_run = self._analysis is not None and len(self._analysis.fitted_ids) > 0
@@ -1343,7 +1393,8 @@ class _PosteriorTab(QWidget):
         caller refreshes the summary once the filters are back too."""
         analysis = saved.analysis
         self._min_frames.setValue(analysis.min_frames)
-        self._alpha.setChecked(analysis.alpha_ids is not None and self._alpha.isEnabled())
+        self._alpha.setChecked(analysis.alpha_ids is not None)
+        self._long_stride.setValue(analysis.D_long_stride or 1)
         self._msd_comparison.setChecked(saved.msd is not None)
         self.set_deconvolution(saved.deconvolution)
         n_ok = self._adopt(analysis, saved.msd)
@@ -1405,10 +1456,14 @@ class _PosteriorTab(QWidget):
         if not panels:
             return
         figure = plot_d_ensemble(
-            self._analysis.D_grid_um2_s, panels, self._analysis.alpha_grid if self._analysis.has_alpha else None
+            self._analysis.D_grid_um2_s,
+            panels,
+            self._analysis.alpha_grid if self._analysis.has_alpha else None,
+            ratio_label=_ratio_label(self._analysis),
         )
         if self._ensemble_window is None:
             self._ensemble_window = PlotWindow("Posterior: ensemble", parent=self)
+        _fit_window_to_figure(self._ensemble_window, figure)
         self._ensemble_window.show_figure(figure)
 
     def _show_track(self) -> None:
@@ -1462,6 +1517,31 @@ class _PosteriorTab(QWidget):
         style_status_label(self._status, "error")
 
 
+def _fit_window_to_figure(window: QWidget, figure) -> None:
+    """Size a plot window for `figure`'s own layout (its inches at its dpi,
+    plus room for the toolbar), within the screen: the ensemble figure gains
+    a column per optional analysis, which a fixed-size window squeezes."""
+    width, height = (figure.get_size_inches() * figure.dpi).astype(int)
+    height += 60  # the navigation toolbar
+    screen = window.screen() or QApplication.primaryScreen()
+    if screen is not None:
+        available = screen.availableGeometry()
+        width, height = min(width, available.width() - 40), min(height, available.height() - 80)
+    window.resize(width, height)
+
+
+def _fmt_time(seconds: float) -> str:
+    """A timescale for a label: ms below a second, s above."""
+    return f"{seconds * 1e3:.3g} ms" if seconds < 1 else f"{seconds:.3g} s"
+
+
+def _ratio_label(analysis: Optional[PosteriorAnalysis]) -> Optional[str]:
+    """ "D(175 ms) / D(35 ms)" for a run with D at a second timescale."""
+    if analysis is None or analysis.tau_long_s is None:
+        return None
+    return f"D({_fmt_time(analysis.tau_long_s)}) / D({_fmt_time(analysis.acquisition.dt_s)})"
+
+
 def _format_by_group(by_group: Optional[dict]) -> str:
     """One line per region class under the pooled summary: each region was
     linked on its own, and whether its motion differs is why it was drawn."""
@@ -1477,6 +1557,8 @@ def _format_by_group(by_group: Optional[dict]) -> str:
             line += f" · shared {summary['summed_D_median_um2_s']:.3g}"
         if summary.get("median_alpha") is not None:
             line += f" · α {summary['median_alpha']:.2f}"
+        if summary.get("median_D_ratio") is not None:
+            line += f" · D ratio {summary['median_D_ratio']:.2f} ({summary['n_D_slower']} slower)"
         lines.append(line)
     return "\n".join(lines)
 
@@ -1489,7 +1571,7 @@ def _format_posterior_summary(summary: dict, analysis: Optional[PosteriorAnalysi
         key[2:]: value
         for key, value in summary.items()
         if key.startswith("n_")
-        and key not in ("n_tracks", "n_ok", "n_alpha", "n_D_at_grid_edge")
+        and key not in ("n_tracks", "n_ok", "n_alpha", "n_D_at_grid_edge", "n_D_ratio", "n_D_slower", "n_D_faster")
         and not key.startswith("n_frames")
     }
     counts = f"{summary.get('n_ok', 0)} fitted"
@@ -1521,6 +1603,13 @@ def _format_posterior_summary(summary: dict, analysis: Optional[PosteriorAnalysi
         lines.append(
             f"median α {summary['median_alpha']:.2f} (IQR {summary['q25_alpha']:.2f}–"
             f"{summary['q75_alpha']:.2f}) · shared α {summary['summed_alpha_median']:.2f}"
+        )
+    if summary.get("median_D_ratio") is not None:
+        lines.append(
+            f"{_ratio_label(analysis) if analysis is not None else 'D ratio'}: median "
+            f"{summary['median_D_ratio']:.2f} (IQR {summary['q25_D_ratio']:.2f}–{summary['q75_D_ratio']:.2f}) "
+            f"of {summary['n_D_ratio']} · slower {summary['n_D_slower']}, faster {summary['n_D_faster']} "
+            f"(P > {SLOWDOWN_EVIDENCE:g})"
         )
     if analysis is not None:
         acquisition = analysis.acquisition
@@ -1671,8 +1760,9 @@ class _NutsTab(QWidget):
     """`diffusionkit.bayes.fit_track`: a full NUTS posterior for the one
     track selected in the tracks pane -- the per-track diagnostic for when
     a posterior's shape matters (the K/alpha/sigma correlations the 1D
-    grid posteriors don't show). Tens of seconds per track, so there is no
-    bulk version. Needs the optional `[bayes]` extra (JAX, NumPyro)."""
+    grid posteriors don't show). It models the Posterior tab's exposure
+    blur, as the grid posteriors do. Tens of seconds per track, so there is
+    no bulk version. Needs the optional `[bayes]` extra (JAX, NumPyro)."""
 
     def __init__(self, host: "DiffusionAnalysisWidget") -> None:
         super().__init__()
@@ -1686,7 +1776,11 @@ class _NutsTab(QWidget):
             "anomalous: K, α and the localization σ. normal: D and σ."
         )
         self._fit_button = QPushButton("Fit selected track")
-        self._fit_button.setToolTip("Full NUTS posterior (4 chains) for the track selected above.")
+        self._fit_button.setToolTip(
+            "Full NUTS posterior (4 chains) for the track selected above, with the\n"
+            "Posterior tab's exposure blur modelled. Fits one localization σ per\n"
+            "track, where the grid posteriors use each frame's own."
+        )
         self._fit_button.clicked.connect(self._run)
         self._status = status_label("")
         self._result_label = status_label("")
@@ -1725,10 +1819,15 @@ class _NutsTab(QWidget):
             self._status.setText(f"track {track_id} is too short to fit")
             style_status_label(self._status, "caution")
             return
+        exposure = self.host.run_exposure_s()
+        if exposure is None:
+            self._status.setText("set the camera exposure in the Posterior tab first")
+            style_status_label(self._status, "caution")
+            return
         model = self._model_picker.currentText()
         self._status.setText("running… (compiles on first use; tens of seconds)")
         style_status_label(self._status)
-        worker = _run_nuts_worker(track_df, self.host.dt_s, model)
+        worker = _run_nuts_worker(track_df, self.host.dt_s, exposure, model)
         self.host.start_worker(
             worker, self._on_finished, self._on_error, [self._fit_button], f"NUTS, track {track_id}"
         )
@@ -1843,7 +1942,7 @@ class DiffusionAnalysisWidget(QWidget):
         tabs.addTab(scrolled(self._posterior_tab), "Posterior")
         tabs.addTab(scrolled(self._map_tab), "Map")
         tabs.addTab(scrolled(self._nuts_tab), "NUTS")
-        tabs.setTabToolTip(0, "Per-track grid posteriors over D (and α), and the ensemble (diffusionkit.gridpost)")
+        tabs.setTabToolTip(0, "Per-track grid posteriors over D, α and D at a longer timescale, and the ensemble (diffusionkit.gridpost)")
         tabs.setTabToolTip(1, "Color each track's centroid in the viewer by a result")
         tabs.setTabToolTip(2, "Full NUTS posterior for the selected track (diffusionkit.bayes)")
 
@@ -1976,6 +2075,11 @@ class DiffusionAnalysisWidget(QWidget):
         self._update_spatial_map_layer()
         self._map_tab.refresh_map_histogram()
         self._posterior_tab.refresh_summary()
+
+    def run_exposure_s(self) -> Optional[float]:
+        """The exposure a fit runs with (the Posterior tab's, as its Run would
+        use it), or None when there is none to run with."""
+        return self._posterior_tab.run_exposure_s()
 
     def diffkit_tracks_for_fit(self) -> Optional[pl.DataFrame]:
         """The tracks a fit should run on, honoring the footer's one
@@ -2600,14 +2704,17 @@ class DiffusionAnalysisWidget(QWidget):
         pinning to one end of the colormap."""
         if self._posterior_df is None:
             return df
-        present = [c for c in _TRACK_COLOR_COLUMNS[1:] if c in self._posterior_df.columns]
-        colors = self._posterior_df.select(
-            "track_id",
-            pl.col("D_median_um2_s").log10().alias("log10_D_median"),
-            *present,
-        )
+        # Only the colors this run has the columns for (alpha and the D
+        # ratio are optional).
+        available = set(self._posterior_df.columns)
+        present = {
+            name: expression
+            for name, expression in _TRACK_COLOR_EXPRESSIONS.items()
+            if set(expression.meta.root_names()) <= available
+        }
+        colors = self._posterior_df.select("track_id", *(e.alias(name) for name, e in present.items()))
         return df.join(colors, on="track_id", how="left").with_columns(
-            pl.col(c).cast(pl.Float64).fill_null(float("nan")) for c in ["log10_D_median", *present]
+            pl.col(c).cast(pl.Float64).fill_null(float("nan")) for c in present
         )
 
     def _set_tracks_layer_data(self, df: pl.DataFrame) -> None:
