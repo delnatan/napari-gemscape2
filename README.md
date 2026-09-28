@@ -426,26 +426,59 @@ diffusion_summary.json    settings (dt, exposure, grid -- GridPostOptions' field
 Points and tracks stay parquet (the atomic data); the tables people open in a
 spreadsheet are CSV. `tracks_summary.csv` — the table to read an experiment's
 tracks from and to pool across experiments (*Export CSV…* writes the same table
-anywhere) — has every track as a row, filtered-out and excluded ones included:
+anywhere) — has every track as a row, filtered-out and excluded ones included.
+Point estimates are posterior **medians**, and `_low`/`_high` are the 5% and
+95% quantiles (a 90% credible interval). Empty cells mean "not computed for
+this track": it was excluded, too short, or that analysis was off.
 
-- identity: `result_id` (the bundle), `track_id`, `region_class`, `cell`, and `passes_filters`
-  (the tracks pane's length and histogram cuts, recorded in
-  `diffusion_summary.json`);
-- size and position: `track_length`, `duration_s`, `mean_step_um`, mean
-  `x_um`/`y_um` (and px);
-- the posterior: `posterior_status`, `D_median_um2_s`, `D_low_um2_s`,
-  `D_high_um2_s` (5% and 95% quantiles), `D_at_grid_edge` (the posterior is
-  cut by the D grid's range), and with α: `alpha_status`,
-  `alpha_median`, `alpha_low`, `alpha_high`; with a D ratio: `D_long_median_um2_s`
-  (and `_low`/`_high`), `D_ratio_median` (and `_low`/`_high`), `P_D_decrease`;
-  `D_msd_um2_s`/`alpha_msd` when the
-  MSD comparison ran, `*_nuts*` for tracks fitted with NUTS;
-- shape: `radius_of_gyration_um`, `net_displacement_um`, `straightness`,
-  `gyration_asymmetry`;
-- track quality, as the mean over the track's detections of each detector
-  column: `flux_mean`, `bg_mean`, `fit_sigma_mean`, `se_x_mean`/`se_y_mean`,
-  ... — in the detector's units (`fit_sigma`, `se_x` in px;
-  the `_um` variants in µm).
+| Column | Unit | Meaning |
+|---|---|---|
+| **Identity** | | |
+| `result_id` | | The bundle (movie) the track came from; lets you concatenate bundles |
+| `track_id` | | Track number within the bundle |
+| `region_class` | | Name of the painted region the track is in (only when regions were used) |
+| `passes_filters` | | True if the track passes the tracks-pane cuts (recorded in `diffusion_summary.json`) |
+| **Size and position** | | |
+| `track_length` | points | Number of localizations in the track |
+| `duration_s` | s | Time from first to last frame |
+| `mean_step_um` | µm | Mean frame-to-frame step length |
+| `x_um`, `y_um` / `x_px`, `y_px` | µm / px | Track centroid |
+| **D (one frame interval)** | | |
+| `posterior_status` | | `ok`, `excluded` (shorter than `min_frames`), or `invalid_input` |
+| `D_median_um2_s` | µm²/s | D, Brownian model, exposure blur included |
+| `D_low_um2_s`, `D_high_um2_s` | µm²/s | 90% credible interval on D |
+| `D_at_grid_edge` | | The posterior is cut off by the D grid's range. Treat the D as a bound, not a value |
+| `D_info_bits` | bits | How much the track narrowed D from the flat prior. Only comparable on the same grid |
+| `D_motion_lrt` | | 2 ln LR of motion + noise over noise alone; near 0 means you can't tell it from localization noise (not a p-value) |
+| **α (fBm exponent)** | | |
+| `alpha_status` | | As `posterior_status`, for α |
+| `alpha_median` | | Anomalous exponent (1 = Brownian, < 1 subdiffusive, > 1 superdiffusive) |
+| `alpha_low`, `alpha_high` | | 90% credible interval on α |
+| **D at a second timescale** (with `D_long_stride`) | | |
+| `D_long_median_um2_s` (`_low`, `_high`) | µm²/s | D refitted on the track thinned to every k-th frame (τ = `tau_long_s` in the summary json) |
+| `D_ratio_median` (`_low`, `_high`) | | D(τ) / D(one frame): < 1 slows at longer times (confined, α < 1); > 1 persistent or directed. Needs ≥ (`min_frames` − 1)·k + 1 points |
+| `P_D_decrease` | | Posterior probability that the ratio is < 1 |
+| **Optional fits** | | |
+| `D_msd_um2_s`, `alpha_msd` | µm²/s, – | Classical MSD fit, when the MSD comparison ran (no uncertainties) |
+| `*_nuts*` | | Full-posterior NUTS fit, for tracks fitted in the NUTS tab |
+| **Shape** (raw, so localization error inflates it) | | |
+| `radius_of_gyration_um` | µm | RMS distance of positions from their centroid |
+| `net_displacement_um` | µm | Straight-line distance from first to last position |
+| `straightness` | 0–1 | Net displacement / path length; near 1 for directed motion |
+| `gyration_asymmetry` | 0–1 | 0 for an isotropic cloud, 1 for a line |
+| **Detection quality** (mean over the track's detections, spotsolve's columns) | | |
+| `sigma` | px | Detector's reference PSF width (the same for every track) |
+| `t_mean` | s | Mean detection time |
+| `x_um_mean`, `y_um_mean` | µm | Mean position (same as the centroid) |
+| `se_x_mean`, `se_y_mean`, `se_pos_mean` | px | Localization standard error (CRLB) per axis, and their hypot |
+| `se_x_um_mean`, `se_y_um_mean` | µm | Same, in µm |
+| `flux_mean`, `se_flux_mean` | ADU | Background-free integrated brightness and its standard error |
+| `flux_snr_mean` | | flux / se_flux |
+| `peak_mean` | ADU | On-centre model pixel value; compare with `bg_mean` |
+| `bg_mean` | ADU/px | Fitted local background |
+| `fit_sigma_mean`, `sigma_se_mean` | px | Fitted spot width and its standard error |
+| `sigma_ratio_mean` | | fit_sigma / sigma; well above 1 flags blur or overlapping spots |
+| `fisher_flux_mean`, `fisher_x_mean`, `fisher_y_mean`, `fisher_sigma_mean` | | Conditional / marginal Fisher variance per fit parameter; small means strongly coupled to another parameter (a diagnostic, not precision) |
 
 The tracks pane's histogram filters cover per-track results too — so a
 posterior `D` or `alpha` is filterable by the same drag as any other feature.
