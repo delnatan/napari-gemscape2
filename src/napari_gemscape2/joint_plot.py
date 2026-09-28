@@ -1,10 +1,17 @@
-"""Generic 2D scatter+KDE joint-distribution plot for any pair of per-track
+"""Generic 2D joint-distribution plot for any pair of per-track
 properties. diffusionkit ships this exact diagnostic for D vs alpha
 (`bayes.plot_K_joint`), but hardcodes a log10 transform on the D
 column and always draws an alpha=1 Brownian reference line -- both specific
 to that one comparison. This generalizes it to arbitrary columns/labels/log
 scaling so any two trajectory properties (classical vs Bayesian D, alpha,
 r2, track length, ...) can be compared the same way.
+
+Few tracks are drawn as points over a KDE; many (`DENSITY_MIN_POINTS` or
+more, with `style="auto"`) as a 2D histogram, because stacked points
+saturate: at opacity 0.6, three overlapping dots are already 94% opaque,
+so the dense core -- the part worth reading -- goes uniformly dark. Bins
+holding fewer than `SPARSE_MAX_COUNT` tracks are left empty and their tracks
+drawn as points instead, so outliers stay visible one track at a time.
 
 The posterior figures (`plot_d_ensemble`, `plot_track_posterior`) follow
 one color assignment by role, not by series (per-track medians of alpha and
@@ -31,10 +38,23 @@ import numpy as np
 import pandas as pd
 import polars as pl
 import seaborn as sns
-from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.colors import LinearSegmentedColormap, LogNorm, Normalize
 from matplotlib.figure import Figure
 
 from napari_gemscape2 import units
+
+
+# `style="auto"` switches from points to the binned density at this many
+# tracks; bins with fewer than `SPARSE_MAX_COUNT` tracks are drawn as points.
+DENSITY_MIN_POINTS = 1000
+SPARSE_MAX_COUNT = 3
+JOINT_STYLES = ("auto", "points", "density")
+# The density's bin count per axis: Freedman-Diaconis, but at most
+# sqrt(n)/2 (a 2D grid spreads n tracks over the square of it), held to
+# this range. Its colors go on a log scale when the fullest bin holds this
+# many times the median occupied bin.
+_BINS_RANGE = (15, 60)
+_LOG_COLOR_RATIO = 10
 
 
 def plot_property_joint(
@@ -47,7 +67,13 @@ def plot_property_joint(
     log_x: bool = False,
     log_y: bool = False,
     display_quantiles: tuple[float, float] = (0.01, 0.99),
+    style: str = "auto",
 ) -> Figure:
+    """`style` is "points" (scatter over a KDE), "density" (2D histogram,
+    sparse bins as points), or "auto": density from `DENSITY_MIN_POINTS`
+    tracks up."""
+    if style not in JOINT_STYLES:
+        raise ValueError(f"style must be one of {JOINT_STYLES}, not {style!r}")
     sub = df.select(x_col, y_col).drop_nulls()
     if log_x:
         sub = sub.filter(pl.col(x_col) > 0)
@@ -67,18 +93,26 @@ def plot_property_joint(
     pdf = pd.DataFrame({"x": x[in_view], "y": y[in_view]})
 
     r = np.corrcoef(x, y)[0, 1] if len(x) > 1 else float("nan")
+    density = style == "density" or (style == "auto" and len(pdf) >= DENSITY_MIN_POINTS)
 
     g = sns.JointGrid(data=pdf, x="x", y="y", height=6, ratio=4)
-    sns.kdeplot(
-        data=pdf, x="x", y="y", ax=g.ax_joint,
-        fill=True, cmap="Blues", alpha=0.6, thresh=0.05, levels=12, zorder=0,
-    )
-    sns.scatterplot(
-        data=pdf, x="x", y="y", ax=g.ax_joint,
-        s=18, alpha=0.6, color="0.15", edgecolor="none", zorder=1,
-    )
-    g.ax_marg_x.hist(pdf["x"], bins=30, color="steelblue", edgecolor="white")
-    g.ax_marg_y.hist(pdf["y"], bins=30, color="steelblue", edgecolor="white", orientation="horizontal")
+    if density:
+        x_edges = _bin_edges(pdf["x"].to_numpy(), integer=not log_x and _is_integer(x))
+        y_edges = _bin_edges(pdf["y"].to_numpy(), integer=not log_y and _is_integer(y))
+        _draw_density(g, pdf["x"].to_numpy(), pdf["y"].to_numpy(), x_edges, y_edges)
+        x_bins, y_bins = x_edges, y_edges
+    else:
+        sns.kdeplot(
+            data=pdf, x="x", y="y", ax=g.ax_joint,
+            fill=True, cmap="Blues", alpha=0.6, thresh=0.05, levels=12, zorder=0,
+        )
+        sns.scatterplot(
+            data=pdf, x="x", y="y", ax=g.ax_joint,
+            s=18, alpha=0.6, color="0.15", edgecolor="none", zorder=1,
+        )
+        x_bins = y_bins = 30
+    g.ax_marg_x.hist(pdf["x"], bins=x_bins, color="steelblue", edgecolor="white")
+    g.ax_marg_y.hist(pdf["y"], bins=y_bins, color="steelblue", edgecolor="white", orientation="horizontal")
 
     # A log axis keeps its quantity's unit -- it is the unit the log was
     # taken of, and dropping it (the old "log10(D_map_um2_s)") leaves the
@@ -95,8 +129,61 @@ def plot_property_joint(
         pct = int(100 * (display_quantiles[1] - display_quantiles[0]))
         subtitle += f", {n_dropped} outside {pct}% display range"
     subtitle += ")"
-    g.ax_marg_x.set_title(subtitle, fontsize=10, loc="left")
+    g.ax_marg_x.set_title(subtitle, fontsize=10, loc="left", wrap=True)
+    # Laid out again for the title: JointGrid's own layout ran before it
+    # existed, and a long one otherwise runs off the top of the figure.
+    g.figure.tight_layout()
     return g.figure
+
+
+def _is_integer(v: np.ndarray) -> bool:
+    return bool(np.all(v == np.round(v)))
+
+
+def _bin_edges(v: np.ndarray, *, integer: bool) -> np.ndarray:
+    """Freedman-Diaconis edges, at most sqrt(n)/2 and held to
+    `_BINS_RANGE` bins. An integer
+    column (track length) gets edges between its integers, whole numbers
+    per bin, so no bin catches one more integer than its neighbours and
+    stripes the histogram."""
+    lo, hi = float(v.min()), float(v.max())
+    if integer:
+        step = max(1, int(np.ceil((hi - lo + 1) / _BINS_RANGE[1])))
+        return np.arange(lo - 0.5, hi + 0.5 + step, step)
+    if hi == lo:
+        return np.array([lo - 0.5, lo + 0.5])
+    n = min(len(np.histogram_bin_edges(v, bins="fd")) - 1, np.sqrt(len(v)) / 2)
+    return np.linspace(lo, hi, int(np.clip(n, *_BINS_RANGE)) + 1)
+
+
+def _draw_density(g, x: np.ndarray, y: np.ndarray, x_edges: np.ndarray, y_edges: np.ndarray) -> None:
+    """The 2D histogram on `g.ax_joint`, bins below `SPARSE_MAX_COUNT` left
+    empty and their tracks drawn as points, and its color bar in the
+    grid's empty top-right corner."""
+    counts, _, _ = np.histogram2d(x, y, bins=[x_edges, y_edges])
+    ix = np.clip(np.searchsorted(x_edges, x, side="right") - 1, 0, len(x_edges) - 2)
+    iy = np.clip(np.searchsorted(y_edges, y, side="right") - 1, 0, len(y_edges) - 2)
+    sparse = counts[ix, iy] < SPARSE_MAX_COUNT
+    shown = np.ma.masked_less(counts, SPARSE_MAX_COUNT)
+    ax = g.ax_joint
+    if shown.count():
+        occupied = shown.compressed()
+        norm = (
+            LogNorm(vmin=SPARSE_MAX_COUNT, vmax=occupied.max())
+            if occupied.max() >= _LOG_COLOR_RATIO * np.median(occupied)
+            else Normalize(vmin=SPARSE_MAX_COUNT, vmax=occupied.max())
+        )
+        mesh = ax.pcolormesh(x_edges, y_edges, shown.T, cmap=_DENSITY_CMAP, norm=norm, rasterized=True, zorder=0)
+        corner = g.figure.add_subplot(ax.get_subplotspec().get_gridspec()[0, -1])
+        corner.set_axis_off()
+        cax = corner.inset_axes([0.1, 0.4, 0.8, 0.14])
+        bar = g.figure.colorbar(mesh, cax=cax, orientation="horizontal")
+        bar.ax.tick_params(labelsize=7, length=2)
+        bar.outline.set_visible(False)
+        cax.set_title("tracks per bin", fontsize=8, color=_MUTED_INK)
+    ax.scatter(x[sparse], y[sparse], s=8, color=_INK, edgecolor="none", zorder=1)
+    ax.set_xlim(x_edges[0], x_edges[-1])
+    ax.set_ylim(y_edges[0], y_edges[-1])
 
 
 def numeric_columns(df: pl.DataFrame, exclude: tuple[str, ...] = ("track_id",)) -> list[str]:
@@ -113,6 +200,11 @@ _POOLED_COLOR = "#1baf7a"
 # the per-track heat map is magnitude, not identity.
 _POSTERIOR_CMAP = LinearSegmentedColormap.from_list(
     "posterior", ["#fcfcfb", "#cde2fb", "#86b6ef", "#2a78d6", "#184f95", "#0d366b"]
+)
+# The joint plot's density: the same ramp without its surface-colored end,
+# so the emptiest drawn bin still reads against the empty ones.
+_DENSITY_CMAP = LinearSegmentedColormap.from_list(
+    "density", ["#cde2fb", "#86b6ef", "#2a78d6", "#184f95", "#0d366b"]
 )
 _INK = "#0b0b0b"
 _MUTED_INK = "#52514e"

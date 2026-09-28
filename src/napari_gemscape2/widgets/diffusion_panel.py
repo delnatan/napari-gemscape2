@@ -188,6 +188,8 @@ from napari_gemscape2.results import (
     write_diffusion_results,
 )
 from napari_gemscape2.joint_plot import (
+    DENSITY_MIN_POINTS,
+    JOINT_STYLES,
     numeric_columns,
     plot_d_ensemble,
     plot_d_posteriors,
@@ -600,7 +602,25 @@ class _TracksPane(QWidget):
             "quality, and every fit run so far -- over the tracks currently shown."
         )
         self._joint_plot_control.plotRequested.connect(self._show_joint_plot)
-        self._plot_section = CollapsibleSection("Joint plot", self._joint_plot_control, expanded=False)
+        # Beside the picker rather than in it: `AxisPicker` is qtkit's, and
+        # holds only the axes.
+        self._joint_style = QComboBox()
+        self._joint_style.addItems([style.capitalize() for style in JOINT_STYLES])
+        self._joint_style.setToolTip(
+            f"Auto: points up to {DENSITY_MIN_POINTS - 1} tracks, a 2D histogram from "
+            f"{DENSITY_MIN_POINTS} (bins with fewer than 3 tracks drawn as points).\n"
+            "Points: every track as a dot over a density contour.\n"
+            "Density: the 2D histogram at any count."
+        )
+        style_form = QFormLayout()
+        style_form.setContentsMargins(0, 0, 0, 0)
+        style_form.addRow("show as:", self._joint_style)
+        plot_body = QWidget()
+        plot_layout = QVBoxLayout(plot_body)
+        plot_layout.setContentsMargins(0, 0, 0, 0)
+        plot_layout.addLayout(style_form)
+        plot_layout.addWidget(self._joint_plot_control)
+        self._plot_section = CollapsibleSection("Joint plot", plot_body, expanded=False)
 
         self._model = _UnitHeaderModel()
         # Can carry 40+ columns after three fits (hence fixed-width
@@ -809,7 +829,9 @@ class _TracksPane(QWidget):
         # No `title=`: `plot_property_joint` then titles the panel with
         # both axes' own labels (quantity + unit), which says more than
         # "Tracks" does when the axes are picked at runtime.
-        figure = plot_property_joint(df, x_col, y_col, log_x=log_x, log_y=log_y)
+        figure = plot_property_joint(
+            df, x_col, y_col, log_x=log_x, log_y=log_y, style=self._joint_style.currentText().lower()
+        )
         if self._joint_plot_window is None:
             self._joint_plot_window = PlotWindow("Tracks: joint plot", parent=self)
         self._joint_plot_window.show_figure(figure)
