@@ -9,8 +9,8 @@ scaled here rather than duplicated upstream.
 
 The analysis is `diffusionkit.gridpost`: for each track, the exact Gaussian
 displacement likelihood evaluated on a grid in ln D (and the fBm exponent
-alpha with K integrated out), both with the camera exposure's motion blur
-modelled. `analyze_posteriors`
+alpha with its scale, D at one frame, integrated out over the same grid),
+both with the camera exposure's motion blur modelled. `analyze_posteriors`
 is diffusionkit's own `gridpost.analyze_tracks`, asked to keep each track's
 posterior vector (what the ensemble is built from and what the bundle
 saves), and every grid comes from the one `GridPostOptions` the run is
@@ -20,21 +20,25 @@ posterior cut by an edge is flagged in `D_at_grid_edge`.
 
   - **per track**: the posterior median of D and its equal-tailed 90%
     interval (`D_low`/`D_high` = the 5% and 95% quantiles), likewise alpha;
-  - **D at a second timescale** (`D_long_stride` frames, optional): D
-    refitted to the track thinned to every k-th frame, and its ratio to D
-    at one frame -- how the apparent diffusivity changes with timescale
-    (below 1: motion slows, as with confinement or alpha < 1), with no
-    model of why (`diffusionkit.gridpost.timescale`);
-  - **summed**: the per-track log posteriors added up -- the posterior of
-    one D shared by every track. Sharp, but only honest when the tracks
-    really do share a D;
+  - **shared**: the per-track log posteriors added up -- the posterior of
+    one value shared by every track. Sharp, but only honest when the
+    tracks really do share it;
+  - **mean posterior**: the tracks' posteriors averaged -- where they put
+    the value, blurred by each track's own uncertainty and prior;
   - **deconvolved**: `gridpost.deconvolve`, the smoothed nonparametric
-    MLE of how D is distributed across tracks, with each track's own
-    uncertainty taken out rather than averaged in. Peak locations and the
-    mass in each mode are robust; peak widths are resolution-limited.
+    MLE of how D (and alpha) is distributed across tracks, with each
+    track's own uncertainty taken out rather than averaged in. Peak
+    locations and the mass in each mode are robust; peak widths are
+    resolution-limited;
+  - **localization floor** (`D_floor_um2_s`, diffusionkit's
+    `posterior.localization_floor`): the D at which a track's motion per
+    frame equals its localization noise. Every D axis shows it as a
+    reference scale (its median over the tracks, and their 10-90% band),
+    not as a threshold anything is classified by.
 
-`track_geometry` (radius of gyration, straightness, ...) is model-free
-shape, ported from diffusionkit when that package narrowed to analysis.
+There are no per-track shape metrics (radius of gyration, straightness,
+...): they measure the same bending of the MSD that alpha does, with less
+information, and are easily computed from the tracks when wanted.
 """
 
 from __future__ import annotations
@@ -54,6 +58,8 @@ from diffusionkit.gridpost import GridPostOptions
 from diffusionkit.gridpost import analyze_tracks as dk_analyze_tracks
 from diffusionkit.gridpost import deconvolve as dk_deconvolve
 from diffusionkit.gridpost import posterior as dk_post
+from diffusionkit.gridpost import posterior_alpha as dk_post_alpha
+from scipy.interpolate import CubicSpline
 from scipy.special import logsumexp
 
 from napari_gemscape2.pipeline import filter_mask
@@ -72,27 +78,23 @@ DECONVOLVE_SMOOTH = 0.5
 # `GridPostOptions`' grid fields, the ones settable here (the widget's Grid
 # section, the CLI's `[diffusion] grid`). Unset ones are diffusionkit's
 # defaults; whichever were used are saved (`analysis_summary`'s "grid").
-GRID_FIELDS = ("D_min_um2_s", "D_max_um2_s", "n_D", "alpha_min", "alpha_max", "n_alpha", "n_K")
+GRID_FIELDS = ("D_min_um2_s", "D_max_um2_s", "n_D", "alpha_min", "alpha_max", "n_alpha")
 
 
 def posterior_options(
     min_frames: int = MIN_FRAMES,
     alpha: bool = True,
     grid: Optional[dict] = None,
-    D_long_stride: Optional[int] = None,
 ) -> GridPostOptions:
     """The `GridPostOptions` a run here uses: `grid` holds any of
     `GRID_FIELDS`; the credible level is fixed at `LEVEL`, and alpha's
     likelihood is diffusionkit's default ("auto": exact for short tracks,
-    debiased Whittle for long ones). `D_long_stride` (frames, >= 2) adds D
-    at that longer timescale; None skips it. Raises ValueError for an
-    unknown key or an invalid grid."""
+    debiased Whittle for long ones). Raises ValueError for an unknown key
+    or an invalid grid."""
     unknown = set(grid or {}) - set(GRID_FIELDS)
     if unknown:
         raise ValueError(f"unknown grid settings: {', '.join(sorted(unknown))}")
-    return GridPostOptions(
-        min_frames=min_frames, level=LEVEL, compute_alpha=alpha, D_long_stride=D_long_stride, **(grid or {})
-    )
+    return GridPostOptions(min_frames=min_frames, level=LEVEL, compute_alpha=alpha, **(grid or {}))
 
 
 def grid_record(options: GridPostOptions) -> dict:
@@ -133,56 +135,6 @@ def tracks_fingerprint(tracks: pl.DataFrame) -> str:
         digest.update(name.encode())
         digest.update(np.ascontiguousarray(ordered[name].to_numpy(), dtype=dtype).tobytes())
     return digest.hexdigest()
-
-
-def track_geometry(tracks: pl.DataFrame) -> pl.DataFrame:
-    """One row per track of `tracks_to_diffusionkit_df`'s table.
-
-    - `radius_of_gyration_um`: RMS distance of the positions from their own
-      centroid -- the track's spatial extent.
-    - `net_displacement_um`: straight-line distance from first to last position.
-    - `straightness`: net displacement over the summed step lengths, in
-      [0, 1]; near 1 for directed motion.
-    - `gyration_asymmetry`: `(l1 - l2)^2 / (l1 + l2)^2` from the gyration
-      tensor's eigenvalues, in [0, 1]; 0 for an isotropic cloud, 1 for a line.
-
-    Raw geometry, so localization error inflates all of it, most on short
-    or slow tracks. Null where undefined: everything for a single-point
-    track, the two ratios for a track that never moved.
-    """
-    ordered = tracks.sort(["track_id", "frame"]).with_columns(
-        (pl.col("x_um").diff().over("track_id") ** 2 + pl.col("y_um").diff().over("track_id") ** 2)
-        .sqrt()
-        .alias("_step_um")
-    )
-    per_track = ordered.group_by("track_id").agg(
-        pl.len().alias("_n"),
-        pl.col("x_um").var(ddof=0).alias("_txx"),
-        pl.col("y_um").var(ddof=0).alias("_tyy"),
-        ((pl.col("x_um") - pl.col("x_um").mean()) * (pl.col("y_um") - pl.col("y_um").mean()))
-        .mean()
-        .alias("_txy"),
-        (
-            (pl.col("x_um").last() - pl.col("x_um").first()) ** 2
-            + (pl.col("y_um").last() - pl.col("y_um").first()) ** 2
-        )
-        .sqrt()
-        .alias("net_displacement_um"),
-        pl.col("_step_um").sum().alias("_path_um"),
-    )
-    trace = pl.col("_txx") + pl.col("_tyy")
-    multi = pl.col("_n") > 1
-    return per_track.select(
-        "track_id",
-        pl.when(multi).then(trace.sqrt()).alias("radius_of_gyration_um"),
-        pl.when(multi).then(pl.col("net_displacement_um")).alias("net_displacement_um"),
-        pl.when(multi & (pl.col("_path_um") > 0))
-        .then(pl.col("net_displacement_um") / pl.col("_path_um"))
-        .alias("straightness"),
-        pl.when(multi & (trace > 0))
-        .then(((pl.col("_txx") - pl.col("_tyy")) ** 2 + 4 * pl.col("_txy") ** 2) / trace**2)
-        .alias("gyration_asymmetry"),
-    ).sort("track_id")
 
 
 # --- the per-track table ------------------------------------------------
@@ -248,9 +200,8 @@ def qc_aggregate_table(tracks_df_px: pl.DataFrame) -> tuple[pl.DataFrame, list[s
 def base_track_table(
     diffkit_tracks: pl.DataFrame, tracks_df_px: pl.DataFrame
 ) -> tuple[pl.DataFrame, list[str]]:
-    """One row per track: identity, position, shape
-    (`track_geometry` -- radius of gyration,
-    straightness, ...) and detection-quality context columns that every
+    """One row per track: identity, position and detection-quality
+    context columns that every
     tab's results get left-joined onto, plus the names of
     the aggregate QC columns (so the tracks pane can hide that group from
     the table when it is not being used -- there are three per detector
@@ -262,12 +213,10 @@ def base_track_table(
         pl.col("y").mean().alias("y_px"), pl.col("x").mean().alias("x_px")
     )
     lengths = diffkit_tracks.group_by("track_id").agg(pl.col("track_length").first())
-    geometry = track_geometry(diffkit_tracks)
     qc, per_point = qc_aggregate_table(tracks_df_px)
     qc_columns = [c for c in qc.columns if c != "track_id"]
     table = (
         lengths.join(centroids, on="track_id", how="left")
-        .join(geometry, on="track_id", how="left")
         .join(qc, on="track_id", how="left")
         .sort("track_id")
     )
@@ -294,35 +243,30 @@ FIT_SCHEMA = {
     "D_high_um2_s": pl.Float64,
     "D_at_grid_edge": pl.Boolean,
     # What the track taught about D (KL from the flat prior, in bits --
-    # relative to the grid's range, so comparable only on one grid), and
-    # twice the log likelihood ratio of motion + noise over noise alone.
+    # relative to the grid's range, so comparable only on one grid).
     "D_info_bits": pl.Float64,
-    "D_motion_lrt": pl.Float64,
+    # The D at which the track's motion per frame equals its localization
+    # noise: a reference scale for D, from the track's own SDs.
+    "D_floor_um2_s": pl.Float64,
     "alpha_status": pl.String,
     "alpha_median": pl.Float64,
     "alpha_low": pl.Float64,
     "alpha_high": pl.Float64,
-    # D at tau = D_long_stride frames, its ratio to D at one frame, and the
-    # posterior probability that it is lower (null when not run, or the
-    # track is too short to thin).
-    "D_long_median_um2_s": pl.Float64,
-    "D_long_low_um2_s": pl.Float64,
-    "D_long_high_um2_s": pl.Float64,
-    "D_ratio_median": pl.Float64,
-    "D_ratio_low": pl.Float64,
-    "D_ratio_high": pl.Float64,
-    "P_D_decrease": pl.Float64,
+    # What the track taught about alpha (bits from the flat alpha prior):
+    # near 0, alpha_median is the prior's midpoint, not a measurement.
+    "alpha_info_bits": pl.Float64,
 }
 
-_ALPHA_COLUMNS = ("alpha_status", "alpha_median", "alpha_low", "alpha_high")
-_TIMESCALE_COLUMNS = (
-    "D_long_median_um2_s", "D_long_low_um2_s", "D_long_high_um2_s",
-    "D_ratio_median", "D_ratio_low", "D_ratio_high", "P_D_decrease",
-)
+_ALPHA_COLUMNS = ("alpha_status", "alpha_median", "alpha_low", "alpha_high", "alpha_info_bits")
 
-# A track "slows" between the two timescales when P_D_decrease is above
-# this, and "speeds up" when it is below 1 minus it.
-SLOWDOWN_EVIDENCE = 0.95
+# The localization floor's band on a plot: these quantiles of the tracks'
+# own floors, around their median.
+FLOOR_BAND = (0.1, 0.9)
+# Columns whose scale is the localization floor, `D_floor_um2_s`.
+FLOOR_COLUMNS = ("D_median_um2_s", "D_low_um2_s", "D_high_um2_s", "D_msd_um2_s")
+# The alpha medians are drawn in these strata of alpha_info_bits, one gray
+# step each (a display, not a cut: every track stays in).
+ALPHA_BITS_STRATA = (0.5, 1.5)
 
 # The per-track columns the widget shows and the summary saves.
 POSTERIOR_COLUMNS = tuple(c for c in FIT_SCHEMA if c not in ("n_frames", "message"))
@@ -380,15 +324,6 @@ class PosteriorAnalysis:
     def has_alpha(self) -> bool:
         return self.log_post_alpha is not None and len(self.alpha_ids) > 0
 
-    @property
-    def D_long_stride(self) -> Optional[int]:
-        return self.options.D_long_stride
-
-    @property
-    def tau_long_s(self) -> Optional[float]:
-        """The longer timescale D was refitted at, or None."""
-        return None if self.D_long_stride is None else self.D_long_stride * self.acquisition.dt_s
-
     def rows_for(self, track_ids: Optional[set], *, alpha: bool = False) -> np.ndarray:
         """Row indices into the D (or alpha) arrays for `track_ids`, or all
         rows for None."""
@@ -410,13 +345,6 @@ def _at_grid_edge(log_post_D: np.ndarray) -> np.ndarray:
     )
 
 
-def _info_bits(log_post_D: np.ndarray, u_D: np.ndarray) -> np.ndarray:
-    """Per row of `log_post_D`: diffusionkit's `posterior.information_bits`
-    against the flat prior `analyze_posteriors` runs with."""
-    prior = dk_post.flat(u_D)
-    return np.array([dk_post.information_bits(lp, prior) for lp in log_post_D], dtype=float)
-
-
 def analyze_posteriors(
     tracks: pl.DataFrame,
     acquisition: Acquisition,
@@ -425,8 +353,7 @@ def analyze_posteriors(
     progress: Optional[Callable[[int, int], None]] = None,
     threads: Optional[int] = None,
 ) -> PosteriorAnalysis:
-    """Grid posteriors over D (and alpha, and D at `options.D_long_stride`)
-    for every track in `tracks`, on `options`' grids (`posterior_options`).
+    """Grid posteriors over D (and alpha) for every track in `tracks`, on `options`' grids (`posterior_options`).
 
     `tracks` is `tracks_to_diffusionkit_df`'s table. This is
     `diffusionkit.gridpost.analyze_tracks` itself -- same statuses, same
@@ -446,7 +373,7 @@ def analyze_posteriors(
     post = result.posteriors
     by_model = {
         model: result.fits.filter(pl.col("model") == model).drop("model", "n_frames")
-        for model in ("posterior_D", "posterior_alpha", "posterior_D_timescale")
+        for model in ("posterior_D", "posterior_alpha")
     }
     D = by_model["posterior_D"].select(
         "track_id",
@@ -456,7 +383,7 @@ def analyze_posteriors(
         pl.col("D_post_lo_um2_s").alias("D_low_um2_s"),
         pl.col("D_post_hi_um2_s").alias("D_high_um2_s"),
         pl.col("D_post_info_bits").alias("D_info_bits"),
-        "D_motion_lrt",
+        "D_floor_um2_s",
     )
     alpha = by_model["posterior_alpha"].select(
         "track_id",
@@ -465,16 +392,7 @@ def analyze_posteriors(
         pl.col("alpha_post_median").alias("alpha_median"),
         pl.col("alpha_post_lo").alias("alpha_low"),
         pl.col("alpha_post_hi").alias("alpha_high"),
-    )
-    timescale = by_model["posterior_D_timescale"].select(
-        "track_id",
-        pl.col("D_long_post_median_um2_s").alias("D_long_median_um2_s"),
-        pl.col("D_long_post_lo_um2_s").alias("D_long_low_um2_s"),
-        pl.col("D_long_post_hi_um2_s").alias("D_long_high_um2_s"),
-        pl.col("D_ratio_post_median").alias("D_ratio_median"),
-        pl.col("D_ratio_post_lo").alias("D_ratio_low"),
-        pl.col("D_ratio_post_hi").alias("D_ratio_high"),
-        "P_D_decrease",
+        pl.col("alpha_post_info_bits").alias("alpha_info_bits"),
     )
     edge = pl.DataFrame(
         {"track_id": post.D_track_ids, "D_at_grid_edge": _at_grid_edge(post.log_post_D)},
@@ -484,7 +402,6 @@ def analyze_posteriors(
     fits = (
         n_frames.join(D, on="track_id", how="left")
         .join(alpha, on="track_id", how="left")
-        .join(timescale, on="track_id", how="left")
         .join(edge, on="track_id", how="left")
         .with_columns(
             # One message per track: the D posterior's, then the alpha
@@ -516,7 +433,7 @@ def analyze_posteriors(
 @dataclass(frozen=True)
 class Deconvolution:
     """`gridpost.deconvolve`'s settings. `iters` EM iterations: one from
-    the flat start is just the pooled posterior, more remove the blur the
+    the flat start is just the mean posterior, more remove the blur the
     tracks' own uncertainty adds. `smooth` is the Gaussian smoothing per
     iteration in grid cells (a cell is ~2.3% of D on the default grid):
     less lets peaks sharpen toward spikes, more widens them -- read a width
@@ -531,11 +448,9 @@ class Deconvolution:
         return asdict(self)
 
     @classmethod
-    def from_record(cls, record: Optional[dict]) -> "Deconvolution":
-        """A saved record; absent (a summary from before these were
-        settable) means the defaults it was run with."""
-        names = {f for f in cls.__dataclass_fields__}
-        return cls(**{k: v for k, v in (record or {}).items() if k in names})
+    def from_record(cls, record: dict) -> "Deconvolution":
+        """A saved record."""
+        return cls(**record)
 
 
 @dataclass(frozen=True)
@@ -543,24 +458,31 @@ class Ensemble:
     """The population read of one set of tracks' posteriors, on the D grid
     (and the alpha grid, when alpha was computed).
 
-    `summed_log_*` is the sum of the tracks' normalized log posteriors --
-    unnormalized, so it keeps its scale (a sum over n tracks) --
-    and `summed_*` the same thing normalized to grid weights: the
-    posterior of one value shared by every track. `pooled_D` is the
-    average of the tracks' posteriors (their sum, normalized) -- where
-    the tracks put D, blurred by each track's own uncertainty; it is
-    the deconvolution's starting point. `deconvolved_D` is
-    `gridpost.deconvolve`'s distribution of D across the tracks, that
-    blur removed. All weights sum to 1 over their grid."""
+    `shared_log_*` is the sum of the tracks' normalized log posteriors,
+    shifted to 0 at its peak (its absolute level, a sum over n tracks, is
+    thousands below 0 and means nothing), and `shared_*` the same thing
+    as grid weights: the posterior of one value shared by every track.
+    With many tracks it is narrower than a grid cell, so its weights sit
+    in a cell or two; `_shared_summary` reads it below the grid step. `mean_posterior_*` is the average
+    of the tracks' posteriors -- where the tracks put the value, blurred
+    by each track's own uncertainty and prior; it is the deconvolution's
+    starting point. `deconvolved_*` is `gridpost.deconvolve`'s
+    distribution across the tracks, that blur removed: for alpha, of the
+    K-marginalized likelihoods (flat alpha prior), so a track with a flat
+    alpha posterior adds nothing, where it adds mass at the prior's
+    midpoint to the mean posterior and the histogram of medians. All
+    weights sum to 1 over their grid."""
 
     n_tracks: int
-    summed_log_D: np.ndarray
-    summed_D: np.ndarray
-    pooled_D: np.ndarray
+    shared_log_D: np.ndarray
+    shared_D: np.ndarray
+    mean_posterior_D: np.ndarray
     deconvolved_D: np.ndarray
     n_tracks_alpha: int = 0
-    summed_log_alpha: Optional[np.ndarray] = None
-    summed_alpha: Optional[np.ndarray] = None
+    shared_log_alpha: Optional[np.ndarray] = None
+    shared_alpha: Optional[np.ndarray] = None
+    mean_posterior_alpha: Optional[np.ndarray] = None
+    deconvolved_alpha: Optional[np.ndarray] = None
 
 
 _ENSEMBLE_CACHE_SIZE = 32
@@ -590,25 +512,37 @@ def _ensemble(
     if len(rows) == 0:
         return None
     log_post = analysis.log_post_D[rows]
-    summed_log = log_post.sum(axis=0)
+    shared_log = log_post.sum(axis=0)
+    shared_log = shared_log - shared_log.max()
     deconvolved = dk_deconvolve.deconvolve(
         log_post, dk_post.flat(analysis.u_D), iters=deconvolution.iters, smooth=deconvolution.smooth
     )
     result = dict(
         n_tracks=len(rows),
-        summed_log_D=summed_log,
-        summed_D=np.exp(_normalized_log(summed_log)),
-        pooled_D=np.exp(log_post).mean(axis=0),
+        shared_log_D=shared_log,
+        shared_D=np.exp(_normalized_log(shared_log)),
+        mean_posterior_D=np.exp(log_post).mean(axis=0),
         deconvolved_D=deconvolved,
     )
     if analysis.has_alpha:
         alpha_rows = analysis.rows_for(track_ids, alpha=True)
         if len(alpha_rows):
-            summed_alpha = analysis.log_post_alpha[alpha_rows].sum(axis=0)
+            # Flat alpha prior: each row is also the track's K-marginalized
+            # log likelihood up to a constant, what `deconvolve` takes.
+            log_post_alpha = analysis.log_post_alpha[alpha_rows]
+            shared_alpha = log_post_alpha.sum(axis=0)
+            shared_alpha = shared_alpha - shared_alpha.max()
             result.update(
                 n_tracks_alpha=len(alpha_rows),
-                summed_log_alpha=summed_alpha,
-                summed_alpha=np.exp(_normalized_log(summed_alpha)),
+                shared_log_alpha=shared_alpha,
+                shared_alpha=np.exp(_normalized_log(shared_alpha)),
+                mean_posterior_alpha=np.exp(log_post_alpha).mean(axis=0),
+                deconvolved_alpha=dk_deconvolve.deconvolve(
+                    log_post_alpha,
+                    dk_post_alpha.flat_alpha(analysis.alpha_grid),
+                    iters=deconvolution.iters,
+                    smooth=deconvolution.smooth,
+                ),
             )
     return Ensemble(**result)
 
@@ -622,6 +556,36 @@ def _grid_summary(weights: np.ndarray, grid: np.ndarray, level: float, log_grid:
     if log_grid:
         q = np.exp(q)
     return {"low": float(q[0]), "median": float(q[1]), "high": float(q[2])}
+
+
+# The shared posterior's summary is read off a cubic spline of its log
+# through the cells within `_SHARED_WINDOW` (log units) of its peak, at
+# `_SHARED_REFINE` points per grid cell.
+_SHARED_WINDOW = 40.0
+_SHARED_REFINE = 64
+
+
+def _shared_summary(shared_log: np.ndarray, grid: np.ndarray, level: float, log_grid: bool) -> dict:
+    """Median and equal-tailed interval of the shared posterior
+    (`Ensemble.shared_log_*`), resolved below the grid step.
+
+    With many tracks the shared posterior is narrower than a grid cell, so
+    `_grid_summary` of its weights returns the peak cell and about one
+    cell either side, whatever its real width. Its log is a sum of smooth
+    per-track log likelihoods -- close to a parabola near the peak, which
+    the spline's not-a-knot ends reproduce -- so it is interpolated on
+    the grid it is smooth on (ln D, or alpha) and summarized there."""
+    x = np.log(grid) if log_grid else np.asarray(grid, dtype=float)
+    near = np.flatnonzero(shared_log >= shared_log.max() - _SHARED_WINDOW)
+    lo, hi = max(near[0] - 2, 0), min(near[-1] + 2, len(x) - 1)
+    while hi - lo < 3 and (lo > 0 or hi < len(x) - 1):  # a cubic needs four points
+        lo, hi = max(lo - 1, 0), min(hi + 1, len(x) - 1)
+    if hi - lo < 3:
+        return _grid_summary(np.exp(_normalized_log(shared_log)), grid, level, log_grid)
+    fine = np.linspace(x[lo], x[hi], (hi - lo) * _SHARED_REFINE + 1)
+    log_w = CubicSpline(x[lo : hi + 1], shared_log[lo : hi + 1])(fine)
+    out = _grid_summary(np.exp(_normalized_log(log_w)), fine, level, log_grid=False)
+    return {k: float(np.exp(v)) for k, v in out.items()} if log_grid else out
 
 
 def _grid_mode(weights: np.ndarray, grid: np.ndarray) -> float:
@@ -639,14 +603,14 @@ def summarize(
     Counts are by diffusionkit's own statuses (`n_ok`, `n_excluded`,
     `n_invalid_input`), plus `n_D_at_grid_edge`: fitted tracks whose D
     posterior is cut by the grid's range, so their numbers depend on it. `median_D_um2_s`/`q25`/`q75` are over the per-track
-    posterior medians -- the typical track. `summed_D_*` is the shared-D
-    posterior's median and 90% interval, and `deconvolved_D_*` the
-    deconvolved distribution's median and 90% range (a spread across
-    tracks, not an uncertainty) plus its mode. With D at a second
-    timescale, `median_D_ratio`/`q25`/`q75` are over the per-track ratio
-    medians, and `n_D_slower`/`n_D_faster` count the tracks whose D is
-    lower/higher at `tau_long_s` with probability above
-    `SLOWDOWN_EVIDENCE`."""
+    posterior medians -- the typical track. `shared_D_*` is the shared-D
+    posterior's median and 90% interval (resolved below the grid step,
+    `_shared_summary`), and `deconvolved_D_*` the deconvolved
+    distribution's median and 90% range (a spread across tracks, not an
+    uncertainty) plus its mode; likewise `shared_alpha_*` and
+    `deconvolved_alpha_*`. `D_floor_*_um2_s` are the median and 10%/90%
+    quantiles of the tracks' localization floors, and
+    `median_alpha_info_bits` what the typical track taught about alpha."""
     fits = analysis.fits
     if track_ids is not None:
         fits = fits.filter(pl.col("track_id").is_in(list(track_ids)))
@@ -670,30 +634,32 @@ def summarize(
             median_alpha=_scalar(alpha_ok["alpha_median"].median()),
             q25_alpha=_scalar(alpha_ok["alpha_median"].quantile(0.25)),
             q75_alpha=_scalar(alpha_ok["alpha_median"].quantile(0.75)),
+            median_alpha_info_bits=_scalar(alpha_ok["alpha_info_bits"].median()),
         )
-    ratio_ok = fits.filter(pl.col("D_ratio_median").is_not_null())
-    if ratio_ok.height:
+    floors = ok["D_floor_um2_s"].drop_nulls()
+    if floors.len():
         out.update(
-            tau_long_s=analysis.tau_long_s,
-            n_D_ratio=ratio_ok.height,
-            median_D_ratio=_scalar(ratio_ok["D_ratio_median"].median()),
-            q25_D_ratio=_scalar(ratio_ok["D_ratio_median"].quantile(0.25)),
-            q75_D_ratio=_scalar(ratio_ok["D_ratio_median"].quantile(0.75)),
-            n_D_slower=int((ratio_ok["P_D_decrease"] > SLOWDOWN_EVIDENCE).sum()),
-            n_D_faster=int((ratio_ok["P_D_decrease"] < 1 - SLOWDOWN_EVIDENCE).sum()),
+            D_floor_median_um2_s=_scalar(floors.median()),
+            D_floor_q10_um2_s=_scalar(floors.quantile(FLOOR_BAND[0])),
+            D_floor_q90_um2_s=_scalar(floors.quantile(FLOOR_BAND[1])),
         )
     ens = ensemble(analysis, track_ids, deconvolution)
     if ens is not None:
-        summed = _grid_summary(ens.summed_D, analysis.D_grid_um2_s, analysis.level, log_grid=True)
+        shared = _shared_summary(ens.shared_log_D, analysis.D_grid_um2_s, analysis.level, log_grid=True)
         spread = _grid_summary(ens.deconvolved_D, analysis.D_grid_um2_s, analysis.level, log_grid=True)
         out.update(
-            {f"summed_D_{k}_um2_s": v for k, v in summed.items()},
+            {f"shared_D_{k}_um2_s": v for k, v in shared.items()},
             **{f"deconvolved_D_{k}_um2_s": v for k, v in spread.items()},
             deconvolved_D_mode_um2_s=_grid_mode(ens.deconvolved_D, analysis.D_grid_um2_s),
         )
-        if ens.summed_alpha is not None:
-            summed_a = _grid_summary(ens.summed_alpha, analysis.alpha_grid, analysis.level, log_grid=False)
-            out.update({f"summed_alpha_{k}": v for k, v in summed_a.items()})
+        if ens.shared_log_alpha is not None:
+            shared_a = _shared_summary(ens.shared_log_alpha, analysis.alpha_grid, analysis.level, log_grid=False)
+            spread_a = _grid_summary(ens.deconvolved_alpha, analysis.alpha_grid, analysis.level, log_grid=False)
+            out.update(
+                {f"shared_alpha_{k}": v for k, v in shared_a.items()},
+                **{f"deconvolved_alpha_{k}": v for k, v in spread_a.items()},
+                deconvolved_alpha_mode=_grid_mode(ens.deconvolved_alpha, analysis.alpha_grid),
+            )
     return out
 
 
@@ -726,7 +692,9 @@ def ensemble_panels(
     """What `joint_plot.plot_d_ensemble` and `plot_d_posteriors` draw, one
     dict per group (default one group, "all"); groups with no fitted track
     are left out. `track_posteriors` adds every track's posterior weights
-    as rows sorted by their median (`track_posteriors`), for the heat map."""
+    as rows sorted by their median (`track_posteriors`), for the heat map.
+    `floor` is the tracks' localization floor as (10%, median, 90%), None
+    when no track has one."""
     fits = analysis.fits.filter(pl.col("posterior_status") == "ok")
     panels = []
     for name, ids in (groups or {"all": None}).items():
@@ -734,33 +702,54 @@ def ensemble_panels(
         if ens is None:
             continue
         rows = fits if ids is None else fits.filter(pl.col("track_id").is_in(list(ids)))
-        summed = _grid_summary(ens.summed_D, analysis.D_grid_um2_s, analysis.level, log_grid=True)
+        shared = _shared_summary(ens.shared_log_D, analysis.D_grid_um2_s, analysis.level, log_grid=True)
         panel = {
             "name": name,
             "n_tracks": ens.n_tracks,
             "medians": rows["D_median_um2_s"].to_numpy(),
             "deconvolved": ens.deconvolved_D,
-            "pooled": ens.pooled_D,
-            "summed": ens.summed_D,
-            "summed_interval": (summed["low"], summed["median"], summed["high"]),
+            "mean_posterior": ens.mean_posterior_D,
+            "shared_interval": (shared["low"], shared["median"], shared["high"]),
+            "floor": floor_band(rows["D_floor_um2_s"]),
         }
         if track_posteriors:
             weights = np.exp(analysis.log_post_D[analysis.rows_for(ids)])
             # Each row's median grid cell: where its CDF first reaches 1/2.
             order = np.argsort((np.cumsum(weights, axis=1) >= 0.5).argmax(axis=1), kind="stable")
             panel["track_posteriors"] = weights[order]
-        if ens.summed_alpha is not None:
-            summed_a = _grid_summary(ens.summed_alpha, analysis.alpha_grid, analysis.level, log_grid=False)
-            panel["alpha_medians"] = rows["alpha_median"].drop_nulls().to_numpy()
-            panel["alpha_summed_interval"] = (summed_a["low"], summed_a["median"], summed_a["high"])
-        if analysis.D_long_stride is not None:
-            ratios = rows.filter(pl.col("D_ratio_median").is_not_null())
-            panel["ratio_medians"] = ratios["D_ratio_median"].to_numpy()
-            panel["n_slower"] = int((ratios["P_D_decrease"] > SLOWDOWN_EVIDENCE).sum())
-            panel["n_faster"] = int((ratios["P_D_decrease"] < 1 - SLOWDOWN_EVIDENCE).sum())
-            panel["evidence"] = SLOWDOWN_EVIDENCE
+        if ens.shared_log_alpha is not None:
+            shared_a = _shared_summary(ens.shared_log_alpha, analysis.alpha_grid, analysis.level, log_grid=False)
+            alpha_rows = rows.filter(pl.col("alpha_median").is_not_null())
+            panel["alpha_medians"] = alpha_rows["alpha_median"].to_numpy()
+            panel["alpha_info_bits"] = alpha_rows["alpha_info_bits"].to_numpy()
+            panel["alpha_bits_strata"] = ALPHA_BITS_STRATA
+            panel["alpha_deconvolved"] = ens.deconvolved_alpha
+            panel["alpha_shared_interval"] = (shared_a["low"], shared_a["median"], shared_a["high"])
         panels.append(panel)
     return panels
+
+
+def floor_band(floors) -> Optional[tuple[float, float, float]]:
+    """(10%, median, 90%) of per-track localization floors (`D_floor_um2_s`
+    values, nulls skipped), or None when there are none."""
+    values = np.asarray(pl.Series(floors).drop_nulls().to_numpy(), dtype=float)
+    values = values[np.isfinite(values) & (values > 0)]
+    if not len(values):
+        return None
+    lo, mid, hi = np.quantile(values, [FLOOR_BAND[0], 0.5, FLOOR_BAND[1]])
+    return float(lo), float(mid), float(hi)
+
+
+def floor_references(table: pl.DataFrame, columns) -> dict[str, tuple[float, float, float]]:
+    """`{column: floor_band}` for those of `columns` that are a D with a
+    floor (`FLOOR_COLUMNS`), from `table`'s `D_floor_um2_s`, for the joint
+    plot, over the tracks it draws."""
+    if "D_floor_um2_s" not in table.columns:
+        return {}
+    band = floor_band(table["D_floor_um2_s"])
+    if band is None:
+        return {}
+    return {c: band for c in columns if c in FLOOR_COLUMNS}
 
 
 def track_posterior(analysis: PosteriorAnalysis, track_id: int) -> Optional[dict]:
@@ -776,6 +765,7 @@ def track_posterior(analysis: PosteriorAnalysis, track_id: int) -> Optional[dict
         "d_grid": analysis.D_grid_um2_s,
         "d_weights": np.exp(analysis.log_post_D[rows[0]]),
         "d_interval": (fit["D_low_um2_s"], fit["D_median_um2_s"], fit["D_high_um2_s"]),
+        "d_floor": fit["D_floor_um2_s"],
     }
     if analysis.has_alpha:
         alpha_rows = np.flatnonzero(analysis.alpha_ids == track_id)
@@ -784,6 +774,7 @@ def track_posterior(analysis: PosteriorAnalysis, track_id: int) -> Optional[dict
                 alpha_grid=analysis.alpha_grid,
                 alpha_weights=np.exp(analysis.log_post_alpha[alpha_rows[0]]),
                 alpha_interval=(fit["alpha_low"], fit["alpha_median"], fit["alpha_high"]),
+                alpha_info_bits=fit["alpha_info_bits"],
             )
     return out
 
@@ -820,11 +811,13 @@ def distributions_table(
     alpha: bool = False,
     deconvolution: Deconvolution = Deconvolution(),
 ) -> Optional[pl.DataFrame]:
-    """The ensemble distributions on their shared grid, long by group:
-    `group`, `n_tracks`, the grid column (`D_um2_s` or `alpha`),
-    `summed_log_posterior`, `summed_posterior` and -- for D --
-    `pooled_posterior` and `deconvolved` (weights; each sums to 1 over
-    the grid within a group).
+    """The ensemble distributions on their grid, long by group: `group`,
+    `n_tracks`, the grid column (`D_um2_s` or `alpha`), and
+    `Ensemble`'s four reads -- `shared_log_posterior` (the summed log
+    posteriors, 0 at their peak), `shared_posterior` (the same as
+    weights: one value shared by every track, often within a cell or
+    two), `mean_posterior` (the tracks' posteriors averaged) and
+    `deconvolved` (weights; each sums to 1 over the grid within a group).
 
     `groups` maps a group name to its track ids; the default is one group,
     "all", over every fitted track."""
@@ -835,21 +828,23 @@ def distributions_table(
         if ens is None:
             continue
         if alpha:
-            if ens.summed_alpha is None:
+            if ens.shared_log_alpha is None:
                 continue
             part = {
                 "alpha": analysis.alpha_grid,
-                "summed_log_posterior": ens.summed_log_alpha,
-                "summed_posterior": ens.summed_alpha,
+                "shared_log_posterior": ens.shared_log_alpha,
+                "shared_posterior": ens.shared_alpha,
+                "mean_posterior": ens.mean_posterior_alpha,
+                "deconvolved": ens.deconvolved_alpha,
             }
             n = ens.n_tracks_alpha
             grid_len = len(analysis.alpha_grid)
         else:
             part = {
                 "D_um2_s": analysis.D_grid_um2_s,
-                "summed_log_posterior": ens.summed_log_D,
-                "summed_posterior": ens.summed_D,
-                "pooled_posterior": ens.pooled_D,
+                "shared_log_posterior": ens.shared_log_D,
+                "shared_posterior": ens.shared_D,
+                "mean_posterior": ens.mean_posterior_D,
                 "deconvolved": ens.deconvolved_D,
             }
             n = ens.n_tracks
@@ -1027,7 +1022,7 @@ def analysis_tables(
         posterior_D=posterior_long_table(analysis),
         posterior_alpha=posterior_long_table(analysis, alpha=True),
         distributions_D=distributions_table(analysis, groups, deconvolution=deconvolution),
-        distributions_alpha=distributions_table(analysis, groups, alpha=True),
+        distributions_alpha=distributions_table(analysis, groups, alpha=True, deconvolution=deconvolution),
     )
 
 
@@ -1065,7 +1060,6 @@ def analysis_summary(
             if analysis.has_alpha
             else None
         ),
-        "D_long_stride": analysis.D_long_stride,
         "msd_comparison": msd_comparison,
         "tracks_sha256": analysis.tracks_sha256,
         "deconvolution": deconvolution.record(),
@@ -1086,8 +1080,6 @@ def posterior_results_table(analysis: PosteriorAnalysis, msd: Optional[pl.DataFr
     display = analysis.fits.select(POSTERIOR_COLUMNS)
     if not analysis.has_alpha:
         display = display.drop(_ALPHA_COLUMNS)
-    if analysis.D_long_stride is None:
-        display = display.drop(_TIMESCALE_COLUMNS)
     if msd is not None:
         display = display.join(msd, on="track_id", how="left")
     return display
@@ -1120,7 +1112,7 @@ class SavedAnalysis:
 
     @property
     def deconvolution(self) -> Deconvolution:
-        return Deconvolution.from_record(self.summary.get("deconvolution"))
+        return Deconvolution.from_record(self.summary["deconvolution"])
 
 
 def _posterior_matrix(table: pl.DataFrame, grid_col: str, grid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -1136,28 +1128,19 @@ def _posterior_matrix(table: pl.DataFrame, grid_col: str, grid: np.ndarray) -> t
 
 
 def _saved_options(summary: dict) -> GridPostOptions:
-    """The `GridPostOptions` a saved analysis ran with. A summary from
-    before the grid was settable has no "grid", and ran on diffusionkit's
-    default grids, whose D and alpha ranges it recorded."""
-    grid = summary.get("grid")
-    if grid is None:
-        grid = {}
-        if summary.get("D_grid_um2_s"):
-            lo, hi, n = summary["D_grid_um2_s"]
-            grid.update(D_min_um2_s=lo, D_max_um2_s=hi, n_D=int(n))
-        if summary.get("alpha_grid"):
-            lo, hi, n = summary["alpha_grid"]
-            grid.update(alpha_min=lo, alpha_max=hi, n_alpha=int(n))
-    # A summary from before alpha had a Whittle likelihood ran it exactly.
-    alpha_likelihood = summary.get("alpha_likelihood") or {"method": "exact"}
+    """The `GridPostOptions` a saved analysis ran with. Raises
+    `StaleAnalysisError` for a grid this version has no field for."""
+    unknown = set(summary["grid"]) - set(GRID_FIELDS)
+    if unknown:
+        raise StaleAnalysisError(f"saved with grid settings this version doesn't have: {', '.join(sorted(unknown))}")
+    alpha_likelihood = summary["alpha_likelihood"] or {}
     return GridPostOptions(
         min_frames=summary["min_frames"],
         level=summary["credible_level"],
-        compute_alpha=summary.get("alpha_grid") is not None,
-        alpha_method=alpha_likelihood.get("method", "exact"),
-        alpha_whittle_min_frames=alpha_likelihood.get("whittle_min_frames", GridPostOptions.alpha_whittle_min_frames),
-        D_long_stride=summary.get("D_long_stride"),
-        **{k: v for k, v in grid.items() if k in GRID_FIELDS},
+        compute_alpha=summary["alpha_grid"] is not None,
+        **({"alpha_method": alpha_likelihood["method"],
+            "alpha_whittle_min_frames": alpha_likelihood["whittle_min_frames"]} if alpha_likelihood else {}),
+        **summary["grid"],
     )
 
 
@@ -1197,35 +1180,25 @@ def restore_analysis(
         else:  # alpha ran, and no track got one
             alpha_ids, log_post_alpha = np.empty(0, dtype=np.int64), np.empty((0, options.n_alpha))
 
-    # `D_at_grid_edge` and `D_info_bits` from the posteriors themselves --
-    # a bundle saved before either column existed gets them too.
-    # `D_motion_lrt` needs the track, not its posterior: an older bundle
-    # restores it as null.
-    edge = pl.DataFrame(
-        {
-            "track_id": fitted_ids,
-            "D_at_grid_edge": _at_grid_edge(log_post_D),
-            "D_info_bits": _info_bits(log_post_D, options.u_D()),
-        },
-        schema={"track_id": pl.Int64, "D_at_grid_edge": pl.Boolean, "D_info_bits": pl.Float64},
-    )
+    acquisition = Acquisition(dt_s=summary["dt_s"], exposure_s=summary["exposure_s"])
+    # The alpha columns are absent from a run without alpha
+    # (`posterior_results_table`).
     fits = (
         ran.select(
             pl.col(c).cast(dtype) if c in ran.columns else pl.lit(None, dtype=dtype).alias(c)
             for c, dtype in FIT_SCHEMA.items()
-            if c not in ("n_frames", "message", "D_at_grid_edge", "D_info_bits")
+            if c not in ("n_frames", "message")
         )
         .with_columns(
             ran["track_length"].cast(pl.Int64).alias("n_frames"), pl.lit("", dtype=pl.String).alias("message")
         )
-        .join(edge, on="track_id", how="left")
         .select(FIT_SCHEMA.keys())
         .sort("track_id")
     )
 
     analysis = PosteriorAnalysis(
         fits=fits,
-        acquisition=Acquisition(dt_s=summary["dt_s"], exposure_s=summary["exposure_s"]),
+        acquisition=acquisition,
         options=options,
         fitted_ids=fitted_ids,
         log_post_D=log_post_D,

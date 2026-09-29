@@ -95,8 +95,6 @@ def _diffusion_summary_text(settings: dict) -> str:
         parts.append(f"D grid {grid['D_min_um2_s']:g}–{grid['D_max_um2_s']:g} µm²/s")
     if settings.get("alpha"):
         parts.append("α")
-    if settings.get("D_long_stride"):
-        parts.append(f"D also at {settings['D_long_stride']} frames")
     if settings.get("msd_comparison"):
         parts.append("MSD comparison")
     if settings.get("filters"):

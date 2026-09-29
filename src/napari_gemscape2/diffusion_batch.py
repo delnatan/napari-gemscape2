@@ -48,8 +48,6 @@ class DiffusionSettings:
     min_frames: int = MIN_FRAMES
     # The alpha posterior (exposure blur modelled, like D's).
     alpha: bool = False
-    # D also at this many frames, and its ratio to D at one (None: off).
-    D_long_stride: Optional[int] = None
     # The posterior grids (`diffusion.GRID_FIELDS`, `GridPostOptions`'
     # names): D's range is the flat prior's support. Unset keys are
     # diffusionkit's defaults.
@@ -70,7 +68,7 @@ class DiffusionSettings:
 
     def options(self):
         """The run's `GridPostOptions`; raises ValueError for a bad grid."""
-        return posterior_options(self.min_frames, self.alpha, self.grid, D_long_stride=self.D_long_stride)
+        return posterior_options(self.min_frames, self.alpha, self.grid)
 
 
 def settings_from_summary(summary: dict) -> dict:
@@ -82,7 +80,6 @@ def settings_from_summary(summary: dict) -> dict:
         "min_frames": summary.get("min_frames"),
         "alpha": summary.get("alpha_grid") is not None if "alpha_grid" in summary else None,
         "grid": summary.get("grid"),
-        "D_long_stride": summary.get("D_long_stride"),
         "msd_comparison": summary.get("msd_comparison"),
         "min_track_length": record.get("min_track_length"),
         "filters": (

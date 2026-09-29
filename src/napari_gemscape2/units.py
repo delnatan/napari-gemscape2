@@ -7,7 +7,7 @@ point -- `loctable` emits `y`/`x` (px) beside `y_um`/`x_um`,
 diffusionkit returns `D_um2_s`/`K_um2_s_alpha`. The column names carry
 most of that in a suffix, which is why a saved table is readable at all;
 but a suffix is a convention, not a label, and three columns in the same
-tracks-pane table (`se_x`, `se_x_um`, `radius_of_gyration_um`) sit in two
+tracks-pane table (`se_x`, `se_x_um`, `mean_step_um`) sit in two
 different unit systems with only `_um` to tell them apart.
 
 So this module is the one place that answers "what is this column in?",
@@ -125,8 +125,6 @@ _EXACT: dict[str, Optional[str]] = {
     "sigma_ratio": None,
     "flux_ratio": None,
     "flux_snr": None,
-    "straightness": None,
-    "gyration_asymmetry": None,
     # spotsolve's per-fit diagnostics: a `FitFlag` bitmask, and the
     # conditional/marginal Fisher variance ratio per parameter (a pure
     # number; small means strongly coupled to another fitted parameter).
@@ -151,16 +149,9 @@ _EXACT: dict[str, Optional[str]] = {
     "posterior_status": None,
     "alpha_status": None,
     "D_at_grid_edge": None,
-    # What a track's D posterior gained over the flat prior, and the
-    # motion-vs-noise likelihood ratio (2 ln LR, dimensionless).
+    # What a track's D (alpha) posterior gained over the flat prior.
     "D_info_bits": BITS,
-    "D_motion_lrt": None,
-    # D at the longer timescale over D at one frame (its `_median`/`_low`/
-    # `_high`), its log for coloring tracks, and the posterior probability
-    # that it is below 1. (D_long itself is `_um2_s`, by suffix.)
-    "D_ratio": None,
-    "log10_D_ratio": None,
-    "P_D_decrease": None,
+    "alpha_info_bits": BITS,
     "log_posterior": None,
     "posterior": None,
     "weight": None,
@@ -361,8 +352,8 @@ def tooltip(column: str) -> str:
 
 
 def mpl_label(column: str) -> str:
-    """A matplotlib axis label in mathtext: `radius_of_gyration_um` ->
-    `radius of gyration ($\\mu$m)`, `alpha_msd` -> `$\\alpha$ msd`.
+    """A matplotlib axis label in mathtext: `mean_step_um` ->
+    `mean step ($\\mu$m)`, `alpha_msd` -> `$\\alpha$ msd`.
 
     Matches the convention diffusionkit's own `viz` modules use --
     quantity, then unit in parentheses -- so this project's figures and

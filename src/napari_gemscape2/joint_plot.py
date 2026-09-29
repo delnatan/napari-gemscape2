@@ -14,18 +14,24 @@ holding fewer than `SPARSE_MAX_COUNT` tracks are left empty and their tracks
 drawn as points instead, so outliers stay visible one track at a time.
 
 The posterior figures (`plot_d_ensemble`, `plot_track_posterior`) follow
-one color assignment by role, not by series (per-track medians of alpha and
-of the D ratio are the same neutral histogram): per-track medians are a
-neutral histogram, the deconvolved distribution is blue, the summed
-(shared-value) posterior is orange, the pooled (averaged) posterior is aqua,
-and the per-track heat map is one blue ramp. Region classes are separate panels
-stacked on one shared x axis rather than more hues, so every panel reads
-the same way.
+one color assignment by role, not by series (per-track medians of D and
+alpha are the same neutral histogram): per-track medians are a
+neutral histogram, the deconvolved distribution is blue, the shared-value
+posterior is orange, the mean of the tracks' posteriors is aqua, and the
+per-track heat map is one blue ramp. Alpha medians are the same neutral
+histogram stacked in gray steps by how much each track taught about alpha
+(`alpha_info_bits`), light for little: a flat alpha posterior's median is the
+prior's midpoint, and the steps show how much of a peak there is only that.
+Every D axis carries the localization floor -- the D at which a track's
+motion per frame equals its localization noise -- as a dotted line at the
+tracks' median floor over a band of their 10-90% range: a scale to read D
+against, not a cut. Region classes are separate panels stacked on one
+shared x axis rather than more hues, so every panel reads the same way.
 
 Axis labels default to `napari_gemscape2.units.mpl_label(column)` rather than
 to the raw column name: since the axes here are picked at runtime from
 whatever the tracks pane holds, a plot could otherwise put
-`radius_of_gyration_um` (µm) against `se_x_max` (px) with nothing on
+`mean_step_um` (µm) against `se_x_max` (px) with nothing on
 either axis saying which is which. The labels come out in the same
 mathtext style as diffusionkit's own figures -- "$D$ ($\\mu$m$^2$/s)" --
 so a joint plot and an MSD plot from the same session look like they came
@@ -68,10 +74,13 @@ def plot_property_joint(
     log_y: bool = False,
     display_quantiles: tuple[float, float] = (0.01, 0.99),
     style: str = "auto",
+    references: dict[str, tuple[float, float, float]] | None = None,
 ) -> Figure:
     """`style` is "points" (scatter over a KDE), "density" (2D histogram,
     sparse bins as points), or "auto": density from `DENSITY_MIN_POINTS`
-    tracks up."""
+    tracks up. `references` maps an axis column to a (low, mid, high)
+    band drawn across the plot at that axis's value -- the localization
+    floor on a D axis (`diffusion.floor_references`)."""
     if style not in JOINT_STYLES:
         raise ValueError(f"style must be one of {JOINT_STYLES}, not {style!r}")
     sub = df.select(x_col, y_col).drop_nulls()
@@ -113,6 +122,18 @@ def plot_property_joint(
         x_bins = y_bins = 30
     g.ax_marg_x.hist(pdf["x"], bins=x_bins, color="steelblue", edgecolor="white")
     g.ax_marg_y.hist(pdf["y"], bins=y_bins, color="steelblue", edgecolor="white", orientation="horizontal")
+    for col, log, vertical in ((x_col, log_x, True), (y_col, log_y, False)):
+        band = (references or {}).get(col)
+        if band is not None:
+            band = tuple(np.log10(band)) if log else band
+            for ax in (g.ax_joint, g.ax_marg_x if vertical else g.ax_marg_y):
+                _draw_floor(ax, band, vertical=vertical)
+            if vertical:
+                g.ax_joint.text(band[1], 0.99, " localization floor", transform=g.ax_joint.get_xaxis_transform(),
+                                ha="left", va="top", fontsize=7, color=_MUTED_INK, rotation=90)
+            else:
+                g.ax_joint.text(0.99, band[1], "localization floor", transform=g.ax_joint.get_yaxis_transform(),
+                                ha="right", va="bottom", fontsize=7, color=_MUTED_INK)
 
     # A log axis keeps its quantity's unit -- it is the unit the log was
     # taken of, and dropping it (the old "log10(D_map_um2_s)") leaves the
@@ -194,8 +215,8 @@ def numeric_columns(df: pl.DataFrame, exclude: tuple[str, ...] = ("track_id",)) 
 # neutral; text stays in ink colors, never a series color.
 _HIST_COLOR = "#c9c8c2"
 _DECONVOLVED_COLOR = "#2a78d6"
-_SUMMED_COLOR = "#eb6834"
-_POOLED_COLOR = "#1baf7a"
+_SHARED_COLOR = "#eb6834"
+_MEAN_POSTERIOR_COLOR = "#1baf7a"
 # One hue, light to dark, its zero end receding into the figure's surface:
 # the per-track heat map is magnitude, not identity.
 _POSTERIOR_CMAP = LinearSegmentedColormap.from_list(
@@ -208,6 +229,23 @@ _DENSITY_CMAP = LinearSegmentedColormap.from_list(
 )
 _INK = "#0b0b0b"
 _MUTED_INK = "#52514e"
+# The alpha medians' strata by alpha_info_bits, least to most: one neutral
+# ramp (magnitude), so they never read as series next to the role colors.
+_BITS_GRAYS = ("#dcdbd5", "#a3a29c", "#62615c")
+
+
+def _draw_floor(ax, band: tuple[float, float, float], *, vertical: bool = True, label: str | None = None) -> None:
+    """The localization floor on `ax`, in the axis's own coordinates
+    (already log10 on a log10-D axis): a band over (low, high) and a
+    dotted line at mid."""
+    low, mid, high = band
+    span, line = (ax.axvspan, ax.axvline) if vertical else (ax.axhspan, ax.axhline)
+    span(low, high, color=_MUTED_INK, alpha=0.08, lw=0, zorder=0)
+    line(mid, color=_MUTED_INK, lw=1, ls=":", zorder=1, label=label)
+
+
+def _floor_label(band: tuple[float, float, float]) -> str:
+    return f"localization floor {band[1]:.2g} µm²/s (10–90% of tracks)"
 
 
 def _style_axis(ax) -> None:
@@ -244,17 +282,19 @@ def _interval_marker(ax, low: float, median: float, high: float, y: float, color
 
 
 def _log_d_range(panels: list[dict], x: np.ndarray) -> tuple[float, float]:
-    """One log10-D range for every panel: wherever any panel has medians
-    or deconvolved mass, rather than the whole grid, which spans five
+    """One log10-D range for every panel: wherever any panel has medians,
+    deconvolved mass or its localization floor, rather than the whole grid, which spans five
     decades and would squeeze the data into a sliver."""
     spans = []
     for panel in panels:
-        # Not the pooled posterior: short tracks give it a tail decades long.
+        # Not the mean posterior: short tracks give it a tail decades long.
         spans.append(_mass_range(panel["deconvolved"], x, tail=0.01))
         medians = np.asarray(panel["medians"], dtype=float)
         medians = medians[medians > 0]
         if len(medians):
             spans.append((np.log10(medians.min()), np.log10(medians.max())))
+        if panel.get("floor") is not None:  # always in view: it is what D is read against
+            spans.append((np.log10(panel["floor"][0]), np.log10(panel["floor"][2])))
     x_lo = max(min(lo for lo, _ in spans) - _LOG_D_PAD, x[0])
     x_hi = min(max(hi for _, hi in spans) + _LOG_D_PAD, x[-1])
     return x_lo, x_hi
@@ -265,32 +305,32 @@ def plot_d_ensemble(
     panels: list[dict],
     alpha_grid: np.ndarray | None = None,
     title: str | None = None,
-    ratio_label: str | None = None,
 ) -> Figure:
     """The population read of a posterior run: one row per panel (a region
     class, or "all"), with log10 D on the left, then alpha when alpha was
-    computed, then how D changes with timescale when that was (panels with
-    `ratio_medians`; `ratio_label` names the two timescales on its axis).
+    computed.
 
     Each panel dict holds `name`, `n_tracks`, `medians` (per-track D
-    posterior medians), `deconvolved` and `summed` (weights on `d_grid`),
-    `summed_interval` (low, median, high), and optionally
-    `alpha_medians`, `alpha_summed_interval`.
+    posterior medians), `deconvolved` (weights on `d_grid`),
+    `shared_interval` (low, median, high), `floor` (the localization
+    floor's (10%, median, 90%) or None), and optionally `alpha_medians`
+    with `alpha_info_bits`, `alpha_bits_strata`, `alpha_deconvolved` and
+    `alpha_shared_interval` (`diffusion.ensemble_panels`).
 
     On one density axis: the histogram of per-track medians (what the
     typical track says), and the deconvolved distribution (how D is spread
     across tracks, with each track's own uncertainty removed -- widths
-    are resolution-limited). The summed posterior -- one D shared by every
+    are resolution-limited). The shared posterior -- one D shared by every
     track -- is far narrower than either, so rather than a curve that
     would flatten the other two it is a marker with its 90% interval
-    above them.
+    above them. The localization floor sits behind all three. The alpha
+    column is the same read of alpha, its medians stacked by
+    `alpha_info_bits`.
     """
     has_alpha = alpha_grid is not None and any(p.get("alpha_medians") is not None for p in panels)
-    has_ratio = any(p.get("ratio_medians") is not None for p in panels)
-    n, n_cols = len(panels), 1 + has_alpha + has_ratio
+    n, n_cols = len(panels), 1 + has_alpha
     fig = Figure(figsize=(6.0 + 2.6 * (n_cols - 1), 1.2 + 2.3 * n), layout="constrained")
     axes = fig.subplots(n, n_cols, squeeze=False, sharex="col")
-    ratio_col = n_cols - 1
     x = np.log10(d_grid)
     x_lo, x_hi = _log_d_range(panels, x)
     bins = np.arange(x_lo, x_hi + _LOG_D_BIN, _LOG_D_BIN)
@@ -304,75 +344,71 @@ def plot_d_ensemble(
                     lw=0.5, label="per-track medians")
         dens = _density(panel["deconvolved"], x)
         ax.plot(x, dens, color=_DECONVOLVED_COLOR, lw=1.8, label="deconvolved")
+        if panel.get("floor") is not None:
+            _draw_floor(ax, tuple(np.log10(panel["floor"])), label=_floor_label(panel["floor"]))
         top = max(dens.max(), ax.get_ylim()[1])
-        low, median, high = (np.log10(v) for v in panel["summed_interval"])
-        _interval_marker(ax, low, median, high, top * 1.08, _SUMMED_COLOR)
-        ax.plot([], [], "o-", color=_SUMMED_COLOR, lw=2, ms=5, label="summed (shared D), 90%")
+        low, median, high = (np.log10(v) for v in panel["shared_interval"])
+        _interval_marker(ax, low, median, high, top * 1.08, _SHARED_COLOR)
+        ax.plot([], [], "o-", color=_SHARED_COLOR, lw=2, ms=5, label="shared D, 90%")
         ax.set_ylim(0, top * 1.18)
         ax.set_xlim(x_lo, x_hi)
         ax.set_ylabel("density", fontsize=8, color=_MUTED_INK)
         ax.set_title(
             f"{panel['name']} · {panel['n_tracks']} tracks · shared D = "
-            f"{panel['summed_interval'][1]:.3g} µm²/s",
+            f"{panel['shared_interval'][1]:.3g} µm²/s",
             fontsize=9, loc="left", color=_INK,
         )
         if row == 0:
             ax.legend(fontsize=7, frameon=False, loc="upper left")
         if has_alpha:
-            ax_a = axes[row][1]
-            _style_axis(ax_a)
-            alpha_medians = panel.get("alpha_medians")
-            if alpha_medians is not None and len(alpha_medians):
-                ax_a.hist(alpha_medians, bins=np.linspace(0, 2, 26), density=True,
-                          color=_HIST_COLOR, edgecolor="white", lw=0.8)
-                ax_a.axvline(1.0, color=_MUTED_INK, lw=0.8, ls="--", zorder=0)
-                a_top = ax_a.get_ylim()[1]
-                a_low, a_med, a_high = panel["alpha_summed_interval"]
-                _interval_marker(ax_a, a_low, a_med, a_high, a_top * 1.08, _SUMMED_COLOR)
-                ax_a.set_ylim(0, a_top * 1.18)
-                ax_a.set_title(f"shared α = {a_med:.2f}", fontsize=9, loc="left", color=_INK)
-            ax_a.set_xlim(0, 2)
-        if has_ratio:
-            _ratio_panel(axes[row][ratio_col], panel)
+            _alpha_panel(axes[row][1], panel, alpha_grid, legend=row == 0)
     axes[-1][0].set_xlabel(units.mpl_log_label("D_um2_s"), fontsize=9)
     if has_alpha:
         axes[-1][1].set_xlabel(r"$\alpha$ (1 = Brownian, dashed)", fontsize=9)
-    if has_ratio:
-        axes[-1][ratio_col].set_xlabel(ratio_label or "D ratio", fontsize=9)
     if title:
         fig.suptitle(title, fontsize=10, x=0.01, ha="left")
     return fig
 
 
-# The ratio panel's range: a tenth to ten times, log-spaced.
-_RATIO_BINS = np.logspace(-1, 1, 41)
-_RATIO_TICKS = (.25, .5, 1, 2, 4)
+_ALPHA_BINS = np.linspace(0, 2, 41)
 
 
-def _ratio_panel(ax, panel: dict) -> None:
-    """Per-track D(long) / D(short) medians on a log axis, with how many
-    tracks are confidently slower or faster at the longer timescale."""
+def _alpha_panel(ax, panel: dict, alpha_grid: np.ndarray, *, legend: bool) -> None:
+    """Per-track alpha medians stacked by `alpha_info_bits` (light: the
+    track barely moved its flat prior, so its median is the prior's
+    midpoint), the deconvolved distribution of alpha, and the shared
+    alpha as a marker with its 90% interval."""
     _style_axis(ax)
-    ratios = np.asarray(panel.get("ratio_medians", []), dtype=float)
-    ratios = ratios[ratios > 0]
-    if len(ratios):
-        ax.hist(np.clip(ratios, _RATIO_BINS[0], _RATIO_BINS[-1]), bins=_RATIO_BINS, color=_HIST_COLOR,
-                edgecolor="white", lw=0.5)
-        ax.set_title(f"median ratio {np.median(ratios):.2f}", fontsize=9, loc="left", color=_INK)
-        evidence = panel.get("evidence")
-        ax.text(
-            0.98, 0.97,
-            f"{panel.get('n_slower', 0)} slower\n{panel.get('n_faster', 0)} faster\nof {len(ratios)}"
-            + (f"\n(P > {evidence:g})" if evidence else ""),
-            transform=ax.transAxes, ha="right", va="top", fontsize=7, color=_MUTED_INK,
-        )
-    else:
-        ax.set_title("no track long enough", fontsize=9, loc="left", color=_MUTED_INK)
+    medians = panel.get("alpha_medians")
+    if medians is None or not len(medians):
+        ax.set_xlim(0, 2)
+        return
+    bits = np.asarray(panel["alpha_info_bits"], dtype=float)
+    edges = (-np.inf, *panel["alpha_bits_strata"], np.inf)
+    strata = [(bits >= lo) & (bits < hi) for lo, hi in zip(edges[:-1], edges[1:])]
+    names = [f"< {edges[1]:g} bits"] + [f"{lo:g}–{hi:g} bits" for lo, hi in zip(edges[1:-2], edges[2:-1])] + [
+        f"≥ {edges[-2]:g} bits"
+    ]
+    width = _ALPHA_BINS[1] - _ALPHA_BINS[0]
+    bottom = np.zeros(len(_ALPHA_BINS) - 1)
+    for mask, name, color in zip(strata, names, _BITS_GRAYS):
+        heights = np.histogram(medians[mask], _ALPHA_BINS)[0] / (len(medians) * width)
+        ax.bar(_ALPHA_BINS[:-1], heights, width=width, align="edge", bottom=bottom, color=color,
+               edgecolor="white", lw=0.5, label=f"medians, {name} ({int(mask.sum())})")
+        bottom += heights
     ax.axvline(1.0, color=_MUTED_INK, lw=0.8, ls="--", zorder=0)
-    ax.set_xscale("log")
-    ax.set_xlim(_RATIO_BINS[0], _RATIO_BINS[-1])
-    ax.set_xticks(_RATIO_TICKS, [f"{t:g}" for t in _RATIO_TICKS])
-    ax.minorticks_off()
+    top = bottom.max()
+    if panel.get("alpha_deconvolved") is not None:
+        dens = _density(panel["alpha_deconvolved"], alpha_grid)
+        ax.plot(alpha_grid, dens, color=_DECONVOLVED_COLOR, lw=1.8, label="deconvolved")
+        top = max(top, dens.max())
+    a_low, a_med, a_high = panel["alpha_shared_interval"]
+    _interval_marker(ax, a_low, a_med, a_high, top * 1.08, _SHARED_COLOR)
+    ax.set_ylim(0, top * 1.18)
+    ax.set_xlim(0, 2)
+    ax.set_title(f"shared α = {a_med:.2f}", fontsize=9, loc="left", color=_INK)
+    if legend:
+        ax.legend(fontsize=6.5, frameon=False, loc="upper right")
 
 
 def plot_d_posteriors(d_grid: np.ndarray, panels: list[dict], title: str | None = None) -> Figure:
@@ -381,13 +417,13 @@ def plot_d_posteriors(d_grid: np.ndarray, panels: list[dict], title: str | None 
 
     Left, a heat map with one row per track, sorted by its posterior
     median: a well-determined track is a short bright streak, a short or
-    noisy one a long faint smear. Right, on one density axis: the pooled
-    posterior (the tracks' posteriors averaged -- where they put D,
-    blurred by each one's uncertainty), the histogram of per-track
-    medians, and the deconvolved distribution (that blur removed). The
-    summed log posterior -- one D shared by every track -- is far
-    narrower than any of them, so it is the marker with its 90% interval
-    above the curves, as in `plot_d_ensemble`."""
+    noisy one a long faint smear. Right, on one density axis: the mean of
+    the tracks' posteriors (where they put D, blurred by each one's
+    uncertainty), the histogram of per-track medians, and the deconvolved
+    distribution (that blur removed). The shared posterior -- one D
+    shared by every track -- is far narrower than any of them, so it is
+    the marker with its 90% interval above the curves, as in
+    `plot_d_ensemble`. The localization floor is on both panels."""
     n = len(panels)
     fig = Figure(figsize=(10.5, 1.0 + 3.4 * n), layout="constrained")
     axes = fig.subplots(n, 2, squeeze=False, sharex=True, gridspec_kw={"width_ratios": [1, 1.1]})
@@ -413,6 +449,8 @@ def plot_d_posteriors(d_grid: np.ndarray, panels: list[dict], title: str | None 
             f"{panel['name']} · {panel['n_tracks']} tracks' posteriors (one row each)",
             fontsize=9, loc="left", color=_INK,
         )
+        if panel.get("floor") is not None:
+            ax_map.axvline(np.log10(panel["floor"][1]), color=_INK, lw=1, ls=":")
         colorbar = fig.colorbar(image, ax=ax_map, pad=0.01, shrink=0.85)
         colorbar.set_label(r"density per $\log_{10} D$", fontsize=8, color=_MUTED_INK)
         colorbar.ax.tick_params(colors=_MUTED_INK, labelsize=7)
@@ -424,18 +462,20 @@ def plot_d_posteriors(d_grid: np.ndarray, panels: list[dict], title: str | None 
         if len(medians):
             ax.hist(medians, bins=bins, density=True, color=_HIST_COLOR, edgecolor="white",
                     lw=0.5, label="per-track medians")
-        pooled = _density(panel["pooled"], x)
+        mean_posterior = _density(panel["mean_posterior"], x)
         deconvolved = _density(panel["deconvolved"], x)
-        ax.plot(x, pooled, color=_POOLED_COLOR, lw=2, label="pooled posterior")
+        ax.plot(x, mean_posterior, color=_MEAN_POSTERIOR_COLOR, lw=2, label="mean of track posteriors")
         ax.plot(x, deconvolved, color=_DECONVOLVED_COLOR, lw=2, label="deconvolved")
-        top = max(pooled.max(), deconvolved.max(), ax.get_ylim()[1])
-        low, median, high = (np.log10(v) for v in panel["summed_interval"])
-        _interval_marker(ax, low, median, high, top * 1.08, _SUMMED_COLOR)
-        ax.plot([], [], "o-", color=_SUMMED_COLOR, lw=2, ms=5, label="summed log posterior (shared D), 90%")
+        if panel.get("floor") is not None:
+            _draw_floor(ax, tuple(np.log10(panel["floor"])), label=_floor_label(panel["floor"]))
+        top = max(mean_posterior.max(), deconvolved.max(), ax.get_ylim()[1])
+        low, median, high = (np.log10(v) for v in panel["shared_interval"])
+        _interval_marker(ax, low, median, high, top * 1.08, _SHARED_COLOR)
+        ax.plot([], [], "o-", color=_SHARED_COLOR, lw=2, ms=5, label="shared D, 90%")
         ax.set_ylim(0, top * 1.18)
         ax.set_ylabel(r"density per $\log_{10} D$", fontsize=8, color=_MUTED_INK)
         ax.set_title(
-            f"shared D = {panel['summed_interval'][1]:.3g} µm²/s", fontsize=9, loc="left", color=_INK
+            f"shared D = {panel['shared_interval'][1]:.3g} µm²/s", fontsize=9, loc="left", color=_INK
         )
         if row == 0:
             ax.legend(fontsize=7, frameon=False, loc="upper left")
@@ -456,10 +496,13 @@ def plot_track_posterior(
     alpha_weights: np.ndarray | None = None,
     alpha_interval: tuple[float, float, float] | None = None,
     n_frames: int | None = None,
+    d_floor: float | None = None,
+    alpha_info_bits: float | None = None,
 ) -> Figure:
     """One track's posterior over log10 D (and alpha, when computed), with
-    its median and the shaded 90% interval. A short track's posterior is
-    wide, and that width is the answer, not a defect."""
+    its median and the shaded 90% interval, its localization floor on the
+    D axis and its bits about alpha in that title. A short track's
+    posterior is wide, and that width is the answer, not a defect."""
     has_alpha = alpha_weights is not None
     fig = Figure(figsize=(7.0 if has_alpha else 4.2, 2.8), layout="constrained")
     axes = fig.subplots(1, 2 if has_alpha else 1, squeeze=False)[0]
@@ -477,6 +520,12 @@ def plot_track_posterior(
         ax.set_xlabel(label, fontsize=9)
         ax.set_ylim(bottom=0)
     lo, hi = _mass_range(d_weights, specs[0][1])
+    if d_floor is not None and d_floor > 0:
+        floor = np.log10(d_floor)
+        axes[0].axvline(floor, color=_MUTED_INK, lw=1, ls=":")
+        axes[0].text(floor, 0.98, " floor", transform=axes[0].get_xaxis_transform(), ha="left", va="top",
+                     fontsize=7, color=_MUTED_INK)
+        lo, hi = min(lo, floor), max(hi, floor)
     axes[0].set_xlim(lo - _LOG_D_PAD, hi + _LOG_D_PAD)
     if has_alpha:
         axes[1].axvline(1.0, color=_MUTED_INK, lw=0.8, ls="--", zorder=0)
@@ -489,6 +538,7 @@ def plot_track_posterior(
     )
     if has_alpha:
         a_low, a_med, a_high = alpha_interval
-        axes[1].set_title(f"α = {a_med:.2f} [{a_low:.2f}, {a_high:.2f}]", fontsize=9, loc="left",
+        bits = f" · {alpha_info_bits:.2f} bits" if alpha_info_bits is not None else ""
+        axes[1].set_title(f"α = {a_med:.2f} [{a_low:.2f}, {a_high:.2f}]{bits}", fontsize=9, loc="left",
                           color=_INK)
     return fig

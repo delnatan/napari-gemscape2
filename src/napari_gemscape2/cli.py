@@ -176,7 +176,6 @@ def diffusion(
         [diffusion]
         min_frames = 3          # shortest track fitted
         alpha = false           # α posterior (blur modelled; ~2x the cost of D)
-        D_long_stride = 5       # also D at 5 frames, and its ratio to D (omit: off)
         # the posterior grids (diffusionkit's GridPostOptions); D's range is
         # the flat prior's support. Any key left out keeps the template's,
         # else diffusionkit's default (shown).
