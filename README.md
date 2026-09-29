@@ -152,11 +152,13 @@ chosen against a finished stage's real output rather than guessed at beforehand.
 
 This is also how the PSF width is measured; there is no calibration or preview
 step. Set `sigma` on the Detect page, run detect on a few frames (the frame
-range), and read the `fit_sigma` histogram on the Filter page: its peak is the
-width to set. Run again and it should stop moving. A bimodal or ragged
+range), and read the `fit_sigma` histogram on the Filter page: `sigma` is the
+in-focus width, the narrowest a spot can be, so take it from the narrow,
+in-focus end of the main peak, not its middle. Fits can't go below `sigma`
+(`slack` starts at 1.0), so run again and the peak should sit just above it. A bimodal or ragged
 `fit_sigma` (two focal planes, junk being fitted as signal) is something you see
-rather than something a median averages away. A sigma set far too high shows as
-a pile-up at the histogram's low edge, where fits are pinned against the `slack`
+rather than something a median averages away. A sigma set too high shows as a
+pile-up at the histogram's low edge, where fits are pinned against the `slack`
 bound and flagged `AT_BOUND`.
 
 One unit caveat, since two are in play: `sigma` is in **pixels**, while `slack`

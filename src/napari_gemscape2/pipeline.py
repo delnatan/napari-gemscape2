@@ -96,9 +96,10 @@ DEFAULT_CAMERA_KWARGS = dict(
 # that function's own defaults (`spotsolve.native`).
 #
 # `fp_per_mpx` is the detector's one threshold, stated as what it costs:
-# the expected number of false emitters per 10^6 pixels of pure noise
-# (calibrated to within 3% on simulated noise for sigma 1.0-1.45). Lower
-# it for fewer false positives, raise it for dim data.
+# an upper bound on the expected number of false emitters per 10^6 pixels
+# of pure Gaussian noise (derived, not fitted; see spotsolve's
+# docs/DETECTION.md). Lower it for fewer false positives, raise it for dim
+# data.
 #
 # `slack` is the width range a fit is allowed to take, as multiples of
 # `sigma`. Every fit is reported; one that ends on a width bound carries

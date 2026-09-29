@@ -33,7 +33,7 @@ setting on the Detect page: run detect on a few frames (the frame range),
 read the `fit_sigma` histogram on the Filter page, adjust sigma, run
 again. The distribution is on screen throughout, so a bimodal or ragged
 width -- two focal planes, junk fitted as signal -- is seen rather than
-averaged into one number. spotsolve reports every fit, so a badly
+averaged into one number. spotsolve reports every fit, so an
 overestimated sigma shows as a pile-up at the low `slack` bound (those
 fits carry `FitFlag.AT_BOUND`) rather than as missing detections.
 
@@ -314,10 +314,11 @@ class _DetectTab(QWidget):
             "at. Each emitter still gets its own fitted width (fit_sigma);\n"
             "this sets where the search starts and what slack is a\n"
             "multiple of.\n\n"
-            "To settle it: run detect on a few frames, read fit_sigma's peak\n"
-            "on the Filter page, set it here, run again. A pile-up at the\n"
-            "histogram's low edge (fits flagged AT_BOUND) means sigma is set\n"
-            "too high.",
+            "To settle it: run detect on a few frames, read the narrow,\n"
+            "in-focus end of fit_sigma's main peak on the Filter page, set\n"
+            "it here, run again. Fits can't go below sigma, so a pile-up at\n"
+            "the histogram's low edge (fits flagged AT_BOUND) means sigma is\n"
+            "set too high.",
         )
         self.sigma.valueChanged.connect(self._update_slack_note)
 
