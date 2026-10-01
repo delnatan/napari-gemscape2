@@ -7,10 +7,10 @@ here exactly once, unlike napari-gemscape where the interactive handlers
 and its batch subprocess script each reimplemented the pipeline.
 
 Detection and linking are `spotsolve`'s: `spotsolve.localize`/
-`localize_stack` (each frame fitted as one joint Poisson model, counts
-decided by likelihood ratios at a threshold set by `fp_per_mpx`, the
-expected false emitters per 10^6 pixels of pure noise -- so "how many are
-there" and "where are they" are answered as one problem) and
+`localize_stack` (u-track's detector: each seed fitted on its own window,
+every emitter kept by a likelihood ratio at a threshold set by
+`fp_per_mpx`, the expected false emitters per 10^6 pixels of pure noise)
+and
 `spotsolve.link` (Crocker-Grier: frame to frame, least summed squared
 displacement within a required `max_step`).
 `spotsolve.loctable` defines the table that passes between them, and this
@@ -21,18 +21,11 @@ learn a second schema.
 Two things the previous sfwloc-based pipeline did are gone because
 `spotsolve` makes them unnecessary rather than because they were dropped:
 
-  - There is one *default* detector, not a per-acquisition choice of
-    three. `spotsolve.localize`/`localize_stack` (multi-emitter, the
-    default `DetectTrackParams.detector`) fits the frame jointly and
-    decides how many emitters it holds by likelihood ratio -- the same
-    rule handles a crowded field and a sparse one, so there is no
-    dense/sparse/DAOPHOT algorithm to hand-pick per file. `spotsolve`
-    also ships `localize_aguet`/`localize_aguet_stack`
-    (`detector="aguet"`): independent single-emitter fits behind a LoG
-    screen, with no multi-emitter search -- the spotfitlm-compatible
-    baseline for genuinely sparse fields, kept on as an option rather
-    than the default because the joint fit is the more general rule when
-    in doubt.
+  - There is one detector with one switch, not a per-acquisition choice
+    of three. `DetectTrackParams.detector` is "mixtures" (the default:
+    several emitters per window, so neighbours are fitted rather than
+    biasing each other -- right for crowded and sparse fields alike) or
+    "single" (one emitter per window: faster, for well-separated spots).
   - Linking takes one number, `max_step` (px): the largest step a
     particle may take between consecutive frames. It is a setting, not a
     measurement -- spotsolve found that estimating it from the movie's
@@ -101,34 +94,36 @@ DEFAULT_CAMERA_KWARGS = dict(
 # docs/DETECTION.md). Lower it for fewer false positives, raise it for dim
 # data.
 #
-# `slack` is the width range a fit is allowed to take, as multiples of
-# `sigma`. Every fit is reported; one that ends on a width bound carries
-# `FitFlag.AT_BOUND` instead of being dropped.
+# `width` is the range of widths an emitter is reported at, as multiples
+# of `sigma`; wider light is fitted as out-of-focus background.
 DEFAULT_DETECT_KWARGS = dict(
     fp_per_mpx=spotsolve.FP_PER_MPX,
-    slack=spotsolve.SLACK,
+    width=spotsolve.WIDTH,
 )
 
-# Keys a manifest written against spotsolve 0.1 may carry in its
-# `detect_kwargs` that no current detector accepts: the box search's
-# emitter cap and LoG cut, its count rule, and an older reporting band.
-# Dropped on the way back in, so an old bundle still works as a template.
-_OBSOLETE_DETECT_KWARGS = frozenset({"k_max", "threshold", "selection", "count_penalty", "band"})
+# `detect_kwargs` keys older spotsolve versions took and the current one
+# does not. Dropped on the way back in, so an old bundle still works as a
+# template (with the current defaults in their place).
+_OBSOLETE_DETECT_KWARGS = frozenset({
+    "k_max", "threshold", "selection", "count_penalty", "band",  # 0.1
+    "slack", "significance", "boxsize", "itermax",  # 0.2-0.3
+})
 
-# Forwarded to `spotsolve.localize_aguet`/`localize_aguet_stack` as **kwargs
-# when `DetectTrackParams.detector == "aguet"`, mirroring their own defaults
-# (`spotsolve.aguet`). None of `DEFAULT_DETECT_KWARGS`' keys apply here --
-# Aguet fits one emitter per LoG-screened candidate independently rather
-# than fitting the frame jointly, so there is no `slack` (its width is
-# fitted free) and no `fp_per_mpx` (the screening cut is `significance`, a
-# per-pixel level rather than a frame-wide rate). `boxsize` is the
-# odd fit-crop size around each candidate and `itermax` its optimizer's
-# iteration budget -- both rarely need changing.
-DEFAULT_SPARSE_KWARGS = dict(
-    significance=0.05,
-    boxsize=9,
-    itermax=50,
-)
+# The detectors `run_detect_step` runs: spotsolve's `fit_mixtures` on or
+# off. Bundles from spotsolve 0.3 and earlier name the joint model and the
+# spotfitlm port; they map to the current choice that does their job.
+DETECTORS = ("mixtures", "single")
+_LEGACY_DETECTORS = {"multi_emitter": "mixtures", "aguet": "single"}
+
+
+def detector_name(name: Optional[str]) -> Optional[str]:
+    """`name` as one of `DETECTORS`, translating an older bundle's."""
+    if name is None:
+        return None
+    name = _LEGACY_DETECTORS.get(name, name)
+    if name not in DETECTORS:
+        raise ValueError(f"unknown detector {name!r}; expected one of {DETECTORS}")
+    return name
 
 # ProgressCallback(done, total, stage) -- called from whatever thread the
 # stage function executes on; the interactive widget wraps this in a
@@ -217,21 +212,13 @@ class DetectTrackParams:
     # 0 keeps every fit). Off by default, following spotsolve: a flag is a
     # diagnostic, not a verdict that the detection is wrong.
     exclude_flags: int = 0
-    # Which spotsolve detector `run_detect_step` runs: "multi_emitter"
-    # (default -- `spotsolve.localize`/`localize_stack`, one joint model
-    # per frame) or "aguet" (`localize_aguet`/`localize_aguet_stack`, the
-    # independent-fit sparse baseline).
-    detector: str = "multi_emitter"
+    # One of `DETECTORS`: "mixtures" (default) or "single".
+    detector: str = "mixtures"
     camera_kwargs: dict = field(default_factory=lambda: dict(DEFAULT_CAMERA_KWARGS))
-    # None picks `DEFAULT_DETECT_KWARGS` or `DEFAULT_SPARSE_KWARGS` to match
-    # `detector` (see `run_detect_step`) -- left as None rather than always
-    # defaulting to the multi-emitter dict, which would silently hand
-    # `localize_aguet_stack` keyword arguments (`fp_per_mpx`, `slack`) it
-    # doesn't accept.
+    # None means `DEFAULT_DETECT_KWARGS`.
     detect_kwargs: Optional[dict] = None
-    # Worker threads the chosen `detector`'s stack function hands frames to,
-    # in `run_detect_step`. None means every core (os.cpu_count()) --
-    # spotsolve's own default for either detector.
+    # Worker threads `localize_stack` hands frames to, in `run_detect_step`.
+    # None means every core (os.cpu_count()), spotsolve's own default.
     n_threads: Optional[int] = None
     # (start, end) frame slice, Python-slice semantics; None, or end <= 0,
     # means through the real last frame (see _resolve_frame_range).
@@ -385,20 +372,16 @@ def run_detect_step(
     progress_callback: Optional[ProgressCallback] = None,
     cancel_event: Optional[threading.Event] = None,
     n_threads: Optional[int] = None,
-    detector: str = "multi_emitter",
+    detector: str = "mixtures",
 ) -> PipelineSession:
     """Localize every spot over `session.image[start:end]` (default: every
     frame) with `spotsolve`, and assemble the result into the standard
     localization table.
 
-    `detector` picks which spotsolve function does the work: the default
-    "multi_emitter" (`spotsolve.localize_stack`, one joint model per
-    frame) or "aguet" (`spotsolve.localize_aguet_stack`,
-    independent single-emitter fits behind a LoG screen -- the sparse
-    baseline). `detect_kwargs` must match whichever is chosen (`None` picks
-    `DEFAULT_DETECT_KWARGS`/`DEFAULT_SPARSE_KWARGS` accordingly) -- the two
-    detectors take disjoint keyword arguments, so a dict built for one
-    raises a `TypeError` if forwarded to the other.
+    `detector` is one of `DETECTORS`: "mixtures" (the default) fits
+    several emitters per window (`fit_mixtures=True`), "single" one.
+    `detect_kwargs` (`None`: `DEFAULT_DETECT_KWARGS`) is forwarded to
+    `spotsolve.localize_stack`.
 
     Sets `session.points_df` (one row per detection,
     `loctable.LOCALIZATION_SCHEMA`) and `session.frames_df` (one row per
@@ -409,9 +392,8 @@ def run_detect_step(
     `sigma` is the in-focus PSF width. If omitted, falls back to
     `session.sigma` (the last run's) -- raises if neither is available.
     Note this is the width the search runs AT; each emitter still gets its
-    own fitted width (`fit_sigma`); for `detector="multi_emitter"`,
-    `detect_kwargs`' `slack` bounds how far it may stray, and a fit ending
-    on that bound is flagged `AT_BOUND` rather than dropped.
+    own fitted width (`fit_sigma`), reported within `detect_kwargs`'
+    `width` (multiples of `sigma`).
 
     `frame_range`, if given, is a `(start, end)` pair (Python-slice
     semantics: `end` exclusive) restricting which frames are processed --
@@ -430,8 +412,8 @@ def run_detect_step(
     "how much of this movie was junk" stays an auditable fact about the
     run rather than a silent deletion.
 
-    Both paths run every frame through whichever rayon-parallel stack
-    function `detector` selects -- `n_threads` (default: every core,
+    Both paths run every frame through `spotsolve.localize_stack`, which
+    runs frames in parallel -- `n_threads` (default: every core,
     `os.cpu_count()`) is how many native threads it hands frames to. They
     differ only in chunk size: with no `progress_callback`, the whole range
     goes through in one call; with one, the range is split into chunks of
@@ -453,11 +435,11 @@ def run_detect_step(
         sigma = session.sigma
 
     camera = dict(camera_kwargs) if camera_kwargs is not None else dict(DEFAULT_CAMERA_KWARGS)
-    localize_stack_fn = spotsolve.localize_aguet_stack if detector == "aguet" else spotsolve.localize_stack
-    if detect_kwargs is not None:
-        detect = dict(detect_kwargs)
-    else:
-        detect = dict(DEFAULT_SPARSE_KWARGS if detector == "aguet" else DEFAULT_DETECT_KWARGS)
+    detector = detector_name(detector)
+    detect = dict(detect_kwargs if detect_kwargs is not None else DEFAULT_DETECT_KWARGS)
+
+    def localize_stack_fn(frames, **kwargs):
+        return spotsolve.localize_stack(frames, fit_mixtures=detector == "mixtures", **kwargs)
 
     start, end = _resolve_frame_range(frame_range, session.image.shape[0])
     if end <= start:
@@ -474,7 +456,7 @@ def run_detect_step(
             j = min(i + threads, end)
             results.extend(
                 localize_stack_fn(
-                    session.image[i:j], sigma, roi=mask, images=False,
+                    session.image[i:j], sigma=sigma, roi=mask, images=False,
                     n_threads=threads, **camera, **detect
                 )
             )
@@ -482,7 +464,7 @@ def run_detect_step(
             i = j
     else:
         results = localize_stack_fn(
-            session.image[start:end], sigma, roi=mask, images=False,
+            session.image[start:end], sigma=sigma, roi=mask, images=False,
             n_threads=threads, **camera, **detect
         )
 
@@ -1026,7 +1008,7 @@ def session_from_bundle(
         points_df=points_df,
         camera_kwargs_used=params.get("camera_kwargs"),
         detect_kwargs_used=detect_kwargs,
-        detector_used=params.get("detector"),
+        detector_used=detector_name(params.get("detector")),
         frame_range_used=tuple(frame_range) if frame_range is not None else None,
         labels=labels,
         regions=regions,
@@ -1059,7 +1041,7 @@ def _detect_kwargs_from_record(detect_kwargs: Optional[dict]) -> Optional[dict]:
     if detect_kwargs is None:
         return None
     return {
-        key: tuple(value) if key == "slack" and value is not None else value
+        key: tuple(value) if key == "width" and value is not None else value
         for key, value in detect_kwargs.items()
         if key not in _OBSOLETE_DETECT_KWARGS
     }
@@ -1083,7 +1065,7 @@ def detect_track_params_from_manifest(manifest: dict) -> dict:
         # Absent from a bundle linked by spotsolve 0.1, whose linker took
         # no step limit: the config then has to supply one.
         "max_step": params.get("max_step_px"),
-        "detector": params.get("detector"),
+        "detector": detector_name(params.get("detector")),
         "camera_kwargs": params.get("camera_kwargs"),
         "detect_kwargs": _detect_kwargs_from_record(params.get("detect_kwargs")),
         "point_filters": _filters_from_record(params.get("point_filters")),
@@ -1146,14 +1128,14 @@ def parse_flag_names(names: Optional[str]) -> Optional[int]:
 
 
 def _jsonable_detect_kwargs(detect_kwargs: Optional[dict]) -> Optional[dict]:
-    """`detect_kwargs` with `slack` as a list rather than a tuple --
+    """`detect_kwargs` with `width` as a list rather than a tuple --
     `json.dumps` writes both as arrays, but reading a manifest back gives
     lists either way, so normalize here and keep the round-trip honest."""
     if detect_kwargs is None:
         return None
     out = dict(detect_kwargs)
-    if out.get("slack") is not None:
-        out["slack"] = list(out["slack"])
+    if out.get("width") is not None:
+        out["width"] = list(out["width"])
     return out
 
 

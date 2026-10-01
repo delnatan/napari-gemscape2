@@ -125,14 +125,8 @@ _EXACT: dict[str, Optional[str]] = {
     "sigma_ratio": None,
     "flux_ratio": None,
     "flux_snr": None,
-    # spotsolve's per-fit diagnostics: a `FitFlag` bitmask, and the
-    # conditional/marginal Fisher variance ratio per parameter (a pure
-    # number; small means strongly coupled to another fitted parameter).
+    # spotsolve's per-fit diagnostics: a `FitFlag` bitmask.
     "flags": None,
-    "fisher_flux": None,
-    "fisher_y": None,
-    "fisher_x": None,
-    "fisher_sigma": None,
     "n_locs": None,
     "n_flagged": None,
     "crowding_ratio": None,

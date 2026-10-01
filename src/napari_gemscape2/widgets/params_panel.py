@@ -33,9 +33,8 @@ setting on the Detect page: run detect on a few frames (the frame range),
 read the `fit_sigma` histogram on the Filter page, adjust sigma, run
 again. The distribution is on screen throughout, so a bimodal or ragged
 width -- two focal planes, junk fitted as signal -- is seen rather than
-averaged into one number. spotsolve reports every fit, so an
-overestimated sigma shows as a pile-up at the low `slack` bound (those
-fits carry `FitFlag.AT_BOUND`) rather than as missing detections.
+averaged into one number. Fits cannot go narrower than `sigma`, so an
+overestimated sigma shows as a pile-up at the histogram's low edge.
 
 `offset` is the one camera fact spotsolve takes (noise is measured from
 each frame), and `PipelineParamsWidget.get_camera_kwargs` is the single
@@ -52,11 +51,9 @@ the line red and unfolds the section, since `pipeline.load_session` will
 refuse to run without it and the box to fix it is right there.
 
 A note on units, since two different ones are in play: `sigma` is in
-**pixels**, while `slack` is a **multiple of whatever sigma the search is
-running at** (`spotsolve` reports `sigma_ratio = fit_sigma / sigma`). It is
-not a multiple of the *initial* guess, and not absolute pixels, so moving
-`sigma` moves the window with it. The expert section therefore prints the
-current px window under that row, recomputed whenever `sigma` changes.
+**pixels**, while `width` is a **multiple of sigma** (`spotsolve` reports
+`sigma_ratio = fit_sigma / sigma`), so moving `sigma` moves the window with
+it. The expert section prints the current px window under that row.
 
 Each tab shows only the handful of knobs that matter for day-to-day
 tuning; the rest collapse under a per-tab "Expert settings"
@@ -64,20 +61,11 @@ tuning; the rest collapse under a per-tab "Expert settings"
 pages within one keep the dock panel's height bounded to a single step
 rather than to the whole form.
 
-Why this form is so much smaller than the sfwloc-era one it replaces: that
-pipeline offered three detectors, each with its own ~20-key solver-kwargs
-dict, and a linker with a hand-tuned bootstrap gate. `spotsolve`'s default
-detector has one threshold, stated as the false positives it admits
-(`fp_per_mpx`), and its linker one distance (`max_step`), so what's left to
-expose is the camera, the PSF width, and those two numbers. A knob that
-isn't here is not hidden; it doesn't exist.
-
-`spotsolve` also ships a second detector, Aguet -- LoG-screened
-candidates fitted one at a time, with no multi-emitter search (the
-spotfitlm-compatible sparse baseline). The "detector" dropdown at the top
-of the Detect tab's core section picks between them; the knobs beneath it
-swap to match (`fp_per_mpx`/`slack` for the default,
-`significance`/`boxsize`/`itermax` for Aguet) rather than showing both detectors' settings at once.
+`spotsolve`'s detector has one threshold, stated as the false positives it
+admits (`fp_per_mpx`), and its linker one distance (`max_step`), so what's
+left to expose is the camera, the PSF width, those two numbers, and the
+"detector" choice: mixtures (several emitters per window, the default) or
+single fits (one per window, faster for well-separated spots).
 
 Each tab owns its stage's "Run" button and a one-line status label, wired
 to `PipelineParamsWidget`'s `detectRequested`/`trackRequested`/
@@ -138,7 +126,6 @@ from napari_gemscape2.io_formats import StackMetadata
 from napari_gemscape2.pipeline import (
     DEFAULT_CAMERA_KWARGS,
     DEFAULT_DETECT_KWARGS,
-    DEFAULT_SPARSE_KWARGS,
     TRACK_METRIC_COLUMNS,
     FilterSpec,
 )
@@ -246,28 +233,13 @@ class _DetectTab(QWidget):
     knobs plus scope and the Run button, then a filter stack over what it
     found (where `fit_sigma` is read to settle the PSF width), then Save.
 
-    Core: `sigma`, `offset` (the one camera fact `spotsolve` still takes --
-    gain and read noise are measured from each frame now), the `detector`
-    dropdown, that detector's own knobs, a frame range and the regions
-    controls.
-
-    Two detectors, two knob sets, never both on screen at once -- the
-    dropdown's choice sets which rows `_on_detector_changed` shows:
-
-      - `multi_emitter` (default, `spotsolve.localize`/`localize_stack`):
-        `fp_per_mpx` in core -- the one threshold, as the false emitters it
-        admits per 10^6 pixels of pure noise, restated per frame of the
-        current image underneath; `slack` (expert) -- the width range a fit
-        may take, as a multiple of `sigma`, echoed in px. There is no
-        emitter cap, iteration budget or count rule to set: the joint model
-        adds and removes emitters by likelihood ratio at that one
-        threshold, and runs to its own convergence.
-      - `aguet` (`spotsolve.localize_aguet`/`localize_aguet_stack`, the
-        spotfitlm-compatible sparse baseline): `significance` (the LoG
-        screening cut, a per-pixel level rather than a frame-wide rate)
-        in core; `boxsize`/`itermax` (expert) -- the fit-crop size and this
-        detector's own iteration budget. No `slack` (its width is fitted
-        free)."""
+    Core: `sigma`, `offset` (the one camera fact `spotsolve` takes -- gain
+    and read noise are measured from each frame), the `detector` dropdown
+    (mixtures or single fits), `fp_per_mpx` -- the one threshold, as the
+    false emitters it admits per 10^6 pixels of pure noise, restated per
+    frame of the current image underneath -- a frame range and the regions
+    controls. Expert: `width`, the reported widths as a multiple of `sigma`
+    (echoed in px), and the thread count."""
 
     runRequested = Signal()
     cancelRequested = Signal()
@@ -284,46 +256,36 @@ class _DetectTab(QWidget):
             "each frame, not from a gain/read-noise calibration.",
         )
         d = DEFAULT_DETECT_KWARGS
-        s = DEFAULT_SPARSE_KWARGS
-        slack_lo, slack_hi = d["slack"]
+        width_lo, width_hi = d["width"]
 
         # --- detector choice --------------------------------------------
-        # Which spotsolve function `get_detect_kwargs`/pipeline.run_detect_
-        # step actually calls. Switching it swaps the rows below between
-        # this detector's own knobs (`_on_detector_changed`) -- the two take
-        # disjoint keyword arguments, so showing both at once would just
-        # invite setting one that the current choice ignores.
         self.detector = QComboBox()
-        self.detector.addItem("Multi-emitter", "multi_emitter")
-        self.detector.addItem("Sparse (Aguet)", "aguet")
+        self.detector.addItem("Mixtures", "mixtures")
+        self.detector.addItem("Single", "single")
         self.detector.setToolTip(
-            "Multi-emitter (default): fits each frame as one joint model,\n"
-            "adding and removing emitters by likelihood ratio -- one rule for\n"
-            "both crowded and sparse fields.\n\n"
-            "Sparse (Aguet): the spotfitlm-compatible baseline. LoG-screens\n"
-            "candidates, then fits each one independently -- no multi-emitter\n"
-            "search. For genuinely sparse fields where the joint search is\n"
-            "unneeded."
+            "Mixtures (default): several emitters per fit window, so a\n"
+            "neighbour is fitted rather than biasing the spot. Right for\n"
+            "crowded and sparse fields alike.\n\n"
+            "Single: one emitter per window. Faster; use it only where spots\n"
+            "are farther apart than about 6 sigma."
         )
-        self.detector.currentIndexChanged.connect(self._on_detector_changed)
 
         # --- PSF width ----------------------------------------------------
         self.sigma = _dspin(
             1.3, 0.3, 10.0, 0.1, decimals=3,
             tooltip="In-focus PSF sigma in PIXELS -- the width the search runs\n"
             "at. Each emitter still gets its own fitted width (fit_sigma);\n"
-            "this sets where the search starts and what slack is a\n"
+            "this sets where the search starts and what width is a\n"
             "multiple of.\n\n"
             "To settle it: run detect on a few frames, read the narrow,\n"
             "in-focus end of fit_sigma's main peak on the Filter page, set\n"
             "it here, run again. Fits can't go below sigma, so a pile-up at\n"
-            "the histogram's low edge (fits flagged AT_BOUND) means sigma is\n"
-            "set too high.",
+            "the histogram's low edge means sigma is set too high.",
         )
-        self.sigma.valueChanged.connect(self._update_slack_note)
+        self.sigma.valueChanged.connect(self._update_width_note)
 
         # --- detection knob --------------------------------------------
-        # The multi-emitter detector's one threshold, in the currency it
+        # The detector's one threshold, in the currency it
         # costs: false emitters per 10^6 pixels of pure noise. A rate per
         # megapixel is hard to feel, so `_update_fp_note` restates it per
         # frame of the image at hand.
@@ -331,8 +293,7 @@ class _DetectTab(QWidget):
             d["fp_per_mpx"], 0.1, 10_000.0, 1.0, decimals=1,
             tooltip="Expected false spots per million pixels of pure noise -- the\n"
             "detector's one threshold. Lower it for fewer false positives\n"
-            "(e.g. 4), raise it for dim data. Calibrated on simulated noise for\n"
-            "sigma 1.0-1.45 px; wide PSFs at strict values overshoot it.\n\n"
+            "(e.g. 4), raise it for dim data.\n\n"
             f"spotsolve's default: {spotsolve.FP_PER_MPX:g}.",
         )
         self._frame_px: Optional[int] = None
@@ -340,30 +301,17 @@ class _DetectTab(QWidget):
         self.fp_per_mpx.valueChanged.connect(self._update_fp_note)
         self._update_fp_note()
 
-        # Aguet's one core tuning knob: the per-pixel LoG screening level
-        # (not a frame-wide false discovery rate -- see spotsolve.aguet).
-        # Plays the same "main cut" role `fp_per_mpx` plays for the
-        # multi-emitter detector, so it sits in the same row position.
-        self.significance = _dspin(
-            s["significance"], 1e-6, 0.5, 0.01, decimals=4,
-            tooltip="Per-pixel screening significance for the Aguet baseline --\n"
-            "lower is stricter (fewer candidates screened in). This is NOT a\n"
-            "frame-wide false discovery rate. Raise it toward 0.1-0.2 on faint,\n"
-            "sparse data; lower it for fewer false positives.",
-        )
-
         self.core_form = core_form = _compact_form(QFormLayout())
         core_form.setContentsMargins(0, 0, 0, 0)
         core_form.addRow("sigma (px)", self.sigma)
         core_form.addRow("detector", self.detector)
         core_form.addRow("offset (ADU)", self.offset)
         # Row labels carry the unit the same way "offset (ADU)" and
-        # "sigma (px)" do -- a rate and a p-value are exactly the kind of
+        # "sigma (px)" do -- a rate is exactly the kind of
         # thing a bare number invites getting wrong -- kept short so the
         # column stays narrow.
         core_form.addRow("false spots / Mpx", self.fp_per_mpx)
         core_form.addRow(self._fp_note)
-        core_form.addRow("significance (p)", self.significance)
 
         # What gets analyzed, not how -- kept in core (not expert) since
         # these are exactly the knobs that let one image be explored
@@ -385,8 +333,7 @@ class _DetectTab(QWidget):
         frame_row.addWidget(QLabel("to"))
         frame_row.addWidget(self.frame_end)
 
-        # How many native threads the chosen detector's stack function
-        # (`localize_stack` or `localize_aguet_stack`) hands frames to (both
+        # How many native threads `localize_stack` hands frames to (both
         # the headless CLI and, chunked, the interactively-watched run --
         # see `pipeline.run_detect_step`'s docstring). Capped at the
         # machine's own core count; defaulting to it is what "use every
@@ -394,7 +341,7 @@ class _DetectTab(QWidget):
         cpu_count = os.cpu_count() or 1
         self.n_threads = _ispin(
             cpu_count, 1, cpu_count,
-            tooltip="Worker threads the detector's stack function hands frames to.\n"
+            tooltip="Worker threads the detector hands frames to.\n"
             "Defaults to every core on this machine. Lower it to leave some\n"
             "cores free for other work while a long run is going.",
         )
@@ -402,53 +349,35 @@ class _DetectTab(QWidget):
 
         self.regions_panel = RegionsPanel()
 
-        # `slack` is the width range a fit may take, as a multiple of
-        # `sigma`, not absolute pixels -- so `_update_slack_note` prints
-        # what it currently comes to in px. A fit ending on either bound is
-        # still reported, flagged `AT_BOUND`.
-        self.slack_lo = _dspin(
-            slack_lo, 0.1, 10.0, 0.05, decimals=3,
-            tooltip="Narrowest width a fit may take, as a MULTIPLE OF SIGMA.",
+        # `width` is the range of reported widths, as a multiple of
+        # `sigma`, not absolute pixels -- so `_update_width_note` prints
+        # what it currently comes to in px.
+        self.width_lo = _dspin(
+            width_lo, 0.1, 10.0, 0.05, decimals=3,
+            tooltip="Narrowest reported width, as a MULTIPLE OF SIGMA.",
         )
-        self.slack_hi = _dspin(
-            slack_hi, 0.1, 20.0, 0.05, decimals=3,
-            tooltip="Widest width a fit may take, as a MULTIPLE OF SIGMA.",
+        self.width_hi = _dspin(
+            width_hi, 0.1, 10.0, 0.05, decimals=3,
+            tooltip="Widest reported width, as a MULTIPLE OF SIGMA (capped near 2).\n"
+            "Wider light is fitted as out-of-focus background, not reported.\n"
+            "Equal bounds fix every width.",
         )
-        for box in (self.slack_lo, self.slack_hi):
-            box.valueChanged.connect(self._update_slack_note)
+        for box in (self.width_lo, self.width_hi):
+            box.valueChanged.connect(self._update_width_note)
 
-        self._slack_row = slack_row = QHBoxLayout()
-        slack_row.setContentsMargins(0, 0, 0, 0)
-        slack_row.addWidget(self.slack_lo)
-        slack_row.addWidget(QLabel("to"))
-        slack_row.addWidget(self.slack_hi)
+        width_row = QHBoxLayout()
+        width_row.setContentsMargins(0, 0, 0, 0)
+        width_row.addWidget(self.width_lo)
+        width_row.addWidget(QLabel("to"))
+        width_row.addWidget(self.width_hi)
 
-        # Aguet's own expert knobs: the odd fit-crop size and this
-        # detector's optimizer iteration budget. Both rarely need changing
-        # -- there's no per-emitter search to bound the way slack bounds
-        # the multi-emitter fit.
-        self.boxsize = _ispin(
-            s["boxsize"], 3, 99,
-            tooltip="Odd fit-crop size, px, around each screened candidate.\n"
-            "Oversized boxes yield no fits. Leave at the default unless\n"
-            "spots sit close enough to overlap the crop.",
-        )
-        self.itermax = _ispin(
-            s["itermax"], 1, 10_000,
-            tooltip="Max optimizer iterations per candidate fit. Rarely needs\n"
-            "changing.",
-        )
-
-        self._slack_note = note_label("")
+        self._width_note = note_label("")
         self.expert_form = expert_form = _compact_form(QFormLayout())
         expert_form.setContentsMargins(0, 0, 0, 0)
-        expert_form.addRow("slack (× sigma)", slack_row)
-        expert_form.addRow(self._slack_note)
+        expert_form.addRow("width (× sigma)", width_row)
+        expert_form.addRow(self._width_note)
         expert_form.addRow("cores", self.n_threads)
-        expert_form.addRow("boxsize (px)", self.boxsize)
-        expert_form.addRow("max iterations", self.itermax)
-        self._update_slack_note()
-        self._on_detector_changed()
+        self._update_width_note()
 
         self.run_button, self.status_label, run_row = _run_row("Run detect")
         self.run_button.clicked.connect(self._on_run_button_clicked)
@@ -501,15 +430,12 @@ class _DetectTab(QWidget):
 
     # -- PSF width ---------------------------------------------------------
 
-    def _update_slack_note(self) -> None:
-        """Restate `slack` in pixels at the current `sigma`. It is a ratio
-        against the working sigma, not an absolute width, so this line is
-        the only place the actual px window a fit may take is visible --
-        and it moves whenever sigma does."""
+    def _update_width_note(self) -> None:
+        """Restate `width` in pixels at the current `sigma`."""
         sigma = self.sigma.value()
-        self._slack_note.setText(
-            f"× sigma, not px: at sigma = {sigma:.3f} px a fit may take "
-            f"{self.slack_lo.value() * sigma:.2f}–{self.slack_hi.value() * sigma:.2f} px."
+        self._width_note.setText(
+            f"× sigma, not px: at sigma = {sigma:.3f} px emitters are reported at "
+            f"{self.width_lo.value() * sigma:.2f}–{self.width_hi.value() * sigma:.2f} px."
         )
 
     def get_sigma(self) -> float:
@@ -519,21 +445,6 @@ class _DetectTab(QWidget):
 
     def get_detector(self) -> str:
         return self.detector.currentData()
-
-    def _on_detector_changed(self) -> None:
-        """Swap the core/expert rows to match the chosen detector -- see
-        this class's docstring for which knobs belong to which. Both
-        detectors' widgets exist the whole time (their values persist
-        across a switch); only visibility changes, via `QFormLayout.
-        setRowVisible` on whichever field object the row was built with."""
-        sparse = self.get_detector() == "aguet"
-        self.core_form.setRowVisible(self.fp_per_mpx, not sparse)
-        self.core_form.setRowVisible(self._fp_note, not sparse)
-        self.core_form.setRowVisible(self.significance, sparse)
-        self.expert_form.setRowVisible(self._slack_row, not sparse)
-        self.expert_form.setRowVisible(self._slack_note, not sparse)
-        self.expert_form.setRowVisible(self.boxsize, sparse)
-        self.expert_form.setRowVisible(self.itermax, sparse)
 
     def _update_fp_note(self) -> None:
         """Restate `fp_per_mpx` per frame of the current image -- the
@@ -627,15 +538,9 @@ class _DetectTab(QWidget):
         return dict(offset=self.offset.value())
 
     def get_detect_kwargs(self) -> dict:
-        if self.get_detector() == "aguet":
-            return dict(
-                significance=self.significance.value(),
-                boxsize=self.boxsize.value(),
-                itermax=self.itermax.value(),
-            )
         return dict(
             fp_per_mpx=self.fp_per_mpx.value(),
-            slack=(self.slack_lo.value(), self.slack_hi.value()),
+            width=(self.width_lo.value(), self.width_hi.value()),
         )
 
 
@@ -1030,10 +935,8 @@ _FLAG_TOOLTIPS = {
     "(also not converged).",
     spotsolve.FitFlag.COVARIANCE_UNAVAILABLE: "No positive finite variance for some parameter.\n"
     "Fits without a usable position error are never linked anyway.",
-    spotsolve.FitFlag.AT_BOUND: "A fitted parameter (often the width, against slack)\n"
-    "or the shared background sits on an optimization bound.",
-    spotsolve.FitFlag.CONTEXT_UNSETTLED: "Neighboring light changed after this fit beyond\n"
-    "refinement tolerance.",
+    spotsolve.FitFlag.AT_BOUND: "The fitted level, flux or position sits on an\n"
+    "optimization bound.",
 }
 
 

@@ -77,7 +77,7 @@ def _detect_track_summary(params: dict) -> str:
         )
     parts = [
         f"σ {params['sigma']:g} px",
-        params.get("detector", "multi_emitter"),
+        params.get("detector", "mixtures"),
         f"max step {params['max_step']:g} px",
     ]
     if params.get("min_track_length"):

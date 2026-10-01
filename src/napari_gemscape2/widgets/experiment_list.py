@@ -1276,8 +1276,7 @@ class ExperimentListWidget(QWidget):
         n_points = session.points_df.height if session.points_df is not None else 0
         start, end = session.frame_range_used or (0, session.image.shape[0])
         # Shown next to the detection count because a run where most fits
-        # carry a FitFlag (usually AT_BOUND: widths pinned against slack)
-        # is a sigma or focus problem, and the count alone hides it.
+        # carry a FitFlag is a problem the count alone hides.
         extra = ""
         frames = session.frames_df
         if frames is not None and frames.height:
@@ -1914,7 +1913,7 @@ def _run_detect_worker(
     cancel_event: threading.Event,
     emitter: _ProgressEmitter,
     n_threads: Optional[int] = None,
-    detector: str = "multi_emitter",
+    detector: str = "mixtures",
 ) -> PipelineSession:
     def progress_cb(done: int, total: int, stage: str) -> None:
         emitter.updated.emit(done, total, stage)

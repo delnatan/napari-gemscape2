@@ -2,8 +2,8 @@
 
 Batch orchestration and napari visualization for single-particle tracking, connecting:
 
-- [`spotsolve`](https://github.com/delnatan/spotsolve) — multi-emitter 2D localization
-  as one joint Poisson model per frame, plus frame-to-frame linking. Runs in Rust.
+- [`spotsolve`](https://github.com/delnatan/spotsolve) — 2D localization after u-track's
+  detector, with overlapping spots fitted jointly, plus frame-to-frame linking. Runs in Rust.
 - [`diffusionkit`](https://github.com/delnatan/diffusionkit) — per-track grid posteriors over D and α, their
   ensemble (summed and deconvolved), classic MSD fits, and per-track NUTS.
 
@@ -56,13 +56,14 @@ you'll publish, use the clone.
 
 Both halves of the problem are handled by `spotsolve` rather than tuned around:
 
-- **Detection** asks "how many emitters are here, and where?" as one estimation
-  problem. Each frame is fitted as one joint Poisson model, every emitter at its
-  own width, and emitters are added or removed by likelihood ratio — so
+- **Detection** fits each candidate spot on its own window with a Poisson
+  model, every emitter at its own width. With the default "mixtures" detector a
+  window takes as many emitters as the likelihood ratio supports, so
   overlapping spots are resolved instead of being merged into one bright
-  centroid. There is one detector, not a sparse/dense choice, and one knob:
-  `fp_per_mpx`, the false spots it admits per 10⁶ pixels of pure noise (default
-  16; the Detect tab restates it per frame of the image at hand).
+  centroid; "single" fits one per window, faster for well-separated spots. One
+  knob sets the threshold: `fp_per_mpx`, the false spots admitted per 10⁶
+  pixels of pure noise (default 16; the Detect tab restates it per frame of the
+  image at hand).
 - **Linking** is Crocker–Grier: between consecutive frames it picks the
   assignment with the least summed squared displacement, and no step longer than
   `max_step` (px) is linked. `max_step` is the one setting and is not estimated
@@ -155,17 +156,15 @@ step. Set `sigma` on the Detect page, run detect on a few frames (the frame
 range), and read the `fit_sigma` histogram on the Filter page: `sigma` is the
 in-focus width, the narrowest a spot can be, so take it from the narrow,
 in-focus end of the main peak, not its middle. Fits can't go below `sigma`
-(`slack` starts at 1.0), so run again and the peak should sit just above it. A bimodal or ragged
-`fit_sigma` (two focal planes, junk being fitted as signal) is something you see
-rather than something a median averages away. A sigma set too high shows as a
-pile-up at the histogram's low edge, where fits are pinned against the `slack`
-bound and flagged `AT_BOUND`.
+(`width` starts at 1.0), so run again and the peak should sit just above it. A
+bimodal or ragged `fit_sigma` (two focal planes, junk being fitted as signal) is
+something you see rather than something a median averages away. A sigma set too
+high shows as a pile-up at the histogram's low edge.
 
-One unit caveat, since two are in play: `sigma` is in **pixels**, while `slack`
-is a **multiple of whatever sigma the search is running at** (`sigma_ratio =
-fit_sigma / sigma`). It is not a multiple of the initial guess and not absolute
-pixels, so changing `sigma` moves the window with it — the Detect tab prints the
-resulting px window underneath it for that reason.
+One unit caveat, since two are in play: `sigma` is in **pixels**, while `width`
+(the reported widths, expert settings) is a **multiple of sigma** (`sigma_ratio
+= fit_sigma / sigma`), so changing `sigma` moves the window with it — the Detect
+tab prints the resulting px window underneath it.
 
 `max_step` is in **pixels** too, like `sigma` and like spotsolve takes it.
 
@@ -331,8 +330,10 @@ min_track_length = 2
 # `offset` is the only camera fact spotsolve needs -- noise is measured
 # from each frame directly.
 camera_kwargs = { offset = 100.0 }
-# The multi-emitter detector's one knob: expected false spots per 10^6
-# pixels of pure noise. Lower is stricter.
+# "mixtures" (default: several emitters per fit window) or "single".
+detector = "mixtures"
+# The detector's one threshold: expected false spots per 10^6 pixels of
+# pure noise. Lower is stricter.
 detect_kwargs = { fp_per_mpx = 16.0 }
 # The same QC cuts the UI's histogram filters produce, as {column = [lo, hi]}.
 # Applied to what the linker sees and to which tracks are kept -- never to
@@ -484,7 +485,7 @@ this track": it was excluded, too short, or that analysis was off.
 | `bg_mean` | ADU/px | Fitted local background |
 | `fit_sigma_mean`, `sigma_se_mean` | px | Fitted spot width and its standard error |
 | `sigma_ratio_mean` | | fit_sigma / sigma; well above 1 flags blur or overlapping spots |
-| `fisher_flux_mean`, `fisher_x_mean`, `fisher_y_mean`, `fisher_sigma_mean` | | Conditional / marginal Fisher variance per fit parameter; small means strongly coupled to another parameter (a diagnostic, not precision) |
+| `z_mean` | | sqrt(2 × likelihood ratio) of each detection: evidence, not precision |
 
 The tracks pane's histogram filters cover per-track results too — so a
 posterior `D` or `alpha` is filterable by the same drag as any other feature.
