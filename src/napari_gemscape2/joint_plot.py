@@ -264,6 +264,22 @@ def _density(weights: np.ndarray, x: np.ndarray) -> np.ndarray:
     return weights / np.gradient(x)
 
 
+def _draw_deconvolved(ax, x, weights, band, level, lw: float) -> float:
+    """The deconvolved distribution as a density over `x`, with its
+    pointwise band shaded (absent for None); returns the curve's maximum.
+
+    The band does not set the y scale: a peak narrower than the tracks
+    resolve has an unidentified height, and its band would dwarf the curve,
+    so it runs off the top of the axis instead."""
+    dens = _density(weights, x)
+    if band is not None:
+        lo, hi = (_density(b, x) for b in band)
+        ax.fill_between(x, lo, hi, color=_DECONVOLVED_COLOR, alpha=0.2, lw=0,
+                        label=f"deconvolved, {level:.0%} band")
+    ax.plot(x, dens, color=_DECONVOLVED_COLOR, lw=lw, label="deconvolved")
+    return dens.max()
+
+
 def _mass_range(weights: np.ndarray, x: np.ndarray, tail: float = 1e-3) -> tuple[float, float]:
     """The span of `x` holding all but `tail` of `weights` at each end."""
     cdf = np.cumsum(weights)
@@ -311,11 +327,13 @@ def plot_d_ensemble(
     computed.
 
     Each panel dict holds `name`, `n_tracks`, `medians` (per-track D
-    posterior medians), `deconvolved` (weights on `d_grid`),
+    posterior medians), `deconvolved` (weights on `d_grid`) with its
+    pointwise `deconvolved_band` (low, high weights) at credible `level`,
     `shared_interval` (low, median, high), `floor` (the localization
     floor's (10%, median, 90%) or None), and optionally `alpha_medians`
-    with `alpha_info_bits`, `alpha_bits_strata`, `alpha_deconvolved` and
-    `alpha_shared_interval` (`diffusion.ensemble_panels`).
+    with `alpha_info_bits`, `alpha_bits_strata`, `alpha_deconvolved`,
+    `alpha_deconvolved_band` and `alpha_shared_interval`
+    (`diffusion.ensemble_panels`).
 
     On one density axis: the histogram of per-track medians (what the
     typical track says), and the deconvolved distribution (how D is spread
@@ -339,14 +357,16 @@ def plot_d_ensemble(
         _style_axis(ax)
         medians = np.asarray(panel["medians"], dtype=float)
         medians = np.log10(medians[medians > 0])
+        hist_top = 0.0
         if len(medians):
-            ax.hist(medians, bins=bins, density=True, color=_HIST_COLOR, edgecolor="white",
-                    lw=0.5, label="per-track medians")
-        dens = _density(panel["deconvolved"], x)
-        ax.plot(x, dens, color=_DECONVOLVED_COLOR, lw=1.8, label="deconvolved")
+            counts, _, _ = ax.hist(medians, bins=bins, density=True, color=_HIST_COLOR, edgecolor="white",
+                                   lw=0.5, label="per-track medians")
+            hist_top = counts.max()
+        dens_top = _draw_deconvolved(ax, x, panel["deconvolved"], panel.get("deconvolved_band"),
+                                     panel.get("level", 0.9), lw=1.8)
         if panel.get("floor") is not None:
             _draw_floor(ax, tuple(np.log10(panel["floor"])), label=_floor_label(panel["floor"]))
-        top = max(dens.max(), ax.get_ylim()[1])
+        top = max(dens_top, hist_top)
         low, median, high = (np.log10(v) for v in panel["shared_interval"])
         _interval_marker(ax, low, median, high, top * 1.08, _SHARED_COLOR)
         ax.plot([], [], "o-", color=_SHARED_COLOR, lw=2, ms=5, label="shared D, 90%")
@@ -399,9 +419,8 @@ def _alpha_panel(ax, panel: dict, alpha_grid: np.ndarray, *, legend: bool) -> No
     ax.axvline(1.0, color=_MUTED_INK, lw=0.8, ls="--", zorder=0)
     top = bottom.max()
     if panel.get("alpha_deconvolved") is not None:
-        dens = _density(panel["alpha_deconvolved"], alpha_grid)
-        ax.plot(alpha_grid, dens, color=_DECONVOLVED_COLOR, lw=1.8, label="deconvolved")
-        top = max(top, dens.max())
+        top = max(top, _draw_deconvolved(ax, alpha_grid, panel["alpha_deconvolved"],
+                                         panel.get("alpha_deconvolved_band"), panel.get("level", 0.9), lw=1.8))
     a_low, a_med, a_high = panel["alpha_shared_interval"]
     _interval_marker(ax, a_low, a_med, a_high, top * 1.08, _SHARED_COLOR)
     ax.set_ylim(0, top * 1.18)
@@ -459,16 +478,18 @@ def plot_d_posteriors(d_grid: np.ndarray, panels: list[dict], title: str | None 
         _style_axis(ax)
         medians = np.asarray(panel["medians"], dtype=float)
         medians = np.log10(medians[medians > 0])
+        hist_top = 0.0
         if len(medians):
-            ax.hist(medians, bins=bins, density=True, color=_HIST_COLOR, edgecolor="white",
-                    lw=0.5, label="per-track medians")
+            counts, _, _ = ax.hist(medians, bins=bins, density=True, color=_HIST_COLOR, edgecolor="white",
+                                   lw=0.5, label="per-track medians")
+            hist_top = counts.max()
         mean_posterior = _density(panel["mean_posterior"], x)
-        deconvolved = _density(panel["deconvolved"], x)
         ax.plot(x, mean_posterior, color=_MEAN_POSTERIOR_COLOR, lw=2, label="mean of track posteriors")
-        ax.plot(x, deconvolved, color=_DECONVOLVED_COLOR, lw=2, label="deconvolved")
+        deconvolved_top = _draw_deconvolved(ax, x, panel["deconvolved"], panel.get("deconvolved_band"),
+                                            panel.get("level", 0.9), lw=2)
         if panel.get("floor") is not None:
             _draw_floor(ax, tuple(np.log10(panel["floor"])), label=_floor_label(panel["floor"]))
-        top = max(mean_posterior.max(), deconvolved.max(), ax.get_ylim()[1])
+        top = max(mean_posterior.max(), deconvolved_top, hist_top)
         low, median, high = (np.log10(v) for v in panel["shared_interval"])
         _interval_marker(ax, low, median, high, top * 1.08, _SHARED_COLOR)
         ax.plot([], [], "o-", color=_SHARED_COLOR, lw=2, ms=5, label="shared D, 90%")

@@ -184,8 +184,8 @@ def diffusion(
         exposure_s = 0.01       # optional: overrides each bundle's recorded one
         min_track_length = 1    # which tracks pass (passes_filters, ensemble)
         filters = { D_median_um2_s = [0.001, inf], flux_mean = [800.0, inf] }
-        # the ensemble's deconvolution; any key left out keeps the template's
-        deconvolution = { iters = 500, smooth = 0.5 }
+    The ensemble's deconvolution has no settings: its smoothness is chosen
+    by the data (diffusionkit's `gridpost.deconvolve`).
     An [[inputs]] entry's own `exposure_s` wins over both.
     """
     from napari_gemscape2.diffusion_batch import DiffusionSettings, analyze_bundle, settings_from_summary
@@ -208,16 +208,6 @@ def diffusion(
             inherited = settings_from_summary(saved)
             _describe_template(template, inherited, diff_cfg)
     settings_cfg = {**inherited, **diff_cfg}
-    if isinstance(diff_cfg.get("deconvolution"), dict):
-        from dataclasses import asdict
-
-        from napari_gemscape2.diffusion import Deconvolution
-
-        base_deconv = asdict(inherited.get("deconvolution", Deconvolution()))
-        try:
-            settings_cfg["deconvolution"] = Deconvolution(**{**base_deconv, **diff_cfg["deconvolution"]})
-        except TypeError as exc:
-            raise typer.BadParameter(f"[diffusion] deconvolution: {exc}", param_hint="CONFIG") from exc
     if isinstance(diff_cfg.get("grid"), dict):
         settings_cfg["grid"] = {**inherited.get("grid", {}), **diff_cfg["grid"]}
     try:

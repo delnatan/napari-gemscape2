@@ -356,9 +356,10 @@ exposure_s = 0.01       # optional: overrides each bundle's recorded exposure
 # diffusion widget's tracks-pane cuts, on any per-track column.
 min_track_length = 5
 filters = { flux_mean = [800.0, inf], D_median_um2_s = [0.001, inf] }
-# The ensemble's deconvolution; keys left out keep the template's (or the defaults).
-deconvolution = { iters = 500, smooth = 0.5 }
 ```
+
+The ensemble's deconvolution has no settings: its smoothness is chosen by the
+data. A config that still sets `deconvolution` is rejected as an unknown key.
 
 `gemscape2 diffusion` writes the same files as the widget's *Save analysis*
 (see "Reproducible results bundles"), so a bundle analyzed headless reopens in
@@ -389,9 +390,12 @@ diffusionkit script reproduces the widget's numbers exactly. Tracks are fitted o
 a thread pool: about 3 s for ~500 tracks with α. The **Ensemble**
 plot reads them across the tracks the filters pass, per region class (with a
 column for α when it ran): the
-per-track medians, the *deconvolved* distribution of D (each track's own
-uncertainty removed; peak positions and masses are robust, widths are
-resolution-limited), and the *shared* posterior (one D shared by every track).
+per-track medians, the *deconvolved* distribution of D with its 90% band (each
+track's own uncertainty removed; a smooth density whose smoothness the data
+choose by Laplace evidence, so there is nothing to tune -- a peak narrower than
+the tracks resolve comes out as wide as that resolution, and the band widens
+below the localization floor), and the *shared* posterior (one D shared by
+every track).
 α gets the same, with its medians shaded by `alpha_info_bits`: a track that
 taught little about α has a near-flat posterior whose median sits near the
 prior's midpoint (1), so a pile of light medians there is mostly the prior, not
@@ -404,9 +408,9 @@ their 10–90% band. It is a scale to read D against, not a cut, and it moves
 with the square of any error in the SDs.
 The **Posteriors** plot shows every track's posterior as one row of a heat map,
 sorted by median, beside the *mean* of the tracks' posteriors, the histogram of
-medians and the deconvolved distribution. The
-*Deconvolution* section sets its iterations and smoothing (it spreads D over
-the run's D grid); the plots and summary follow without a re-run. MSD fits are a labelled opt-in comparison; the **Track** plot shows the
+medians and the deconvolved distribution. The plots and summary follow the
+filters without a re-run; each group's deconvolution takes a second or two, on
+a worker thread, so they update shortly after a change. MSD fits are a labelled opt-in comparison; the **Track** plot shows the
 selected track's posterior; the **Map** tab colors each track's centroid by any
 result; the **NUTS** tab fits the selected track's full posterior with the same
 exposure (needs `--extra bayes`).
@@ -430,10 +434,14 @@ distributions_D.csv       the ensemble on the D grid, long by group ("all", then
                           many tracks narrower than a grid cell -- the summary's
                           shared_D_* interval is read below the grid step),
                           mean_posterior (the tracks' posteriors averaged), deconvolved
+                          with its pointwise band at the credible level
+                          (deconvolved_low, deconvolved_high)
 distributions_alpha.csv   likewise on the α grid
 diffusion_summary.json    settings (dt, exposure, grid -- GridPostOptions' fields --,
-                          level, alpha's likelihood, deconvolution),
-                          population numbers per group, the tracks-pane filters,
+                          level, alpha's likelihood), population numbers per group
+                          (with each deconvolution's evidence-chosen smoothness,
+                          deconvolved_*_lambda),
+                          the tracks-pane filters,
                           the fitted tracks' fingerprint (tracks_sha256), and packages
                           (diffusionkit's and napari-gemscape2's version and git SHA)
 ```

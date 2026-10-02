@@ -155,7 +155,6 @@ from diffusionkit.gridpost import GridPostOptions
 from napari_gemscape2.diffusion import (
     EXPOSURE_CLAMP_FRACTION,
     MIN_FRAMES,
-    Deconvolution,
     PosteriorAnalysis,
     SavedAnalysis,
     StaleAnalysisError,
@@ -163,6 +162,7 @@ from napari_gemscape2.diffusion import (
     analysis_tables,
     analyze_posteriors,
     base_track_table,
+    ensemble,
     ensemble_panels,
     filter_record,
     floor_band,
@@ -294,6 +294,16 @@ def _run_posterior_worker(
     if msd_comparison:
         msd_fits = msd_fits_blur_free(diffkit_tracks, dt_s, options.min_frames)
     return analysis, msd_fits
+
+
+@thread_worker(start_thread=False)
+def _ensemble_worker(analysis: PosteriorAnalysis, id_sets: list) -> None:
+    """Every `diffusion.ensemble` over `id_sets` (track-id sets, None for
+    all), computed off the GUI thread: each is a deconvolution of a second
+    or more, and `ensemble` caches them on `analysis` for the summary and
+    the figures to read."""
+    for ids in id_sets:
+        ensemble(analysis, ids)
 
 
 @thread_worker(start_thread=False)
@@ -871,11 +881,14 @@ _POSTERIOR_HELP = (
     "<br><br><b>Ensemble</b>: <i>shared</i> adds every track's log posterior &mdash; "
     "the posterior of one D shared by all of them. It is sharp, but only meaningful "
     "if they really do share a D. <i>Deconvolved</i> is how D is distributed across "
-    "tracks, with each track's own uncertainty taken out (a smoothed nonparametric "
-    "maximum likelihood). Its peak locations and the mass under each peak are "
-    "robust; its peak widths are resolution-limited, not measured. The <i>mean "
+    "tracks, with each track's own uncertainty taken out: a smooth density whose "
+    "smoothness the data choose (Laplace evidence), shaded with its pointwise 90% band. "
+    "A peak narrower than the tracks can resolve comes out as wide as that resolution, "
+    "and below the localization floor the band widens because the tracks cannot tell "
+    "those D apart. It takes a second or two per group, so the summary and figures "
+    "update shortly after a filter change. The <i>mean "
     "posterior</i> averages the tracks' posteriors: where they put D, blurred by each "
-    "one's own uncertainty &mdash; the deconvolution's starting point. α gets the same "
+    "one's own uncertainty. α gets the same "
     "three, and its medians are shaded by <i>alpha_info_bits</i>: a track that taught "
     "little about α has a near-flat posterior whose median sits near the prior's midpoint "
     "(1), so a peak of light medians there is mostly the prior, not a measurement."
@@ -884,10 +897,6 @@ _POSTERIOR_HELP = (
     "from its own SDs. Every D axis shows it (median over the tracks, 10&ndash;90% band) "
     "as the scale to read D against &mdash; not a cut: D below it is still measured, with "
     "less information per step. It moves with the square of any error in the SDs."
-    "<br><br><b>Deconvolution</b>: more <i>iterations</i> remove more of that blur; "
-    "<i>smoothing</i> (grid cells) keeps peaks from collapsing into "
-    "spikes &mdash; less sharpens them, more widens them. D is spread over the D grid, "
-    "the same range every track's prior has."
     "<br><br><b>α</b> (fBm exponent) is fitted to the same blurred displacements as D, "
     "with its scale -- the apparent D at one frame -- integrated out over the same D grid "
     "and prior. It is the one shape parameter reported: confinement and subdiffusion both "
@@ -950,9 +959,10 @@ class _PosteriorTab(QWidget):
 
     The summary and the Ensemble and Posteriors figures are read over the
     tracks the tracks pane currently passes (and grouped by region class
-    when there are several), so a filter change -- or a deconvolution
-    setting -- updates them without a re-run: the per-track posteriors
-    don't depend on which other tracks are in view."""
+    when there are several), so a filter change updates them without a
+    re-run: the per-track posteriors don't depend on which other tracks
+    are in view. The ensembles behind them are deconvolved on a worker
+    thread (`_ensemble_worker`), a second or more each."""
 
     # The exposure box's "not set" value -- one step below 0, which is a
     # legitimate (stroboscopic) exposure and must not double as "unknown".
@@ -969,6 +979,10 @@ class _PosteriorTab(QWidget):
         self._posteriors_window: Optional[PlotWindow] = None
         self._track_window: Optional[PlotWindow] = None
         self._msd_plot_window: Optional[PlotWindow] = None
+        # The summary's ensembles, computed off the GUI thread: the running
+        # worker, and whether the filters changed while it ran.
+        self._summary_worker = None
+        self._summary_stale = False
         # What the layer said, so the exposure note can say where the box's
         # value came from.
         self._layer_exposure_s: Optional[float] = None
@@ -1097,42 +1111,6 @@ class _PosteriorTab(QWidget):
             self._msd_plot_button,
         )
 
-        # The ensemble's deconvolution: read on commit (no keyboard
-        # tracking), since each change re-deconvolves every group.
-        default = Deconvolution()
-        self._deconv_iters = _ispin(
-            default.iters, 1, 20_000,
-            tooltip="EM iterations. One is the mean of the posteriors; more remove more of the\n"
-            "blur each track's own uncertainty adds. Cost is linear in it.",
-        )
-        self._deconv_iters.setSingleStep(100)
-        # Units live in the row labels, not as suffixes: a suffix widens
-        # every field to fit it, which is what made this section too wide.
-        self._deconv_smooth = _dspin(
-            default.smooth, 0.0, 20.0, 0.25, decimals=2,
-            tooltip="Gaussian smoothing per iteration, in D grid cells.\n"
-            "0 lets peaks sharpen toward spikes; more widens them. Peak positions\n"
-            "and the mass under each are robust to it, widths are not.",
-        )
-        for box in (self._deconv_iters, self._deconv_smooth):
-            box.setKeyboardTracking(False)
-            box.valueChanged.connect(lambda _v: self._on_deconvolution_changed())
-        self._deconv_reset = QPushButton("defaults")
-        self._deconv_reset.clicked.connect(lambda: self.set_deconvolution(Deconvolution(), notify=True))
-        self._deconv_status = status_label("")
-        deconv_box = QWidget()
-        deconv_layout = QVBoxLayout(deconv_box)
-        deconv_layout.setContentsMargins(0, 0, 0, 0)
-        deconv_layout.setSpacing(2)
-        deconv_form = _compact_form(QFormLayout())
-        deconv_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        deconv_form.addRow("iterations", self._deconv_iters)
-        deconv_form.addRow("smoothing (cells)", self._deconv_smooth)
-        deconv_form.addRow("", self._deconv_reset)
-        deconv_layout.addLayout(deconv_form)
-        deconv_layout.addWidget(self._deconv_status)
-        self._deconv_section = CollapsibleSection("Deconvolution", deconv_box, expanded=False)
-
         help_text = note_label(_POSTERIOR_HELP)
         help_text.setTextFormat(Qt.TextFormat.RichText)
         self._help = CollapsibleSection("Reading the posteriors", help_text, expanded=False)
@@ -1151,7 +1129,6 @@ class _PosteriorTab(QWidget):
         layout.addWidget(self._status)
         layout.addWidget(self._summary)
         layout.addWidget(plot_row)
-        layout.addWidget(self._deconv_section)
         layout.addWidget(self._help)
         layout.addStretch()
         self.setLayout(layout)
@@ -1180,20 +1157,6 @@ class _PosteriorTab(QWidget):
     @property
     def summary_by_group(self) -> Optional[dict]:
         return self._summary_by_group
-
-    def deconvolution(self) -> Deconvolution:
-        return Deconvolution(iters=self._deconv_iters.value(), smooth=self._deconv_smooth.value())
-
-    def set_deconvolution(self, deconvolution: Deconvolution, *, notify: bool = False) -> None:
-        for box, value in ((self._deconv_iters, deconvolution.iters), (self._deconv_smooth, deconvolution.smooth)):
-            blocked = box.blockSignals(True)
-            box.setValue(value)
-            box.blockSignals(blocked)
-        if notify:
-            self._on_deconvolution_changed()
-
-    def _on_deconvolution_changed(self) -> None:
-        self.refresh_summary()
 
     def _grid_boxes(self) -> tuple:
         return (
@@ -1387,7 +1350,6 @@ class _PosteriorTab(QWidget):
         self._min_frames.setValue(analysis.min_frames)
         self._alpha.setChecked(analysis.alpha_ids is not None)
         self._msd_comparison.setChecked(saved.msd is not None)
-        self.set_deconvolution(saved.deconvolution)
         n_ok = self._adopt(analysis, saved.msd)
         self.set_grid(analysis.options)
         self._status.setText(
@@ -1398,15 +1360,42 @@ class _PosteriorTab(QWidget):
 
     def refresh_summary(self) -> None:
         """Recompute the population summary over the tracks the pane passes
-        -- called after a run and whenever the filters change."""
+        -- called after a run and whenever the filters change. Their
+        ensembles are deconvolved on a worker first (`_ensemble_worker`);
+        changes while it runs coalesce into one more pass."""
         if self._analysis is None:
             return
+        if self._summary_worker is not None:
+            self._summary_stale = True
+            return
+        analysis = self._analysis
         ids = self.host.combined_filtered_track_ids()
-        deconvolution = self.deconvolution()
-        self._summary_values = summarize(self._analysis, ids, deconvolution)
+        groups = self.host.group_track_ids(ids) or {}
+        shown = self._summary.text().removesuffix(_UPDATING)
+        self._summary.setText(shown + _UPDATING if shown else _UPDATING.strip())
+        worker = _ensemble_worker(analysis, [ids, *groups.values()])
+        worker.returned.connect(lambda _r: self._ensembles_ready(analysis))
+        worker.errored.connect(self._ensembles_failed)
+        self._summary_worker = worker
+        worker.start()
+
+    def _ensembles_failed(self, exc: Exception) -> None:
+        self._summary_worker = None
+        self._summary_stale = False
+        self._status.setText(f"ensemble failed: {exc}")
+        style_status_label(self._status, "error")
+
+    def _ensembles_ready(self, analysis: PosteriorAnalysis) -> None:
+        self._summary_worker = None
+        if self._summary_stale or analysis is not self._analysis:
+            self._summary_stale = False
+            self.refresh_summary()
+            return
+        ids = self.host.combined_filtered_track_ids()
+        self._summary_values = summarize(self._analysis, ids)
         groups = self.host.group_track_ids(ids)
         self._summary_by_group = (
-            {name: summarize(self._analysis, group_ids, deconvolution) for name, group_ids in groups.items()}
+            {name: summarize(self._analysis, group_ids) for name, group_ids in groups.items()}
             if groups
             else None
         )
@@ -1426,9 +1415,7 @@ class _PosteriorTab(QWidget):
             return []
         ids = self.host.combined_filtered_track_ids()
         groups = self.host.group_track_ids(ids) or {"all": ids}
-        panels = ensemble_panels(
-            self._analysis, groups, self.deconvolution(), track_posteriors=track_posteriors
-        )
+        panels = ensemble_panels(self._analysis, groups, track_posteriors=track_posteriors)
         if not panels:
             self._status.setText("no fitted tracks pass the current filters")
             style_status_label(self._status, "caution")
@@ -1601,6 +1588,10 @@ def _format_posterior_summary(summary: dict, analysis: Optional[PosteriorAnalysi
             f"{units.fmt_unit(acquisition.exposure_s, units.SECONDS)}"
         )
     return "\n".join(lines)
+
+
+# Appended to the summary while its ensembles are being deconvolved.
+_UPDATING = "\n(updating the ensemble…)"
 
 
 class _MapTab(QWidget):
@@ -2866,14 +2857,9 @@ class DiffusionAnalysisWidget(QWidget):
             # region class when there are several.
             ids = self.combined_filtered_track_ids()
             by_class = self.group_track_ids(ids)
-            deconvolution = self._posterior_tab.deconvolution()
-            tables = analysis_tables(analysis, ids, by_class, deconvolution)
+            tables = analysis_tables(analysis, ids, by_class)
             summary = analysis_summary(
-                analysis,
-                ids,
-                by_class,
-                msd_comparison=self._posterior_tab.msd_df is not None,
-                deconvolution=deconvolution,
+                analysis, ids, by_class, msd_comparison=self._posterior_tab.msd_df is not None
             )
         summary["tracks_summary_filters"] = self._summary_filter_record()
         summary["packages"] = _analysis_packages()

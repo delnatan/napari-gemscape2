@@ -25,11 +25,12 @@ posterior cut by an edge is flagged in `D_at_grid_edge`.
     tracks really do share it;
   - **mean posterior**: the tracks' posteriors averaged -- where they put
     the value, blurred by each track's own uncertainty and prior;
-  - **deconvolved**: `gridpost.deconvolve`, the smoothed nonparametric
-    MLE of how D (and alpha) is distributed across tracks, with each
-    track's own uncertainty taken out rather than averaged in. Peak
-    locations and the mass in each mode are robust; peak widths are
-    resolution-limited;
+  - **deconvolved**: `gridpost.deconvolve`, how D (and alpha) is
+    distributed across tracks, with each track's own uncertainty taken out
+    rather than averaged in: a smooth log density whose smoothness the data
+    choose (Laplace evidence), with a pointwise band from posterior draws
+    of the whole distribution. A peak narrower than the tracks can resolve
+    comes out as wide as that resolution;
   - **localization floor** (`D_floor_um2_s`, diffusionkit's
     `posterior.localization_floor`): the D at which a track's motion per
     frame equals its localization noise. Every D axis shows it as a
@@ -46,7 +47,7 @@ from __future__ import annotations
 import hashlib
 import os
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 import numpy as np
@@ -58,7 +59,6 @@ from diffusionkit.gridpost import GridPostOptions
 from diffusionkit.gridpost import analyze_tracks as dk_analyze_tracks
 from diffusionkit.gridpost import deconvolve as dk_deconvolve
 from diffusionkit.gridpost import posterior as dk_post
-from diffusionkit.gridpost import posterior_alpha as dk_post_alpha
 from scipy.interpolate import CubicSpline
 from scipy.special import logsumexp
 
@@ -70,10 +70,6 @@ LEVEL = 0.9
 # diffusionkit's own hard minimum: 3 frames give the 2 displacements the
 # whitening needs.
 MIN_FRAMES = 3
-# `gridpost.deconvolve`'s defaults: EM iterations, and the Gaussian
-# smoothing per iteration in grid cells (~2.3% of D per cell).
-DECONVOLVE_ITERS = 500
-DECONVOLVE_SMOOTH = 0.5
 
 # `GridPostOptions`' grid fields, the ones settable here (the widget's Grid
 # section, the CLI's `[diffusion] grid`). Unset ones are diffusionkit's
@@ -295,9 +291,9 @@ class PosteriorAnalysis:
     alpha_ids: Optional[np.ndarray]
     log_post_alpha: Optional[np.ndarray]
     tracks_sha256: Optional[str] = None
-    # `ensemble`'s results by (track ids, `Deconvolution`): the summary, the
-    # figures and the saved tables all read the same few, and each costs
-    # a deconvolution (~0.2 ms per track per 100 iterations).
+    # `ensemble`'s results by track ids: the summary, the figures and the
+    # saved tables all read the same few, and each costs a deconvolution
+    # (~1-2 s for D and as much for alpha, up to a few thousand tracks).
     _ensembles: dict = field(default_factory=dict, compare=False, repr=False)
 
     @property
@@ -431,29 +427,6 @@ def analyze_posteriors(
 
 
 @dataclass(frozen=True)
-class Deconvolution:
-    """`gridpost.deconvolve`'s settings. `iters` EM iterations: one from
-    the flat start is just the mean posterior, more remove the blur the
-    tracks' own uncertainty adds. `smooth` is the Gaussian smoothing per
-    iteration in grid cells (a cell is ~2.3% of D on the default grid):
-    less lets peaks sharpen toward spikes, more widens them -- read a width
-    as resolution-limited either way. D is spread over the analysis's own
-    D grid, the same range each track's prior has (`GridPostOptions`)."""
-
-    iters: int = DECONVOLVE_ITERS
-    smooth: float = DECONVOLVE_SMOOTH
-
-    def record(self) -> dict:
-        """For `diffusion_summary.json` (and back through `from_record`)."""
-        return asdict(self)
-
-    @classmethod
-    def from_record(cls, record: dict) -> "Deconvolution":
-        """A saved record."""
-        return cls(**record)
-
-
-@dataclass(frozen=True)
 class Ensemble:
     """The population read of one set of tracks' posteriors, on the D grid
     (and the alpha grid, when alpha was computed).
@@ -465,70 +438,75 @@ class Ensemble:
     With many tracks it is narrower than a grid cell, so its weights sit
     in a cell or two; `_shared_summary` reads it below the grid step. `mean_posterior_*` is the average
     of the tracks' posteriors -- where the tracks put the value, blurred
-    by each track's own uncertainty and prior; it is the deconvolution's
-    starting point. `deconvolved_*` is `gridpost.deconvolve`'s
+    by each track's own uncertainty and prior. `deconvolved_*` is `gridpost.deconvolve`'s
     distribution across the tracks, that blur removed: for alpha, of the
     K-marginalized likelihoods (flat alpha prior), so a track with a flat
     alpha posterior adds nothing, where it adds mass at the prior's
-    midpoint to the mean posterior and the histogram of medians. All
-    weights sum to 1 over their grid."""
+    midpoint to the mean posterior and the histogram of medians.
+    `deconvolved_*_band` is its pointwise equal-tailed band at the
+    analysis's credible level (from `gridpost.deconvolve`'s posterior
+    draws), and `deconvolved_*_lambda` the smoothness its evidence chose.
+    All weights sum to 1 over their grid."""
 
     n_tracks: int
     shared_log_D: np.ndarray
     shared_D: np.ndarray
     mean_posterior_D: np.ndarray
     deconvolved_D: np.ndarray
+    deconvolved_D_band: tuple[np.ndarray, np.ndarray]
+    deconvolved_D_lambda: float
     n_tracks_alpha: int = 0
     shared_log_alpha: Optional[np.ndarray] = None
     shared_alpha: Optional[np.ndarray] = None
     mean_posterior_alpha: Optional[np.ndarray] = None
     deconvolved_alpha: Optional[np.ndarray] = None
+    deconvolved_alpha_band: Optional[tuple[np.ndarray, np.ndarray]] = None
+    deconvolved_alpha_lambda: Optional[float] = None
 
 
 _ENSEMBLE_CACHE_SIZE = 32
 
 
-def ensemble(
-    analysis: PosteriorAnalysis,
-    track_ids: Optional[set] = None,
-    deconvolution: Deconvolution = Deconvolution(),
-) -> Optional[Ensemble]:
+def ensemble(analysis: PosteriorAnalysis, track_ids: Optional[set] = None) -> Optional[Ensemble]:
     """The `Ensemble` over `track_ids` (all fitted tracks for None), or
-    None when none of them was fitted."""
-    key = (None if track_ids is None else frozenset(track_ids), deconvolution)
+    None when none of them was fitted. Cached on `analysis`."""
+    key = None if track_ids is None else frozenset(track_ids)
     if key in analysis._ensembles:
         return analysis._ensembles[key]
-    result = _ensemble(analysis, track_ids, deconvolution)
+    result = _ensemble(analysis, track_ids)
     if len(analysis._ensembles) >= _ENSEMBLE_CACHE_SIZE:
         analysis._ensembles.clear()
     analysis._ensembles[key] = result
     return result
 
 
-def _ensemble(
-    analysis: PosteriorAnalysis, track_ids: Optional[set], deconvolution: Deconvolution
-) -> Optional[Ensemble]:
+def _deconvolve(log_post: np.ndarray, grid: np.ndarray, level: float) -> dict:
+    """`gridpost.deconvolve` of normalized log posteriors (flat prior: each row
+    is the track's log likelihood up to a constant), as `Ensemble` field
+    suffixes: the weights, their band at `level`, and the evidence's lambda."""
+    fit = dk_deconvolve.deconvolve(log_post, grid)
+    return {"": fit.weights, "_band": fit.band(level), "_lambda": float(fit.lam)}
+
+
+def _ensemble(analysis: PosteriorAnalysis, track_ids: Optional[set]) -> Optional[Ensemble]:
     rows = analysis.rows_for(track_ids)
     if len(rows) == 0:
         return None
     log_post = analysis.log_post_D[rows]
     shared_log = log_post.sum(axis=0)
     shared_log = shared_log - shared_log.max()
-    deconvolved = dk_deconvolve.deconvolve(
-        log_post, dk_post.flat(analysis.u_D), iters=deconvolution.iters, smooth=deconvolution.smooth
-    )
     result = dict(
         n_tracks=len(rows),
         shared_log_D=shared_log,
         shared_D=np.exp(_normalized_log(shared_log)),
         mean_posterior_D=np.exp(log_post).mean(axis=0),
-        deconvolved_D=deconvolved,
+        **{f"deconvolved_D{k}": v for k, v in _deconvolve(log_post, analysis.u_D, analysis.level).items()},
     )
     if analysis.has_alpha:
         alpha_rows = analysis.rows_for(track_ids, alpha=True)
         if len(alpha_rows):
             # Flat alpha prior: each row is also the track's K-marginalized
-            # log likelihood up to a constant, what `deconvolve` takes.
+            # log likelihood up to a constant.
             log_post_alpha = analysis.log_post_alpha[alpha_rows]
             shared_alpha = log_post_alpha.sum(axis=0)
             shared_alpha = shared_alpha - shared_alpha.max()
@@ -537,12 +515,10 @@ def _ensemble(
                 shared_log_alpha=shared_alpha,
                 shared_alpha=np.exp(_normalized_log(shared_alpha)),
                 mean_posterior_alpha=np.exp(log_post_alpha).mean(axis=0),
-                deconvolved_alpha=dk_deconvolve.deconvolve(
-                    log_post_alpha,
-                    dk_post_alpha.flat_alpha(analysis.alpha_grid),
-                    iters=deconvolution.iters,
-                    smooth=deconvolution.smooth,
-                ),
+                **{
+                    f"deconvolved_alpha{k}": v
+                    for k, v in _deconvolve(log_post_alpha, analysis.alpha_grid, analysis.level).items()
+                },
             )
     return Ensemble(**result)
 
@@ -592,11 +568,7 @@ def _grid_mode(weights: np.ndarray, grid: np.ndarray) -> float:
     return float(grid[int(np.argmax(weights))])
 
 
-def summarize(
-    analysis: PosteriorAnalysis,
-    track_ids: Optional[set] = None,
-    deconvolution: Deconvolution = Deconvolution(),
-) -> dict:
+def summarize(analysis: PosteriorAnalysis, track_ids: Optional[set] = None) -> dict:
     """Population-level numbers for `track_ids` (all for None), flat keys
     with units in their names so the saved JSON reads on its own.
 
@@ -607,7 +579,8 @@ def summarize(
     posterior's median and 90% interval (resolved below the grid step,
     `_shared_summary`), and `deconvolved_D_*` the deconvolved
     distribution's median and 90% range (a spread across tracks, not an
-    uncertainty) plus its mode; likewise `shared_alpha_*` and
+    uncertainty), its mode, and the smoothness (`lambda`) its evidence
+    chose; likewise `shared_alpha_*` and
     `deconvolved_alpha_*`. `D_floor_*_um2_s` are the median and 10%/90%
     quantiles of the tracks' localization floors, and
     `median_alpha_info_bits` what the typical track taught about alpha."""
@@ -643,7 +616,7 @@ def summarize(
             D_floor_q10_um2_s=_scalar(floors.quantile(FLOOR_BAND[0])),
             D_floor_q90_um2_s=_scalar(floors.quantile(FLOOR_BAND[1])),
         )
-    ens = ensemble(analysis, track_ids, deconvolution)
+    ens = ensemble(analysis, track_ids)
     if ens is not None:
         shared = _shared_summary(ens.shared_log_D, analysis.D_grid_um2_s, analysis.level, log_grid=True)
         spread = _grid_summary(ens.deconvolved_D, analysis.D_grid_um2_s, analysis.level, log_grid=True)
@@ -651,6 +624,7 @@ def summarize(
             {f"shared_D_{k}_um2_s": v for k, v in shared.items()},
             **{f"deconvolved_D_{k}_um2_s": v for k, v in spread.items()},
             deconvolved_D_mode_um2_s=_grid_mode(ens.deconvolved_D, analysis.D_grid_um2_s),
+            deconvolved_D_lambda=ens.deconvolved_D_lambda,
         )
         if ens.shared_log_alpha is not None:
             shared_a = _shared_summary(ens.shared_log_alpha, analysis.alpha_grid, analysis.level, log_grid=False)
@@ -659,21 +633,18 @@ def summarize(
                 {f"shared_alpha_{k}": v for k, v in shared_a.items()},
                 **{f"deconvolved_alpha_{k}": v for k, v in spread_a.items()},
                 deconvolved_alpha_mode=_grid_mode(ens.deconvolved_alpha, analysis.alpha_grid),
+                deconvolved_alpha_lambda=ens.deconvolved_alpha_lambda,
             )
     return out
 
 
-def summarize_by_group(
-    analysis: PosteriorAnalysis, groups: pl.DataFrame, deconvolution: Deconvolution = Deconvolution()
-) -> dict[str, dict]:
+def summarize_by_group(analysis: PosteriorAnalysis, groups: pl.DataFrame) -> dict[str, dict]:
     """`summarize` per group -- per region class, when each region's tracks
     were linked on their own. `groups` has `track_id` and `group`; groups
     come back in their order of first appearance."""
     names = groups["group"].unique(maintain_order=True).drop_nulls().to_list()
     return {
-        name: summarize(
-            analysis, set(groups.filter(pl.col("group") == name)["track_id"].to_list()), deconvolution
-        )
+        name: summarize(analysis, set(groups.filter(pl.col("group") == name)["track_id"].to_list()))
         for name in names
     }
 
@@ -685,7 +656,6 @@ def _scalar(value) -> Optional[float]:
 def ensemble_panels(
     analysis: PosteriorAnalysis,
     groups: Optional[dict[str, Optional[set]]] = None,
-    deconvolution: Deconvolution = Deconvolution(),
     *,
     track_posteriors: bool = False,
 ) -> list[dict]:
@@ -698,7 +668,7 @@ def ensemble_panels(
     fits = analysis.fits.filter(pl.col("posterior_status") == "ok")
     panels = []
     for name, ids in (groups or {"all": None}).items():
-        ens = ensemble(analysis, ids, deconvolution)
+        ens = ensemble(analysis, ids)
         if ens is None:
             continue
         rows = fits if ids is None else fits.filter(pl.col("track_id").is_in(list(ids)))
@@ -708,6 +678,8 @@ def ensemble_panels(
             "n_tracks": ens.n_tracks,
             "medians": rows["D_median_um2_s"].to_numpy(),
             "deconvolved": ens.deconvolved_D,
+            "deconvolved_band": ens.deconvolved_D_band,
+            "level": analysis.level,
             "mean_posterior": ens.mean_posterior_D,
             "shared_interval": (shared["low"], shared["median"], shared["high"]),
             "floor": floor_band(rows["D_floor_um2_s"]),
@@ -724,6 +696,7 @@ def ensemble_panels(
             panel["alpha_info_bits"] = alpha_rows["alpha_info_bits"].to_numpy()
             panel["alpha_bits_strata"] = ALPHA_BITS_STRATA
             panel["alpha_deconvolved"] = ens.deconvolved_alpha
+            panel["alpha_deconvolved_band"] = ens.deconvolved_alpha_band
             panel["alpha_shared_interval"] = (shared_a["low"], shared_a["median"], shared_a["high"])
         panels.append(panel)
     return panels
@@ -809,7 +782,6 @@ def distributions_table(
     groups: Optional[dict[str, Optional[set]]] = None,
     *,
     alpha: bool = False,
-    deconvolution: Deconvolution = Deconvolution(),
 ) -> Optional[pl.DataFrame]:
     """The ensemble distributions on their grid, long by group: `group`,
     `n_tracks`, the grid column (`D_um2_s` or `alpha`), and
@@ -817,14 +789,16 @@ def distributions_table(
     posteriors, 0 at their peak), `shared_posterior` (the same as
     weights: one value shared by every track, often within a cell or
     two), `mean_posterior` (the tracks' posteriors averaged) and
-    `deconvolved` (weights; each sums to 1 over the grid within a group).
+    `deconvolved` (weights; each sums to 1 over the grid within a group),
+    with `deconvolved_low`/`deconvolved_high` its pointwise band at the
+    credible level.
 
     `groups` maps a group name to its track ids; the default is one group,
     "all", over every fitted track."""
     groups = groups or {"all": None}
     parts = []
     for name, ids in groups.items():
-        ens = ensemble(analysis, ids, deconvolution)
+        ens = ensemble(analysis, ids)
         if ens is None:
             continue
         if alpha:
@@ -836,6 +810,8 @@ def distributions_table(
                 "shared_posterior": ens.shared_alpha,
                 "mean_posterior": ens.mean_posterior_alpha,
                 "deconvolved": ens.deconvolved_alpha,
+                "deconvolved_low": ens.deconvolved_alpha_band[0],
+                "deconvolved_high": ens.deconvolved_alpha_band[1],
             }
             n = ens.n_tracks_alpha
             grid_len = len(analysis.alpha_grid)
@@ -846,6 +822,8 @@ def distributions_table(
                 "shared_posterior": ens.shared_D,
                 "mean_posterior": ens.mean_posterior_D,
                 "deconvolved": ens.deconvolved_D,
+                "deconvolved_low": ens.deconvolved_D_band[0],
+                "deconvolved_high": ens.deconvolved_D_band[1],
             }
             n = ens.n_tracks
             grid_len = len(analysis.D_grid_um2_s)
@@ -1012,7 +990,6 @@ def analysis_tables(
     analysis: PosteriorAnalysis,
     ids: Optional[set],
     by_class: Optional[dict],
-    deconvolution: Deconvolution = Deconvolution(),
 ) -> dict:
     """The posterior and distribution tables, as `write_diffusion_results`
     keyword arguments. The ensemble is over the tracks passing the filters
@@ -1021,8 +998,8 @@ def analysis_tables(
     return dict(
         posterior_D=posterior_long_table(analysis),
         posterior_alpha=posterior_long_table(analysis, alpha=True),
-        distributions_D=distributions_table(analysis, groups, deconvolution=deconvolution),
-        distributions_alpha=distributions_table(analysis, groups, alpha=True, deconvolution=deconvolution),
+        distributions_D=distributions_table(analysis, groups),
+        distributions_alpha=distributions_table(analysis, groups, alpha=True),
     )
 
 
@@ -1032,7 +1009,6 @@ def analysis_summary(
     by_class: Optional[dict],
     *,
     msd_comparison: bool,
-    deconvolution: Deconvolution = Deconvolution(),
 ) -> dict:
     """`diffusion_summary.json`'s settings and population numbers (the
     caller adds the filter record and provenance). Flat keys with units in
@@ -1062,12 +1038,11 @@ def analysis_summary(
         ),
         "msd_comparison": msd_comparison,
         "tracks_sha256": analysis.tracks_sha256,
-        "deconvolution": deconvolution.record(),
-        **summarize(analysis, ids, deconvolution),
+        **summarize(analysis, ids),
     }
     if by_class:
         summary["by_region_class"] = {
-            name: summarize(analysis, gids, deconvolution) for name, gids in by_class.items()
+            name: summarize(analysis, gids) for name, gids in by_class.items()
         }
     return summary
 
@@ -1109,10 +1084,6 @@ class SavedAnalysis:
     msd: Optional[pl.DataFrame]
     nuts_rows: list[dict] = field(default_factory=list)
     summary: dict = field(default_factory=dict)
-
-    @property
-    def deconvolution(self) -> Deconvolution:
-        return Deconvolution.from_record(self.summary["deconvolution"])
 
 
 def _posterior_matrix(table: pl.DataFrame, grid_col: str, grid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

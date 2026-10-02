@@ -19,7 +19,6 @@ from diffusionkit import Acquisition
 
 from napari_gemscape2.diffusion import (
     EXPOSURE_CLAMP_FRACTION,
-    Deconvolution,
     MIN_FRAMES,
     analysis_summary,
     analysis_tables,
@@ -59,8 +58,6 @@ class DiffusionSettings:
     # track is fitted either way, as the widget does by default.
     min_track_length: int = 1
     filters: FilterSpec = field(default_factory=dict)
-    # The ensemble's deconvolution (`diffusion.Deconvolution`).
-    deconvolution: Deconvolution = field(default_factory=Deconvolution)
 
     @classmethod
     def names(cls) -> set[str]:
@@ -86,9 +83,6 @@ def settings_from_summary(summary: dict) -> dict:
             {col: tuple(bounds) for col, bounds in record["ranges"].items()}
             if record.get("ranges")
             else None
-        ),
-        "deconvolution": (
-            Deconvolution.from_record(summary["deconvolution"]) if "deconvolution" in summary else None
         ),
     }
     return {key: value for key, value in out.items() if value is not None}
@@ -199,16 +193,14 @@ def analyze_bundle(
     table = tracks_summary_table(
         base, results, result_id=result_dir.name, pixel_size_um=pixel_size_um, passing_ids=ids
     )
-    summary = analysis_summary(
-        analysis, ids, by_class, msd_comparison=msd is not None, deconvolution=settings.deconvolution
-    )
+    summary = analysis_summary(analysis, ids, by_class, msd_comparison=msd is not None)
     summary["tracks_summary_filters"] = filter_record(settings.min_track_length, settings.filters)
     import diffusionkit
     import napari_gemscape2
 
     summary["packages"] = package_provenance(diffusionkit, napari_gemscape2)
     write_diffusion_results(
-        result_dir, tracks_summary=table, summary=summary, **analysis_tables(analysis, ids, by_class, settings.deconvolution)
+        result_dir, tracks_summary=table, summary=summary, **analysis_tables(analysis, ids, by_class)
     )
     return BundleReport(
         n_tracks=base.height,
