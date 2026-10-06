@@ -181,6 +181,7 @@ def diffusion(
         # else diffusionkit's default (shown).
         grid = { D_min_um2_s = 1e-5, D_max_um2_s = 10.0, n_D = 601 }
         msd_comparison = false
+        msd_max_lag = 3         # lags the MSD fits use (>= 3)
         exposure_s = 0.01       # optional: overrides each bundle's recorded one
         min_track_length = 1    # which tracks pass (passes_filters, ensemble)
         filters = { D_median_um2_s = [0.001, inf], flux_mean = [800.0, inf] }

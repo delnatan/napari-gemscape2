@@ -57,7 +57,7 @@ from typing import Callable, Optional
 import numpy as np
 import polars as pl
 from diffusionkit import Acquisition
-from diffusionkit.classic import MSDOptions
+from diffusionkit.classic import MSDOptions, compute_msd, fit_anomalous_msd, fit_brownian_msd
 from diffusionkit.classic import analyze_tracks as analyze_msd
 from diffusionkit.gridpost import GridPosteriors, GridPostOptions, LengthComposition, by_track_length
 from diffusionkit.gridpost import analyze_tracks as dk_analyze_tracks
@@ -793,12 +793,19 @@ def length_distributions_table(
 # --- MSD comparison -----------------------------------------------------
 
 
-# The MSD comparison's lag window: diffusionkit's own default. Not exposed
-# -- the MSD fits are a cross-check here, not an analysis to tune.
+# The MSD comparison's default lag window: diffusionkit's own. The power
+# law needs three lags, so that is also the least.
 MSD_MAX_LAG = 3
+MSD_MIN_LAG = 3
 
 
-def msd_fits_blur_free(tracks: pl.DataFrame, dt_s: float, min_frames: int) -> pl.DataFrame:
+def msd_options(min_frames: int, max_lag: int = MSD_MAX_LAG) -> MSDOptions:
+    return MSDOptions(max_lag=max(max_lag, MSD_MIN_LAG), min_frames=max(min_frames, 5), localization="provided")
+
+
+def msd_fits_blur_free(
+    tracks: pl.DataFrame, dt_s: float, min_frames: int, max_lag: int = MSD_MAX_LAG
+) -> pl.DataFrame:
     """diffusionkit.classic's MSD fits of `tracks_to_diffusionkit_df`'s
     table, for comparison with the posteriors.
 
@@ -806,8 +813,37 @@ def msd_fits_blur_free(tracks: pl.DataFrame, dt_s: float, min_frames: int) -> pl
     `exposure_s > 0`; the comparison therefore runs them with the exposure
     treated as 0, which is exactly the assumption that biases them, and is
     labelled as such wherever it shows."""
-    options = MSDOptions(max_lag=MSD_MAX_LAG, min_frames=max(min_frames, 5), localization="provided")
-    return analyze_msd(tracks, Acquisition(dt_s=dt_s), options).fits
+    return analyze_msd(tracks, Acquisition(dt_s=dt_s), msd_options(min_frames, max_lag)).fits
+
+
+def msd_track_curve(
+    tracks: pl.DataFrame, dt_s: float, track_id: int, min_frames: int, max_lag: int = MSD_MAX_LAG
+) -> Optional[dict]:
+    """One track's time-averaged MSD against lag, for
+    `joint_plot.plot_track_msd`: the raw values (noisy, each lag's mean
+    over that track's own displacements), the localization offset the fits
+    subtract, and `fit_brownian_msd` / `fit_anomalous_msd`'s curves on the
+    same lags. None if the track is absent or too short."""
+    track = tracks.filter(pl.col("track_id") == track_id).sort("frame")
+    options = msd_options(min_frames, max_lag)
+    if track.height < options.min_frames:
+        return None
+    curve = compute_msd(track, Acquisition(dt_s=dt_s), options)
+    corrected = curve.msd_um2 - curve.localization_offset_um2
+    brownian = fit_brownian_msd(curve).parameters.get("D_um2_s")
+    power = fit_anomalous_msd(curve, max_nfev=options.max_nfev).parameters
+    return {
+        "track_id": track_id,
+        "n_frames": track.height,
+        "tau_s": np.asarray(curve.tau_s),
+        "msd_um2": np.asarray(curve.msd_um2),
+        "offset_um2": np.asarray(curve.localization_offset_um2),
+        "n_pairs": np.asarray(curve.n_pairs),
+        "D_um2_s": brownian,
+        "K_um2_s_alpha": power.get("K_um2_s_alpha"),
+        "alpha": power.get("alpha"),
+        "corrected_um2": corrected,
+    }
 
 
 def msd_track_table(fits: pl.DataFrame) -> pl.DataFrame:
@@ -965,6 +1001,7 @@ def analysis_summary(
     by_class: Optional[dict],
     *,
     msd_comparison: bool,
+    msd_max_lag: Optional[int] = None,
 ) -> dict:
     """`diffusion_summary.json`'s settings and population numbers (the
     caller adds the filter record and provenance). Flat keys with units in
@@ -981,6 +1018,7 @@ def analysis_summary(
         "grid": grid_record(analysis.options),
         "D_grid_um2_s": [float(analysis.D_grid_um2_s[0]), float(analysis.D_grid_um2_s[-1]), analysis.options.n_D],
         "msd_comparison": msd_comparison,
+        **({"msd_max_lag": msd_max_lag} if msd_comparison and msd_max_lag else {}),
         "tracks_sha256": analysis.tracks_sha256,
         **summarize(analysis, ids),
     }

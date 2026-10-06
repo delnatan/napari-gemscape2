@@ -349,6 +349,7 @@ min_frames = 3          # shortest track fitted
 # template's (or diffusionkit's defaults, shown).
 grid = { D_min_um2_s = 1e-5, D_max_um2_s = 10.0, n_D = 601 }
 msd_comparison = false
+msd_max_lag = 3         # lags the MSD fits use (at least 3)
 exposure_s = 0.01       # optional: overrides each bundle's recorded exposure
 # Which tracks pass (`passes_filters`) and so make up the ensemble -- the
 # diffusion widget's tracks-pane cuts, on any per-track column.

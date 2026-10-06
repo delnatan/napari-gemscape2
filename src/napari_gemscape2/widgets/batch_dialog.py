@@ -94,7 +94,7 @@ def _diffusion_summary_text(settings: dict) -> str:
     if "D_min_um2_s" in grid and "D_max_um2_s" in grid:
         parts.append(f"D grid {grid['D_min_um2_s']:g}–{grid['D_max_um2_s']:g} µm²/s")
     if settings.get("msd_comparison"):
-        parts.append("MSD comparison")
+        parts.append(f"MSD comparison ({settings.get('msd_max_lag', 3)} lags)")
     if settings.get("filters"):
         parts.append(f"filters: {', '.join(sorted(settings['filters']))}")
     return " · ".join(parts)

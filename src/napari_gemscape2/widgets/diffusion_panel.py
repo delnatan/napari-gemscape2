@@ -170,7 +170,10 @@ from napari_gemscape2.diffusion import (
     grid_record,
     length_composition,
     length_panels,
+    MSD_MAX_LAG,
+    MSD_MIN_LAG,
     msd_fits_blur_free,
+    msd_track_curve,
     msd_track_table,
     passing_track_ids,
     posterior_options,
@@ -197,6 +200,7 @@ from napari_gemscape2.joint_plot import (
     plot_d_ensemble,
     plot_d_posteriors,
     plot_property_joint,
+    plot_track_msd,
     plot_track_posterior,
 )
 from napari_gemscape2.pipeline import filter_mask
@@ -285,6 +289,7 @@ def _run_posterior_worker(
     exposure_s: float,
     options: GridPostOptions,
     msd_comparison: bool,
+    msd_max_lag: int,
     progress,
 ) -> tuple[PosteriorAnalysis, Optional[pl.DataFrame]]:
     """`(analysis, msd_fits)`: the grid posteriors with the real exposure,
@@ -295,7 +300,7 @@ def _run_posterior_worker(
     analysis = analyze_posteriors(diffkit_tracks, acquisition, options, progress=progress)
     msd_fits = None
     if msd_comparison:
-        msd_fits = msd_fits_blur_free(diffkit_tracks, dt_s, options.min_frames)
+        msd_fits = msd_fits_blur_free(diffkit_tracks, dt_s, options.min_frames, msd_max_lag)
     return analysis, msd_fits
 
 
@@ -1027,13 +1032,26 @@ class _PosteriorTab(QWidget):
             "Also fit the classic 3-lag MSD models (Brownian D; power-law K and α)\n"
             "for comparison. They have no uncertainties and no blur model, so with\n"
             "exposure > 0 they are run with the exposure treated as 0 -- which\n"
-            "biases them. Adds D_msd / α_msd columns and a D vs α plot."
+            "biases them. Adds D_msd / α_msd columns and a per-track MSD plot."
         )
+        self._msd_lags = QSpinBox()
+        self._msd_lags.setRange(MSD_MIN_LAG, 1000)
+        self._msd_lags.setValue(MSD_MAX_LAG)
+        self._msd_lags.setToolTip(
+            "How many lags of each track's time-averaged MSD the MSD fits use\n"
+            f"(at least {MSD_MIN_LAG}: the power law has two parameters). Few is\n"
+            "better: the later lags average few displacements and are noisy."
+        )
+        self._msd_lags.setEnabled(False)
+        self._msd_comparison.toggled.connect(self._msd_lags.setEnabled)
+        self._msd_max_lag = MSD_MAX_LAG  # the lags the current results were fitted with
 
         # Flow rows rather than a form: a form's field column is too narrow
         # in a dock for three controls, and clipped them.
         exposure_row = flow_row(QLabel("exposure"), self._exposure)
-        options_row = flow_row(QLabel("min points"), self._min_frames, self._msd_comparison)
+        options_row = flow_row(
+            QLabel("min points"), self._min_frames, self._msd_comparison, QLabel("lags"), self._msd_lags
+        )
 
         # The posterior grid -- diffusionkit's `GridPostOptions` fields,
         # read when Run is pressed. D's range is the flat prior's support,
@@ -1083,7 +1101,10 @@ class _PosteriorTab(QWidget):
         )
         self._track_button.clicked.connect(self._show_track)
         self._msd_plot_button = QPushButton("MSD")
-        self._msd_plot_button.setToolTip("D vs α from the MSD fits (no uncertainties).")
+        self._msd_plot_button.setToolTip(
+            "The selected track's raw time-averaged MSD against lag, with the\n"
+            "MSD fits over it. Stays open and follows the selection."
+        )
         self._msd_plot_button.clicked.connect(self._show_msd_plot)
         self._posteriors_button = QPushButton("Posteriors")
         self._posteriors_button.setToolTip(
@@ -1156,6 +1177,11 @@ class _PosteriorTab(QWidget):
     @property
     def msd_df(self) -> Optional[pl.DataFrame]:
         return self._msd_df
+
+    @property
+    def msd_max_lag(self) -> int:
+        """The lags the current MSD fits were run with."""
+        return self._msd_max_lag
 
     @property
     def summary_values(self) -> Optional[dict]:
@@ -1317,12 +1343,14 @@ class _PosteriorTab(QWidget):
             exposure,
             options,
             self._msd_comparison.isChecked(),
+            self._msd_lags.value(),
             self.host.progress_callback,
         )
         self.host.start_worker(worker, self._on_finished, self._on_error, [self._run_button], "posteriors")
 
     def _on_finished(self, result: tuple[PosteriorAnalysis, Optional[pl.DataFrame]]) -> None:
         analysis, msd_fits = result
+        self._msd_max_lag = self._msd_lags.value()
         n_ok = self._adopt(analysis, msd_track_table(msd_fits) if msd_fits is not None else None)
         self._status.setText(f"{n_ok} of {analysis.fits.height} tracks fitted")
         style_status_label(self._status, "ok" if n_ok else "caution")
@@ -1348,6 +1376,8 @@ class _PosteriorTab(QWidget):
         analysis = saved.analysis
         self._min_frames.setValue(analysis.min_frames)
         self._msd_comparison.setChecked(saved.msd is not None)
+        self._msd_max_lag = int(saved.summary.get("msd_max_lag") or MSD_MAX_LAG)
+        self._msd_lags.setValue(self._msd_max_lag)
         n_ok = self._adopt(analysis, saved.msd)
         self.set_grid(analysis.options)
         self._status.setText(
@@ -1511,35 +1541,28 @@ class _PosteriorTab(QWidget):
         """Follow the selection while the track window is open."""
         if self._track_window is not None and self._track_window.isVisible():
             self._show_track()
+        if self._msd_plot_window is not None and self._msd_plot_window.isVisible():
+            self._show_msd_plot()
 
     def _show_msd_plot(self) -> None:
-        if self._msd_df is None:
+        track_id = self.host.selected_track_id
+        tracks = self.host.diffkit_tracks_for_fit()
+        if self._msd_df is None or tracks is None:
             return
-        usable = self._msd_df.filter(
-            pl.col("D_msd_um2_s").is_not_null()
-            & (pl.col("D_msd_um2_s") > 0)
-            & pl.col("alpha_msd").is_not_null()
-        )
-        if usable.height < 2:
-            self._status.setText("MSD comparison: too few tracks with a positive D and an α to plot")
+        if track_id is None:
+            self._status.setText("select a track (table or viewer) first")
             style_status_label(self._status, "caution")
             return
-        exposure0 = self._analysis is not None and self._analysis.acquisition.exposure_s > 0
-        floor = None
-        if self._analysis is not None:
-            floors = self._analysis.fits.join(usable.select("track_id"), on="track_id", how="semi")
-            floor = floor_band(floors["D_floor_um2_s"])
-        figure = plot_property_joint(
-            usable,
-            "D_msd_um2_s",
-            "alpha_msd",
-            log_x=True,
-            references={"D_msd_um2_s": floor} if floor is not None else None,
-            title="MSD comparison — no uncertainties" + (", exposure treated as 0" if exposure0 else ""),
+        data = msd_track_curve(
+            tracks, self.host.dt_s, track_id, self._analysis.min_frames, self._msd_max_lag
         )
+        if data is None:
+            self._status.setText(f"track {track_id} is too short for the MSD fits")
+            style_status_label(self._status, "caution")
+            return
         if self._msd_plot_window is None:
-            self._msd_plot_window = PlotWindow("MSD comparison: D vs α", parent=self)
-        self._msd_plot_window.show_figure(figure)
+            self._msd_plot_window = PlotWindow("MSD: selected track", parent=self)
+        self._msd_plot_window.show_figure(plot_track_msd(**data))
 
     def _on_error(self, exc: Exception) -> None:
         self._status.setText(f"error: {exc}")
@@ -2899,7 +2922,8 @@ class DiffusionAnalysisWidget(QWidget):
             by_class = self.group_track_ids(ids)
             tables = analysis_tables(analysis, ids, by_class)
             summary = analysis_summary(
-                analysis, ids, by_class, msd_comparison=self._posterior_tab.msd_df is not None
+                analysis, ids, by_class, msd_comparison=self._posterior_tab.msd_df is not None,
+                msd_max_lag=self._posterior_tab.msd_max_lag,
             )
         summary["tracks_summary_filters"] = self._summary_filter_record()
         summary["packages"] = _analysis_packages()

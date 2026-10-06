@@ -521,6 +521,46 @@ def plot_d_by_length(panels: list[dict], title: str | None = None) -> Figure:
     return fig
 
 
+def plot_track_msd(
+    track_id: int,
+    n_frames: int,
+    tau_s: np.ndarray,
+    msd_um2: np.ndarray,
+    offset_um2: np.ndarray,
+    n_pairs: np.ndarray,
+    D_um2_s: float | None = None,
+    K_um2_s_alpha: float | None = None,
+    alpha: float | None = None,
+    **_unused,
+) -> Figure:
+    """One track's time-averaged MSD against lag -- the raw, noisy values
+    the MSD fits see -- with the Brownian and power-law fits drawn over
+    them (each plus the localization offset it was fitted net of). The
+    last lags average few displacements and scatter most; that scatter is
+    why the posterior, not this curve, is the estimate."""
+    fig = Figure(figsize=(4.2, 2.8), layout="constrained")
+    ax = fig.subplots()
+    _style_axis(ax)
+    tau = np.asarray(tau_s)
+    ax.plot(tau, msd_um2, "o", color=_INK, ms=4, zorder=3, label="track MSD")
+    # The offset is known only at the measured lags, so the fits are drawn
+    # through them rather than on a finer curve.
+    if D_um2_s is not None:
+        ax.plot(tau, 4 * D_um2_s * tau + offset_um2, "-", color=_SHARED_COLOR, lw=1.4, label="linear (D)")
+    if K_um2_s_alpha is not None and alpha is not None:
+        ax.plot(tau, 4 * K_um2_s_alpha * tau**alpha + offset_um2, "--", color=_DECONVOLVED_COLOR, lw=1.4,
+                label=f"power law (α = {alpha:.2f})")
+    ax.set_xlim(left=0)
+    ax.set_ylim(bottom=0)
+    ax.set_xlabel("lag τ (s)", fontsize=9)
+    ax.set_ylabel("MSD (µm²)", fontsize=9)
+    ax.legend(fontsize=7, frameon=False, loc="upper left")
+    head = f"track {track_id} · {n_frames} frames"
+    fit = f"D_msd = {D_um2_s:.3g} µm²/s · " if D_um2_s is not None else ""
+    ax.set_title(f"{head}\n{fit}{len(tau)} lags (last: {int(n_pairs[-1])} pairs)", fontsize=9, loc="left", color=_INK)
+    return fig
+
+
 def plot_track_posterior(
     track_id: int,
     d_grid: np.ndarray,
