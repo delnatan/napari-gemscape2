@@ -470,8 +470,8 @@ sorted by median, beside the *mean* of the tracks' posteriors, the histogram of
 medians and the deconvolved distribution. The plots and summary follow the
 filters without a re-run; each group's deconvolution takes a second or two, on
 a worker thread, so they update shortly after a change. MSD fits are a labelled opt-in comparison; the **Track** plot shows the
-selected track's posterior; the **Map** tab colors each track's centroid by any
-result; the **NUTS** tab fits the selected track's full posterior with the same
+selected track's posterior; the **Map** tab colors each track's localizations by
+any result; the **NUTS** tab fits the selected track's full posterior with the same
 exposure (needs `--extra bayes`).
 
 Opening a bundle with a saved analysis — saved from the widget, a batch, or

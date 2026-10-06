@@ -38,9 +38,10 @@ pointed at a selection you could not see.
   tracks pane passes, per region class, also split by track length. The
   MSD fits are a labelled opt-in comparison. See `_PosteriorTab`.
 - **Map** -- a `Points` layer in the viewer (`self._spatial_map_layer`,
-  one point per track centroid) colored by any per-track result: the
-  spatial map, and the reason this analysis stays inside napari next to
-  the image. See `_MapTab`.
+  one point per localization, every point of a track carrying that
+  track's value) colored by any per-track result: the spatial map, and
+  the reason this analysis stays inside napari next to the image. See
+  `_MapTab`.
 - **NUTS** -- `diffusionkit.bayes.fit_track` on the selected track, with
   its corner plot; needs the optional `[bayes]` extra. See `_NutsTab`.
 
@@ -1658,9 +1659,9 @@ _UPDATING = "\n(updating the ensemble…)"
 
 
 class _MapTab(QWidget):
-    """The spatial map: one point per track at its centroid, colored by any
-    per-track number a run produced (`DiffusionAnalysisWidget.
-    register_spatial_source`) -- the reason this analysis stays inside
+    """The spatial map: one point per localization, each carrying its
+    track's value of any per-track number a run produced
+    (`DiffusionAnalysisWidget.register_spatial_source`) -- the reason this analysis stays inside
     napari next to the image. Nothing to run here; the color range is set
     by dragging the histogram, and a written scale says what the colors
     mean, since a napari Points layer colored by a feature has no legend."""
@@ -1668,7 +1669,7 @@ class _MapTab(QWidget):
     def __init__(self, host: "DiffusionAnalysisWidget") -> None:
         super().__init__()
         self.host = host
-        self._hint = note_label("Run the posteriors first — the map colors each track's centroid by a result.")
+        self._hint = note_label("Run the posteriors first — the map colors each track's points by a result.")
         self._color_by_picker = QComboBox()
         self._color_by_picker.setEnabled(False)
         self._color_by_picker.currentTextChanged.connect(self._on_color_by_changed)
@@ -1980,7 +1981,7 @@ class DiffusionAnalysisWidget(QWidget):
         tabs.addTab(scrolled(self._map_tab), "Map")
         tabs.addTab(scrolled(self._nuts_tab), "NUTS")
         tabs.setTabToolTip(0, "Per-track grid posteriors over D, and the ensemble (diffusionkit.gridpost)")
-        tabs.setTabToolTip(1, "Color each track's centroid in the viewer by a result")
+        tabs.setTabToolTip(1, "Color each track's points in the viewer by a result")
         tabs.setTabToolTip(2, "Full NUTS posterior for the selected track (diffusionkit.bayes)")
 
         # One session-wide switch, not a copy on each tab -- see this
@@ -2771,7 +2772,7 @@ class DiffusionAnalysisWidget(QWidget):
 
     def _filtered_map_df(self) -> Optional[pl.DataFrame]:
         """Whichever registered spatial source has the current color-by
-        column, joined to pixel-space centroids and restricted to
+        column, one row per track with its pixel-space centroid, restricted to
         `combined_filtered_track_ids()` -- the *display* subset for both
         the spatial map layer and its remap histogram. The underlying fit
         results (`self._spatial_sources`) are untouched by this -- filters
@@ -2795,7 +2796,7 @@ class DiffusionAnalysisWidget(QWidget):
 
     def _update_spatial_map_layer(self) -> None:
         merged = self._filtered_map_df()
-        if merged is None or self._map_color_by is None:
+        if merged is None or self._map_color_by is None or self._tracks_df_px is None:
             return
         color_by = self._map_color_by
         merged = merged.filter(pl.col(color_by).is_not_null())
@@ -2803,9 +2804,15 @@ class DiffusionAnalysisWidget(QWidget):
             if self._live(self._spatial_map_layer) is not None:
                 self._spatial_map_layer.data = np.empty((0, 2))
             return
-        positions = merged.select("y_px", "x_px").to_numpy()
-        values = merged[color_by].to_numpy()
-        track_ids = merged["track_id"].to_numpy()
+        # One point per localization, not per track centroid: a centroid
+        # misplaces where a track explored. The tracks layer underneath
+        # supplies the connectivity; this carries the track's value.
+        vertices = self._tracks_df_px.select("track_id", "y", "x").join(
+            merged.select("track_id", color_by), on="track_id", how="inner"
+        )
+        positions = vertices.select("y", "x").to_numpy()
+        values = vertices[color_by].to_numpy()
+        track_ids = vertices["track_id"].to_numpy()
         if self._live(self._spatial_map_layer) is None:
             self._spatial_map_layer = self.viewer.add_points(
                 positions,
@@ -2829,7 +2836,7 @@ class DiffusionAnalysisWidget(QWidget):
             self._spatial_map_layer.face_colormap = "viridis"
 
     def _make_spatial_map_click_callback(self):
-        """Click a point on the spatial map -> select that track --
+        """Click a point on the spatial map -> select its track --
         `Points.get_value` returns an *index* into `.data` (unlike
         `Tracks.get_value`, which returns a `track_id` directly), so this
         looks the id up via the layer's own `track_id` feature."""
