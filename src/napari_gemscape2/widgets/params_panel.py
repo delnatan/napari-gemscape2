@@ -975,7 +975,7 @@ class _TrackingTab(QWidget):
 
     The filter stack is over `pipeline.track_metrics_df` -- one row per
     track, so "412 of 1893 tracks pass" means what it says. The same panel
-    will take diffusionkit's per-track fit results (`D`, `alpha`) once
+    will take diffusionkit's per-track fit results (`D`, ...) once
     they've been computed onto the track table, which is the point of
     filtering per-track metrics here rather than per-vertex ones."""
 

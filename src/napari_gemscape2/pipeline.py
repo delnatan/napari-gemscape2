@@ -599,7 +599,7 @@ def apply_track_filters(
 
     Columns are matched against the metrics table, so a filter may also
     name a column already on `tracks_df` itself (a per-track fit result
-    joined in, e.g. diffusionkit's `D` or `alpha`) -- those ride along
+    joined in, e.g. diffusionkit's `D`) -- those ride along
     through the `first()` below."""
     if not filters or tracks_df.height == 0 or "track_id" not in tracks_df.columns:
         return tracks_df

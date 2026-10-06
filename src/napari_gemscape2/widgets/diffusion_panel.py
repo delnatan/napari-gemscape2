@@ -1,6 +1,6 @@
 """Diffusion-analysis dock widget: pick a Tracks layer already in the
 napari viewer and explore its per-track diffusion, using diffusionkit's
-grid posteriors over D (and alpha), the ensemble read across tracks, the
+grid posteriors over D, the ensemble read across tracks, the
 classic MSD fits as a comparison, and -- optionally -- a full NUTS
 posterior for one selected track.
 
@@ -33,11 +33,10 @@ pointed at a selection you could not see.
   of their own) and moves the time slider to the track's last frame, so
   its tail is drawn in full inside the box.
 - **Posterior** -- `diffusion.analyze_posteriors` (diffusionkit.gridpost):
-  per track, the posterior median of D and its 5%/95% quantiles, alpha
-  likewise -- both with the camera exposure's blur modelled -- and the
-  ensemble over
-  whatever the tracks pane passes, per region class. The MSD fits are a
-  labelled opt-in comparison. See `_PosteriorTab`.
+  per track, the posterior median of D and its 5%/95% quantiles, with the
+  camera exposure's blur modelled -- and the ensemble over whatever the
+  tracks pane passes, per region class, also split by track length. The
+  MSD fits are a labelled opt-in comparison. See `_PosteriorTab`.
 - **Map** -- a `Points` layer in the viewer (`self._spatial_map_layer`,
   one point per track centroid) colored by any per-track result: the
   spatial map, and the reason this analysis stays inside napari next to
@@ -46,8 +45,8 @@ pointed at a selection you could not see.
   its corner plot; needs the optional `[bayes]` extra. See `_NutsTab`.
 
 Saving writes the per-track summary (`tracks_summary.csv`), every
-track's posterior (`posterior_D.parquet`, `posterior_alpha.parquet`),
-the ensemble distributions (`distributions_*.csv`) and the settings and
+track's posterior (`posterior_D.parquet`), the ensemble distributions
+(`distributions_D.csv`, `distributions_D_by_length.csv`) and the settings and
 population numbers (`diffusion_summary.json`) into the layer's bundle --
 see `results.py`. Picking a layer whose bundle has a saved analysis
 restores it (`diffusion.restore_analysis`) when the tracks it was fitted
@@ -165,9 +164,12 @@ from napari_gemscape2.diffusion import (
     ensemble,
     ensemble_panels,
     filter_record,
+    LENGTH_WEIGHTS,
     floor_band,
     floor_references,
     grid_record,
+    length_composition,
+    length_panels,
     msd_fits_blur_free,
     msd_track_table,
     passing_track_ids,
@@ -191,6 +193,7 @@ from napari_gemscape2.joint_plot import (
     DENSITY_MIN_POINTS,
     JOINT_STYLES,
     numeric_columns,
+    plot_d_by_length,
     plot_d_ensemble,
     plot_d_posteriors,
     plot_property_joint,
@@ -199,7 +202,7 @@ from napari_gemscape2.joint_plot import (
 from napari_gemscape2.pipeline import filter_mask
 from napari_gemscape2.viewer import set_tracks_layer_data
 from napari_gemscape2.widgets.feature_filters import FeatureFilterPanel
-from napari_gemscape2.widgets.params_panel import _compact_form, _dspin, _ispin
+from napari_gemscape2.widgets.params_panel import _compact_form, _ispin
 
 # Look for the two viewer overlays this widget owns -- kept visually
 # distinct from DETECTED_POINTS_STYLE's magenta "+" (viewer.py) so a
@@ -307,6 +310,15 @@ def _ensemble_worker(analysis: PosteriorAnalysis, id_sets: list) -> None:
 
 
 @thread_worker(start_thread=False)
+def _length_worker(analysis: PosteriorAnalysis, id_sets: list, weight: str) -> None:
+    """Every `diffusion.length_composition` over `id_sets` at `weight`, off
+    the GUI thread: each is one pass over every track's posterior per draw
+    of the deconvolved distribution, a second or more."""
+    for ids in id_sets:
+        length_composition(analysis, ids, weight)
+
+
+@thread_worker(start_thread=False)
 def _run_nuts_worker(track_df: pl.DataFrame, dt_s: float, exposure_s: float, model: str):
     from diffusionkit import bayes as dk_bayes
 
@@ -375,8 +387,6 @@ class _ProgressRelay(QObject):
 _TRACK_COLOR_EXPRESSIONS = {
     "log10_D_median": pl.col("D_median_um2_s").log10(),
     "D_info_bits": pl.col("D_info_bits"),
-    "alpha_median": pl.col("alpha_median"),
-    "alpha_info_bits": pl.col("alpha_info_bits"),
 }
 _TRACK_COLOR_COLUMNS = tuple(_TRACK_COLOR_EXPRESSIONS)
 
@@ -495,9 +505,9 @@ class _TracksPane(QWidget):
     Before any fit that is `track_length`/`duration_s`/`mean_step_um` plus
     the per-point detection quality aggregated to the track (`flux_min`,
     `se_x_max`, ... -- see `diffusion.qc_aggregate_table`); after a posterior run
-    it is also `D_median_um2_s`, `D_low_um2_s`, `alpha_median` and the
+    it is also `D_median_um2_s`, `D_low_um2_s`, `D_info_bits` and the
     rest. So "drop the tracks with a bad worst-point localization
-    error, then keep the ones whose fitted alpha is below 0.8, and look at
+    error, then keep the ones whose D is below 0.01 µm²/s, and look at
     where they are" is three drags in one panel, against one table, at one
     granularity. That single granularity is the point: this pane replaced
     a separate per-point "Data Explorer" whose cuts were
@@ -507,7 +517,7 @@ class _TracksPane(QWidget):
 
     The "Joint plot" section scatters any two of those same columns
     against each other, over the rows the table is currently showing -- so
-    "D against flux_mean, for the tracks with alpha below 0.8" is a cut and
+    "D against flux_mean, for the tracks with D below 0.01" is a cut and
     a plot on one table. It used to be a separate picker on each analysis
     tab, each over only that tab's own raw fit output; that
     could not put a fit result against a track property at all, and it
@@ -888,21 +898,18 @@ _POSTERIOR_HELP = (
     "those D apart. It takes a second or two per group, so the summary and figures "
     "update shortly after a filter change. The <i>mean "
     "posterior</i> averages the tracks' posteriors: where they put D, blurred by each "
-    "one's own uncertainty. α gets the same "
-    "three, and its medians are shaded by <i>alpha_info_bits</i>: a track that taught "
-    "little about α has a near-flat posterior whose median sits near the prior's midpoint "
-    "(1), so a peak of light medians there is mostly the prior, not a measurement."
+    "one's own uncertainty."
+    "<br><br><b>By length</b>: the mean posterior and the deconvolved distribution, "
+    "stacked by track length. Fast particles leave the focal depth within a few frames, "
+    "so short tracks come mostly from fast particles and long ones from slow particles. "
+    "Counted per <i>track</i>, the stack is the deconvolved distribution; per "
+    "<i>detection</i> each track counts once per frame, which is the make-up of the spots "
+    "seen in focus. Tracks shorter than <i>min points</i> are in neither."
     "<br><br><b>Localization floor</b> (<i>D_floor_um2_s</i>): the D at which a track's "
     "motion per frame equals its localization noise, &lt;σ²&gt; / (dt &minus; exposure/3) "
     "from its own SDs. Every D axis shows it (median over the tracks, 10&ndash;90% band) "
     "as the scale to read D against &mdash; not a cut: D below it is still measured, with "
     "less information per step. It moves with the square of any error in the SDs."
-    "<br><br><b>α</b> (fBm exponent) is fitted to the same blurred displacements as D, "
-    "with its scale -- the apparent D at one frame -- integrated out over the same D grid "
-    "and prior. It is the one shape parameter reported: confinement and subdiffusion both "
-    "read as α &lt; 1. Read its medians with <i>alpha_info_bits</i>: near 0 bits the "
-    "median is the prior's. Tracks of 40 frames or more use a fast approximate likelihood "
-    "(debiased Whittle): as well calibrated, a few percent less precise. It costs ~2x D."
 
 )
 
@@ -954,8 +961,7 @@ class _PosteriorTab(QWidget):
     likelihood models the blur of a continuous exposure, so treating 20 ms
     as instantaneous biases D low. It is pre-filled from the layer's
     metadata and otherwise has to be typed -- the box starts at "not set",
-    never at 0, and Run stays off until it has a value. D and alpha both
-    model that blur.
+    never at 0, and Run stays off until it has a value.
 
     The summary and the Ensemble and Posteriors figures are read over the
     tracks the tracks pane currently passes (and grouped by region class
@@ -977,6 +983,11 @@ class _PosteriorTab(QWidget):
         self._summary_by_group: Optional[dict] = None
         self._ensemble_window: Optional[PlotWindow] = None
         self._posteriors_window: Optional[PlotWindow] = None
+        self._length_window: Optional[PlotWindow] = None
+        # The by-length split's worker (one at a time), and whether the
+        # filters or the weight changed while it ran.
+        self._length_worker = None
+        self._length_stale = False
         self._track_window: Optional[PlotWindow] = None
         self._msd_plot_window: Optional[PlotWindow] = None
         # The summary's ensembles, computed off the GUI thread: the running
@@ -1011,14 +1022,6 @@ class _PosteriorTab(QWidget):
             "just gets a wide posterior, so there is no need to raise it for accuracy."
         )
 
-        self._alpha = QCheckBox("α")
-        self._alpha.setChecked(True)
-        self._alpha.setToolTip(
-            "Also compute the posterior over the fBm exponent α, with its scale\n"
-            "(D at one frame) integrated out over the D grid and the exposure's\n"
-            "blur modelled. About twice the\n"
-            "cost of D; tracks of 40+ frames use a fast approximate likelihood."
-        )
         self._msd_comparison = QCheckBox("MSD")
         self._msd_comparison.setToolTip(
             "Also fit the classic 3-lag MSD models (Brownian D; power-law K and α)\n"
@@ -1030,12 +1033,11 @@ class _PosteriorTab(QWidget):
         # Flow rows rather than a form: a form's field column is too narrow
         # in a dock for three controls, and clipped them.
         exposure_row = flow_row(QLabel("exposure"), self._exposure)
-        options_row = flow_row(QLabel("min points"), self._min_frames, self._alpha, self._msd_comparison)
+        options_row = flow_row(QLabel("min points"), self._min_frames, self._msd_comparison)
 
-        # The posterior grids -- diffusionkit's `GridPostOptions` fields,
+        # The posterior grid -- diffusionkit's `GridPostOptions` fields,
         # read when Run is pressed. D's range is the flat prior's support,
-        # so it stays in view (it is alpha's scale grid too); the alpha grid
-        # folds away.
+        # so it stays in view.
         grid_default = GridPostOptions()
         d_range_tip = (
             "The range of D (µm²/s) the posterior is evaluated over -- the flat\n"
@@ -1050,25 +1052,13 @@ class _PosteriorTab(QWidget):
             tooltip="Grid points in ln D, spaced evenly between D min and D max.\n"
             f"diffusionkit's default {grid_default.n_D} gives ~2.3% steps over its default range.",
         )
-        self._grid_alpha_min = _dspin(grid_default.alpha_min, 0.01, 1.99, 0.05, decimals=2,
-                                      tooltip="Lowest α on the α grid (above 0, where fGn degenerates).")
-        self._grid_alpha_max = _dspin(grid_default.alpha_max, 0.01, 1.99, 0.05, decimals=2,
-                                      tooltip="Highest α on the α grid (below 2, where fGn degenerates).")
-        self._grid_n_alpha = _ispin(grid_default.n_alpha, 2, 10_000, tooltip="Grid points in α.")
         grid_form = _compact_form(QFormLayout())
         grid_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         grid_form.addRow("D min (µm²/s)", self._grid_D_min)
         grid_form.addRow("D max (µm²/s)", self._grid_D_max)
         grid_form.addRow("D points", self._grid_n_D)
-        alpha_grid_box = QWidget()
-        alpha_grid_form = _compact_form(QFormLayout(alpha_grid_box))
-        alpha_grid_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        alpha_grid_form.addRow("α min", self._grid_alpha_min)
-        alpha_grid_form.addRow("α max", self._grid_alpha_max)
-        alpha_grid_form.addRow("α points", self._grid_n_alpha)
-        self._alpha_grid_section = CollapsibleSection("α grid", alpha_grid_box, expanded=False)
         self._grid_reset = QPushButton("default grid")
-        self._grid_reset.setToolTip("diffusionkit's default grids (GridPostOptions()).")
+        self._grid_reset.setToolTip("diffusionkit's default grid (GridPostOptions()).")
         self._grid_reset.clicked.connect(lambda: self.set_grid(GridPostOptions()))
         self._grid_status = status_label("")
         for box in self._grid_boxes():
@@ -1083,8 +1073,7 @@ class _PosteriorTab(QWidget):
         self._ensemble_button = QPushButton("Ensemble")
         self._ensemble_button.setToolTip(
             "Per-track medians, the deconvolved distribution and the shared-D\n"
-            "posterior against the localization floor -- and α (medians shaded by\n"
-            "alpha_info_bits) when it was run -- over the tracks\n"
+            "posterior against the localization floor, over the tracks\n"
             "the filters pass, one row per region class."
         )
         self._ensemble_button.clicked.connect(self._show_ensemble)
@@ -1103,10 +1092,29 @@ class _PosteriorTab(QWidget):
             "the deconvolved distribution -- over the tracks the filters pass."
         )
         self._posteriors_button.clicked.connect(self._show_posteriors)
+        self._length_button = QPushButton("By length")
+        self._length_button.setToolTip(
+            "The mean posterior and the deconvolved distribution stacked by\n"
+            "track length, and each length's own distribution -- which tracks\n"
+            "each part of the distribution comes from -- over the tracks the\n"
+            "filters pass, one row per region class."
+        )
+        self._length_button.clicked.connect(self._show_by_length)
+        self._length_weight = QComboBox()
+        self._length_weight.addItems(LENGTH_WEIGHTS)
+        self._length_weight.setToolTip(
+            "per track: each track counts once, and the stack is the deconvolved\n"
+            "distribution. per detection: each track counts once per frame -- the\n"
+            "make-up of the spots seen in focus, where fast particles' many short\n"
+            "tracks weigh less."
+        )
+        self._length_weight.currentTextChanged.connect(lambda _w: self._refresh_length_window())
         plot_row = flow_row(
             QLabel("plot:"),
             self._ensemble_button,
             self._posteriors_button,
+            self._length_button,
+            self._length_weight,
             self._track_button,
             self._msd_plot_button,
         )
@@ -1122,7 +1130,6 @@ class _PosteriorTab(QWidget):
         layout.addWidget(self._exposure_note)
         layout.addWidget(options_row)
         layout.addLayout(grid_form)
-        layout.addWidget(self._alpha_grid_section)
         layout.addWidget(self._grid_reset, alignment=Qt.AlignmentFlag.AlignLeft)
         layout.addWidget(self._grid_status)
         layout.addWidget(self._run_button)
@@ -1159,10 +1166,7 @@ class _PosteriorTab(QWidget):
         return self._summary_by_group
 
     def _grid_boxes(self) -> tuple:
-        return (
-            self._grid_D_min, self._grid_D_max, self._grid_n_D,
-            self._grid_alpha_min, self._grid_alpha_max, self._grid_n_alpha,
-        )
+        return (self._grid_D_min, self._grid_D_max, self._grid_n_D)
 
     def options(self) -> GridPostOptions:
         """The next run's `GridPostOptions`, from the controls. Raises
@@ -1171,17 +1175,11 @@ class _PosteriorTab(QWidget):
             D_min_um2_s=self._grid_D_min.value(),
             D_max_um2_s=self._grid_D_max.value(),
             n_D=self._grid_n_D.value(),
-            alpha_min=self._grid_alpha_min.value(),
-            alpha_max=self._grid_alpha_max.value(),
-            n_alpha=self._grid_n_alpha.value(),
         )
-        return posterior_options(self._min_frames.value(), self._alpha.isChecked(), grid)
+        return posterior_options(self._min_frames.value(), grid)
 
     def set_grid(self, options: GridPostOptions) -> None:
-        values = (
-            options.D_min_um2_s, options.D_max_um2_s, options.n_D,
-            options.alpha_min, options.alpha_max, options.n_alpha,
-        )
+        values = (options.D_min_um2_s, options.D_max_um2_s, options.n_D)
         for box, value in zip(self._grid_boxes(), values):
             blocked = box.blockSignals(True)
             box.setValue(value)
@@ -1282,6 +1280,7 @@ class _PosteriorTab(QWidget):
         has_run = self._analysis is not None and len(self._analysis.fitted_ids) > 0
         self._ensemble_button.setEnabled(has_run)
         self._posteriors_button.setEnabled(has_run)
+        self._length_button.setEnabled(has_run)
         self._track_button.setEnabled(has_run)
         self._msd_plot_button.setEnabled(self._msd_df is not None)
 
@@ -1348,7 +1347,6 @@ class _PosteriorTab(QWidget):
         caller refreshes the summary once the filters are back too."""
         analysis = saved.analysis
         self._min_frames.setValue(analysis.min_frames)
-        self._alpha.setChecked(analysis.alpha_ids is not None)
         self._msd_comparison.setChecked(saved.msd is not None)
         n_ok = self._adopt(analysis, saved.msd)
         self.set_grid(analysis.options)
@@ -1407,6 +1405,7 @@ class _PosteriorTab(QWidget):
             self._show_ensemble()
         if self._posteriors_window is not None and self._posteriors_window.isVisible():
             self._show_posteriors()
+        self._refresh_length_window()
 
     def _panels(self, *, track_posteriors: bool = False) -> list[dict]:
         """`ensemble_panels` over the tracks the filters pass, one per
@@ -1433,15 +1432,63 @@ class _PosteriorTab(QWidget):
         panels = self._panels()
         if not panels:
             return
-        figure = plot_d_ensemble(
-            self._analysis.D_grid_um2_s,
-            panels,
-            self._analysis.alpha_grid if self._analysis.has_alpha else None,
-        )
+        figure = plot_d_ensemble(self._analysis.D_grid_um2_s, panels)
         if self._ensemble_window is None:
             self._ensemble_window = PlotWindow("Posterior: ensemble", parent=self)
         _fit_window_to_figure(self._ensemble_window, figure)
         self._ensemble_window.show_figure(figure)
+
+    def _show_by_length(self) -> None:
+        """The by-length figure: its compositions are computed on a worker
+        first (`_length_worker`), then drawn."""
+        if self._analysis is None:
+            return
+        if self._length_worker is not None:
+            self._length_stale = True
+            return
+        analysis = self._analysis
+        weight = self._length_weight.currentText()
+        ids = self.host.combined_filtered_track_ids()
+        groups = self.host.group_track_ids(ids) or {"all": ids}
+        self._status.setText("splitting by track length…")
+        style_status_label(self._status)
+        worker = _length_worker(analysis, list(groups.values()), weight)
+        worker.returned.connect(lambda _r: self._length_ready(analysis, weight))
+        worker.errored.connect(self._length_failed)
+        self._length_worker = worker
+        worker.start()
+
+    def _length_failed(self, exc: Exception) -> None:
+        self._length_worker = None
+        self._length_stale = False
+        self._status.setText(f"by-length split failed: {exc}")
+        style_status_label(self._status, "error")
+
+    def _length_ready(self, analysis: PosteriorAnalysis, weight: str) -> None:
+        self._length_worker = None
+        if self._length_stale or analysis is not self._analysis or weight != self._length_weight.currentText():
+            self._length_stale = False
+            self._show_by_length()
+            return
+        self._status.setText("")
+        style_status_label(self._status)
+        ids = self.host.combined_filtered_track_ids()
+        groups = self.host.group_track_ids(ids) or {"all": ids}
+        panels = length_panels(analysis, groups, weight)
+        if not panels:
+            self._status.setText("no fitted tracks pass the current filters")
+            style_status_label(self._status, "caution")
+            return
+        figure = plot_d_by_length(panels)
+        if self._length_window is None:
+            self._length_window = PlotWindow("Posterior: by track length", parent=self)
+        _fit_window_to_figure(self._length_window, figure)
+        self._length_window.show_figure(figure)
+
+    def _refresh_length_window(self) -> None:
+        """Redraw the by-length figure when it is open (filters or weight changed)."""
+        if self._length_window is not None and self._length_window.isVisible():
+            self._show_by_length()
 
     def _show_track(self) -> None:
         track_id = self.host.selected_track_id
@@ -1527,8 +1574,6 @@ def _format_by_group(by_group: Optional[dict]) -> str:
             line += f" · shared {summary['shared_D_median_um2_s']:.3g}"
         if summary.get("D_floor_median_um2_s") is not None:
             line += f" · floor {summary['D_floor_median_um2_s']:.2g}"
-        if summary.get("median_alpha") is not None:
-            line += f" · α {summary['median_alpha']:.2f}"
         lines.append(line)
     return "\n".join(lines)
 
@@ -1541,13 +1586,15 @@ def _format_posterior_summary(summary: dict, analysis: Optional[PosteriorAnalysi
         key[2:]: value
         for key, value in summary.items()
         if key.startswith("n_")
-        and key not in ("n_tracks", "n_ok", "n_alpha", "n_D_at_grid_edge")
+        and key not in ("n_tracks", "n_ok", "n_detections", "n_D_at_grid_edge")
         and not key.startswith("n_frames")
     }
     counts = f"{summary.get('n_ok', 0)} fitted"
     if others:
         counts += " · " + " · ".join(f"{count} {status}" for status, count in sorted(others.items()))
     lines = [f"{summary['n_tracks']} tracks: {counts}"]
+    if summary.get("n_detections") is not None:
+        lines[0] += f" ({summary['n_detections']} detections)"
     if summary.get("n_frames_median") is not None:
         lines.append(
             f"length {summary['n_frames_min']:.0f} / {summary['n_frames_median']:.0f} / "
@@ -1573,13 +1620,6 @@ def _format_posterior_summary(summary: dict, analysis: Optional[PosteriorAnalysi
         lines.append(
             f"localization floor {units.fmt(summary['D_floor_median_um2_s'], 'D_um2_s')} "
             f"(10–90% {summary['D_floor_q10_um2_s']:.2g}–{summary['D_floor_q90_um2_s']:.2g})"
-        )
-    if summary.get("median_alpha") is not None:
-        lines.append(
-            f"median α {summary['median_alpha']:.2f} (IQR {summary['q25_alpha']:.2f}–"
-            f"{summary['q75_alpha']:.2f}) · shared α {summary['shared_alpha_median']:.2f} · "
-            f"deconvolved mode {summary['deconvolved_alpha_mode']:.2f} · "
-            f"median {summary['median_alpha_info_bits']:.2f} bits"
         )
     if analysis is not None:
         acquisition = analysis.acquisition
@@ -1916,7 +1956,7 @@ class DiffusionAnalysisWidget(QWidget):
         tabs.addTab(scrolled(self._posterior_tab), "Posterior")
         tabs.addTab(scrolled(self._map_tab), "Map")
         tabs.addTab(scrolled(self._nuts_tab), "NUTS")
-        tabs.setTabToolTip(0, "Per-track grid posteriors over D and α, and the ensemble (diffusionkit.gridpost)")
+        tabs.setTabToolTip(0, "Per-track grid posteriors over D, and the ensemble (diffusionkit.gridpost)")
         tabs.setTabToolTip(1, "Color each track's centroid in the viewer by a result")
         tabs.setTabToolTip(2, "Full NUTS posterior for the selected track (diffusionkit.bayes)")
 
@@ -1934,8 +1974,9 @@ class DiffusionAnalysisWidget(QWidget):
         self._save_button = QPushButton("Save analysis")
         self._save_button.setToolTip(
             f"Write the per-track summary ({TRACKS_SUMMARY_FILENAME}), every\n"
-            "track's posterior (posterior_D/_alpha.parquet), the ensemble\n"
-            "distributions (distributions_D/_alpha.csv, over the tracks the\n"
+            "track's posterior (posterior_D.parquet), the ensemble\n"
+            "distributions (distributions_D.csv and, by track length,\n"
+            "distributions_D_by_length.csv, over the tracks the\n"
             "filters pass) and the settings and population summary\n"
             "(diffusion_summary.json) into this layer's bundle."
         )
@@ -2551,7 +2592,7 @@ class DiffusionAnalysisWidget(QWidget):
         self._tracks_pane.set_plot_columns(
             self._joined_track_df,
             prefer_x="D_median_um2_s",
-            prefer_y="alpha_median" if analysis.has_alpha else "track_length",
+            prefer_y="track_length",
         )
         self._map_tab.on_spatial_source_registered("D_median_um2_s")
         self._update_save_enabled()
@@ -2683,8 +2724,7 @@ class DiffusionAnalysisWidget(QWidget):
         pinning to one end of the colormap."""
         if self._posterior_df is None:
             return df
-        # Only the colors this run has the columns for (alpha and the D
-        # ratio are optional).
+        # Only the colors this run has the columns for.
         available = set(self._posterior_df.columns)
         present = {
             name: expression

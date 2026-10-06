@@ -141,11 +141,9 @@ _EXACT: dict[str, Optional[str]] = {
     # posterior's own summaries are named `<quantity>_<median|low|high>`,
     # resolved through the statistic suffixes above.
     "posterior_status": None,
-    "alpha_status": None,
     "D_at_grid_edge": None,
-    # What a track's D (alpha) posterior gained over the flat prior.
+    # What a track's D posterior gained over the flat prior.
     "D_info_bits": BITS,
-    "alpha_info_bits": BITS,
     "log_posterior": None,
     "posterior": None,
     "weight": None,

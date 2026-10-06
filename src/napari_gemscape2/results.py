@@ -16,9 +16,8 @@ and, once the diffusion widget has saved an analysis of it
 (`write_diffusion_results`):
     <result_dir>/tracks_summary.csv       one row per track
     <result_dir>/posterior_D.parquet      every track's log posterior over D
-    <result_dir>/posterior_alpha.parquet  likewise over alpha, when it was run
     <result_dir>/distributions_D.csv      the ensemble on the D grid
-    <result_dir>/distributions_alpha.csv  likewise on the alpha grid
+    <result_dir>/distributions_D_by_length.csv  the same split by track length
     <result_dir>/diffusion_summary.json   settings + population numbers
 
 Points and tracks are the atomic data, and stay parquet: everything else
@@ -70,12 +69,13 @@ DIFFUSION_SUMMARY_FILENAME = "diffusion_summary.json"
 # (`diffusion.tracks_summary_table`).
 TRACKS_SUMMARY_FILENAME = "tracks_summary.csv"
 POSTERIOR_D_FILENAME = "posterior_D.parquet"
-POSTERIOR_ALPHA_FILENAME = "posterior_alpha.parquet"
 DISTRIBUTIONS_D_FILENAME = "distributions_D.csv"
-DISTRIBUTIONS_ALPHA_FILENAME = "distributions_alpha.csv"
+DISTRIBUTIONS_D_BY_LENGTH_FILENAME = "distributions_D_by_length.csv"
 # Written by earlier versions of the diffusion widget; removed on the next
 # save so a bundle never mixes two analyses.
-_STALE_DIFFUSION_FILES = ("diffusion_fits.parquet", "tracks_summary.parquet")
+_STALE_DIFFUSION_FILES = (
+    "diffusion_fits.parquet", "tracks_summary.parquet", "posterior_alpha.parquet", "distributions_alpha.csv",
+)
 
 
 def git_sha(repo_path: str | Path) -> str | None:
@@ -250,30 +250,25 @@ def write_diffusion_results(
     tracks_summary: pl.DataFrame,
     summary: dict,
     posterior_D: Optional[pl.DataFrame] = None,
-    posterior_alpha: Optional[pl.DataFrame] = None,
     distributions_D: Optional[pl.DataFrame] = None,
-    distributions_alpha: Optional[pl.DataFrame] = None,
+    distributions_D_by_length: Optional[pl.DataFrame] = None,
 ) -> None:
     """The diffusion widget's analysis of this bundle's tracks (see this
     module's docstring for the files). An optional table left as None has
     its file removed rather than kept, so what is on disk is always one
-    analysis -- an alpha posterior from an earlier run never sits beside a
-    D posterior from a later one that skipped alpha."""
+    analysis -- the distributions of an earlier run never sit beside the
+    per-track table of a later one that wrote none."""
     result_dir = Path(result_dir)
     result_dir.mkdir(parents=True, exist_ok=True)
     tracks_summary.write_csv(result_dir / TRACKS_SUMMARY_FILENAME)
     (result_dir / DIFFUSION_SUMMARY_FILENAME).write_text(json.dumps(summary, indent=2))
-    for table, filename in (
-        (posterior_D, POSTERIOR_D_FILENAME),
-        (posterior_alpha, POSTERIOR_ALPHA_FILENAME),
-    ):
-        if table is None:
-            (result_dir / filename).unlink(missing_ok=True)
-        else:
-            table.write_parquet(result_dir / filename)
+    if posterior_D is None:
+        (result_dir / POSTERIOR_D_FILENAME).unlink(missing_ok=True)
+    else:
+        posterior_D.write_parquet(result_dir / POSTERIOR_D_FILENAME)
     for table, filename in (
         (distributions_D, DISTRIBUTIONS_D_FILENAME),
-        (distributions_alpha, DISTRIBUTIONS_ALPHA_FILENAME),
+        (distributions_D_by_length, DISTRIBUTIONS_D_BY_LENGTH_FILENAME),
     ):
         if table is None:
             (result_dir / filename).unlink(missing_ok=True)
@@ -292,23 +287,20 @@ def load_diffusion_summary(result_dir: str | Path) -> Optional[dict]:
 
 def load_diffusion_results(result_dir: str | Path) -> Optional[dict]:
     """What `write_diffusion_results` wrote, under its keyword names
-    (`summary`, `tracks_summary`, `posterior_D`, `posterior_alpha`; an
-    absent optional table is None) -- or None when there is no saved
-    posterior analysis to read back."""
+    (`summary`, `tracks_summary`, `posterior_D`) -- or None when there is
+    no saved posterior analysis to read back."""
     result_dir = Path(result_dir)
     summary = load_diffusion_summary(result_dir)
     posterior_d_path = result_dir / POSTERIOR_D_FILENAME
     summary_path = result_dir / TRACKS_SUMMARY_FILENAME
     if summary is None or not posterior_d_path.exists() or not summary_path.exists():
         return None
-    alpha_path = result_dir / POSTERIOR_ALPHA_FILENAME
     return {
         "summary": summary,
         # Every row read before typing a column: one that is empty for the
-        # first thousand tracks (alpha, NUTS) would otherwise be a string.
+        # first thousand tracks (MSD, NUTS) would otherwise be a string.
         "tracks_summary": pl.read_csv(summary_path, infer_schema_length=None),
         "posterior_D": pl.read_parquet(posterior_d_path),
-        "posterior_alpha": pl.read_parquet(alpha_path) if alpha_path.exists() else None,
     }
 
 

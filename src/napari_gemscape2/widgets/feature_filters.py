@@ -12,10 +12,10 @@ Used three times, against three tables:
     keeps.
   - `diffusion_panel._TracksPane` -- per-track columns again, post-hoc: the
     per-detection QC fields aggregated to the track (`flux_min`,
-    `se_x_max`, ...) plus whatever fit results (`D`, `alpha`) have been
+    `se_x_max`, ...) plus whatever fit results (`D`, ...) have been
     joined in. A cut like "every point in this track has acceptable flux"
     is a statement about the track's min, so it belongs beside the cut on
-    the track's fitted alpha.
+    the track's fitted D.
 
 `filters()` returns a `pipeline.FilterSpec`, which `pipeline.filter_mask`
 applies and `manifest.json` records -- a range dragged here, one read back

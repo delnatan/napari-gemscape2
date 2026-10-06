@@ -19,6 +19,7 @@ from diffusionkit import Acquisition
 
 from napari_gemscape2.diffusion import (
     EXPOSURE_CLAMP_FRACTION,
+    GRID_FIELDS,
     MIN_FRAMES,
     analysis_summary,
     analysis_tables,
@@ -45,9 +46,7 @@ class DiffusionSettings:
     """The widget's Posterior-tab controls and tracks-pane filters."""
 
     min_frames: int = MIN_FRAMES
-    # The alpha posterior (exposure blur modelled, like D's).
-    alpha: bool = False
-    # The posterior grids (`diffusion.GRID_FIELDS`, `GridPostOptions`'
+    # The posterior grid (`diffusion.GRID_FIELDS`, `GridPostOptions`'
     # names): D's range is the flat prior's support. Unset keys are
     # diffusionkit's defaults.
     grid: dict = field(default_factory=dict)
@@ -65,7 +64,7 @@ class DiffusionSettings:
 
     def options(self):
         """The run's `GridPostOptions`; raises ValueError for a bad grid."""
-        return posterior_options(self.min_frames, self.alpha, self.grid)
+        return posterior_options(self.min_frames, self.grid)
 
 
 def settings_from_summary(summary: dict) -> dict:
@@ -75,8 +74,9 @@ def settings_from_summary(summary: dict) -> dict:
     record = summary.get("tracks_summary_filters") or {}
     out = {
         "min_frames": summary.get("min_frames"),
-        "alpha": summary.get("alpha_grid") is not None if "alpha_grid" in summary else None,
-        "grid": summary.get("grid"),
+        # Only the D grid: a summary saved with the alpha posterior also
+        # records alpha's grid, which no run here has any more.
+        "grid": {k: v for k, v in summary["grid"].items() if k in GRID_FIELDS} if summary.get("grid") else None,
         "msd_comparison": summary.get("msd_comparison"),
         "min_track_length": record.get("min_track_length"),
         "filters": (
@@ -143,7 +143,6 @@ class BundleReport:
     n_fitted: int
     n_passing: int
     exposure_s: float
-    alpha: bool
     units_known: bool
     pixel_size_um: float
     dt_s: float
@@ -207,7 +206,6 @@ def analyze_bundle(
         n_fitted=len(analysis.fitted_ids),
         n_passing=base.height if ids is None else len(ids),
         exposure_s=exposure_s,
-        alpha=analysis.has_alpha,
         units_known=units["units_known"],
         pixel_size_um=pixel_size_um,
         dt_s=dt_s,

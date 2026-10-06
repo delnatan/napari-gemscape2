@@ -168,18 +168,18 @@ def diffusion(
 
     Reads `<results_root>/<result_id>/` for each [[inputs]] entry and
     writes the widget's files there (tracks_summary.csv, posterior_D.parquet,
-    distributions_D.csv, diffusion_summary.json, ...), so the result reopens
+    distributions_D.csv, distributions_D_by_length.csv,
+    diffusion_summary.json), so the result reopens
     in the widget as if saved from it.
 
     Settings come from the template bundle's diffusion_summary.json when
     `template` is set and it has one, overridden by [diffusion]:
         [diffusion]
         min_frames = 3          # shortest track fitted
-        alpha = false           # α posterior (blur modelled; ~2x the cost of D)
-        # the posterior grids (diffusionkit's GridPostOptions); D's range is
+        # the posterior grid (diffusionkit's GridPostOptions); D's range is
         # the flat prior's support. Any key left out keeps the template's,
         # else diffusionkit's default (shown).
-        grid = { D_min_um2_s = 1e-4, D_max_um2_s = 10.0, n_D = 501 }
+        grid = { D_min_um2_s = 1e-5, D_max_um2_s = 10.0, n_D = 601 }
         msd_comparison = false
         exposure_s = 0.01       # optional: overrides each bundle's recorded one
         min_track_length = 1    # which tracks pass (passes_filters, ensemble)
@@ -237,8 +237,6 @@ def diffusion(
             continue
         if not report.units_known:
             typer.echo("  ! the bundle records no pixel size / frame interval: every µm and s is px and frames")
-        if settings.alpha and not report.alpha:
-            typer.echo("  ! α computed for no track")
         typer.echo(
             f"  {units.fmt(report.pixel_size_um, 'pixel_size_um')} · {units.fmt(report.dt_s, 'dt_s')} · "
             f"exposure {units.fmt(report.exposure_s, 'exposure_s')}"
