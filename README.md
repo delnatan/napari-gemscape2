@@ -64,12 +64,15 @@ Both halves of the problem are handled by `spotsolve` rather than tuned around:
   knob sets the threshold: `fp_per_mpx`, the false spots admitted per 10⁶
   pixels of pure noise (default 16; the Detect tab restates it per frame of the
   image at hand).
-- **Linking** is Crocker–Grier: between consecutive frames it picks the
-  assignment with the least summed squared displacement, and no step longer than
-  `max_step` (px) is linked. `max_step` is the one setting and is not estimated
-  from the movie: about 3× the rms step of the fastest particles of interest.
-  The Track tab restates it in µm and as the fastest D it admits, and the status
-  line after a run reports the linked steps' rms to check it against.
+- **Linking** holds each track to its own diffusion scale: between consecutive
+  frames a link is scored by the step density the track predicts from its own
+  steps, against the cost of ending the track, which spotsolve reads from the
+  movie. So a fast particle passing a slow or immobile one keeps its identity.
+  No step longer than `max_step` (px) is linked. `max_step` is the one setting
+  and is not estimated from the movie: about 3× the rms step of the fastest
+  particles of interest (default 20 px). A large value costs slow particles
+  little. The Track tab restates it in µm and as the fastest D the linker
+  models, and the status line after a run reports the linked steps' rms.
 
 Linking is frame-to-frame only: a missed detection **ends** a track rather than
 being bridged across the gap. Fragmenting a trajectory is a safe failure and
@@ -325,8 +328,9 @@ Without a template, or to override it:
 sigma = 1.3
 # Largest step linked between consecutive frames, px -- required too
 # (a template linked before spotsolve 0.2 has none). About 3x the rms step
-# of the fastest particles of interest.
-max_step = 5.0
+# of the fastest particles of interest; each track is linked at its own
+# scale, so a large value costs slow particles little.
+max_step = 20.0
 min_track_length = 2
 # `offset` is the only camera fact spotsolve needs -- noise is measured
 # from each frame directly.

@@ -945,16 +945,17 @@ class _TrackingTab(QWidget):
     what to feed it, then a filter stack over the tracks it produced, then
     the save that finalizes the bundle.
 
-    `spotsolve.link` is Crocker-Grier: between consecutive frames it
-    minimizes the summed squared displacement, and ending a track costs
-    `max_step`^2. So `max_step` (px) is the whole linker -- no step longer
-    is linked, and within it the nearer assignment wins. spotsolve's advice
+    `spotsolve.link` scores each link between consecutive frames by the
+    step density the track predicts from its own steps, against the cost
+    of ending the track, which it reads from the movie. `max_step` (px) is
+    its one setting: no longer step is linked, and three rms steps of the
+    fastest diffusion the linker models fit inside it. spotsolve's advice
     is about three times the rms step of the fastest particles of
-    interest: smaller breaks their tracks, larger admits identity switches
-    where particles are dense. The note under it restates the value in µm
-    and as the fastest D it admits at that rule, at the current image's
+    interest: smaller breaks their tracks, and larger costs slow particles
+    little, since each track is held to its own scale. The note under it
+    restates the value in µm and as that fastest D, at the current image's
     pixel size and frame interval, and the status line after a run reports
-    the linked steps' own rms to check it against.
+    the linked steps' own rms.
 
     What the linker is fed: one checkbox per `spotsolve.FitFlag`, each
     excluding the fits carrying it (all off by default -- spotsolve's
@@ -992,17 +993,19 @@ class _TrackingTab(QWidget):
             "so an n-point track spans n-1 intervals and its duration_s is\n"
             "(n-1) x dt. 1 = keep everything, including singletons.",
         )
-        # Required by spotsolve and not estimated from the movie. 5 px sits
-        # inside the 3.8-6.5 px spotsolve's docs/TRACKING.md validated on
-        # beads and GEM movies (3x their rms step).
+        # Required by spotsolve and not estimated from the movie. 20 px is
+        # 3 rms steps at D = 5.5 µm²/s at 104 nm/px and 22 ms, above the
+        # fastest GEMs; slow particles lose little to a large value.
         self.max_step = _dspin(
-            5.0, 0.1, 1000.0, 0.5, decimals=1,
+            20.0, 0.1, 1000.0, 0.5, decimals=1,
             tooltip="Largest distance, in PIXELS, a particle may move between\n"
-            "consecutive frames. Within it the linker picks the assignment with\n"
-            "the least summed squared displacement; a longer step ends the track.\n\n"
+            "consecutive frames; a longer step ends the track. Each track is\n"
+            "linked at its own diffusion scale, learned from its own steps,\n"
+            "and three rms steps of the fastest one the linker models fit\n"
+            "inside this distance.\n\n"
             "About 3x the rms step of the fastest particles of interest: smaller\n"
-            "breaks their tracks, larger admits identity switches where particles\n"
-            "are dense. The status line reports the linked steps' rms after a run.",
+            "breaks their tracks, larger costs slow particles little. The status\n"
+            "line reports the linked steps' rms after a run.",
         )
         self._scale: tuple[Optional[float], Optional[float]] = (None, None)
         self._max_step_note = note_label("")
@@ -1109,9 +1112,9 @@ class _TrackingTab(QWidget):
         self._update_max_step_note()
 
     def _update_max_step_note(self) -> None:
-        """`max_step` in µm, and the fastest D it admits under the 3-rms
-        rule: rms step = max_step / 3 = sqrt(4 D dt), localization error
-        neglected (which makes that D an upper estimate)."""
+        """`max_step` in µm, and the fastest D the linker models: rms
+        step = max_step / 3 = sqrt(4 D dt), localization error neglected
+        (which makes that D an upper estimate)."""
         pixel_size_um, dt_s = self._scale
         if pixel_size_um is None or dt_s is None:
             self._max_step_note.setText("≈ 3× the fastest particles' rms step.")

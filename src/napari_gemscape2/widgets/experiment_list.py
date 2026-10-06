@@ -1396,9 +1396,9 @@ class ExperimentListWidget(QWidget):
         # Units from `napari_gemscape2.units` rather than spelled out here, so
         # this line, the diffusion panel's fit summaries and every plot
         # axis say µm²/s the same way.
-        # The linked steps' rms beside max_step, since "about 3x the rms
-        # step" is the rule max_step is set by -- this is the one place
-        # that rule can be checked against the movie.
+        # The linked steps' rms beside max_step: "about 3x the fastest
+        # particles' rms step" is the rule max_step is set by, so under 3x
+        # here it is too small for even the typical particle.
         rms = summary.get("rms_step_px")
         step_check = (
             f"  rms step {rms:.2f} px (max step = {session.max_step_used / rms:.1f}×)"

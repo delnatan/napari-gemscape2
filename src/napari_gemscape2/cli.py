@@ -82,7 +82,7 @@ def detect_track(
 
         [params]
         sigma = 1.3      # PSF width, px (required unless the template has it)
-        max_step = 5.0   # largest linked step, px (likewise required)
+        max_step = 20.0  # largest linked step, px (likewise required)
         exclude_flags = ["STALLED"]   # optional: spotsolve FitFlag names
 
         [[inputs]]

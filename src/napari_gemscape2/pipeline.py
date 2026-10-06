@@ -11,8 +11,8 @@ Detection and linking are `spotsolve`'s: `spotsolve.localize`/
 every emitter kept by a likelihood ratio at a threshold set by
 `fp_per_mpx`, the expected false emitters per 10^6 pixels of pure noise)
 and
-`spotsolve.link` (Crocker-Grier: frame to frame, least summed squared
-displacement within a required `max_step`).
+`spotsolve.link` (frame to frame within a required `max_step`, each track
+held to its own diffusion scale, learned from its own steps).
 `spotsolve.loctable` defines the table that passes between them, and this
 module emits it verbatim -- `se_y`/`se_x` (per-detection CRLB), `flux`,
 `flags` (`spotsolve.FitFlag`) and the rest -- so nothing downstream has to
@@ -27,11 +27,12 @@ Two things the previous sfwloc-based pipeline did are gone because
     biasing each other -- right for crowded and sparse fields alike) or
     "single" (one emitter per window: faster, for well-separated spots).
   - Linking takes one number, `max_step` (px): the largest step a
-    particle may take between consecutive frames. It is a setting, not a
-    measurement -- spotsolve found that estimating it from the movie's
-    own links creeps upward as each wider radius admits wrong links --
-    so the old bootstrap-link -> estimate-D -> relink dance is gone, and
-    nothing is fitted before linking.
+    particle may take between consecutive frames, set for the fastest
+    particles of interest. The linker learns each track's diffusion scale
+    from the track's own steps as it links, and reads what else it needs
+    (the detector's gap, how often a detection continues, the density)
+    from the movie, so the old bootstrap-link -> estimate-D -> relink
+    dance is gone.
 
 `PipelineSession` + `load_session`/`run_detect_step`/`run_track_step` let
 each stage run independently and be re-run after tweaking that stage's own
@@ -629,12 +630,13 @@ def run_track_step(
     then drop tracks shorter than `min_track_length`. Requires
     `session.points_df` from a prior `run_detect_step` call.
 
-    `max_step` (px) is the linker's one setting: between consecutive
-    frames it minimizes the summed squared displacement, ending a track
-    costs `max_step`^2, and no longer step is linked. About three times the
-    rms step of the fastest particles of interest is spotsolve's advice;
-    `track_summary`'s `rms_step_px` reports what the linked steps came to,
-    to check the setting against.
+    `max_step` (px) is the linker's one setting: no longer step is
+    linked, and three rms steps of the fastest diffusion the linker
+    models fit inside it. Each track is held to its own scale, learned
+    from its own steps, so a value large enough for the fastest particles
+    of interest costs slow ones little. About three times the fastest
+    particles' rms step is spotsolve's advice; `track_summary`'s
+    `rms_step_px` reports what the linked steps came to.
 
     Frame-to-frame only: a missed detection ENDS a track rather than being
     bridged, so trajectories fragment instead of swapping identity. That
@@ -646,8 +648,8 @@ def run_track_step(
     what the linker sees, not to what was saved:
 
       1. `loctable.filter_quality`: finite coordinates and positive
-         `se_y`/`se_x`. Always applied -- the linker itself reads only
-         positions, but diffusionkit needs each point's position error.
+         `se_y`/`se_x`. Always applied -- the linker and diffusionkit
+         both read each point's position error.
       2. `exclude_flags`: fits carrying any of these `spotsolve.FitFlag`
          bits (default 0, none excluded).
       3. `point_filters`: the Detect tab's histogram cuts
@@ -660,8 +662,10 @@ def run_track_step(
 
     When the table is labeled with more than one region, each region is
     linked on its own, which is what guarantees no track crosses a region
-    boundary (nucleus -> cytoplasm, cell -> cell); `track_summary`'s
-    `by_class` then reports each region class's own numbers.
+    boundary (nucleus -> cytoplasm, cell -> cell), and the linker reads
+    each region's density and continuation from its own detections;
+    `track_summary`'s `by_class` then reports each region class's own
+    numbers.
 
     `min_track_length` defaults to 2 (drop singletons only): a length-1
     "track" is just an unlinked detection with no displacement of its own
@@ -853,9 +857,10 @@ def _link_summary(
         "sigma_loc_um": sigma_loc_um,
         "D_est_um2_s": D_est,
         "n_linked_steps": n_links,
-        # The 2-D rms of the linked steps, px -- what `max_step` is judged
-        # against (spotsolve: about 3x the fastest particles' rms step).
-        # Truncated by `max_step` itself, so read it as a floor.
+        # The 2-D rms of the linked steps, px. `max_step` should be about
+        # 3x the fastest particles' rms step, so under 3x this one it is
+        # too small for even the typical particle. Truncated by `max_step`
+        # itself, so read it as a floor.
         "rms_step_px": rms_step_px(tracks_df),
         "density_um2": density_um2,
         "crowding_ratio": resolvability["ratio"],

@@ -28,9 +28,9 @@ moved off sfwloc onto `spotsolve`. The two closed forms above are sample
 physics and carry over unchanged. The thresholds are the one thing to know
 before reading a verdict: `RATIO_CAUTION`/`RATIO_UNRESOLVABLE` below were read
 off a recall-vs-ratio sweep of sfwloc's Stage-1 LAP linker, which gated on a
-single flat distance. `spotsolve.link` is the same kind of linker (least
-summed squared displacement within one `max_step`), but the sweep has not
-been rerun against it. Treat the verdict as an advisory ordering ("this
+single flat distance. `spotsolve.link` holds each track to its own
+diffusion scale and breaks a track rather than risk a switch, and the
+sweep has not been rerun against it. Treat the verdict as an advisory ordering ("this
 movie is crowded relative to its step size"), not a measured error rate.
 """
 
