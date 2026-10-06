@@ -88,3 +88,42 @@ def test_a_bundle_without_an_analysis_stops_the_pooling(project, tmp_path):
     result = CliRunner().invoke(app, ["pool", str(path)])
     assert result.exit_code == 1
     assert "gemscape2 diffusion" in result.output
+
+
+def test_the_cdf_and_its_band_are_cumulative(project):
+    # The CDF is the deconvolution's mode summed; its band is the draws' own
+    # CDFs' quantiles (not the density band summed), so each is a CDF.
+    result = CliRunner().invoke(app, ["pool", str(_config(project))])
+    assert result.exit_code == 0, result.output
+    pops = pl.read_csv(project / "results" / "pooled" / "pooled_distributions_D.csv")
+    for (_by, _group), rows in pops.group_by("by", "group", maintain_order=True):
+        rows = rows.sort("D_um2_s")
+        assert np.allclose(rows["cumulative"].to_numpy(), np.cumsum(rows["deconvolved"].to_numpy()))
+        for column in ("cumulative", "cumulative_low", "cumulative_high"):
+            values = rows[column].to_numpy()
+            assert np.all(np.diff(values) >= -1e-9) and values[-1] == pytest.approx(1.0)
+        assert np.all(rows["cumulative_low"].to_numpy() <= rows["cumulative_high"].to_numpy())
+
+
+def test_a_config_written_for_a_pooling_reruns_it(project):
+    from napari_gemscape2.pooling import PoolSettings, guess_sample, write_pool_config
+
+    names = ("wt_1", "wt_2", "mut_1")
+    assert [guess_sample(n) for n in names] == ["wt", "wt", "mut"]
+    assert guess_sample("2024") == "2024"
+    settings = PoolSettings(ensemble_msd=True, ensemble_max_lag=6, ensemble_n_points=3, n_boot=10)
+    path = project / "pool.toml"
+    write_pool_config(
+        path,
+        results_root=project / "results",
+        inputs=[(project / f"{n}.tif", n, guess_sample(n)) for n in names],
+        settings=settings,
+        output=project / "results" / "written",
+    )
+    result = CliRunner().invoke(app, ["pool", str(path)])
+    assert result.exit_code == 0, result.output
+    out = project / "results" / "written"
+    summary = __import__("json").loads((out / "pooled_summary.json").read_text())
+    assert summary["samples"] == {"wt": ["wt_1", "wt_2"], "mut": ["mut_1"]}
+    assert summary["ensemble_msd"]["ensemble_n_points"] == 3
+    assert (out / "pooled_ensemble_msd_fits.csv").exists()

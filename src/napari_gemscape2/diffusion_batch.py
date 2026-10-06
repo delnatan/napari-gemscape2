@@ -27,6 +27,7 @@ from napari_gemscape2.diffusion import (
     base_track_table,
     filter_record,
     MSD_MAX_LAG,
+    MSD_MIN_LAG,
     msd_fits_blur_free,
     msd_track_table,
     passing_track_ids,
@@ -53,12 +54,21 @@ class DiffusionSettings:
     grid: dict = field(default_factory=dict)
     msd_comparison: bool = False
     msd_max_lag: int = MSD_MAX_LAG
+    # When set, replaces `msd_max_lag`: each track's MSD fits use this
+    # fraction of its own longest lag (the 25-40% rule, at least 3 lags).
+    msd_lag_fraction: Optional[float] = None
     # Overrides the bundle's recorded exposure. None: use the manifest's.
     exposure_s: Optional[float] = None
     # Which tracks `passes_filters` marks and the ensemble is over. Every
     # track is fitted either way, as the widget does by default.
     min_track_length: int = 1
     filters: FilterSpec = field(default_factory=dict)
+
+    def __post_init__(self):
+        if self.msd_lag_fraction is not None and not 0 < self.msd_lag_fraction <= 1:
+            raise ValueError(f"msd_lag_fraction must be in (0, 1], got {self.msd_lag_fraction}")
+        if self.msd_max_lag < MSD_MIN_LAG:
+            raise ValueError(f"msd_max_lag must be at least {MSD_MIN_LAG}, got {self.msd_max_lag}")
 
     @classmethod
     def names(cls) -> set[str]:
@@ -81,6 +91,7 @@ def settings_from_summary(summary: dict) -> dict:
         "grid": {k: v for k, v in summary["grid"].items() if k in GRID_FIELDS} if summary.get("grid") else None,
         "msd_comparison": summary.get("msd_comparison"),
         "msd_max_lag": summary.get("msd_max_lag"),
+        "msd_lag_fraction": summary.get("msd_lag_fraction"),
         "min_track_length": record.get("min_track_length"),
         "filters": (
             {col: tuple(bounds) for col, bounds in record["ranges"].items()}
@@ -183,7 +194,11 @@ def analyze_bundle(
         diffkit_tracks, Acquisition(dt_s=dt_s, exposure_s=exposure_s), settings.options(), progress=progress
     )
     msd = (
-        msd_track_table(msd_fits_blur_free(diffkit_tracks, dt_s, settings.min_frames, settings.msd_max_lag))
+        msd_track_table(
+            msd_fits_blur_free(
+                diffkit_tracks, dt_s, settings.min_frames, settings.msd_max_lag, settings.msd_lag_fraction
+            )
+        )
         if settings.msd_comparison
         else None
     )
@@ -195,7 +210,10 @@ def analyze_bundle(
     table = tracks_summary_table(
         base, results, result_id=result_dir.name, pixel_size_um=pixel_size_um, passing_ids=ids
     )
-    summary = analysis_summary(analysis, ids, by_class, msd_comparison=msd is not None, msd_max_lag=settings.msd_max_lag)
+    summary = analysis_summary(
+        analysis, ids, by_class, msd_comparison=msd is not None,
+        msd_max_lag=settings.msd_max_lag, msd_lag_fraction=settings.msd_lag_fraction,
+    )
     summary["tracks_summary_filters"] = filter_record(settings.min_track_length, settings.filters)
     import diffusionkit
     import napari_gemscape2

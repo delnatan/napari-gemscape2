@@ -63,8 +63,10 @@ other movies ticked in the dialog. That keeps the filter histograms'
 role: the cuts are chosen by looking at one movie, then reused, never
 set blind. The batch goes through the same `batch.detect_track_bundle`
 and `diffusion_batch.analyze_bundle` as the `gemscape2` CLI, and writes
-the CLI config that re-runs it. Pooling results across experiments is a
-script's job, over the saved bundles.
+the CLI config that re-runs it. "Pool analyses…" (`widgets/pool_dialog.py`)
+then pools the movies' saved analyses by sample, through the same
+`pooling.run_pooling` as `gemscape2 pool`, and likewise writes the config
+that re-runs it.
 
 Regions are painted per movie, so a folder can be masked first and
 batched after: leaving a row that has no results yet saves its mask to
@@ -185,6 +187,14 @@ from napari_gemscape2.widgets.batch_dialog import (
     run_batch_worker,
 )
 from napari_gemscape2.widgets.params_panel import PipelineParamsWidget
+from napari_gemscape2.widgets.pool_dialog import (
+    PoolDialog,
+    PoolEmitter,
+    PoolPlan,
+    has_saved_analysis,
+    pool_config_path,
+    run_pool_worker,
+)
 
 
 def _package_provenance() -> dict:
@@ -514,9 +524,21 @@ class ExperimentListWidget(QWidget):
             "saved diffusion analysis) over other movies in this folder."
         )
         self.batch_button.clicked.connect(self._open_batch_dialog)
+        self.pool_button = QPushButton("Pool analyses…")
+        self.pool_button.setToolTip(
+            "Pool the saved diffusion analyses of movies in this folder by\n"
+            "sample (replicates together): D by sample and how far apart the\n"
+            "samples are, against their replicates -- what `gemscape2 pool` does."
+        )
+        self.pool_button.clicked.connect(self._open_pool_dialog)
         button_row = QHBoxLayout()
         button_row.addWidget(self.open_button)
         button_row.addWidget(self.batch_button)
+        button_row.addWidget(self.pool_button)
+        # The last pooling's figures, one window each, reused.
+        self._pool_windows: dict = {}
+        self._pool_plan: Optional[PoolPlan] = None
+        self._pool_config_note = ""
         # The running batch: its plan, cancel flag and one line per movie
         # (shown when it ends). `self._worker` holds the worker itself, so
         # everything that waits on a step run also waits on a batch.
@@ -689,6 +711,7 @@ class ExperimentListWidget(QWidget):
         self.list_view.setEnabled(not running)
         self.open_button.setEnabled(not running)
         self.batch_button.setEnabled(not running)
+        self.pool_button.setEnabled(not running)
         self.params_panel.setEnabled(not running)
         self.batch_cancel_button.setVisible(running)
         self.batch_cancel_button.setEnabled(running)
@@ -753,6 +776,100 @@ class ExperimentListWidget(QWidget):
         self._finish_step_worker()
         self._set_batch_running(False)
         self._batch_plan = None
+
+    # -- Pool the saved analyses of several movies --
+
+    def _open_pool_dialog(self) -> None:
+        if self._worker is not None:
+            self.progress_label.setText("a run is in progress -- wait for it to finish")
+            return
+        entries = [
+            (item.entry.image_path, item.entry.result_dir)
+            for item in self.list_view.items()
+            if has_saved_analysis(item.entry.result_dir)
+        ]
+        if not entries:
+            QMessageBox.information(
+                self,
+                "Pool analyses",
+                "No movie in this folder has a saved diffusion analysis yet. Analyze one in the "
+                "Diffusion analysis widget and press Save analysis (or batch the others from it).",
+            )
+            return
+        dialog = PoolDialog(self.list_view.results_root, entries, parent=self)
+        if dialog.exec() != PoolDialog.DialogCode.Accepted:
+            return
+        self._start_pool(dialog.plan())
+
+    def _start_pool(self, plan: PoolPlan) -> None:
+        from napari_gemscape2.pooling import write_pool_config
+
+        if not plan.inputs:
+            return
+        self._pool_plan = plan
+        self._pool_config_note = ""
+        if plan.write_config:
+            config_path = pool_config_path(plan.results_root)
+            try:
+                plan.results_root.mkdir(parents=True, exist_ok=True)
+                write_pool_config(
+                    config_path,
+                    results_root=plan.results_root,
+                    inputs=[(image, result_dir.name, sample) for image, result_dir, sample in plan.inputs],
+                    settings=plan.settings,
+                    output=None if plan.out_dir == plan.results_root / "pooled" else plan.out_dir,
+                )
+                self._pool_config_note = f"\nconfig: {config_path.name}"
+            except Exception as exc:
+                self._pool_config_note = f"\n! config not written: {exc}"
+        emitter = PoolEmitter(self)
+        emitter.stage.connect(self.progress_label.setText)
+        worker = run_pool_worker(plan, emitter)
+        worker.finished.connect(emitter.deleteLater)
+        self._set_batch_running(True)
+        # Pooling has no checkpoints to stop at; it takes seconds per sample.
+        self.batch_cancel_button.setVisible(False)
+        self._start_step_worker(worker, self._on_pool_done, indeterminate=True, on_error=self._on_pool_error)
+
+    def _on_pool_done(self, result) -> None:
+        from qtkit.plot import PlotWindow
+
+        from napari_gemscape2.diffusion import ensemble_msd_panels
+        from napari_gemscape2.joint_plot import plot_ensemble_msd, plot_pooled_populations
+
+        plan = self._pool_plan
+        self._end_pool()
+        samples = result.summary["samples"]
+        self.progress_label.setText(
+            f"pooled {len(plan.inputs)} movies into {len(samples)} samples → {plan.out_dir}{self._pool_config_note}"
+        )
+        figures = [
+            (
+                "Pooled: D by sample",
+                plot_pooled_populations(
+                    result.distributions, result.distances, samples, result.summary["credible_level"]
+                ),
+            )
+        ]
+        if result.ensemble is not None:
+            settings = plan.settings
+            panels = ensemble_msd_panels(result.ensemble, settings.ensemble_n_points, settings.ensemble_offset)
+            figures.append(("Pooled: ensemble MSD", plot_ensemble_msd(panels)))
+        for title, figure in figures:
+            window = self._pool_windows.get(title)
+            if window is None:
+                window = self._pool_windows[title] = PlotWindow(title, parent=self)
+            window.show_figure(figure)
+
+    def _on_pool_error(self, exc: Exception) -> None:
+        self._end_pool()
+        self.progress_label.setText(f"pooling stopped: {exc}")
+        QMessageBox.warning(self, "Pool analyses", f"Pooling stopped: {exc}")
+
+    def _end_pool(self) -> None:
+        self._finish_step_worker()
+        self._set_batch_running(False)
+        self._pool_plan = None
 
     def _open_folder_dialog(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Select folder of timelapses")

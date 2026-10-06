@@ -21,7 +21,6 @@ from napari_gemscape2.results import (
     load_diffusion_summary,
     load_manifest,
     package_provenance,
-    write_pooled_results,
 )
 from napari_gemscape2.pipeline import (
     DetectTrackParams,
@@ -183,6 +182,7 @@ def diffusion(
         grid = { D_min_um2_s = 1e-5, D_max_um2_s = 10.0, n_D = 601 }
         msd_comparison = false
         msd_max_lag = 3         # lags the MSD fits use (>= 3)
+        # msd_lag_fraction = 0.3  # or: each track's first 30% of lags (replaces msd_max_lag)
         exposure_s = 0.01       # optional: overrides each bundle's recorded one
         min_track_length = 1    # which tracks pass (passes_filters, ensemble)
         filters = { D_median_um2_s = [0.001, inf], flux_mean = [800.0, inf] }
@@ -210,6 +210,9 @@ def diffusion(
             inherited = settings_from_summary(saved)
             _describe_template(template, inherited, diff_cfg)
     settings_cfg = {**inherited, **diff_cfg}
+    if "msd_max_lag" in diff_cfg and "msd_lag_fraction" not in diff_cfg:
+        # Lags asked for here replace a fraction the template was saved with.
+        settings_cfg.pop("msd_lag_fraction", None)
     if isinstance(diff_cfg.get("grid"), dict):
         settings_cfg["grid"] = {**inherited.get("grid", {}), **diff_cfg["grid"]}
     try:
@@ -277,14 +280,7 @@ def pool(
         ensemble_offset = "provided"   # or "fit": the intercept of the linear fit (no SDs used)
     A bundle without a saved or current analysis stops the pooling: a missing replicate would bias it.
     """
-    from napari_gemscape2.diffusion import grid_record
-    from napari_gemscape2.pooling import (
-        PoolSettings,
-        load_pooled_bundle,
-        pooled_batch,
-        pooled_ensemble_msd,
-        population_tables,
-    )
+    from napari_gemscape2.pooling import PoolSettings, load_pooled_bundle, n_pooled, run_pooling, write_pool
 
     cfg, base = _load_config(config)
     results_root = _resolve(base, cfg.get("results_root", "results"))
@@ -311,48 +307,15 @@ def pool(
             typer.echo(f"  ! {line}")
         raise typer.Exit(code=1)
     for b in bundles:
-        n = len(b.analysis.fitted_ids) if b.passing_ids is None else len(set(b.analysis.fitted_ids.tolist()) & b.passing_ids)
-        typer.echo(f"[{b.result_id}] sample {b.sample}: {n} fitted tracks pooled")
+        typer.echo(f"[{b.result_id}] sample {b.sample}: {n_pooled(b)} fitted tracks pooled")
 
     try:
-        batch = pooled_batch(bundles)
-        distributions, distances = population_tables(batch, bundles[0].analysis.level)
-        ens = fits = None
-        if settings.ensemble_msd:
-            ens, fits = pooled_ensemble_msd(bundles, settings)
+        result = run_pooling(bundles, settings)
     except ValueError as exc:
         typer.echo(f"  ! {exc}")
         raise typer.Exit(code=1) from exc
-
-    import diffusionkit
-    import napari_gemscape2
-
-    samples: dict[str, list[str]] = {}
-    for b in bundles:
-        samples.setdefault(b.sample, []).append(b.result_id)
-    summary = {
-        "analysis": "diffusionkit.gridpost populations pooled over saved posteriors (flat prior in ln D)",
-        "samples": samples,
-        "credible_level": bundles[0].analysis.level,
-        "grid": grid_record(bundles[0].analysis.options),
-        "tracks_pooled": "those that passed each bundle's saved filters",
-        "ensemble_msd": (
-            {**{k: v for k, v in vars(settings).items() if k != "ensemble_msd"}, "exposure": "treated as 0 (no blur model)",
-             "weight": "pairs", "resample": "track"}
-            if settings.ensemble_msd
-            else None
-        ),
-        "packages": package_provenance(diffusionkit, napari_gemscape2),
-    }
-    write_pooled_results(
-        out_dir,
-        distributions_D=distributions,
-        distances_D=distances,
-        summary=summary,
-        ensemble_msd=None if ens is None else ens.curves,
-        ensemble_msd_fits=fits,
-    )
-    typer.echo(f"  -> {out_dir}  ({len(samples)} samples, {len(bundles)} bundles)")
+    write_pool(out_dir, result)
+    typer.echo(f"  -> {out_dir}  ({len(result.summary['samples'])} samples, {len(bundles)} bundles)")
 
 
 @app.command("view")

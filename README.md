@@ -355,6 +355,8 @@ min_frames = 3          # shortest track fitted
 grid = { D_min_um2_s = 1e-5, D_max_um2_s = 10.0, n_D = 601 }
 msd_comparison = false
 msd_max_lag = 3         # lags the MSD fits use (at least 3)
+# msd_lag_fraction = 0.3  # or: each track's first 30% of lags (at least 3);
+#                         # replaces msd_max_lag, so longer tracks fit more lags
 exposure_s = 0.01       # optional: overrides each bundle's recorded exposure
 # Which tracks pass (`passes_filters`) and so make up the ensemble -- the
 # diffusion widget's tracks-pane cuts, on any per-track column.
@@ -370,6 +372,12 @@ data. A config that still sets `deconvolution` is rejected as an unknown key.
 the widget like any other.
 
 ### Pooling replicates: `gemscape2 pool`
+
+In the widget, **Pool analyses…** in the experiment list does the same over the
+folder's movies that have a saved analysis: name each one's sample (*Samples
+from names* takes a trailing replicate number off: `wt_1`, `wt_2` → `wt`), and
+it writes the tables below, a `pool.toml` that re-runs it headless, and shows D
+by sample beside the distances between samples and between replicates.
 
 Replicates of one sample are pooled from what `diffusion` saved: each
 bundle's posteriors and the filters it was saved with are read back, so
@@ -473,10 +481,25 @@ The **Posteriors** plot shows every track's posterior as one row of a heat map,
 sorted by median, beside the *mean* of the tracks' posteriors, the histogram of
 medians and the deconvolved distribution. The plots and summary follow the
 filters without a re-run; each group's deconvolution takes a second or two, on
-a worker thread, so they update shortly after a change. MSD fits are a labelled opt-in comparison; the **Track** plot shows the
-selected track's posterior; the **Map** tab colors each track's localizations by
-any result; the **NUTS** tab fits the selected track's full posterior with the same
-exposure (needs `--extra bayes`).
+a worker thread, so they update shortly after a change. The **Track** plot shows
+the selected track's posterior; the **Map** tab colors each track's localizations
+by any result; the **NUTS** tab fits the selected track's full posterior with the
+same exposure (needs `--extra bayes`).
+
+The classical MSD analysis is a labelled comparison, run with the exposure
+treated as 0 (diffusionkit's MSD estimators have no blur model):
+
+- **MSD** (a Run option) fits each track's time-averaged MSD over a window that
+  is either a fixed number of lags or a share of each track's own lags (the
+  usual 25–40% rule, never under 3), adding `D_msd`/`α_msd` columns. Its plot
+  shows the selected track's MSD with the fits, and a linear fit with a free
+  intercept, whose localization SD is a check on the SDs.
+- **Ensemble MSD** needs no run: the MSDs of the tracks the filters pass are
+  averaged per region class, each squared displacement counting once, and
+  fitted for D (linear) and α (log-log) over the first lags you choose, with
+  intervals from resampling whole tracks. The offset is the SDs' or the linear
+  fit's intercept. A mix of slow and fast tracks averages to one curve, which
+  the deconvolved distribution would show as two.
 
 Opening a bundle with a saved analysis — saved from the widget, a batch, or
 `gemscape2 diffusion` — restores it: plots, per-track columns, filters and

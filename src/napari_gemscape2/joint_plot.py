@@ -43,6 +43,7 @@ import polars as pl
 import seaborn as sns
 from matplotlib.colors import LinearSegmentedColormap, LogNorm, Normalize
 from matplotlib.figure import Figure
+from matplotlib.ticker import FuncFormatter, LogLocator, MaxNLocator, NullFormatter
 
 from napari_gemscape2 import units
 
@@ -531,14 +532,20 @@ def plot_track_msd(
     D_um2_s: float | None = None,
     K_um2_s_alpha: float | None = None,
     alpha: float | None = None,
+    D_linear_um2_s: float | None = None,
+    offset_fit_um2: float | None = None,
+    sigma_fit_um: float | None = None,
+    sigma_sds_um: float | None = None,
     **_unused,
 ) -> Figure:
     """One track's time-averaged MSD against lag -- the raw, noisy values
     the MSD fits see -- with the Brownian and power-law fits drawn over
-    them (each plus the localization offset it was fitted net of). The
-    last lags average few displacements and scatter most; that scatter is
-    why the posterior, not this curve, is the estimate."""
-    fig = Figure(figsize=(4.2, 2.8), layout="constrained")
+    them (each plus the localization offset it was fitted net of), and the
+    linear fit with a free intercept, which reads the offset off the curve
+    instead of the SDs. The last lags average few displacements and
+    scatter most; that scatter is why the posterior, not this curve, is the
+    estimate."""
+    fig = Figure(figsize=(4.4, 3.0), layout="constrained")
     ax = fig.subplots()
     _style_axis(ax)
     tau = np.asarray(tau_s)
@@ -546,18 +553,236 @@ def plot_track_msd(
     # The offset is known only at the measured lags, so the fits are drawn
     # through them rather than on a finer curve.
     if D_um2_s is not None:
-        ax.plot(tau, 4 * D_um2_s * tau + offset_um2, "-", color=_SHARED_COLOR, lw=1.4, label="linear (D)")
+        ax.plot(tau, 4 * D_um2_s * tau + offset_um2, "-", color=_SHARED_COLOR, lw=1.4, label="linear (D), SDs' offset")
     if K_um2_s_alpha is not None and alpha is not None:
         ax.plot(tau, 4 * K_um2_s_alpha * tau**alpha + offset_um2, "--", color=_DECONVOLVED_COLOR, lw=1.4,
                 label=f"power law (α = {alpha:.2f})")
+    if D_linear_um2_s is not None and offset_fit_um2 is not None:
+        # Drawn from τ = 0, where it meets its intercept: the offset it fitted.
+        t = np.concatenate([[0.0], tau])
+        ax.plot(t, 4 * D_linear_um2_s * t + offset_fit_um2, ":", color=_MEAN_POSTERIOR_COLOR, lw=1.6,
+                label=f"linear, fitted offset (D = {D_linear_um2_s:.3g})")
     ax.set_xlim(left=0)
     ax.set_ylim(bottom=0)
     ax.set_xlabel("lag τ (s)", fontsize=9)
     ax.set_ylabel("MSD (µm²)", fontsize=9)
-    ax.legend(fontsize=7, frameon=False, loc="upper left")
+    # An MSD rises left to right, so the lower right stays clear.
+    ax.legend(fontsize=7, frameon=False, loc="lower right")
     head = f"track {track_id} · {n_frames} frames"
     fit = f"D_msd = {D_um2_s:.3g} µm²/s · " if D_um2_s is not None else ""
-    ax.set_title(f"{head}\n{fit}{len(tau)} lags (last: {int(n_pairs[-1])} pairs)", fontsize=9, loc="left", color=_INK)
+    lines = [head, f"{fit}{len(tau)} lags (last: {int(n_pairs[-1])} pairs)"]
+    sigmas = [f"SDs {1000 * sigma_sds_um:.0f} nm"] if sigma_sds_um is not None else []
+    if sigma_fit_um is not None:
+        sigmas.append(f"intercept {1000 * sigma_fit_um:.0f} nm")
+    elif offset_fit_um2 is not None and offset_fit_um2 < 0:
+        sigmas.append("intercept < 0, none")
+    if sigmas:
+        lines.append("localization σ: " + " · ".join(sigmas))
+    ax.set_title("\n".join(lines), fontsize=9, loc="left", color=_INK)
+    return fig
+
+
+def _with_interval(value, low, high, fmt: str = ".3g") -> str:
+    """`value [low–high]`, the interval left off when it was not estimated."""
+    if value is None:
+        return "—"
+    if low is None or high is None:
+        return f"{value:{fmt}}"
+    return f"{value:{fmt}} [{low:{fmt}}–{high:{fmt}}]"
+
+
+def _msd_points(ax, tau, y, yerr, inside) -> None:
+    """Ensemble MSD points: filled inside the fit window, hollow past it."""
+    yerr = np.asarray(yerr, float)
+    for mask, face, label in ((inside, _INK, "fit window"), (~inside, "white", "past the window")):
+        if mask.any():
+            err = yerr[..., mask]
+            ax.errorbar(tau[mask], y[mask], yerr=None if np.isnan(err).all() else err, fmt="o", ms=4, color=_INK,
+                        mfc=face, mec=_INK, ecolor=_MUTED_INK, elinewidth=0.8, capsize=0, zorder=3,
+                        label=f"ensemble MSD, {label}")
+
+
+def _fit_line(ax, t, y, n_solid: int, color: str, style: str, label: str) -> None:
+    """A fit drawn `style` over its window (the first `n_solid` points) and dotted past it."""
+    ax.plot(t[:n_solid], y[:n_solid], style, color=color, lw=1.5, label=label)
+    if n_solid < len(t):
+        ax.plot(t[n_solid - 1:], y[n_solid - 1:], ":", color=color, lw=1.1)
+
+
+def _plain_log_ticks(ax) -> None:
+    """Log axes labelled at 1, 2 and 5 per decade as plain numbers: an MSD
+    curve spans a decade or two, where matplotlib's default labels every
+    minor tick in scientific notation and they run into each other."""
+    plain = FuncFormatter(lambda v, _pos: f"{v:g}")
+    for axis in (ax.xaxis, ax.yaxis):
+        axis.set_major_locator(LogLocator(base=10, subs=(1.0, 2.0, 5.0)))
+        axis.set_major_formatter(plain)
+        axis.set_minor_formatter(NullFormatter())
+
+
+def _nm(value_um):
+    return None if value_um is None else 1000 * value_um
+
+
+def plot_ensemble_msd(panels: list[dict], title: str | None = None) -> Figure:
+    """The ensemble-averaged MSD of each group (`diffusion.ensemble_msd_panels`),
+    one row per group: on linear axes with the linear fit that gives D, and
+    on log-log axes net of the localization offset, with the power law that
+    gives α. The fit window (the first `n_points` lags) is filled and its
+    fits solid; the lags past it are hollow and the fits continue dotted, so
+    where the curve leaves the model shows. Error bars are ±1 bootstrap SD
+    of the averaged curve; the intervals in the text are the fits' own."""
+    fig = Figure(figsize=(8.6, 0.7 + 2.7 * len(panels)), layout="constrained")
+    axes = fig.subplots(len(panels), 2, sharex="col", squeeze=False)
+    for row, p in enumerate(panels):
+        tau, msd, se, off = p["tau_s"], p["msd_um2"], p["se_um2"], p["offset_um2"]
+        k = min(p["n_points"], len(tau))
+        inside = np.arange(len(tau)) < k
+        lin, pw = p["linear"], p["power_law"]
+        ax_lin, ax_log = axes[row]
+        for ax in (ax_lin, ax_log):
+            _style_axis(ax)
+
+        # Linear axes: D. The SDs' offset is known per lag only, so that line
+        # runs through the lags; a fitted intercept is drawn from τ = 0.
+        _msd_points(ax_lin, tau, msd, se, inside)
+        D = lin.get("D_um2_s")
+        if D is not None and p["offset"] == "fit" and lin.get("offset_um2") is not None:
+            t = np.concatenate([[0.0], tau])
+            _fit_line(ax_lin, t, 4 * D * t + lin["offset_um2"], k + 1, _SHARED_COLOR, "-", "linear (D), fitted offset")
+        elif D is not None:
+            _fit_line(ax_lin, tau, 4 * D * tau + off, k, _SHARED_COLOR, "-", "linear (D), SDs' offset")
+        text = [f"D = {_with_interval(D, lin.get('D_um2_s_lo'), lin.get('D_um2_s_hi'))} µm²/s"]
+        if p["offset"] == "fit":
+            sigma = _with_interval(_nm(lin.get("localization_sd_um")), _nm(lin.get("localization_sd_um_lo")),
+                                   _nm(lin.get("localization_sd_um_hi")), ".0f")
+            text.append(f"σ = {sigma} nm")
+        if lin.get("status") not in (None, "ok"):
+            text.append(f"{lin['status']}: {lin.get('message')}")
+        ax_lin.text(0.02, 0.97, "\n".join(text), transform=ax_lin.transAxes, va="top", ha="left", fontsize=8,
+                    color=_INK)
+        ax_lin.set_xlim(left=0)
+        ax_lin.set_ylim(bottom=0)
+        ax_lin.set_ylabel("MSD (µm²)", fontsize=9)
+        ax_lin.set_title(f"{p['name']} · {p['n_tracks']} tracks · fit over {k} lags", fontsize=9, loc="left",
+                         color=_INK)
+
+        # Log-log axes: α, net of the offset. Lags with nothing left after it
+        # cannot be logged, and are left out here as the fit leaves them out.
+        net = msd - off
+        keep = net > 0
+        # The lower bar stops short of zero, which a log axis cannot show.
+        _msd_points(ax_log, tau[keep], net[keep], [np.minimum(se, 0.999 * net)[keep], se[keep]], inside[keep])
+        K, alpha = pw.get("K_um2_s_alpha"), pw.get("alpha")
+        if K is not None and alpha is not None:
+            _fit_line(ax_log, tau, 4 * K * tau**alpha, k, _DECONVOLVED_COLOR, "--", "power law (α)")
+        ax_log.set_xscale("log")
+        ax_log.set_yscale("log")
+        _plain_log_ticks(ax_log)
+        ax_log.set_ylabel("MSD − offset (µm²)", fontsize=9)
+        text = [f"α = {_with_interval(alpha, pw.get('alpha_lo'), pw.get('alpha_hi'), '.2f')}"]
+        if pw.get("status") not in (None, "ok"):
+            text.append(f"{pw['status']}: {pw.get('message')}")
+        ax_log.text(0.02, 0.97, "\n".join(text), transform=ax_log.transAxes, va="top", ha="left", fontsize=8,
+                    color=_INK)
+        if row == 0:
+            for ax in (ax_lin, ax_log):
+                ax.legend(fontsize=7, frameon=False, loc="lower right")
+    for ax in axes[-1]:
+        ax.set_xlabel("lag τ (s)", fontsize=9)
+    if title is None:
+        offset_rule = "offset fitted (intercept)" if panels[0]["offset"] == "fit" else "offset from the SDs"
+        title = (
+            f"Ensemble-averaged MSD, pair-weighted · {offset_rule} · exposure treated as 0 (no blur model)\n"
+            f"bars ±1 bootstrap SD · intervals {panels[0]['level']:.0%}, bootstrap over tracks"
+        )
+    fig.suptitle(title, fontsize=8, x=0.01, ha="left", color=_MUTED_INK)
+    return fig
+
+
+# Samples are identities compared on one axis, so -- unlike region classes,
+# which get a panel each -- they are hues, in this fixed order (validated
+# for adjacent lines; the first three carry the posterior figures' roles).
+_SAMPLE_COLORS = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948")
+
+
+def plot_pooled_populations(
+    distributions: pl.DataFrame, distances: pl.DataFrame, samples: dict[str, list[str]], level: float
+) -> Figure:
+    """`pooling.population_tables` drawn: each sample's D distribution as a
+    CDF with its `level` band (each replicate's own CDF thin, in its
+    sample's color), and the W1 distance in ln D between every pair of
+    samples beside the distances between replicates of one sample.
+    `samples` maps each sample to its bundles. Two draws of one population
+    are still apart, so a sample pair reads against the replicate pairs'
+    spread (shaded), not against zero. Samples past the eighth color are
+    left to the tables, with a note."""
+    by_sample = distributions.filter(pl.col("by") == "sample")
+    names = list(dict.fromkeys(by_sample["group"].to_list()))
+    shown = names[: len(_SAMPLE_COLORS)]
+    color = dict(zip(shown, _SAMPLE_COLORS))
+    sample_of = {bundle: sample for sample, bundles in samples.items() for bundle in bundles}
+    pairs = distances.filter(
+        (pl.col("by") == "sample") | ((pl.col("by") == "experiment") & pl.col("same_sample").fill_null(False))
+    )
+    fig = Figure(figsize=(9.6, max(3.6, 1.4 + 0.24 * pairs.height)), layout="constrained")
+    ax_cdf, ax_dist = fig.subplots(1, 2, width_ratios=(1.15, 1))
+    for ax in (ax_cdf, ax_dist):
+        _style_axis(ax)
+
+    spans = []
+    for i, name in enumerate(shown):
+        rows = by_sample.filter(pl.col("group") == name)
+        D, cdf = rows["D_um2_s"].to_numpy(), rows["cumulative"].to_numpy()
+        ax_cdf.fill_between(D, rows["cumulative_low"].to_numpy(), rows["cumulative_high"].to_numpy(),
+                            color=color[name], alpha=0.2, lw=0)
+        ax_cdf.plot(D, cdf, color=color[name], lw=2, label=f"{name} · {rows['n_tracks'][0]} tracks")
+        spans.append(_mass_range(rows["deconvolved"].to_numpy(), np.log10(D), tail=0.005))
+        # A direct label on each curve, each at its own height so none collide.
+        y = 0.2 + 0.6 * (i + 0.5) / len(shown)
+        j = min(int(np.searchsorted(cdf, y)), len(D) - 1)
+        ax_cdf.annotate(name, (D[j], y), xytext=(5, 0), textcoords="offset points", fontsize=8, color=_INK,
+                        va="center")
+    for (bundle,), rows in distributions.filter(pl.col("by") == "experiment").group_by("group", maintain_order=True):
+        if sample_of.get(bundle) in color:
+            ax_cdf.plot(rows["D_um2_s"].to_numpy(), rows["cumulative"].to_numpy(), color=color[sample_of[bundle]],
+                        lw=0.8, alpha=0.7)
+    ax_cdf.set_xscale("log")
+    _plain_log_ticks(ax_cdf)
+    ax_cdf.yaxis.set_major_locator(MaxNLocator(5))
+    ax_cdf.yaxis.set_major_formatter(FuncFormatter(lambda v, _pos: f"{v:g}"))
+    if spans:
+        ax_cdf.set_xlim(10 ** (min(lo for lo, _ in spans) - _LOG_D_PAD), 10 ** (max(hi for _, hi in spans) + _LOG_D_PAD))
+    ax_cdf.set_ylim(0, 1)
+    ax_cdf.set_xlabel("D (µm²/s)", fontsize=9)
+    ax_cdf.set_ylabel("fraction of tracks below D", fontsize=9)
+    ax_cdf.legend(fontsize=7, frameon=False, loc="upper left")
+    replicates_drawn = distributions.filter(pl.col("by") == "experiment").height > 0
+    note = f"band {level:.0%} · every track weighs the same" + (" · thin: each replicate" if replicates_drawn else "")
+    if len(names) > len(shown):
+        note += f" · {len(names) - len(shown)} more samples in the tables only"
+    ax_cdf.set_title(f"D by sample, deconvolved\n{note}", fontsize=9, loc="left", color=_INK)
+
+    labels = []
+    for y, row in enumerate(pairs.iter_rows(named=True)):
+        replicate = row["by"] == "experiment"
+        tone = _MUTED_INK if replicate else _INK
+        ax_dist.plot([row["W1_ln_D_low"], row["W1_ln_D_high"]], [y, y], color=tone, lw=1.4)
+        ax_dist.plot(row["W1_ln_D_median"], y, "o", ms=5, color=tone, mfc="white" if replicate else tone, zorder=3)
+        labels.append(f"{row['a']} – {row['b']}" + (f"  ({sample_of.get(row['a'], '?')})" if replicate else ""))
+    within = pairs.filter(pl.col("by") == "experiment")
+    if within.height:
+        ax_dist.axvspan(within["W1_ln_D_low"].min(), within["W1_ln_D_high"].max(), color=_HIST_COLOR, alpha=0.4,
+                        lw=0, label="replicates' spread")
+        ax_dist.legend(fontsize=7, frameon=False, loc="lower right")
+    ax_dist.set_yticks(range(len(labels)), labels, fontsize=8)
+    ax_dist.set_ylim(len(labels) - 0.5, -0.5)
+    ax_dist.set_xlim(left=0)
+    ax_dist.set_xlabel("W1 distance in ln D", fontsize=9)
+    ax_dist.set_title(
+        f"How far apart (median, {level:.0%} interval)\nfilled: two samples · hollow: two replicates of one",
+        fontsize=9, loc="left", color=_INK,
+    )
     return fig
 
 

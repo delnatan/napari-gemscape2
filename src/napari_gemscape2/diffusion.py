@@ -56,8 +56,17 @@ from typing import Callable, Optional
 
 import numpy as np
 import polars as pl
-from diffusionkit import Acquisition
-from diffusionkit.classic import MSDOptions, compute_msd, fit_anomalous_msd, fit_brownian_msd
+from diffusionkit import Acquisition, Experiment
+from diffusionkit.classic import (
+    EnsembleMSD,
+    MSDOptions,
+    analyze_experiments,
+    compute_msd,
+    ensemble_msd,
+    fit_anomalous_msd,
+    fit_brownian_msd,
+    fit_linear_msd,
+)
 from diffusionkit.classic import analyze_tracks as analyze_msd
 from diffusionkit.gridpost import GridPosteriors, GridPostOptions, LengthComposition, by_track_length
 from diffusionkit.gridpost import analyze_tracks as dk_analyze_tracks
@@ -797,41 +806,71 @@ def length_distributions_table(
 # law needs three lags, so that is also the least.
 MSD_MAX_LAG = 3
 MSD_MIN_LAG = 3
+# The other window: a fraction of each track's own longest lag, the usual
+# 25-40% rule (diffusionkit's `window_lags`, never under MSD_MIN_LAG lags).
+MSD_LAG_FRACTION = 0.3
 
 
-def msd_options(min_frames: int, max_lag: int = MSD_MAX_LAG) -> MSDOptions:
+def msd_options(min_frames: int, max_lag: int = MSD_MAX_LAG, lag_fraction: Optional[float] = None) -> MSDOptions:
+    """The per-track MSD window: `max_lag` lags, or -- when `lag_fraction`
+    is set, which replaces it -- that fraction of each track's longest lag,
+    so a longer track fits more of its curve."""
+    if lag_fraction is not None:
+        return MSDOptions(max_lag=None, lag_fraction=lag_fraction, min_frames=max(min_frames, 5), localization="provided")
     return MSDOptions(max_lag=max(max_lag, MSD_MIN_LAG), min_frames=max(min_frames, 5), localization="provided")
 
 
+def msd_window_text(max_lag: int, lag_fraction: Optional[float]) -> str:
+    """The window as a reader sees it: "3 lags" or "30% of each track"."""
+    return f"{lag_fraction:.0%} of each track" if lag_fraction is not None else f"{max_lag} lags"
+
+
 def msd_fits_blur_free(
-    tracks: pl.DataFrame, dt_s: float, min_frames: int, max_lag: int = MSD_MAX_LAG
+    tracks: pl.DataFrame,
+    dt_s: float,
+    min_frames: int,
+    max_lag: int = MSD_MAX_LAG,
+    lag_fraction: Optional[float] = None,
 ) -> pl.DataFrame:
     """diffusionkit.classic's MSD fits of `tracks_to_diffusionkit_df`'s
-    table, for comparison with the posteriors.
+    table, for comparison with the posteriors, over `msd_options`' window.
 
     The MSD fits have no blur model, so diffusionkit excludes them when
     `exposure_s > 0`; the comparison therefore runs them with the exposure
     treated as 0, which is exactly the assumption that biases them, and is
     labelled as such wherever it shows."""
-    return analyze_msd(tracks, Acquisition(dt_s=dt_s), msd_options(min_frames, max_lag)).fits
+    return analyze_msd(tracks, Acquisition(dt_s=dt_s), msd_options(min_frames, max_lag, lag_fraction)).fits
 
 
 def msd_track_curve(
-    tracks: pl.DataFrame, dt_s: float, track_id: int, min_frames: int, max_lag: int = MSD_MAX_LAG
+    tracks: pl.DataFrame,
+    dt_s: float,
+    track_id: int,
+    min_frames: int,
+    max_lag: int = MSD_MAX_LAG,
+    lag_fraction: Optional[float] = None,
 ) -> Optional[dict]:
     """One track's time-averaged MSD against lag, for
     `joint_plot.plot_track_msd`: the raw values (noisy, each lag's mean
     over that track's own displacements), the localization offset the fits
     subtract, and `fit_brownian_msd` / `fit_anomalous_msd`'s curves on the
-    same lags. None if the track is absent or too short."""
+    same lags. Also `fit_linear_msd`'s, whose free intercept is the offset
+    read off the curve itself rather than from the SDs: the two
+    localization SDs (`sigma_sds_um`, `sigma_fit_um`) disagreeing is a
+    sign the SDs are miscalibrated -- or that three noisy lags cannot pin
+    an intercept, which is why the comparison's own D does not use it.
+    None if the track is absent or too short."""
     track = tracks.filter(pl.col("track_id") == track_id).sort("frame")
-    options = msd_options(min_frames, max_lag)
+    options = msd_options(min_frames, max_lag, lag_fraction)
     if track.height < options.min_frames:
         return None
     curve = compute_msd(track, Acquisition(dt_s=dt_s), options)
     corrected = curve.msd_um2 - curve.localization_offset_um2
     brownian = fit_brownian_msd(curve).parameters.get("D_um2_s")
     power = fit_anomalous_msd(curve, max_nfev=options.max_nfev).parameters
+    linear = fit_linear_msd(curve).parameters
+    # The SDs' offset is 4 sigma^2 for an isotropic 2-D error.
+    offset_sds = float(np.mean(curve.localization_offset_um2))
     return {
         "track_id": track_id,
         "n_frames": track.height,
@@ -842,6 +881,10 @@ def msd_track_curve(
         "D_um2_s": brownian,
         "K_um2_s_alpha": power.get("K_um2_s_alpha"),
         "alpha": power.get("alpha"),
+        "D_linear_um2_s": linear.get("D_um2_s"),
+        "offset_fit_um2": linear.get("offset_um2"),
+        "sigma_fit_um": linear.get("localization_sd_um"),
+        "sigma_sds_um": float(np.sqrt(offset_sds / 4)) if offset_sds >= 0 else None,
         "corrected_um2": corrected,
     }
 
@@ -859,6 +902,78 @@ def msd_track_table(fits: pl.DataFrame) -> pl.DataFrame:
         pl.col("alpha").alias("alpha_msd"),
     )
     return brownian.join(power_law, on="track_id", how="full", coalesce=True)
+
+
+# --- the ensemble-averaged MSD ------------------------------------------
+
+# Where the ensemble fit's localization offset comes from: the tracks' SDs
+# ("provided": D through the origin of the offset-corrected curve), or the
+# intercept of a linear fit to the raw curve ("fit", no SDs used).
+ENSEMBLE_MSD_OFFSETS = ("provided", "fit")
+# Bootstrap resamples of whole tracks behind the ensemble MSD's intervals.
+ENSEMBLE_MSD_BOOT = 200
+
+
+def ensemble_msd_blur_free(
+    experiments: list[Experiment], min_frames: int, max_lag: int, n_boot: int = ENSEMBLE_MSD_BOOT
+) -> EnsembleMSD:
+    """diffusionkit's ensemble-averaged MSD of each `sample` among
+    `experiments`: every track's time-averaged MSD to `max_lag`, averaged
+    so each squared displacement counts once (pair-weighted), with `n_boot`
+    resamples of whole tracks for the intervals. The experiments'
+    acquisitions carry no exposure: as in the per-track comparison, the MSD
+    estimators have no blur model, so the exposure is treated as 0."""
+    options = MSDOptions(max_lag=max_lag, min_frames=max(min_frames, 5), localization="provided")
+    return ensemble_msd(analyze_experiments(experiments, options), "sample", n_boot=n_boot)
+
+
+def group_experiments(tracks: pl.DataFrame, dt_s: float, groups: dict[str, Optional[set]]) -> list[Experiment]:
+    """One blur-free `Experiment` per group of one movie's tracks
+    (`tracks_to_diffusionkit_df`'s table; ids None = all), named and
+    sampled after the group, for `ensemble_msd_blur_free`. Empty groups
+    are left out."""
+    out = []
+    for name, ids in groups.items():
+        rows = tracks if ids is None else tracks.filter(pl.col("track_id").is_in(list(ids)))
+        if rows.height:
+            out.append(Experiment(str(name), rows, Acquisition(dt_s=dt_s), str(name)))
+    return out
+
+
+def ensemble_msd_panels(ens: EnsembleMSD, n_points: int, offset: str, level: float = LEVEL) -> list[dict]:
+    """What `joint_plot.plot_ensemble_msd` draws, one dict per group: the
+    averaged curve (`tau_s`, `msd_um2`, its bootstrap SD `se_um2`, and
+    `n_units`, the tracks reaching each lag), the offset the fits took off
+    (`offset_um2`, per lag), and `EnsembleMSD.fit`'s rows over the first
+    `n_points` lags (`linear`, `power_law`) with their `level` intervals.
+    Raises ValueError when a group's curve has fewer than `n_points` lags."""
+    fits = ens.fit(n_points, offset, level=level)
+    panels = []
+    for name, curve in ens.means.items():
+        rows = {r["model"]: r for r in fits.filter(pl.col("group") == name).iter_rows(named=True)}
+        linear = rows.get("linear") or rows.get("brownian") or {}
+        if offset == "fit":
+            # The power law is fitted net of the intercept, clipped at 0.
+            b = linear.get("offset_um2")
+            offsets = np.full(len(curve.lag), max(b, 0.0) if b is not None else 0.0)
+        else:
+            offsets = np.asarray(curve.localization_offset_um2, float)
+        table = ens.curves.filter(pl.col("group") == name).sort("lag")
+        panels.append({
+            "name": name,
+            "n_tracks": ens.n_units[name],
+            "n_points": n_points,
+            "offset": offset,
+            "level": level,
+            "tau_s": np.asarray(curve.tau_s, float),
+            "msd_um2": np.asarray(curve.msd_um2, float),
+            "se_um2": table["msd_se_um2"].fill_null(np.nan).to_numpy(),
+            "n_units": table["n_units"].to_numpy(),
+            "offset_um2": offsets,
+            "linear": linear,
+            "power_law": rows.get("power_law") or {},
+        })
+    return panels
 
 
 # --- the per-track summary ----------------------------------------------
@@ -1002,6 +1117,7 @@ def analysis_summary(
     *,
     msd_comparison: bool,
     msd_max_lag: Optional[int] = None,
+    msd_lag_fraction: Optional[float] = None,
 ) -> dict:
     """`diffusion_summary.json`'s settings and population numbers (the
     caller adds the filter record and provenance). Flat keys with units in
@@ -1018,7 +1134,14 @@ def analysis_summary(
         "grid": grid_record(analysis.options),
         "D_grid_um2_s": [float(analysis.D_grid_um2_s[0]), float(analysis.D_grid_um2_s[-1]), analysis.options.n_D],
         "msd_comparison": msd_comparison,
-        **({"msd_max_lag": msd_max_lag} if msd_comparison and msd_max_lag else {}),
+        # The window: a fraction of each track when one was set, else lags.
+        **(
+            {"msd_lag_fraction": msd_lag_fraction}
+            if msd_comparison and msd_lag_fraction is not None
+            else {"msd_max_lag": msd_max_lag}
+            if msd_comparison and msd_max_lag
+            else {}
+        ),
         "tracks_sha256": analysis.tracks_sha256,
         **summarize(analysis, ids),
     }
