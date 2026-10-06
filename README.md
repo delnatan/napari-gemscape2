@@ -290,6 +290,7 @@ Headless batch run (see `pyproject.toml`'s `[project.scripts]` entry `gemscape2`
 ```
 gemscape2 detect-track config.toml   # detect + track every input
 gemscape2 diffusion config.toml      # then the diffusion analysis of each bundle
+gemscape2 pool config.toml           # then pool replicates by sample
 ```
 
 Both read the same config. Relative paths in it are read from the config's
@@ -363,6 +364,65 @@ data. A config that still sets `deconvolution` is rejected as an unknown key.
 `gemscape2 diffusion` writes the same files as the widget's *Save analysis*
 (see "Reproducible results bundles"), so a bundle analyzed headless reopens in
 the widget like any other.
+
+### Pooling replicates: `gemscape2 pool`
+
+Replicates of one sample are pooled from what `diffusion` saved: each
+bundle's posteriors and the filters it was saved with are read back, so
+nothing is refitted and only tracks that passed those filters are pooled.
+Give the replicates a shared `sample` (default: the bundle's own name), and
+optionally a `[pool]` table:
+
+```toml
+[[inputs]]
+path = "data/wt_1.tif"
+sample = "wt"
+
+[[inputs]]
+path = "data/wt_2.tif"
+sample = "wt"
+
+[[inputs]]
+path = "data/mut_1.tif"
+sample = "mut"
+
+[pool]
+output = "pooled"            # default: <results_root>/pooled
+# The ensemble-averaged MSD is off unless asked for, and its windows are
+# explicit: each track's MSD is computed to ensemble_max_lag, and the fit
+# uses the averaged curve's first ensemble_n_points lags (3 or more).
+ensemble_msd = true
+ensemble_max_lag = 8
+ensemble_n_points = 4
+ensemble_offset = "provided"  # or "fit": the intercept of the linear MSD fit (no SDs used)
+n_boot = 200                  # bootstrap resamples of tracks
+```
+
+It writes, to the output folder:
+
+```
+pooled_distributions_D.csv   the D distribution per sample (by = "sample") and, where a
+                             sample has replicates, per bundle (by = "experiment"):
+                             n_tracks, D_um2_s, deconvolved and its band
+pooled_distances_D.csv       the W1 distance in ln D between every pair of samples and of
+                             bundles (median and credible interval over the draws);
+                             same_sample marks replicate pairs
+pooled_ensemble_msd.csv      the ensemble-averaged MSD per sample and lag (pair-weighted)
+pooled_ensemble_msd_fits.csv linear/Brownian D (and the localization SD when the offset
+                             is fitted) and the log-log power law of the averaged curve,
+                             with bootstrap intervals
+pooled_summary.json          which bundles make up each sample, the grid, packages
+```
+
+A sample's population weighs every track equally, whichever movie it came
+from. Two draws of one population are still some distance apart, so read the
+distance between samples against the distances between their replicates
+(`same_sample`), not against zero. The ensemble MSD treats the exposure as 0,
+like the widget's MSD comparison (the MSD estimators have no blur model), and
+its intervals resample tracks: they do not cover shared drift or
+miscalibrated localization errors. The bundles must share one D grid, and a
+bundle with no current saved analysis stops the pooling rather than being
+skipped: a missing replicate would bias it.
 
 Interactive: open napari and use the "Experiment list" dock widget to browse a
 folder of raw images and work one image through **Detect** (PSF width and

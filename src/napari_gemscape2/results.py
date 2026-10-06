@@ -20,6 +20,10 @@ and, once the diffusion widget has saved an analysis of it
     <result_dir>/distributions_D_by_length.csv  the same split by track length
     <result_dir>/diffusion_summary.json   settings + population numbers
 
+Across bundles, `gemscape2 pool` writes one more directory (`write_pooled_results`), by default
+`<results_root>/pooled/`: the D populations per sample (and per bundle where a sample has replicates), the
+distances between them, and optionally the ensemble-averaged MSD, all read from the saved analyses above.
+
 Points and tracks are the atomic data, and stay parquet: everything else
 is derived from them. The per-track summary and the distributions are the
 tables people open in a spreadsheet or Prism, so they are CSV. The
@@ -276,6 +280,39 @@ def write_diffusion_results(
             table.write_csv(result_dir / filename)
     for filename in _STALE_DIFFUSION_FILES:
         (result_dir / filename).unlink(missing_ok=True)
+
+
+POOLED_DISTRIBUTIONS_FILENAME = "pooled_distributions_D.csv"
+POOLED_DISTANCES_FILENAME = "pooled_distances_D.csv"
+POOLED_ENSEMBLE_MSD_FILENAME = "pooled_ensemble_msd.csv"
+POOLED_ENSEMBLE_MSD_FITS_FILENAME = "pooled_ensemble_msd_fits.csv"
+POOLED_SUMMARY_FILENAME = "pooled_summary.json"
+
+
+def write_pooled_results(
+    out_dir: str | Path,
+    *,
+    distributions_D: pl.DataFrame,
+    distances_D: pl.DataFrame,
+    summary: dict,
+    ensemble_msd: Optional[pl.DataFrame] = None,
+    ensemble_msd_fits: Optional[pl.DataFrame] = None,
+) -> None:
+    """What `gemscape2 pool` found across bundles. The ensemble MSD tables left as None have their files removed,
+    so the directory is always one pooling."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / POOLED_SUMMARY_FILENAME).write_text(json.dumps(summary, indent=2))
+    distributions_D.write_csv(out_dir / POOLED_DISTRIBUTIONS_FILENAME)
+    distances_D.write_csv(out_dir / POOLED_DISTANCES_FILENAME)
+    for table, filename in (
+        (ensemble_msd, POOLED_ENSEMBLE_MSD_FILENAME),
+        (ensemble_msd_fits, POOLED_ENSEMBLE_MSD_FITS_FILENAME),
+    ):
+        if table is None:
+            (out_dir / filename).unlink(missing_ok=True)
+        else:
+            table.write_csv(out_dir / filename)
 
 
 def load_diffusion_summary(result_dir: str | Path) -> Optional[dict]:

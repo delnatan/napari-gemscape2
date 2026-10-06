@@ -21,6 +21,7 @@ from napari_gemscape2.results import (
     load_diffusion_summary,
     load_manifest,
     package_provenance,
+    write_pooled_results,
 )
 from napari_gemscape2.pipeline import (
     DetectTrackParams,
@@ -248,6 +249,110 @@ def diffusion(
         )
     if failed:
         raise typer.Exit(code=1)
+
+
+@app.command("pool")
+def pool(
+    config: Path = typer.Argument(..., help="The same TOML config diffusion ran"),
+) -> None:
+    """Pool the saved diffusion analyses of CONFIG's bundles by sample: the D populations of replicates
+    together, the distances between samples and replicates, and optionally the ensemble-averaged MSD.
+
+    Nothing is refitted: each bundle's saved posteriors (`gemscape2 diffusion` first) and the filters it
+    was saved with are read back, and only tracks that passed them are pooled. Writes
+    pooled_distributions_D.csv, pooled_distances_D.csv, pooled_summary.json (and the ensemble MSD tables)
+    to `<results_root>/pooled/`, or to `[pool] output`. Bundles are grouped by their `sample`:
+        [[inputs]]
+        path = "data/wt_1.tif"
+        sample = "wt"           # replicates share it; default: the bundle's own name
+
+        [pool]
+        output = "pooled"       # a folder under the config's folder (default: results_root/pooled)
+        n_boot = 200            # ensemble MSD: bootstrap resamples of tracks
+        # Ensemble-averaged MSD, off by default. Its windows are explicit: each track's MSD is computed
+        # to ensemble_max_lag, and the fit uses the averaged curve's first ensemble_n_points lags.
+        ensemble_msd = true
+        ensemble_max_lag = 8
+        ensemble_n_points = 4
+        ensemble_offset = "provided"   # or "fit": the intercept of the linear fit (no SDs used)
+    A bundle without a saved or current analysis stops the pooling: a missing replicate would bias it.
+    """
+    from napari_gemscape2.diffusion import grid_record
+    from napari_gemscape2.pooling import (
+        PoolSettings,
+        load_pooled_bundle,
+        pooled_batch,
+        pooled_ensemble_msd,
+        population_tables,
+    )
+
+    cfg, base = _load_config(config)
+    results_root = _resolve(base, cfg.get("results_root", "results"))
+    pool_cfg = dict(cfg.get("pool", {}))
+    output = pool_cfg.pop("output", None)
+    unknown = set(pool_cfg) - PoolSettings.names()
+    if unknown:
+        raise typer.BadParameter(f"[pool] has unknown keys: {', '.join(sorted(unknown))}", param_hint="CONFIG")
+    try:
+        settings = PoolSettings(**pool_cfg)
+    except (TypeError, ValueError) as exc:
+        raise typer.BadParameter(f"[pool] {exc}", param_hint="CONFIG") from exc
+    out_dir = _resolve(base, output) if output else results_root / "pooled"
+
+    bundles, problems = [], []
+    for entry in cfg["inputs"]:
+        result_dir = _result_dir(entry, results_root)
+        try:
+            bundles.append(load_pooled_bundle(result_dir, entry.get("sample")))
+        except (ValueError, OSError) as exc:
+            problems.append(f"[{result_dir.name}] {exc}")
+    if problems:
+        for line in problems:
+            typer.echo(f"  ! {line}")
+        raise typer.Exit(code=1)
+    for b in bundles:
+        n = len(b.analysis.fitted_ids) if b.passing_ids is None else len(set(b.analysis.fitted_ids.tolist()) & b.passing_ids)
+        typer.echo(f"[{b.result_id}] sample {b.sample}: {n} fitted tracks pooled")
+
+    try:
+        batch = pooled_batch(bundles)
+        distributions, distances = population_tables(batch, bundles[0].analysis.level)
+        ens = fits = None
+        if settings.ensemble_msd:
+            ens, fits = pooled_ensemble_msd(bundles, settings)
+    except ValueError as exc:
+        typer.echo(f"  ! {exc}")
+        raise typer.Exit(code=1) from exc
+
+    import diffusionkit
+    import napari_gemscape2
+
+    samples: dict[str, list[str]] = {}
+    for b in bundles:
+        samples.setdefault(b.sample, []).append(b.result_id)
+    summary = {
+        "analysis": "diffusionkit.gridpost populations pooled over saved posteriors (flat prior in ln D)",
+        "samples": samples,
+        "credible_level": bundles[0].analysis.level,
+        "grid": grid_record(bundles[0].analysis.options),
+        "tracks_pooled": "those that passed each bundle's saved filters",
+        "ensemble_msd": (
+            {**{k: v for k, v in vars(settings).items() if k != "ensemble_msd"}, "exposure": "treated as 0 (no blur model)",
+             "weight": "pairs", "resample": "track"}
+            if settings.ensemble_msd
+            else None
+        ),
+        "packages": package_provenance(diffusionkit, napari_gemscape2),
+    }
+    write_pooled_results(
+        out_dir,
+        distributions_D=distributions,
+        distances_D=distances,
+        summary=summary,
+        ensemble_msd=None if ens is None else ens.curves,
+        ensemble_msd_fits=fits,
+    )
+    typer.echo(f"  -> {out_dir}  ({len(samples)} samples, {len(bundles)} bundles)")
 
 
 @app.command("view")
