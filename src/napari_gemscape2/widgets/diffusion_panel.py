@@ -35,13 +35,18 @@ pointed at a selection you could not see.
 - **Posterior** -- `diffusion.analyze_posteriors` (diffusionkit.gridpost):
   per track, the posterior median of D and its 5%/95% quantiles, with the
   camera exposure's blur modelled -- and the ensemble over whatever the
-  tracks pane passes, per region class, also split by track length. The
-  MSD fits are a labelled opt-in comparison. See `_PosteriorTab`.
+  tracks pane passes, per region class, also split by track length. See
+  `_PosteriorTab`.
+- **MSD** -- diffusionkit.classic: per-track MSD fits (D over the first
+  lags, alpha by log-log over a wider window) with their own Run, and the
+  selected track's and the ensemble-averaged MSD. A labelled comparison:
+  no blur model, so the exposure is treated as 0. See `msd_tab.MSDTab`.
 - **Map** -- a `Points` layer in the viewer (`self._spatial_map_layer`,
   one point per localization, every point of a track carrying that
-  track's value) colored by any per-track result: the spatial map, and
-  the reason this analysis stays inside napari next to the image. See
-  `_MapTab`.
+  track's value) colored by any per-track value -- track length from the
+  start, then any fit's result: the spatial map, and the reason this
+  analysis stays inside napari next to the image. The layer is added when
+  the tab is first opened. See `_MapTab`.
 - **NUTS** -- `diffusionkit.bayes.fit_track` on the selected track, with
   its corner plot; needs the optional `[bayes]` extra. See `_NutsTab`.
 
@@ -131,7 +136,6 @@ from qtkit.napari import live_layer, tabify_with_open_widget
 from qtkit.plot import AxisPicker, PlotWindow
 from qtpy.QtGui import QValidator
 from qtpy.QtWidgets import (
-    QApplication,
     QCheckBox,
     QDoubleSpinBox,
     QComboBox,
@@ -171,17 +175,7 @@ from napari_gemscape2.diffusion import (
     grid_record,
     length_composition,
     length_panels,
-    ENSEMBLE_MSD_OFFSETS,
-    MSD_LAG_FRACTION,
-    MSD_MAX_LAG,
-    MSD_MIN_LAG,
-    ensemble_msd_blur_free,
-    ensemble_msd_panels,
-    group_experiments,
-    msd_fits_blur_free,
-    msd_track_curve,
-    msd_track_table,
-    msd_window_text,
+    MSDWindow,
     passing_track_ids,
     posterior_options,
     posterior_results_table,
@@ -206,14 +200,14 @@ from napari_gemscape2.joint_plot import (
     plot_d_by_length,
     plot_d_ensemble,
     plot_d_posteriors,
-    plot_ensemble_msd,
     plot_property_joint,
-    plot_track_msd,
     plot_track_posterior,
 )
 from napari_gemscape2.pipeline import filter_mask
 from napari_gemscape2.viewer import set_tracks_layer_data
 from napari_gemscape2.widgets.feature_filters import FeatureFilterPanel
+from napari_gemscape2.widgets.msd_tab import MSDTab
+from napari_gemscape2.widgets.msd_widgets import fit_window_to_figure
 from napari_gemscape2.widgets.params_panel import _compact_form, _ispin
 
 # Look for the two viewer overlays this widget owns -- kept visually
@@ -296,28 +290,11 @@ def _run_posterior_worker(
     dt_s: float,
     exposure_s: float,
     options: GridPostOptions,
-    msd_comparison: bool,
-    msd_max_lag: int,
-    msd_lag_fraction: Optional[float],
     progress,
-) -> tuple[PosteriorAnalysis, Optional[pl.DataFrame]]:
-    """`(analysis, msd_fits)`: the grid posteriors with the real exposure,
-    on `options`' grids, and -- when asked for -- diffusionkit.classic's
-    MSD fits, run with the exposure treated as 0 (see
-    `diffusion.msd_fits_blur_free`)."""
+) -> PosteriorAnalysis:
+    """The grid posteriors with the real exposure, on `options`' grids."""
     acquisition = Acquisition(dt_s=dt_s, exposure_s=exposure_s)
-    analysis = analyze_posteriors(diffkit_tracks, acquisition, options, progress=progress)
-    msd_fits = None
-    if msd_comparison:
-        msd_fits = msd_fits_blur_free(diffkit_tracks, dt_s, options.min_frames, msd_max_lag, msd_lag_fraction)
-    return analysis, msd_fits
-
-
-@thread_worker(start_thread=False)
-def _ensemble_msd_worker(experiments: list, min_frames: int, max_lag: int):
-    """`diffusion.ensemble_msd_blur_free` off the GUI thread: every track's
-    MSD, then the bootstrap over tracks -- a second or so per thousand."""
-    return ensemble_msd_blur_free(experiments, min_frames, max_lag)
+    return analyze_posteriors(diffkit_tracks, acquisition, options, progress=progress)
 
 
 @thread_worker(start_thread=False)
@@ -923,22 +900,18 @@ _POSTERIOR_HELP = (
     "<br><br><b>By length</b>: the mean posterior and the deconvolved distribution, "
     "stacked by track length. Fast particles leave the focal depth within a few frames, "
     "so short tracks come mostly from fast particles and long ones from slow particles. "
-    "Counted per <i>track</i>, the stack is the deconvolved distribution; per "
-    "<i>detection</i> each track counts once per frame, which is the make-up of the spots "
-    "seen in focus. Tracks shorter than <i>min points</i> are in neither."
+    "Its window counts <i>each track once</i> (the default, and the usual per-trajectory "
+    "reading: the stack is the deconvolved distribution of D across tracks) or <i>each "
+    "detection</i> (a track once per frame, so long tracks weigh more: the make-up of the "
+    "spots seen in focus at a moment). Neither is the share of particles: a fast particle "
+    "leaves the focus and may come back as another track, a slow one stays as one long "
+    "track. Tracks shorter than <i>min points</i> are in neither."
     "<br><br><b>Localization floor</b> (<i>D_floor_um2_s</i>): the D at which a track's "
     "motion per frame equals its localization noise, &lt;σ²&gt; / (dt &minus; exposure/3) "
     "from its own SDs. Every D axis shows it (median over the tracks, 10&ndash;90% band) "
     "as the scale to read D against &mdash; not a cut: D below it is still measured, with "
     "less information per step. It moves with the square of any error in the SDs."
-    "<br><br><b>MSD</b> (a comparison, with the exposure treated as 0: the MSD fits have no "
-    "blur model). <i>Per track</i>: each track's time-averaged MSD fitted over a fixed number "
-    "of lags, or over a share of its own (the usual 25&ndash;40%, so longer tracks use more of "
-    "their curve); the <i>MSD</i> plot adds a linear fit with a free intercept, whose "
-    "localization SD is a check on the SDs. <i>Ensemble MSD</i>: the tracks' MSDs averaged, "
-    "each squared displacement counting once, fitted over the first lags you choose, with "
-    "intervals from resampling whole tracks. A population curve: a mix of slow and fast "
-    "tracks averages to one line, which the deconvolved distribution would show as two."
+    "<br><br>The classic MSD analysis is on the <b>MSD</b> tab."
 
 )
 
@@ -1007,7 +980,6 @@ class _PosteriorTab(QWidget):
         super().__init__()
         self.host = host
         self._analysis: Optional[PosteriorAnalysis] = None
-        self._msd_df: Optional[pl.DataFrame] = None
         self._summary_values: Optional[dict] = None
         self._summary_by_group: Optional[dict] = None
         self._ensemble_window: Optional[PlotWindow] = None
@@ -1018,8 +990,6 @@ class _PosteriorTab(QWidget):
         self._length_worker = None
         self._length_stale = False
         self._track_window: Optional[PlotWindow] = None
-        self._msd_plot_window: Optional[PlotWindow] = None
-        self._ensemble_msd_window: Optional[_EnsembleMSDWindow] = None
         # The summary's ensembles, computed off the GUI thread: the running
         # worker, and whether the filters changed while it ran.
         self._summary_worker = None
@@ -1052,56 +1022,10 @@ class _PosteriorTab(QWidget):
             "just gets a wide posterior, so there is no need to raise it for accuracy."
         )
 
-        self._msd_comparison = QCheckBox("MSD")
-        self._msd_comparison.setToolTip(
-            "Also fit the classic MSD models (Brownian D; power-law K and α) to\n"
-            "each track, over the window beside it, for comparison. They have no\n"
-            "uncertainties and no blur model, so with exposure > 0 they are run\n"
-            "with the exposure treated as 0 -- which biases them. Adds D_msd /\n"
-            "α_msd columns and a per-track MSD plot."
-        )
-        self._msd_lags = QSpinBox()
-        self._msd_lags.setRange(MSD_MIN_LAG, 1000)
-        self._msd_lags.setValue(MSD_MAX_LAG)
-        self._msd_lags.setToolTip(
-            "How many lags of each track's time-averaged MSD the MSD fits use\n"
-            f"(at least {MSD_MIN_LAG}: the power law has two parameters). Few is\n"
-            "better: the later lags average few displacements and are noisy."
-        )
-        # The window's other form: a share of each track's own longest lag.
-        self._msd_percent = QSpinBox()
-        self._msd_percent.setRange(5, 100)
-        self._msd_percent.setSingleStep(5)
-        self._msd_percent.setSuffix(" %")
-        self._msd_percent.setValue(round(100 * MSD_LAG_FRACTION))
-        self._msd_percent.setToolTip(
-            "The share of each track's longest lag its MSD fits use -- the usual\n"
-            f"25-40% rule, never under {MSD_MIN_LAG} lags -- so a longer track fits\n"
-            "more of its curve, and a short one only its reliable first lags."
-        )
-        self._msd_window = QComboBox()
-        self._msd_window.addItems(["lags", "of each track"])
-        self._msd_window.setToolTip(
-            "The MSD fits' window: the same number of lags for every track, or a\n"
-            "share of each track's own (diffusionkit's lag_fraction)."
-        )
-        self._msd_window.currentIndexChanged.connect(self._on_msd_window_mode)
-        for box in (self._msd_lags, self._msd_percent, self._msd_window):
-            box.setEnabled(False)
-            self._msd_comparison.toggled.connect(box.setEnabled)
-        self._on_msd_window_mode()
-        # The window the current results were fitted with, and the one a
-        # running fit asked for (adopted when it returns).
-        self._msd_max_lag = MSD_MAX_LAG
-        self._msd_lag_fraction: Optional[float] = None
-        self._pending_msd_window: tuple[int, Optional[float]] = (MSD_MAX_LAG, None)
-
         # Flow rows rather than a form: a form's field column is too narrow
         # in a dock for three controls, and clipped them.
         exposure_row = flow_row(QLabel("exposure"), self._exposure)
         options_row = flow_row(QLabel("min points"), self._min_frames)
-        # Its own row, so it reads as one phrase: "MSD over 30 % of each track".
-        msd_row = flow_row(self._msd_comparison, QLabel("over"), self._msd_lags, self._msd_percent, self._msd_window)
 
         # The posterior grid -- diffusionkit's `GridPostOptions` fields,
         # read when Run is pressed. D's range is the flat prior's support,
@@ -1150,19 +1074,6 @@ class _PosteriorTab(QWidget):
             "The selected track's posterior. Stays open and follows the selection."
         )
         self._track_button.clicked.connect(self._show_track)
-        self._msd_plot_button = QPushButton("MSD")
-        self._msd_plot_button.setToolTip(
-            "The selected track's raw time-averaged MSD against lag, with the\n"
-            "MSD fits over it. Stays open and follows the selection."
-        )
-        self._msd_plot_button.clicked.connect(self._show_msd_plot)
-        self._ensemble_msd_button = QPushButton("Ensemble MSD")
-        self._ensemble_msd_button.setToolTip(
-            "The ensemble-averaged MSD over the tracks the filters pass, one row\n"
-            "per region class, with its linear (D) and power-law (α) fits over a\n"
-            "window you set. Needs no run; exposure treated as 0 (no blur model)."
-        )
-        self._ensemble_msd_button.clicked.connect(self._show_ensemble_msd)
         self._posteriors_button = QPushButton("Posteriors")
         self._posteriors_button.setToolTip(
             "Every track's posterior as one row of a heat map, sorted by its\n"
@@ -1178,24 +1089,25 @@ class _PosteriorTab(QWidget):
             "filters pass, one row per region class."
         )
         self._length_button.clicked.connect(self._show_by_length)
+        # Lives in the by-length window, the only figure it changes.
         self._length_weight = QComboBox()
-        self._length_weight.addItems(LENGTH_WEIGHTS)
+        for weight, label in zip(LENGTH_WEIGHTS, _LENGTH_WEIGHT_LABELS):
+            self._length_weight.addItem(label, weight)
         self._length_weight.setToolTip(
-            "per track: each track counts once, and the stack is the deconvolved\n"
-            "distribution. per detection: each track counts once per frame -- the\n"
-            "make-up of the spots seen in focus, where fast particles' many short\n"
-            "tracks weigh less."
+            "Each track once: every particle track is one sample, and the stack\n"
+            "is the deconvolved distribution of D across tracks -- the usual\n"
+            "per-trajectory reading. Each detection: a track counts once per\n"
+            "frame, so long tracks weigh more -- the make-up of the spots seen in\n"
+            "focus at a moment, where fast particles (short tracks, out of focus\n"
+            "sooner) weigh less."
         )
-        self._length_weight.currentTextChanged.connect(lambda _w: self._refresh_length_window())
+        self._length_weight.currentIndexChanged.connect(lambda _i: self._refresh_length_window())
         plot_row = flow_row(
             QLabel("plot:"),
             self._ensemble_button,
             self._posteriors_button,
             self._length_button,
-            self._length_weight,
             self._track_button,
-            self._msd_plot_button,
-            self._ensemble_msd_button,
         )
 
         help_text = note_label(_POSTERIOR_HELP)
@@ -1208,7 +1120,6 @@ class _PosteriorTab(QWidget):
         layout.addWidget(exposure_row)
         layout.addWidget(self._exposure_note)
         layout.addWidget(options_row)
-        layout.addWidget(msd_row)
         layout.addLayout(grid_form)
         layout.addWidget(self._grid_reset, alignment=Qt.AlignmentFlag.AlignLeft)
         layout.addWidget(self._grid_status)
@@ -1234,41 +1145,9 @@ class _PosteriorTab(QWidget):
         return self._analysis
 
     @property
-    def msd_df(self) -> Optional[pl.DataFrame]:
-        return self._msd_df
-
-    @property
-    def msd_max_lag(self) -> int:
-        """The lags the current MSD fits were run with."""
-        return self._msd_max_lag
-
-    @property
     def min_frames(self) -> int:
         """The shortest track a fit takes, as the control stands."""
         return self._min_frames.value()
-
-    @property
-    def msd_lag_fraction(self) -> Optional[float]:
-        """The share of each track the current MSD fits used, when they
-        used one rather than `msd_max_lag`."""
-        return self._msd_lag_fraction
-
-    def _on_msd_window_mode(self) -> None:
-        share = self._msd_window.currentIndex() == 1
-        self._msd_lags.setVisible(not share)
-        self._msd_percent.setVisible(share)
-
-    def _msd_window_choice(self) -> tuple[int, Optional[float]]:
-        """`(max_lag, lag_fraction)` the controls ask for; the fraction is
-        None when the window is a number of lags."""
-        share = self._msd_window.currentIndex() == 1
-        return self._msd_lags.value(), (self._msd_percent.value() / 100 if share else None)
-
-    def _set_msd_window(self, max_lag: int, lag_fraction: Optional[float]) -> None:
-        self._msd_lags.setValue(max_lag)
-        if lag_fraction is not None:
-            self._msd_percent.setValue(round(100 * lag_fraction))
-        self._msd_window.setCurrentIndex(0 if lag_fraction is None else 1)
 
     @property
     def summary_values(self) -> Optional[dict]:
@@ -1322,7 +1201,6 @@ class _PosteriorTab(QWidget):
 
     def reset(self) -> None:
         self._analysis = None
-        self._msd_df = None
         self._summary_values = None
         self._summary_by_group = None
         self._status.setText("")
@@ -1330,9 +1208,6 @@ class _PosteriorTab(QWidget):
         self._summary.setText("")
         self._refresh_plot_buttons()
         self._on_grid_changed()
-        if self._ensemble_msd_window is not None:
-            self._ensemble_msd_window.invalidate()
-            self._refresh_ensemble_msd()
 
     def set_layer_exposure(self, exposure_s: Optional[float]) -> None:
         """What the newly loaded layer records -- pre-fills the box, or
@@ -1398,8 +1273,6 @@ class _PosteriorTab(QWidget):
         self._posteriors_button.setEnabled(has_run)
         self._length_button.setEnabled(has_run)
         self._track_button.setEnabled(has_run)
-        self._msd_plot_button.setEnabled(self._msd_df is not None)
-        self._ensemble_msd_button.setEnabled(self.host.has_tracks)
 
     def report_saved(self, text: str) -> None:
         self._status.setText(text)
@@ -1433,39 +1306,25 @@ class _PosteriorTab(QWidget):
             self.host.dt_s,
             exposure,
             options,
-            self._msd_comparison.isChecked(),
-            *self._pending_msd_window_from_controls(),
             self.host.progress_callback,
         )
         self.host.start_worker(worker, self._on_finished, self._on_error, [self._run_button], "posteriors")
 
-    def _pending_msd_window_from_controls(self) -> tuple[int, Optional[float]]:
-        """The MSD window a run is starting with, remembered for when it ends:
-        the controls may change while it runs."""
-        self._pending_msd_window = self._msd_window_choice()
-        return self._pending_msd_window
-
-    def _on_finished(self, result: tuple[PosteriorAnalysis, Optional[pl.DataFrame]]) -> None:
-        analysis, msd_fits = result
-        self._msd_max_lag, self._msd_lag_fraction = self._pending_msd_window
-        n_ok = self._adopt(analysis, msd_track_table(msd_fits) if msd_fits is not None else None)
-        msd_note = (
-            f" · MSD over {msd_window_text(self._msd_max_lag, self._msd_lag_fraction)}" if msd_fits is not None else ""
-        )
-        self._status.setText(f"{n_ok} of {analysis.fits.height} tracks fitted{msd_note}")
+    def _on_finished(self, analysis: PosteriorAnalysis) -> None:
+        n_ok = self._adopt(analysis)
+        self._status.setText(f"{n_ok} of {analysis.fits.height} tracks fitted")
         style_status_label(self._status, "ok" if n_ok else "caution")
         self.refresh_summary()
         if n_ok:
             self._show_ensemble()
 
-    def _adopt(self, analysis: PosteriorAnalysis, msd_df: Optional[pl.DataFrame]) -> int:
+    def _adopt(self, analysis: PosteriorAnalysis) -> int:
         """Make `analysis` this tab's, and hand its per-track columns to
         the host. Returns how many tracks were fitted."""
         self._analysis = analysis
-        self._msd_df = msd_df
         self._refresh_plot_buttons()
         self._on_grid_changed()
-        self.host.set_posterior_results(analysis, posterior_results_table(analysis, msd_df))
+        self.host.set_posterior_results(analysis, posterior_results_table(analysis, None))
         return len(analysis.fitted_ids)
 
     def restore(self, saved: SavedAnalysis) -> None:
@@ -1475,12 +1334,7 @@ class _PosteriorTab(QWidget):
         caller refreshes the summary once the filters are back too."""
         analysis = saved.analysis
         self._min_frames.setValue(analysis.min_frames)
-        self._msd_comparison.setChecked(saved.msd is not None)
-        self._msd_max_lag = int(saved.summary.get("msd_max_lag") or MSD_MAX_LAG)
-        fraction = saved.summary.get("msd_lag_fraction")
-        self._msd_lag_fraction = float(fraction) if fraction is not None else None
-        self._set_msd_window(self._msd_max_lag, self._msd_lag_fraction)
-        n_ok = self._adopt(analysis, saved.msd)
+        n_ok = self._adopt(analysis)
         self.set_grid(analysis.options)
         self._status.setText(
             f"saved analysis loaded: {n_ok} of {analysis.fits.height} tracks fitted, "
@@ -1493,7 +1347,6 @@ class _PosteriorTab(QWidget):
         -- called after a run and whenever the filters change. Their
         ensembles are deconvolved on a worker first (`_ensemble_worker`);
         changes while it runs coalesce into one more pass."""
-        self._refresh_ensemble_msd()
         if self._analysis is None:
             return
         if self._summary_worker is not None:
@@ -1568,7 +1421,7 @@ class _PosteriorTab(QWidget):
         figure = plot_d_ensemble(self._analysis.D_grid_um2_s, panels)
         if self._ensemble_window is None:
             self._ensemble_window = PlotWindow("Posterior: ensemble", parent=self)
-        _fit_window_to_figure(self._ensemble_window, figure)
+        fit_window_to_figure(self._ensemble_window, figure)
         self._ensemble_window.show_figure(figure)
 
     def _show_by_length(self) -> None:
@@ -1580,7 +1433,7 @@ class _PosteriorTab(QWidget):
             self._length_stale = True
             return
         analysis = self._analysis
-        weight = self._length_weight.currentText()
+        weight = self._length_weight.currentData()
         ids = self.host.combined_filtered_track_ids()
         groups = self.host.group_track_ids(ids) or {"all": ids}
         self._status.setText("splitting by track length…")
@@ -1599,7 +1452,7 @@ class _PosteriorTab(QWidget):
 
     def _length_ready(self, analysis: PosteriorAnalysis, weight: str) -> None:
         self._length_worker = None
-        if self._length_stale or analysis is not self._analysis or weight != self._length_weight.currentText():
+        if self._length_stale or analysis is not self._analysis or weight != self._length_weight.currentData():
             self._length_stale = False
             self._show_by_length()
             return
@@ -1615,7 +1468,8 @@ class _PosteriorTab(QWidget):
         figure = plot_d_by_length(panels)
         if self._length_window is None:
             self._length_window = PlotWindow("Posterior: by track length", parent=self)
-        _fit_window_to_figure(self._length_window, figure)
+            self._length_window.layout().insertWidget(0, flow_row(QLabel("count"), self._length_weight))
+        fit_window_to_figure(self._length_window, figure)
         self._length_window.show_figure(figure)
 
     def _refresh_length_window(self) -> None:
@@ -1644,183 +1498,10 @@ class _PosteriorTab(QWidget):
         """Follow the selection while the track window is open."""
         if self._track_window is not None and self._track_window.isVisible():
             self._show_track()
-        if self._msd_plot_window is not None and self._msd_plot_window.isVisible():
-            self._show_msd_plot()
-
-    def _show_msd_plot(self) -> None:
-        track_id = self.host.selected_track_id
-        tracks = self.host.diffkit_tracks_for_fit()
-        if self._msd_df is None or tracks is None:
-            return
-        if track_id is None:
-            self._status.setText("select a track (table or viewer) first")
-            style_status_label(self._status, "caution")
-            return
-        data = msd_track_curve(
-            tracks, self.host.dt_s, track_id, self._analysis.min_frames, self._msd_max_lag, self._msd_lag_fraction
-        )
-        if data is None:
-            self._status.setText(f"track {track_id} is too short for the MSD fits")
-            style_status_label(self._status, "caution")
-            return
-        if self._msd_plot_window is None:
-            self._msd_plot_window = PlotWindow("MSD: selected track", parent=self)
-        self._msd_plot_window.show_figure(plot_track_msd(**data))
-
-    def _show_ensemble_msd(self) -> None:
-        if self._ensemble_msd_window is None:
-            self._ensemble_msd_window = _EnsembleMSDWindow(self)
-        self._ensemble_msd_window.show()
-        self._ensemble_msd_window.refresh()
-
-    def _refresh_ensemble_msd(self) -> None:
-        """Follow the filters (and new tracks) while the window is open."""
-        if self._ensemble_msd_window is not None and self._ensemble_msd_window.isVisible():
-            self._ensemble_msd_window.refresh()
 
     def _on_error(self, exc: Exception) -> None:
         self._status.setText(f"error: {exc}")
         style_status_label(self._status, "error")
-
-
-class _EnsembleMSDWindow(PlotWindow):
-    """The ensemble-averaged MSD over the tracks the filters pass, one row
-    per region class (`diffusion.ensemble_msd_panels`): diffusionkit's
-    textbook population curve, beside the posteriors as the comparison
-    people know. It needs no run -- only tracks -- and follows the filters
-    like the other figures.
-
-    Its window is explicit, since it changes the answer: how far each
-    track's MSD runs (`max_lag`, which recomputes the curves on a worker,
-    bootstrap included) and how many of the averaged curve's first lags
-    the fits use (`n_points`), with where the localization offset comes
-    from; those two only refit."""
-
-    _OFFSET_LABELS = {"provided": "from the SDs", "fit": "fitted (intercept)"}
-
-    def __init__(self, tab: "_PosteriorTab") -> None:
-        super().__init__("MSD: ensemble average", parent=tab)
-        self._tab = tab
-        self._ens = None
-        self._key = None
-        self._worker = None
-        self._stale = False
-        self._max_lag = _ispin(
-            10, MSD_MIN_LAG, 1000,
-            tooltip="How far each track's time-averaged MSD is computed before the\n"
-            "tracks are averaged. The averaged curve's late lags rest on the few\n"
-            "long tracks that reach them (each lag's bar is its bootstrap SD).",
-        )
-        self._n_points = _ispin(
-            4, MSD_MIN_LAG, 1000,
-            tooltip="How many of the averaged curve's first lags the linear (D) and\n"
-            "power-law (α) fits use. The window changes both answers, so it is\n"
-            f"yours to set (at least {MSD_MIN_LAG}): the usual rule is the first\n"
-            "25-40% of the curve. The lags past it stay drawn, hollow.",
-        )
-        self._offset = QComboBox()
-        for key in ENSEMBLE_MSD_OFFSETS:
-            self._offset.addItem(self._OFFSET_LABELS[key], key)
-        self._offset.setToolTip(
-            "The localization offset the fits take off: the tracks' own position\n"
-            "SDs (D through the origin of the corrected curve), or the intercept of\n"
-            "a linear fit to the raw curve, which uses no SDs and reports the\n"
-            "localization SD it implies -- a check on the SDs."
-        )
-        self._status = status_label("")
-        self._max_lag.valueChanged.connect(lambda _v: self.refresh())
-        self._n_points.valueChanged.connect(lambda _v: self._redraw())
-        self._offset.currentIndexChanged.connect(lambda _i: self._redraw())
-        controls = flow_row(
-            QLabel("each track's MSD to lag"), self._max_lag, QLabel("· fit the first"), self._n_points,
-            QLabel("lags · offset"), self._offset,
-        )
-        self.layout().insertWidget(0, controls)
-        self.layout().insertWidget(1, self._status)
-
-    def invalidate(self) -> None:
-        """The tracks changed: the curves computed so far are not theirs."""
-        self._ens = None
-        self._key = None
-
-    def refresh(self) -> None:
-        """Recompute the curves when what they are over has changed (the
-        filters, the tracks, `max_lag`, min points), else just redraw."""
-        host = self._tab.host
-        tracks = host.diffkit_tracks_for_fit()
-        if tracks is None or tracks.height == 0:
-            self._say("no tracks loaded", "caution")
-            return
-        ids = host.combined_filtered_track_ids()
-        groups = host.group_track_ids(ids) or {"all": ids}
-        min_frames, max_lag = self._tab.min_frames, self._max_lag.value()
-        key = (
-            tuple((name, None if g is None else frozenset(g)) for name, g in groups.items()),
-            min_frames,
-            max_lag,
-        )
-        if key == self._key and self._ens is not None:
-            self._redraw()
-            return
-        if self._worker is not None:
-            self._stale = True
-            return
-        experiments = group_experiments(tracks, host.dt_s, groups)
-        if not experiments:
-            self._say("no tracks pass the current filters", "caution")
-            return
-        self._say("averaging every track's MSD…")
-        worker = _ensemble_msd_worker(experiments, min_frames, max_lag)
-        worker.returned.connect(lambda ens: self._ready(key, ens))
-        worker.errored.connect(self._failed)
-        self._worker = worker
-        worker.start()
-
-    def _ready(self, key, ens) -> None:
-        self._worker = None
-        if self._stale:
-            self._stale = False
-            self.refresh()
-            return
-        self._ens, self._key = ens, key
-        self._redraw()
-
-    def _failed(self, exc: Exception) -> None:
-        self._worker = None
-        self._stale = False
-        self._say(f"ensemble MSD failed: {exc}", "error")
-
-    def _redraw(self) -> None:
-        if self._ens is None:
-            return
-        try:
-            panels = ensemble_msd_panels(self._ens, self._n_points.value(), self._offset.currentData())
-        except ValueError as exc:
-            self._say(f"{exc} -- fit fewer lags, or run each track's MSD further", "error")
-            return
-        self._say("")
-        figure = plot_ensemble_msd(panels)
-        _fit_window_to_figure(self, figure)
-        self.show_figure(figure)
-
-    def _say(self, text: str, level: str = "neutral") -> None:
-        self._status.setText(text)
-        style_status_label(self._status, level)
-        if text and not self.isVisible():
-            self.show()
-
-
-def _fit_window_to_figure(window: QWidget, figure) -> None:
-    """Size a plot window for `figure`'s own layout (its inches at its dpi,
-    plus room for the toolbar), within the screen: the ensemble figure gains
-    a column per optional analysis, which a fixed-size window squeezes."""
-    width, height = (figure.get_size_inches() * figure.dpi).astype(int)
-    height += 60  # the navigation toolbar
-    screen = window.screen() or QApplication.primaryScreen()
-    if screen is not None:
-        available = screen.availableGeometry()
-        width, height = min(width, available.width() - 40), min(height, available.height() - 80)
-    window.resize(width, height)
 
 
 def _format_by_group(by_group: Optional[dict]) -> str:
@@ -1894,6 +1575,9 @@ def _format_posterior_summary(summary: dict, analysis: Optional[PosteriorAnalysi
     return "\n".join(lines)
 
 
+# The by-length window's weights, as its picker reads them (`LENGTH_WEIGHTS`).
+_LENGTH_WEIGHT_LABELS = ("each track once", "each detection (long tracks weigh more)")
+
 # Appended to the summary while its ensembles are being deconvolved.
 _UPDATING = "\n(updating the ensemble…)"
 
@@ -1909,7 +1593,7 @@ class _MapTab(QWidget):
     def __init__(self, host: "DiffusionAnalysisWidget") -> None:
         super().__init__()
         self.host = host
-        self._hint = note_label("Run the posteriors first — the map colors each track's points by a result.")
+        self._hint = note_label("Pick a Tracks layer — the map colors each track's points by a per-track value.")
         self._color_by_picker = QComboBox()
         self._color_by_picker.setEnabled(False)
         self._color_by_picker.currentTextChanged.connect(self._on_color_by_changed)
@@ -1936,6 +1620,12 @@ class _MapTab(QWidget):
         layout.addWidget(self._map_histogram)
         layout.addStretch()
         self.setLayout(layout)
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        # The map layer is drawn once this tab is first looked at, not as
+        # soon as there is something to color by (track length, at load).
+        super().showEvent(event)
+        self.host.show_spatial_map()
 
     def reset(self) -> None:
         self._color_by_picker.blockSignals(True)
@@ -2160,9 +1850,12 @@ class DiffusionAnalysisWidget(QWidget):
         self._qc_columns: list[str] = []
         self._joined_track_df: Optional[pl.DataFrame] = None
         # The last posterior run, and the per-track columns the tracks
-        # pane shows from it (plus the MSD comparison's, when run).
+        # pane shows from it; the MSD tab's per-track fits likewise, with
+        # the window they ran on.
         self._posterior: Optional[PosteriorAnalysis] = None
         self._posterior_df: Optional[pl.DataFrame] = None
+        self._msd_df: Optional[pl.DataFrame] = None
+        self._msd_window: Optional[MSDWindow] = None
         self._map_color_by: Optional[str] = None
         # name -> per-track df (track_id + one or more value columns) --
         # every tab that produces a per-track number registers here, and
@@ -2208,6 +1901,7 @@ class DiffusionAnalysisWidget(QWidget):
 
         self._tracks_pane = _TracksPane(self)
         self._posterior_tab = _PosteriorTab(self)
+        self._msd_tab = MSDTab(self)
         self._map_tab = _MapTab(self)
         self._nuts_tab = _NutsTab(self)
 
@@ -2218,11 +1912,13 @@ class DiffusionAnalysisWidget(QWidget):
         tabs = QTabWidget()
         tabs.setDocumentMode(True)
         tabs.addTab(scrolled(self._posterior_tab), "Posterior")
+        tabs.addTab(scrolled(self._msd_tab), "MSD")
         tabs.addTab(scrolled(self._map_tab), "Map")
         tabs.addTab(scrolled(self._nuts_tab), "NUTS")
         tabs.setTabToolTip(0, "Per-track grid posteriors over D, and the ensemble (diffusionkit.gridpost)")
-        tabs.setTabToolTip(1, "Color each track's points in the viewer by a result")
-        tabs.setTabToolTip(2, "Full NUTS posterior for the selected track (diffusionkit.bayes)")
+        tabs.setTabToolTip(1, "Classic MSD analysis, per track and ensemble-averaged (diffusionkit.classic)")
+        tabs.setTabToolTip(2, "Color each track's points in the viewer by a per-track value")
+        tabs.setTabToolTip(3, "Full NUTS posterior for the selected track (diffusionkit.bayes)")
 
         # One session-wide switch, not a copy on each tab -- see this
         # module's docstring.
@@ -2308,6 +2004,11 @@ class DiffusionAnalysisWidget(QWidget):
     def has_tracks(self) -> bool:
         return self._diffkit_tracks is not None and self._diffkit_tracks.height > 0
 
+    @property
+    def min_frames(self) -> int:
+        """The shortest track any fit takes (the Posterior tab's min points)."""
+        return self._posterior_tab.min_frames
+
     def diffkit_track(self, track_id: int) -> Optional[pl.DataFrame]:
         if self._diffkit_tracks is None:
             return None
@@ -2359,6 +2060,7 @@ class DiffusionAnalysisWidget(QWidget):
         self._update_spatial_map_layer()
         self._map_tab.refresh_map_histogram()
         self._posterior_tab.refresh_summary()
+        self._msd_tab.refresh()
 
     def run_exposure_s(self) -> Optional[float]:
         """The exposure a fit runs with (the Posterior tab's, as its Run would
@@ -2521,6 +2223,8 @@ class DiffusionAnalysisWidget(QWidget):
         track set that was loaded, not to the one about to be."""
         self._posterior = None
         self._posterior_df = None
+        self._msd_df = None
+        self._msd_window = None
         self._map_color_by = None
         self._spatial_sources = {}
         self._nuts_rows = []
@@ -2546,6 +2250,7 @@ class DiffusionAnalysisWidget(QWidget):
         self._tracks_pane.reset()
         self._posterior_tab.reset()
         self._posterior_tab.set_layer_exposure(None)
+        self._msd_tab.reset()
         self._map_tab.reset()
         self._nuts_tab.reset()
         self._save_button.setEnabled(False)
@@ -2707,6 +2412,7 @@ class DiffusionAnalysisWidget(QWidget):
         self._tracks_pane.set_qc_columns(self._qc_columns)
         self._tracks_pane.set_region_choices(self._region_classes_loaded())
         self._posterior_tab.reset()
+        self._msd_tab.reset()
         self._map_tab.reset()
         self._nuts_tab.reset()
         self._rebuild_track_table()
@@ -2714,6 +2420,10 @@ class DiffusionAnalysisWidget(QWidget):
             self._joined_track_df, prefer_x="mean_step_um", prefer_y="flux_mean"
         )
         self._clear_overlay_layers()
+        # Track length is a color before any fit: the late lags of an
+        # ensemble MSD, and the by-length split, are about which tracks are long.
+        self.register_spatial_source("tracks", self._base_track_df.select("track_id", "track_length"))
+        self._map_tab.on_spatial_source_registered()
 
         self._mouse_callback = self._make_click_callback()
         layer.mouse_drag_callbacks.append(self._mouse_callback)
@@ -2741,6 +2451,8 @@ class DiffusionAnalysisWidget(QWidget):
             return
         self._nuts_rows = list(saved.nuts_rows)
         self._posterior_tab.restore(saved)
+        if saved.msd is not None:
+            self._msd_tab.restore(saved.msd, MSDWindow.from_settings(saved.summary["msd"]))
         # The tracks pane's cuts it was summarized under -- after the
         # results are joined in, since a cut may be on a result column.
         record = saved.summary.get("tracks_summary_filters") or {}
@@ -2787,6 +2499,7 @@ class DiffusionAnalysisWidget(QWidget):
         self._update_spatial_map_layer()
         self._map_tab.refresh_map_histogram()
         self._posterior_tab.refresh_summary()
+        self._msd_tab.refresh()
         self._update_save_enabled()
 
     def _region_classes_loaded(self) -> list[str]:
@@ -2836,9 +2549,12 @@ class DiffusionAnalysisWidget(QWidget):
         self._sync_tracks_layer_display(ids)
 
     def _per_track_results(self) -> Optional[pl.DataFrame]:
-        """Every analysis column, one row per track: the posterior run's
-        (and MSD comparison's), and the latest NUTS fit of each track."""
+        """Every analysis column, one row per track: the posterior run's,
+        the MSD fits', and the latest NUTS fit of each track."""
         df = self._posterior_df
+        if self._msd_df is not None:
+            msd = self._msd_df
+            df = msd if df is None else df.join(msd, on="track_id", how="full", coalesce=True)
         if self._nuts_rows:
             nuts = pl.DataFrame(self._nuts_rows).group_by("track_id", maintain_order=True).last()
             df = nuts if df is None else df.join(nuts, on="track_id", how="full", coalesce=True)
@@ -2859,6 +2575,17 @@ class DiffusionAnalysisWidget(QWidget):
             prefer_y="track_length",
         )
         self._map_tab.on_spatial_source_registered("D_median_um2_s")
+        self._update_save_enabled()
+
+    def set_msd_results(self, msd_df: pl.DataFrame, window: MSDWindow) -> None:
+        """The MSD tab's per-track fits finished (or were restored): keep
+        them for Save, join their columns into the tracks pane, and offer
+        them as spatial-map colors."""
+        self._msd_df = msd_df
+        self._msd_window = window
+        self.register_spatial_source("msd", msd_df)
+        self._rebuild_track_table()
+        self._map_tab.on_spatial_source_registered()
         self._update_save_enabled()
 
     def register_spatial_source(self, name: str, df: pl.DataFrame) -> None:
@@ -2897,12 +2624,14 @@ class DiffusionAnalysisWidget(QWidget):
         self._update_highlight_layer(track_id)
         self._jump_to_track_end(track_id)
         self._posterior_tab.on_track_selected()
+        self._msd_tab.on_track_selected()
 
     def on_viewer_track_clicked(self, track_id: int) -> None:
         self._current_track_id = track_id
         self._update_highlight_layer(track_id)
         self._tracks_pane.select_track_id(track_id)
         self._posterior_tab.on_track_selected()
+        self._msd_tab.on_track_selected()
 
     # -- viewer overlays --
 
@@ -3034,7 +2763,16 @@ class DiffusionAnalysisWidget(QWidget):
             return None
         return merged[self._map_color_by].drop_nulls().to_numpy()
 
-    def _update_spatial_map_layer(self) -> None:
+    def show_spatial_map(self) -> None:
+        """Draw the spatial map now (the Map tab came into view)."""
+        self._update_spatial_map_layer(create=True)
+
+    def _update_spatial_map_layer(self, create: bool = False) -> None:
+        """Redraw the map layer. It is only created by `create` (the Map
+        tab in view): there is a color as soon as tracks load, and a layer
+        nobody asked for would sit over the image."""
+        if self._live(self._spatial_map_layer) is None and not (create or self._map_tab.isVisible()):
+            return
         merged = self._filtered_map_df()
         if merged is None or self._map_color_by is None or self._tracks_df_px is None:
             return
@@ -3169,9 +2907,7 @@ class DiffusionAnalysisWidget(QWidget):
             by_class = self.group_track_ids(ids)
             tables = analysis_tables(analysis, ids, by_class)
             summary = analysis_summary(
-                analysis, ids, by_class, msd_comparison=self._posterior_tab.msd_df is not None,
-                msd_max_lag=self._posterior_tab.msd_max_lag,
-                msd_lag_fraction=self._posterior_tab.msd_lag_fraction,
+                analysis, ids, by_class, msd=self._msd_window if self._msd_df is not None else None
             )
         summary["tracks_summary_filters"] = self._summary_filter_record()
         summary["packages"] = _analysis_packages()

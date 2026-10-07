@@ -180,9 +180,14 @@ def diffusion(
         # the flat prior's support. Any key left out keeps the template's,
         # else diffusionkit's default (shown).
         grid = { D_min_um2_s = 1e-5, D_max_um2_s = 10.0, n_D = 601 }
-        msd_comparison = false
-        msd_max_lag = 3         # lags the MSD fits use (>= 3)
-        # msd_lag_fraction = 0.3  # or: each track's first 30% of lags (replaces msd_max_lag)
+        # The per-track MSD fits (always run, a comparison with the exposure
+        # treated as 0): D over the first msd_max_lag lags, alpha (log-log)
+        # over the first msd_alpha_max_lag (each >= 3).
+        msd_max_lag = 3
+        msd_alpha_max_lag = 10
+        # or shares of each track's longest lag (replace both lag counts):
+        # msd_lag_fraction = 0.3
+        # msd_alpha_lag_fraction = 0.5
         exposure_s = 0.01       # optional: overrides each bundle's recorded one
         min_track_length = 1    # which tracks pass (passes_filters, ensemble)
         filters = { D_median_um2_s = [0.001, inf], flux_mean = [800.0, inf] }
@@ -210,9 +215,10 @@ def diffusion(
             inherited = settings_from_summary(saved)
             _describe_template(template, inherited, diff_cfg)
     settings_cfg = {**inherited, **diff_cfg}
-    if "msd_max_lag" in diff_cfg and "msd_lag_fraction" not in diff_cfg:
-        # Lags asked for here replace a fraction the template was saved with.
+    if {"msd_max_lag", "msd_alpha_max_lag"} & set(diff_cfg) and "msd_lag_fraction" not in diff_cfg:
+        # Lags asked for here replace shares the template was saved with.
         settings_cfg.pop("msd_lag_fraction", None)
+        settings_cfg.pop("msd_alpha_lag_fraction", None)
     if isinstance(diff_cfg.get("grid"), dict):
         settings_cfg["grid"] = {**inherited.get("grid", {}), **diff_cfg["grid"]}
     try:
@@ -273,10 +279,12 @@ def pool(
         output = "pooled"       # a folder under the config's folder (default: results_root/pooled)
         n_boot = 200            # ensemble MSD: bootstrap resamples of tracks
         # Ensemble-averaged MSD, off by default. Its windows are explicit: each track's MSD is computed
-        # to ensemble_max_lag, and the fit uses the averaged curve's first ensemble_n_points lags.
+        # to ensemble_max_lag; the linear fit (D) uses the averaged curve's first ensemble_n_points lags,
+        # the log-log fit (alpha) its first ensemble_alpha_points (default: all ensemble_max_lag).
         ensemble_msd = true
-        ensemble_max_lag = 8
-        ensemble_n_points = 4
+        ensemble_max_lag = 10
+        ensemble_n_points = 3
+        ensemble_alpha_points = 10
         ensemble_offset = "provided"   # or "fit": the intercept of the linear fit (no SDs used)
     A bundle without a saved or current analysis stops the pooling: a missing replicate would bias it.
     """

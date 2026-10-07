@@ -24,7 +24,6 @@ from napari.qt.threading import thread_worker
 from qtpy.QtCore import QObject, Qt, Signal
 from qtpy.QtWidgets import (
     QCheckBox,
-    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -38,11 +37,10 @@ from qtpy.QtWidgets import (
     QVBoxLayout,
 )
 
-from napari_gemscape2.diffusion import ENSEMBLE_MSD_BOOT, ENSEMBLE_MSD_OFFSETS, MSD_MIN_LAG
+from napari_gemscape2.diffusion import ENSEMBLE_MSD_BOOT, MSD_MIN_LAG
 from napari_gemscape2.pooling import PoolSettings, guess_sample, load_pooled_bundle, run_pooling, write_pool
 from napari_gemscape2.results import DIFFUSION_SUMMARY_FILENAME
-
-_OFFSET_LABELS = {"provided": "from the SDs", "fit": "fitted (intercept)"}
+from napari_gemscape2.widgets.msd_widgets import EnsembleWindowControls
 
 
 def has_saved_analysis(result_dir: Path) -> bool:
@@ -117,22 +115,9 @@ class PoolDialog(QDialog):
             "MSD estimators have no blur model), pair-weighted, with intervals from\n"
             "resampling whole tracks."
         )
-        self.max_lag = _spin(10, "Each track's MSD is computed to this lag before averaging.")
-        self.n_points = _spin(4, "The fits use the averaged curve's first this many lags\n(the usual rule: 25-40% of it).")
-        self.offset = QComboBox()
-        for key in ENSEMBLE_MSD_OFFSETS:
-            self.offset.addItem(_OFFSET_LABELS[key], key)
-        self.offset.setToolTip(
-            "The localization offset the fits take off: the tracks' SDs, or the\n"
-            "intercept of a linear fit to the curve (no SDs used)."
-        )
         self.n_boot = _spin(ENSEMBLE_MSD_BOOT, "Bootstrap resamples of whole tracks.", minimum=0, maximum=10_000)
-        ensemble_row = QHBoxLayout()
-        for widget in (QLabel("to lag"), self.max_lag, QLabel("fit first"), self.n_points, QLabel("offset"),
-                       self.offset, QLabel("resamples"), self.n_boot):
-            ensemble_row.addWidget(widget)
-        ensemble_row.addStretch(1)
-        self._ensemble_widgets = (self.max_lag, self.n_points, self.offset, self.n_boot)
+        # The same window controls as the diffusion widget's Ensemble MSD.
+        self.window = EnsembleWindowControls(("· resamples", self.n_boot))
 
         self.out_label = QLabel()
         self.out_label.setWordWrap(True)
@@ -163,7 +148,7 @@ class PoolDialog(QDialog):
         layout.addLayout(select_row)
         layout.addWidget(self.table, 1)
         layout.addWidget(self.ensemble_check)
-        layout.addLayout(ensemble_row)
+        layout.addWidget(self.window)
         layout.addLayout(out_row)
         layout.addWidget(self.config_check)
         layout.addWidget(self.warning)
@@ -171,8 +156,8 @@ class PoolDialog(QDialog):
 
         self.table.itemChanged.connect(self._refresh)
         self.ensemble_check.toggled.connect(self._refresh)
-        self.max_lag.valueChanged.connect(self._refresh)
-        self.n_points.valueChanged.connect(self._refresh)
+        self.window.curve_changed.connect(self._refresh)
+        self.window.fit_changed.connect(self._refresh)
         self._refresh()
 
     def _rows(self) -> range:
@@ -207,17 +192,18 @@ class PoolDialog(QDialog):
         """The `[pool]` settings; raises ValueError for an impossible window."""
         if not self.ensemble_check.isChecked():
             return PoolSettings()
+        n_points, alpha_points = self.window.windows()
         return PoolSettings(
             ensemble_msd=True,
-            ensemble_max_lag=self.max_lag.value(),
-            ensemble_n_points=self.n_points.value(),
-            ensemble_offset=self.offset.currentData(),
+            ensemble_max_lag=self.window.max_lag.value(),
+            ensemble_n_points=n_points,
+            ensemble_alpha_points=alpha_points,
+            ensemble_offset=self.window.offset_key(),
             n_boot=self.n_boot.value(),
         )
 
     def _refresh(self, *_args) -> None:
-        for widget in self._ensemble_widgets:
-            widget.setEnabled(self.ensemble_check.isChecked())
+        self.window.setEnabled(self.ensemble_check.isChecked())
         self.out_label.setText(f"Write the pooled tables to: {self._out_dir}")
         inputs = self.inputs()
         samples = {sample for _image, _dir, sample in inputs}

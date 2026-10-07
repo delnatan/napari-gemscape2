@@ -79,6 +79,10 @@ def test_ensemble_msd_recovers_D(project):
     D = dict(zip(*fits.filter(pl.col("model") == "brownian").select("group", "D_um2_s")))
     assert D["wt"] == pytest.approx(0.05, rel=0.2)
     assert D["mut"] == pytest.approx(0.5, rel=0.2)
+    # alpha is fitted over the whole curve unless told otherwise.
+    power = fits.filter(pl.col("model") == "power_law")
+    assert set(power["n_points"]) == {6}
+    assert power["alpha"].to_list() == pytest.approx([1.0, 1.0], abs=0.2)
 
 
 def test_a_bundle_without_an_analysis_stops_the_pooling(project, tmp_path):
@@ -111,7 +115,9 @@ def test_a_config_written_for_a_pooling_reruns_it(project):
     names = ("wt_1", "wt_2", "mut_1")
     assert [guess_sample(n) for n in names] == ["wt", "wt", "mut"]
     assert guess_sample("2024") == "2024"
-    settings = PoolSettings(ensemble_msd=True, ensemble_max_lag=6, ensemble_n_points=3, n_boot=10)
+    settings = PoolSettings(
+        ensemble_msd=True, ensemble_max_lag=6, ensemble_n_points=3, ensemble_alpha_points=5, n_boot=10
+    )
     path = project / "pool.toml"
     write_pool_config(
         path,
@@ -126,4 +132,22 @@ def test_a_config_written_for_a_pooling_reruns_it(project):
     summary = __import__("json").loads((out / "pooled_summary.json").read_text())
     assert summary["samples"] == {"wt": ["wt_1", "wt_2"], "mut": ["mut_1"]}
     assert summary["ensemble_msd"]["ensemble_n_points"] == 3
+    assert summary["ensemble_msd"]["ensemble_alpha_points"] == 5
+    with pytest.raises(ValueError, match="ensemble_alpha_points"):
+        PoolSettings(ensemble_msd=True, ensemble_max_lag=6, ensemble_n_points=3, ensemble_alpha_points=7)
     assert (out / "pooled_ensemble_msd_fits.csv").exists()
+
+
+def test_a_batch_runs_the_msd_fits_alongside_and_they_reopen(project):
+    from napari_gemscape2.diffusion import MSDWindow, restore_analysis, tracks_to_diffusionkit_df
+    from napari_gemscape2.diffusion_batch import bundle_track_table
+    from napari_gemscape2.results import load_diffusion_results, load_result
+
+    bundle = project / "results" / "wt_1"
+    tables = load_diffusion_results(bundle)
+    assert MSDWindow.from_settings(tables["summary"]["msd"]) == MSDWindow()
+    assert tables["tracks_summary"]["D_msd_um2_s"].drop_nulls().len() == 50
+    _points, tracks_df, _manifest, _labels, regions = load_result(bundle)
+    tracks = tracks_to_diffusionkit_df(bundle_track_table(tracks_df, PX, DT, regions), PX, DT)
+    saved = restore_analysis(tracks, **tables)
+    assert set(saved.msd.columns) == {"track_id", "D_msd_um2_s", "K_msd_um2_s_alpha", "alpha_msd"}

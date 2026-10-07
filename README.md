@@ -353,10 +353,14 @@ min_frames = 3          # shortest track fitted
 # flat prior's support, so it is part of the analysis. Keys left out keep the
 # template's (or diffusionkit's defaults, shown).
 grid = { D_min_um2_s = 1e-5, D_max_um2_s = 10.0, n_D = 601 }
-msd_comparison = false
-msd_max_lag = 3         # lags the MSD fits use (at least 3)
-# msd_lag_fraction = 0.3  # or: each track's first 30% of lags (at least 3);
-#                         # replaces msd_max_lag, so longer tracks fit more lags
+# The per-track MSD fits always run (a comparison: exposure treated as 0):
+# D over each track's first msd_max_lag lags, alpha (log-log) over the first
+# msd_alpha_max_lag -- both at least 3, each capped at the track's length.
+msd_max_lag = 3
+msd_alpha_max_lag = 10
+# or shares of each track's longest lag, replacing both lag counts:
+# msd_lag_fraction = 0.3        # D: the usual 25-40% rule
+# msd_alpha_lag_fraction = 0.5  # alpha
 exposure_s = 0.01       # optional: overrides each bundle's recorded exposure
 # Which tracks pass (`passes_filters`) and so make up the ensemble -- the
 # diffusion widget's tracks-pane cuts, on any per-track column.
@@ -401,11 +405,13 @@ sample = "mut"
 [pool]
 output = "pooled"            # default: <results_root>/pooled
 # The ensemble-averaged MSD is off unless asked for, and its windows are
-# explicit: each track's MSD is computed to ensemble_max_lag, and the fit
-# uses the averaged curve's first ensemble_n_points lags (3 or more).
+# explicit: each track's MSD is computed to ensemble_max_lag; D is fitted
+# over the averaged curve's first ensemble_n_points lags (3 or more), alpha
+# (log-log) over its first ensemble_alpha_points (default: all of it).
 ensemble_msd = true
-ensemble_max_lag = 8
-ensemble_n_points = 4
+ensemble_max_lag = 10
+ensemble_n_points = 3
+ensemble_alpha_points = 10
 ensemble_offset = "provided"  # or "fit": the intercept of the linear MSD fit (no SDs used)
 n_boot = 200                  # bootstrap resamples of tracks
 ```
@@ -467,9 +473,12 @@ every track). The **By length** plot splits the mean posterior and the
 deconvolved distribution by track length (`gridpost.by_track_length`), stacked
 so the groups add up to the whole, beside each length's own distribution. Fast
 particles leave the focal depth within a few frames, so short tracks come
-mostly from fast particles and long ones from slow particles. Counted *per
-track*, the stack is the deconvolved distribution; *per detection*, each track
-counts once per frame, which gives the make-up of the spots seen in focus.
+mostly from fast particles and long ones from slow particles. Its window counts
+*each track once* (the default and the usual per-trajectory reading: the stack
+is the deconvolved distribution of D across tracks) or *each detection* (a track
+once per frame, so long tracks weigh more: the make-up of the spots seen in
+focus at a moment). Neither is the share of particles, since a fast particle can
+leave the focus and return as another track.
 Every D axis — the ensemble,
 the posteriors, the track plot, and the joint plot when an axis is D at one
 frame interval — shows the **localization floor** `D_floor_um2_s`, the D at
@@ -483,23 +492,31 @@ medians and the deconvolved distribution. The plots and summary follow the
 filters without a re-run; each group's deconvolution takes a second or two, on
 a worker thread, so they update shortly after a change. The **Track** plot shows
 the selected track's posterior; the **Map** tab colors each track's localizations
-by any result; the **NUTS** tab fits the selected track's full posterior with the
+by any per-track value (track length from the start, then any result); the **NUTS** tab fits the selected track's full posterior with the
 same exposure (needs `--extra bayes`).
 
-The classical MSD analysis is a labelled comparison, run with the exposure
-treated as 0 (diffusionkit's MSD estimators have no blur model):
+The classical MSD analysis has its own **MSD** tab. It needs only tracks, and it
+is a labelled comparison, run with the exposure treated as 0 (diffusionkit's
+MSD estimators have no blur model). D and α are fitted over separate windows
+everywhere: D over the first, best-measured lags, α by log-log over a wider span,
+since a log-log slope needs about a decade of τ to mean much.
 
-- **MSD** (a Run option) fits each track's time-averaged MSD over a window that
-  is either a fixed number of lags or a share of each track's own lags (the
-  usual 25–40% rule, never under 3), adding `D_msd`/`α_msd` columns. Its plot
-  shows the selected track's MSD with the fits, and a linear fit with a free
-  intercept, whose localization SD is a check on the SDs.
-- **Ensemble MSD** needs no run: the MSDs of the tracks the filters pass are
-  averaged per region class, each squared displacement counting once, and
-  fitted for D (linear) and α (log-log) over the first lags you choose, with
+- **Run MSD fits** fits each track's time-averaged MSD: D over its first lags
+  (default 3) and α over its first 10, or over shares of each track's own lags
+  (D the usual 25–40%), adding `D_msd`/`K_msd`/`α_msd` columns. A batch
+  always runs them alongside the posteriors.
+- **Track** draws the selected track's MSD on linear (D) and log-log (α) axes,
+  each fit over its window, with a linear fit with a free intercept whose
+  localization SD is a check on the SDs. No error bars: one track's lags share
+  their displacements.
+- **Ensemble** averages the MSDs of the tracks the filters pass per region class,
+  each squared displacement counting once, and fits D over the curve's first
+  30% and α over all of it (both adjustable), with ±1 SEM over tracks and fit
   intervals from resampling whole tracks. The offset is the SDs' or the linear
-  fit's intercept. A mix of slow and fast tracks averages to one curve, which
-  the deconvolved distribution would show as two.
+  fit's intercept. The late lags rest on the long tracks alone (the α panel
+  says how many reach its last lag; the Map tab colors tracks by length). A mix
+  of slow and fast tracks averages to one curve, which the deconvolved
+  distribution would show as two.
 
 Opening a bundle with a saved analysis — saved from the widget, a batch, or
 `gemscape2 diffusion` — restores it: plots, per-track columns, filters and
@@ -566,7 +583,7 @@ this track": it was excluded, too short, or that analysis was off.
 | `D_info_bits` | bits | How much the track narrowed D from the flat prior. Only comparable on the same grid |
 | `D_floor_um2_s` | µm²/s | Localization floor: the D at which motion per frame equals localization noise, ⟨σ²⟩ / (dt − exposure/3) from the track's SDs. A reference scale, not a threshold |
 | **Optional fits** | | |
-| `D_msd_um2_s`, `alpha_msd` | µm²/s, – | Classical MSD fit, when the MSD comparison ran (no uncertainties) |
+| `D_msd_um2_s`, `K_msd_um2_s_alpha`, `alpha_msd` | µm²/s, µm²/s^α, – | Classical MSD fits (D over D's window, α by log-log over its own), when they ran; no uncertainties |
 | `*_nuts*` | | Full-posterior NUTS fit, for tracks fitted in the NUTS tab |
 | **Detection quality** (mean over the track's detections, spotsolve's columns) | | |
 | `sigma` | px | Detector's reference PSF width (the same for every track) |

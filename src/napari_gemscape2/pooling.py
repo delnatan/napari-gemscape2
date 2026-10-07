@@ -8,7 +8,7 @@ refitted -- and hands them to diffusionkit's batch layer:
 - the D populations (`GridPostBatch.populations`): one per sample (the bundles that are replicates of each
   other), and one per bundle when a sample has several, with the distances between them;
 - optionally the ensemble-averaged MSD (`classic.ensemble_msd`) of each sample, recomputed from the tracks,
-  with its fit over an explicit number of lags.
+  with D and alpha each fitted over an explicit number of lags.
 
 Only tracks that passed the filters when each bundle was saved enter either. The posteriors must share one D
 grid. The ensemble MSD runs with the exposure treated as 0, as the widget's MSD comparison does: the MSD
@@ -37,6 +37,7 @@ from napari_gemscape2.diffusion import (
     ENSEMBLE_MSD_OFFSETS,
     PosteriorAnalysis,
     ensemble_msd_blur_free,
+    ensemble_msd_fits,
     grid_record,
     restore_analysis,
     tracks_to_diffusionkit_df,
@@ -65,11 +66,13 @@ class PooledBundle:
 class PoolSettings:
     """`[pool]` in the config. The ensemble MSD is off unless asked for, and then its windows are explicit:
     `ensemble_max_lag` is how far each track's MSD is computed, `ensemble_n_points` how many of the averaged
-    curve's first lags the fit uses (the window changes D and alpha, so it has no default)."""
+    curve's first lags the linear fit (D) uses -- the window changes D, so it has no default -- and
+    `ensemble_alpha_points` how many the log-log fit (alpha) uses, the whole curve when left out."""
 
     ensemble_msd: bool = False
     ensemble_max_lag: Optional[int] = None
     ensemble_n_points: Optional[int] = None
+    ensemble_alpha_points: Optional[int] = None
     ensemble_offset: str = "provided"  # where the localization offset comes from: the tracks' SDs, or the fit's intercept
     n_boot: int = ENSEMBLE_MSD_BOOT
 
@@ -81,6 +84,11 @@ class PoolSettings:
                 raise ValueError("ensemble_msd needs ensemble_max_lag and ensemble_n_points (the fit's lag window is explicit)")
             if not 3 <= self.ensemble_n_points <= self.ensemble_max_lag:
                 raise ValueError("need 3 <= ensemble_n_points <= ensemble_max_lag")
+            if self.ensemble_alpha_points is None:
+                # Recorded resolved, so the summary and a written config say the window used.
+                object.__setattr__(self, "ensemble_alpha_points", self.ensemble_max_lag)
+            if not 3 <= self.ensemble_alpha_points <= self.ensemble_max_lag:
+                raise ValueError("need 3 <= ensemble_alpha_points <= ensemble_max_lag")
 
     @classmethod
     def names(cls) -> set[str]:
@@ -184,7 +192,8 @@ def population_tables(batch: GridPostBatch, level: float, n_samples: int = POPUL
 
 
 def pooled_ensemble_msd(bundles: list[PooledBundle], settings: PoolSettings) -> tuple[EnsembleMSD, pl.DataFrame]:
-    """The ensemble-averaged MSD of each sample, and its fit over `settings.ensemble_n_points` lags.
+    """The ensemble-averaged MSD of each sample, and its fits: D over `settings.ensemble_n_points` lags, alpha
+    over `settings.ensemble_alpha_points` (a sample whose curve stops short gets `insufficient_data` rows).
 
     Tracks are the bundles' passing ones, with the exposure treated as 0 (blur-free); each track's MSD is
     computed to `ensemble_max_lag`, then averaged, pair-weighted, per sample. Intervals resample tracks."""
@@ -199,7 +208,11 @@ def pooled_ensemble_msd(bundles: list[PooledBundle], settings: PoolSettings) -> 
     ]
     min_frames = max(b.analysis.min_frames for b in bundles)
     ens = ensemble_msd_blur_free(experiments, min_frames, settings.ensemble_max_lag, settings.n_boot)
-    return ens, ens.fit(settings.ensemble_n_points, settings.ensemble_offset, level=bundles[0].analysis.level)
+    fits = ensemble_msd_fits(
+        ens, settings.ensemble_n_points, settings.ensemble_offset, bundles[0].analysis.level,
+        settings.ensemble_alpha_points,
+    )
+    return ens, fits
 
 
 @dataclass(frozen=True)
@@ -291,6 +304,7 @@ def write_pool_config(
         lines += [
             f"ensemble_max_lag = {settings.ensemble_max_lag}",
             f"ensemble_n_points = {settings.ensemble_n_points}",
+            f"ensemble_alpha_points = {settings.ensemble_alpha_points}",
             f"ensemble_offset = {s(settings.ensemble_offset)}",
             f"n_boot = {settings.n_boot}",
         ]

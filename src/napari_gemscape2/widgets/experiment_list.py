@@ -853,7 +853,10 @@ class ExperimentListWidget(QWidget):
         ]
         if result.ensemble is not None:
             settings = plan.settings
-            panels = ensemble_msd_panels(result.ensemble, settings.ensemble_n_points, settings.ensemble_offset)
+            panels = ensemble_msd_panels(
+                result.ensemble, settings.ensemble_n_points, settings.ensemble_offset,
+                alpha_points=settings.ensemble_alpha_points,
+            )
             figures.append(("Pooled: ensemble MSD", plot_ensemble_msd(panels)))
         for title, figure in figures:
             window = self._pool_windows.get(title)

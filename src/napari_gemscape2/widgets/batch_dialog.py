@@ -93,11 +93,9 @@ def _diffusion_summary_text(settings: dict) -> str:
     grid = settings.get("grid") or {}
     if "D_min_um2_s" in grid and "D_max_um2_s" in grid:
         parts.append(f"D grid {grid['D_min_um2_s']:g}–{grid['D_max_um2_s']:g} µm²/s")
-    if settings.get("msd_comparison"):
-        from napari_gemscape2.diffusion import MSD_MAX_LAG, msd_window_text
+    from napari_gemscape2.diffusion import MSDWindow
 
-        window = msd_window_text(settings.get("msd_max_lag", MSD_MAX_LAG), settings.get("msd_lag_fraction"))
-        parts.append(f"MSD comparison ({window})")
+    parts.append(f"MSD {MSDWindow.from_settings(settings).text()}")
     if settings.get("filters"):
         parts.append(f"filters: {', '.join(sorted(settings['filters']))}")
     return " · ".join(parts)

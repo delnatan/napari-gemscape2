@@ -37,6 +37,8 @@ from one program.
 
 from __future__ import annotations
 
+import textwrap
+
 import numpy as np
 import pandas as pd
 import polars as pl
@@ -517,68 +519,14 @@ def plot_d_by_length(panels: list[dict], title: str | None = None) -> Figure:
     axes[-1][0].set_xlim(x_lo - _LOG_D_PAD, x_hi + _LOG_D_PAD)
     for ax in axes[-1]:
         ax.set_xlabel(units.mpl_log_label("D_um2_s"), fontsize=9)
-    if title:
-        fig.suptitle(title, fontsize=10, x=0.01, ha="left")
-    return fig
-
-
-def plot_track_msd(
-    track_id: int,
-    n_frames: int,
-    tau_s: np.ndarray,
-    msd_um2: np.ndarray,
-    offset_um2: np.ndarray,
-    n_pairs: np.ndarray,
-    D_um2_s: float | None = None,
-    K_um2_s_alpha: float | None = None,
-    alpha: float | None = None,
-    D_linear_um2_s: float | None = None,
-    offset_fit_um2: float | None = None,
-    sigma_fit_um: float | None = None,
-    sigma_sds_um: float | None = None,
-    **_unused,
-) -> Figure:
-    """One track's time-averaged MSD against lag -- the raw, noisy values
-    the MSD fits see -- with the Brownian and power-law fits drawn over
-    them (each plus the localization offset it was fitted net of), and the
-    linear fit with a free intercept, which reads the offset off the curve
-    instead of the SDs. The last lags average few displacements and
-    scatter most; that scatter is why the posterior, not this curve, is the
-    estimate."""
-    fig = Figure(figsize=(4.4, 3.0), layout="constrained")
-    ax = fig.subplots()
-    _style_axis(ax)
-    tau = np.asarray(tau_s)
-    ax.plot(tau, msd_um2, "o", color=_INK, ms=4, zorder=3, label="track MSD")
-    # The offset is known only at the measured lags, so the fits are drawn
-    # through them rather than on a finer curve.
-    if D_um2_s is not None:
-        ax.plot(tau, 4 * D_um2_s * tau + offset_um2, "-", color=_SHARED_COLOR, lw=1.4, label="linear (D), SDs' offset")
-    if K_um2_s_alpha is not None and alpha is not None:
-        ax.plot(tau, 4 * K_um2_s_alpha * tau**alpha + offset_um2, "--", color=_DECONVOLVED_COLOR, lw=1.4,
-                label=f"power law (α = {alpha:.2f})")
-    if D_linear_um2_s is not None and offset_fit_um2 is not None:
-        # Drawn from τ = 0, where it meets its intercept: the offset it fitted.
-        t = np.concatenate([[0.0], tau])
-        ax.plot(t, 4 * D_linear_um2_s * t + offset_fit_um2, ":", color=_MEAN_POSTERIOR_COLOR, lw=1.6,
-                label=f"linear, fitted offset (D = {D_linear_um2_s:.3g})")
-    ax.set_xlim(left=0)
-    ax.set_ylim(bottom=0)
-    ax.set_xlabel("lag τ (s)", fontsize=9)
-    ax.set_ylabel("MSD (µm²)", fontsize=9)
-    # An MSD rises left to right, so the lower right stays clear.
-    ax.legend(fontsize=7, frameon=False, loc="lower right")
-    head = f"track {track_id} · {n_frames} frames"
-    fit = f"D_msd = {D_um2_s:.3g} µm²/s · " if D_um2_s is not None else ""
-    lines = [head, f"{fit}{len(tau)} lags (last: {int(n_pairs[-1])} pairs)"]
-    sigmas = [f"SDs {1000 * sigma_sds_um:.0f} nm"] if sigma_sds_um is not None else []
-    if sigma_fit_um is not None:
-        sigmas.append(f"intercept {1000 * sigma_fit_um:.0f} nm")
-    elif offset_fit_um2 is not None and offset_fit_um2 < 0:
-        sigmas.append("intercept < 0, none")
-    if sigmas:
-        lines.append("localization σ: " + " · ".join(sigmas))
-    ax.set_title("\n".join(lines), fontsize=9, loc="left", color=_INK)
+    if title is None:
+        title = (
+            "counted per track: each track once -- the stack is the deconvolved distribution of D across tracks"
+            if panels[0]["composition"].weight == "tracks"
+            else "counted per detection: each track once per frame, so long (often slow) tracks weigh more -- "
+            "the make-up of the spots in focus"
+        )
+    fig.suptitle(title, fontsize=8, x=0.01, ha="left", color=_MUTED_INK)
     return fig
 
 
@@ -591,15 +539,15 @@ def _with_interval(value, low, high, fmt: str = ".3g") -> str:
     return f"{value:{fmt}} [{low:{fmt}}–{high:{fmt}}]"
 
 
-def _msd_points(ax, tau, y, yerr, inside) -> None:
-    """Ensemble MSD points: filled inside the fit window, hollow past it."""
+def _msd_points(ax, tau, y, yerr, inside, curve: str = "ensemble MSD") -> None:
+    """MSD points: filled inside the fit window, hollow past it."""
     yerr = np.asarray(yerr, float)
     for mask, face, label in ((inside, _INK, "fit window"), (~inside, "white", "past the window")):
         if mask.any():
             err = yerr[..., mask]
             ax.errorbar(tau[mask], y[mask], yerr=None if np.isnan(err).all() else err, fmt="o", ms=4, color=_INK,
                         mfc=face, mec=_INK, ecolor=_MUTED_INK, elinewidth=0.8, capsize=0, zorder=3,
-                        label=f"ensemble MSD, {label}")
+                        label=f"{curve}, {label}")
 
 
 def _fit_line(ax, t, y, n_solid: int, color: str, style: str, label: str) -> None:
@@ -620,6 +568,14 @@ def _plain_log_ticks(ax) -> None:
         axis.set_minor_formatter(NullFormatter())
 
 
+def _fit_problem(fit: dict) -> list[str]:
+    """A fit's status and message, wrapped to sit inside half a figure's
+    width -- or nothing when it is ok."""
+    if fit.get("status") in (None, "ok"):
+        return []
+    return textwrap.wrap(f"{fit['status']}: {fit.get('message')}", 46)
+
+
 def _nm(value_um):
     return None if value_um is None else 1000 * value_um
 
@@ -628,24 +584,66 @@ def plot_ensemble_msd(panels: list[dict], title: str | None = None) -> Figure:
     """The ensemble-averaged MSD of each group (`diffusion.ensemble_msd_panels`),
     one row per group: on linear axes with the linear fit that gives D, and
     on log-log axes net of the localization offset, with the power law that
-    gives α. The fit window (the first `n_points` lags) is filled and its
-    fits solid; the lags past it are hollow and the fits continue dotted, so
-    where the curve leaves the model shows. Error bars are ±1 bootstrap SD
-    of the averaged curve; the intervals in the text are the fits' own."""
+    gives α. Each fit has its own window -- D the first `n_points` lags, α
+    the first `alpha_points`, usually more -- filled with its fit solid; the
+    lags past it are hollow and the fit continues dotted, so where the curve
+    leaves the model shows. The α panel says how many decades of τ its
+    window spans and how many tracks still reach its last lag: the late
+    lags rest on the long tracks alone, which are not a random sample of
+    the particles (fast ones leave the focus sooner). Error bars are ±1 SEM
+    of the averaged curve over tracks, the independent unit: the bootstrap
+    SD over resampled tracks, which is that SEM (pair-weighted) without a
+    formula -- not the spread of the tracks (SD, √n times wider, a
+    population's heterogeneity rather than the mean's uncertainty), and not
+    an SEM over displacement pairs, which overlap and are correlated, so
+    that one comes out several times too small. The intervals in the text
+    are the fits' own, from refitting every resample."""
+    if title is None:
+        offset_rule = "offset fitted (intercept)" if panels[0]["offset"] == "fit" else "offset from the SDs"
+        title = (
+            f"Ensemble-averaged MSD, pair-weighted · {offset_rule} · exposure treated as 0 (no blur model)\n"
+            f"bars ±1 SEM over tracks · fit intervals {panels[0]['level']:.0%}, bootstrap over tracks"
+        )
+    return _plot_msd_rows(panels, title)
+
+
+def plot_track_msd(panel: dict, title: str | None = None) -> Figure:
+    """One track's time-averaged MSD (`diffusion.msd_track_panel`), drawn
+    as `plot_ensemble_msd` draws a group: D's fit on linear axes, alpha's
+    log-log fit on log axes, each over its own window -- the fits behind
+    the track's D_msd / alpha_msd. The linear axes add the fit with a free
+    intercept (dotted grey), whose offset is read off the curve instead of
+    the SDs; the localization SDs the two imply are compared in the text.
+    No error bars: the lags of one track share their displacements."""
+    if title is None:
+        title = (
+            "Time-averaged MSD of one track · offset from the SDs · exposure treated as 0 (no blur model)\n"
+            "no error bars: a track's lags share their displacements, so they are not independent points"
+        )
+    return _plot_msd_rows([panel], title)
+
+
+def _plot_msd_rows(panels: list[dict], title: str) -> Figure:
+    """The MSD rows `plot_ensemble_msd` and `plot_track_msd` share: per
+    panel, linear axes with D's fit and log-log axes with alpha's."""
     fig = Figure(figsize=(8.6, 0.7 + 2.7 * len(panels)), layout="constrained")
     axes = fig.subplots(len(panels), 2, sharex="col", squeeze=False)
     for row, p in enumerate(panels):
         tau, msd, se, off = p["tau_s"], p["msd_um2"], p["se_um2"], p["offset_um2"]
         k = min(p["n_points"], len(tau))
+        m = min(p.get("alpha_points", k), len(tau))
         inside = np.arange(len(tau)) < k
+        inside_log = np.arange(len(tau)) < m
         lin, pw = p["linear"], p["power_law"]
+        per_track = p.get("unit") == "pairs"
+        curve = "track MSD" if per_track else "ensemble MSD"
         ax_lin, ax_log = axes[row]
         for ax in (ax_lin, ax_log):
             _style_axis(ax)
 
         # Linear axes: D. The SDs' offset is known per lag only, so that line
         # runs through the lags; a fitted intercept is drawn from τ = 0.
-        _msd_points(ax_lin, tau, msd, se, inside)
+        _msd_points(ax_lin, tau, msd, se, inside, curve)
         D = lin.get("D_um2_s")
         if D is not None and p["offset"] == "fit" and lin.get("offset_um2") is not None:
             t = np.concatenate([[0.0], tau])
@@ -653,18 +651,28 @@ def plot_ensemble_msd(panels: list[dict], title: str | None = None) -> Figure:
         elif D is not None:
             _fit_line(ax_lin, tau, 4 * D * tau + off, k, _SHARED_COLOR, "-", "linear (D), SDs' offset")
         text = [f"D = {_with_interval(D, lin.get('D_um2_s_lo'), lin.get('D_um2_s_hi'))} µm²/s"]
-        if p["offset"] == "fit":
+        if p["offset"] == "fit" and D is not None:
             sigma = _with_interval(_nm(lin.get("localization_sd_um")), _nm(lin.get("localization_sd_um_lo")),
                                    _nm(lin.get("localization_sd_um_hi")), ".0f")
             text.append(f"σ = {sigma} nm")
-        if lin.get("status") not in (None, "ok"):
-            text.append(f"{lin['status']}: {lin.get('message')}")
+        check = p.get("intercept_check") or {}
+        if check.get("D_um2_s") is not None and check.get("offset_um2") is not None:
+            # Drawn from τ = 0, where it meets its intercept: the offset it fitted.
+            t = np.concatenate([[0.0], tau])
+            _fit_line(ax_lin, t, 4 * check["D_um2_s"] * t + check["offset_um2"], k + 1, _MUTED_INK, ":",
+                      "linear, fitted offset (check)")
+            sigmas = [f"SDs {_nm(check['sigma_sds_um']):.0f} nm"] if check.get("sigma_sds_um") is not None else []
+            sigmas.append(f"intercept {_nm(check['localization_sd_um']):.0f} nm"
+                          if check.get("localization_sd_um") is not None else "intercept < 0")
+            text.append("σ: " + " · ".join(sigmas))
+        text += _fit_problem(lin)
         ax_lin.text(0.02, 0.97, "\n".join(text), transform=ax_lin.transAxes, va="top", ha="left", fontsize=8,
                     color=_INK)
         ax_lin.set_xlim(left=0)
         ax_lin.set_ylim(bottom=0)
         ax_lin.set_ylabel("MSD (µm²)", fontsize=9)
-        ax_lin.set_title(f"{p['name']} · {p['n_tracks']} tracks · fit over {k} lags", fontsize=9, loc="left",
+        size = f"{p['n_frames']} frames" if per_track else f"{p['n_tracks']} tracks"
+        ax_lin.set_title(f"{p['name']} · {size} · D: first {p['n_points']} lags", fontsize=9, loc="left",
                          color=_INK)
 
         # Log-log axes: α, net of the offset. Lags with nothing left after it
@@ -672,17 +680,24 @@ def plot_ensemble_msd(panels: list[dict], title: str | None = None) -> Figure:
         net = msd - off
         keep = net > 0
         # The lower bar stops short of zero, which a log axis cannot show.
-        _msd_points(ax_log, tau[keep], net[keep], [np.minimum(se, 0.999 * net)[keep], se[keep]], inside[keep])
+        _msd_points(ax_log, tau[keep], net[keep], [np.minimum(se, 0.999 * net)[keep], se[keep]], inside_log[keep],
+                    curve)
         K, alpha = pw.get("K_um2_s_alpha"), pw.get("alpha")
         if K is not None and alpha is not None:
-            _fit_line(ax_log, tau, 4 * K * tau**alpha, k, _DECONVOLVED_COLOR, "--", "power law (α)")
+            _fit_line(ax_log, tau, 4 * K * tau**alpha, m, _DECONVOLVED_COLOR, "--", "power law (α)")
         ax_log.set_xscale("log")
         ax_log.set_yscale("log")
         _plain_log_ticks(ax_log)
         ax_log.set_ylabel("MSD − offset (µm²)", fontsize=9)
+        n_alpha = p.get("alpha_points", p["n_points"])
+        span = f" · {np.log10(tau[n_alpha - 1] / tau[0]):.1f} decades of τ" if n_alpha <= len(tau) else ""
+        ax_log.set_title(f"α: first {n_alpha} lags{span}", fontsize=9, loc="left", color=_INK)
         text = [f"α = {_with_interval(alpha, pw.get('alpha_lo'), pw.get('alpha_hi'), '.2f')}"]
-        if pw.get("status") not in (None, "ok"):
-            text.append(f"{pw['status']}: {pw.get('message')}")
+        if alpha is not None and per_track:
+            text.append(f"{int(p['n_units'][m - 1])} displacement pairs at lag {m}")
+        elif alpha is not None:
+            text.append(f"{int(p['n_units'][m - 1])} of {p['n_tracks']} tracks reach lag {m}")
+        text += _fit_problem(pw)
         ax_log.text(0.02, 0.97, "\n".join(text), transform=ax_log.transAxes, va="top", ha="left", fontsize=8,
                     color=_INK)
         if row == 0:
@@ -690,12 +705,6 @@ def plot_ensemble_msd(panels: list[dict], title: str | None = None) -> Figure:
                 ax.legend(fontsize=7, frameon=False, loc="lower right")
     for ax in axes[-1]:
         ax.set_xlabel("lag τ (s)", fontsize=9)
-    if title is None:
-        offset_rule = "offset fitted (intercept)" if panels[0]["offset"] == "fit" else "offset from the SDs"
-        title = (
-            f"Ensemble-averaged MSD, pair-weighted · {offset_rule} · exposure treated as 0 (no blur model)\n"
-            f"bars ±1 bootstrap SD · intervals {panels[0]['level']:.0%}, bootstrap over tracks"
-        )
     fig.suptitle(title, fontsize=8, x=0.01, ha="left", color=_MUTED_INK)
     return fig
 

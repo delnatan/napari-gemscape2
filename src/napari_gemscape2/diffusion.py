@@ -51,7 +51,7 @@ from __future__ import annotations
 import hashlib
 import os
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Optional
 
 import numpy as np
@@ -63,11 +63,14 @@ from diffusionkit.classic import (
     analyze_experiments,
     compute_msd,
     ensemble_msd,
-    fit_anomalous_msd,
     fit_brownian_msd,
     fit_linear_msd,
+    fit_loglog_msd,
+    fit_windows,
+    window_lags,
 )
 from diffusionkit.classic import analyze_tracks as analyze_msd
+from diffusionkit.classic.batch import FIT_SCHEMA as ENSEMBLE_FIT_SCHEMA
 from diffusionkit.gridpost import GridPosteriors, GridPostOptions, LengthComposition, by_track_length
 from diffusionkit.gridpost import analyze_tracks as dk_analyze_tracks
 from diffusionkit.gridpost import deconvolve as dk_deconvolve
@@ -802,97 +805,157 @@ def length_distributions_table(
 # --- MSD comparison -----------------------------------------------------
 
 
-# The MSD comparison's default lag window: diffusionkit's own. The power
-# law needs three lags, so that is also the least.
+# The per-track MSD fits' default windows. D over the first 3 lags
+# (diffusionkit's own default, and the least: the fits need three points);
+# alpha over the first 10, about a decade of tau -- a log-log slope over
+# three lags spans half a decade and says little about curvature. The
+# share-of-each-track form: D over 30% (the 25-40% rule), alpha over 50%,
+# short of the last lags, where a single track's MSD rests on a pair or two.
 MSD_MAX_LAG = 3
 MSD_MIN_LAG = 3
-# The other window: a fraction of each track's own longest lag, the usual
-# 25-40% rule (diffusionkit's `window_lags`, never under MSD_MIN_LAG lags).
+MSD_ALPHA_MAX_LAG = 10
 MSD_LAG_FRACTION = 0.3
+MSD_ALPHA_LAG_FRACTION = 0.5
+# What the per-track and ensemble MSD comparisons are, for the summaries.
+MSD_METHOD = {
+    "D_fit": "linear through the origin of the offset-corrected MSD (offset from the SDs)",
+    "alpha_fit": "log-log OLS of the offset-corrected MSD (offset from the SDs)",
+    "exposure": "treated as 0 (the MSD estimators have no blur model)",
+}
 
 
-def msd_options(min_frames: int, max_lag: int = MSD_MAX_LAG, lag_fraction: Optional[float] = None) -> MSDOptions:
-    """The per-track MSD window: `max_lag` lags, or -- when `lag_fraction`
-    is set, which replaces it -- that fraction of each track's longest lag,
-    so a longer track fits more of its curve."""
-    if lag_fraction is not None:
-        return MSDOptions(max_lag=None, lag_fraction=lag_fraction, min_frames=max(min_frames, 5), localization="provided")
-    return MSDOptions(max_lag=max(max_lag, MSD_MIN_LAG), min_frames=max(min_frames, 5), localization="provided")
+@dataclass(frozen=True)
+class MSDWindow:
+    """The per-track MSD fits' windows: D over each track's first `max_lag`
+    lags and alpha over its first `alpha_max_lag` -- or, when `lag_fraction`
+    is set, shares of each track's longest lag (`lag_fraction` for D,
+    `alpha_lag_fraction` for alpha), so longer tracks fit more of their
+    curve. Each is capped at the track's own longest lag. The names are
+    diffusionkit's `MSDOptions`'."""
 
+    max_lag: int = MSD_MAX_LAG
+    alpha_max_lag: int = MSD_ALPHA_MAX_LAG
+    lag_fraction: Optional[float] = None
+    alpha_lag_fraction: float = MSD_ALPHA_LAG_FRACTION
 
-def msd_window_text(max_lag: int, lag_fraction: Optional[float]) -> str:
-    """The window as a reader sees it: "3 lags" or "30% of each track"."""
-    return f"{lag_fraction:.0%} of each track" if lag_fraction is not None else f"{max_lag} lags"
+    def __post_init__(self):
+        for name in ("max_lag", "alpha_max_lag"):
+            if getattr(self, name) < MSD_MIN_LAG:
+                raise ValueError(f"msd_{name} must be at least {MSD_MIN_LAG}, got {getattr(self, name)}")
+        for name in ("lag_fraction", "alpha_lag_fraction"):
+            value = getattr(self, name)
+            if value is not None and not 0 < value <= 1:
+                raise ValueError(f"msd_{name} must be in (0, 1], got {value}")
+
+    @property
+    def by_fraction(self) -> bool:
+        return self.lag_fraction is not None
+
+    def options(self, min_frames: int) -> MSDOptions:
+        """diffusionkit's `MSDOptions` for these windows, alpha by log-log."""
+        common = dict(min_frames=max(min_frames, 5), localization="provided", alpha_fit="loglog")
+        if self.by_fraction:
+            return MSDOptions(
+                max_lag=None, lag_fraction=self.lag_fraction, alpha_lag_fraction=self.alpha_lag_fraction, **common
+            )
+        return MSDOptions(max_lag=self.max_lag, alpha_max_lag=self.alpha_max_lag, **common)
+
+    def text(self) -> str:
+        """As a reader sees it: "D: 3 lags · α: 10 lags", or by share."""
+        if self.by_fraction:
+            return f"D: {self.lag_fraction:.0%} · α: {self.alpha_lag_fraction:.0%} of each track"
+        return f"D: {self.max_lag} lags · α: {self.alpha_max_lag} lags"
+
+    def record(self) -> dict:
+        """For `diffusion_summary.json`: the two windows in use, under
+        their `[diffusion]` config names, and what the fits are."""
+        windows = (
+            {"msd_lag_fraction": self.lag_fraction, "msd_alpha_lag_fraction": self.alpha_lag_fraction}
+            if self.by_fraction
+            else {"msd_max_lag": self.max_lag, "msd_alpha_max_lag": self.alpha_max_lag}
+        )
+        return {**windows, **MSD_METHOD}
+
+    @classmethod
+    def from_settings(cls, settings: dict) -> "MSDWindow":
+        """From `msd_*` keys (a `record()`, or a `[diffusion]` config); the
+        ones left out keep their defaults."""
+        keys = {"max_lag", "alpha_max_lag", "lag_fraction", "alpha_lag_fraction"}
+        return cls(**{k: settings[f"msd_{k}"] for k in keys if settings.get(f"msd_{k}") is not None})
 
 
 def msd_fits_blur_free(
     tracks: pl.DataFrame,
     dt_s: float,
     min_frames: int,
-    max_lag: int = MSD_MAX_LAG,
-    lag_fraction: Optional[float] = None,
+    window: MSDWindow,
+    progress: Optional[Callable[[int, int], None]] = None,
 ) -> pl.DataFrame:
     """diffusionkit.classic's MSD fits of `tracks_to_diffusionkit_df`'s
-    table, for comparison with the posteriors, over `msd_options`' window.
+    table over `window`, for comparison with the posteriors.
 
     The MSD fits have no blur model, so diffusionkit excludes them when
     `exposure_s > 0`; the comparison therefore runs them with the exposure
     treated as 0, which is exactly the assumption that biases them, and is
     labelled as such wherever it shows."""
-    return analyze_msd(tracks, Acquisition(dt_s=dt_s), msd_options(min_frames, max_lag, lag_fraction)).fits
+    return analyze_msd(tracks, Acquisition(dt_s=dt_s), window.options(min_frames), progress=progress).fits
 
 
-def msd_track_curve(
-    tracks: pl.DataFrame,
-    dt_s: float,
-    track_id: int,
-    min_frames: int,
-    max_lag: int = MSD_MAX_LAG,
-    lag_fraction: Optional[float] = None,
+def msd_track_panel(
+    tracks: pl.DataFrame, dt_s: float, track_id: int, min_frames: int, window: MSDWindow
 ) -> Optional[dict]:
-    """One track's time-averaged MSD against lag, for
-    `joint_plot.plot_track_msd`: the raw values (noisy, each lag's mean
-    over that track's own displacements), the localization offset the fits
-    subtract, and `fit_brownian_msd` / `fit_anomalous_msd`'s curves on the
-    same lags. Also `fit_linear_msd`'s, whose free intercept is the offset
-    read off the curve itself rather than from the SDs: the two
-    localization SDs (`sigma_sds_um`, `sigma_fit_um`) disagreeing is a
-    sign the SDs are miscalibrated -- or that three noisy lags cannot pin
-    an intercept, which is why the comparison's own D does not use it.
+    """One track's time-averaged MSD, as a panel `joint_plot.plot_track_msd`
+    draws the way `plot_ensemble_msd` draws a group: the raw curve over the
+    larger of the two windows, D's fit over its window (through the origin
+    of the SD-corrected curve) and alpha's log-log fit over its own --
+    the fits in the D_msd / alpha_msd columns. Also the linear fit with a
+    free intercept over D's window, whose offset is read off the curve
+    rather than the SDs (`intercept_check`): the two localization SDs
+    disagreeing is a sign the SDs are miscalibrated -- or that a few noisy
+    lags cannot pin an intercept, which is why D_msd does not use it. No
+    error bars: a track's lags share their displacements, so its points are
+    not independent and no per-point SD means what it would on an ensemble.
     None if the track is absent or too short."""
     track = tracks.filter(pl.col("track_id") == track_id).sort("frame")
-    options = msd_options(min_frames, max_lag, lag_fraction)
+    options = window.options(min_frames)
     if track.height < options.min_frames:
         return None
     curve = compute_msd(track, Acquisition(dt_s=dt_s), options)
-    corrected = curve.msd_um2 - curve.localization_offset_um2
-    brownian = fit_brownian_msd(curve).parameters.get("D_um2_s")
-    power = fit_anomalous_msd(curve, max_nfev=options.max_nfev).parameters
-    linear = fit_linear_msd(curve).parameters
+    n_d, n_alpha = fit_windows(track.height, options)
+    brownian = fit_brownian_msd(curve.head(n_d))
+    power = fit_loglog_msd(curve.head(n_alpha))
+    linear = fit_linear_msd(curve.head(n_d)).parameters
     # The SDs' offset is 4 sigma^2 for an isotropic 2-D error.
-    offset_sds = float(np.mean(curve.localization_offset_um2))
+    offset_sds = float(np.mean(curve.localization_offset_um2[:n_d]))
     return {
-        "track_id": track_id,
+        "name": f"track {track_id}",
         "n_frames": track.height,
-        "tau_s": np.asarray(curve.tau_s),
-        "msd_um2": np.asarray(curve.msd_um2),
-        "offset_um2": np.asarray(curve.localization_offset_um2),
-        "n_pairs": np.asarray(curve.n_pairs),
-        "D_um2_s": brownian,
-        "K_um2_s_alpha": power.get("K_um2_s_alpha"),
-        "alpha": power.get("alpha"),
-        "D_linear_um2_s": linear.get("D_um2_s"),
-        "offset_fit_um2": linear.get("offset_um2"),
-        "sigma_fit_um": linear.get("localization_sd_um"),
-        "sigma_sds_um": float(np.sqrt(offset_sds / 4)) if offset_sds >= 0 else None,
-        "corrected_um2": corrected,
+        "unit": "pairs",
+        "n_points": n_d,
+        "alpha_points": n_alpha,
+        "offset": "provided",
+        "level": LEVEL,
+        "tau_s": np.asarray(curve.tau_s, float),
+        "msd_um2": np.asarray(curve.msd_um2, float),
+        "se_um2": np.full(len(curve.lag), np.nan),
+        "n_units": np.asarray(curve.n_pairs),
+        "offset_um2": np.asarray(curve.localization_offset_um2, float),
+        "linear": {"model": "brownian", "status": brownian.status, "message": brownian.message, **brownian.parameters},
+        "power_law": {"model": "power_law", "status": power.status, "message": power.message, **power.parameters},
+        "intercept_check": {
+            "D_um2_s": linear.get("D_um2_s"),
+            "offset_um2": linear.get("offset_um2"),
+            "localization_sd_um": linear.get("localization_sd_um"),
+            "sigma_sds_um": float(np.sqrt(offset_sds / 4)) if offset_sds >= 0 else None,
+        },
     }
 
 
 def msd_track_table(fits: pl.DataFrame) -> pl.DataFrame:
     """diffusionkit.classic's MSD fits, one row per track: `D_msd_um2_s`
-    from the linear fit, `K_msd_um2_s_alpha`/`alpha_msd` from the power
-    law. No uncertainties -- diffusionkit estimates none for MSD fits."""
+    over D's window, `K_msd_um2_s_alpha`/`alpha_msd` from the log-log fit
+    over alpha's. No uncertainties -- diffusionkit estimates none for one
+    track's MSD fits."""
     brownian = fits.filter(pl.col("model") == "brownian").select(
         "track_id", pl.col("D_um2_s").alias("D_msd_um2_s")
     )
@@ -912,6 +975,21 @@ def msd_track_table(fits: pl.DataFrame) -> pl.DataFrame:
 ENSEMBLE_MSD_OFFSETS = ("provided", "fit")
 # Bootstrap resamples of whole tracks behind the ensemble MSD's intervals.
 ENSEMBLE_MSD_BOOT = 200
+# The ensemble MSD's windows. The curve runs to ENSEMBLE_MSD_MAX_LAG; D is
+# fitted over its first 30% (the 25-40% rule: the best-measured lags), and
+# alpha over all of it, since a log-log slope needs a span of lags to show
+# curvature -- three lags cover well under a decade of tau.
+ENSEMBLE_MSD_MAX_LAG = 10
+ENSEMBLE_D_FRACTION = MSD_LAG_FRACTION
+ENSEMBLE_ALPHA_FRACTION = 1.0
+
+
+def ensemble_windows(max_lag: int, d_fraction: float, alpha_fraction: float) -> tuple[int, int]:
+    """`(n_points, alpha_points)`: the first lags of a curve run to `max_lag`
+    that D and alpha are fitted over, each a fraction of it (diffusionkit's
+    `window_lags`: never under three lags, never more than `max_lag`). One
+    window for every group, so their fits compare on the same lags."""
+    return window_lags(max_lag, d_fraction), window_lags(max_lag, alpha_fraction)
 
 
 def ensemble_msd_blur_free(
@@ -923,7 +1001,8 @@ def ensemble_msd_blur_free(
     resamples of whole tracks for the intervals. The experiments'
     acquisitions carry no exposure: as in the per-track comparison, the MSD
     estimators have no blur model, so the exposure is treated as 0."""
-    options = MSDOptions(max_lag=max_lag, min_frames=max(min_frames, 5), localization="provided")
+    # Each track's own fits are not used here; log-log keeps them cheap.
+    options = MSDOptions(max_lag=max_lag, min_frames=max(min_frames, 5), localization="provided", alpha_fit="loglog")
     return ensemble_msd(analyze_experiments(experiments, options), "sample", n_boot=n_boot)
 
 
@@ -940,14 +1019,53 @@ def group_experiments(tracks: pl.DataFrame, dt_s: float, groups: dict[str, Optio
     return out
 
 
-def ensemble_msd_panels(ens: EnsembleMSD, n_points: int, offset: str, level: float = LEVEL) -> list[dict]:
+def ensemble_msd_fits(
+    ens: EnsembleMSD, n_points: int, offset: str, level: float = LEVEL, alpha_points: Optional[int] = None
+) -> pl.DataFrame:
+    """`EnsembleMSD.fit` -- D over the first `n_points` lags, alpha over the
+    first `alpha_points` (default `n_points`) -- one group at a time: a
+    group whose curve stops short of a window (no track of it reaches that
+    lag) gets rows with status `insufficient_data` saying so, and the other
+    groups are still fitted."""
+    alpha_points = n_points if alpha_points is None else alpha_points
+    need = max(n_points, alpha_points)
+    parts = []
+    for name, curve in ens.means.items():
+        if len(curve.lag) >= need:
+            one = replace(
+                ens,
+                curves=ens.curves.filter(pl.col("group") == name),
+                means={name: curve},
+                resamples={name: ens.resamples[name]},
+                n_units={name: ens.n_units[name]},
+            )
+            parts.append(one.fit(n_points, offset, level=level, alpha_points=alpha_points))
+            continue
+        message = f"no track reaches lag {need}: the curve ends at lag {len(curve.lag)}"
+        rows = [
+            {
+                **{column: None for column in ENSEMBLE_FIT_SCHEMA},
+                "group": name, "model": model, "status": "insufficient_data", "message": message,
+                "n_lags": 0, "n_points": n, "n_units": ens.n_units[name], "uncertainty_method": "not_estimated",
+            }
+            for model, n in (("linear" if offset == "fit" else "brownian", n_points), ("power_law", alpha_points))
+        ]
+        parts.append(pl.DataFrame(rows, schema=ENSEMBLE_FIT_SCHEMA))
+    return pl.concat(parts)
+
+
+def ensemble_msd_panels(
+    ens: EnsembleMSD, n_points: int, offset: str, level: float = LEVEL, alpha_points: Optional[int] = None
+) -> list[dict]:
     """What `joint_plot.plot_ensemble_msd` draws, one dict per group: the
-    averaged curve (`tau_s`, `msd_um2`, its bootstrap SD `se_um2`, and
-    `n_units`, the tracks reaching each lag), the offset the fits took off
-    (`offset_um2`, per lag), and `EnsembleMSD.fit`'s rows over the first
-    `n_points` lags (`linear`, `power_law`) with their `level` intervals.
-    Raises ValueError when a group's curve has fewer than `n_points` lags."""
-    fits = ens.fit(n_points, offset, level=level)
+    averaged curve (`tau_s`, `msd_um2`, its SEM over tracks `se_um2` --
+    the bootstrap SD over resampled tracks -- and `n_units`, the tracks
+    reaching each lag), the offset the fits took off
+    (`offset_um2`, per lag), and `ensemble_msd_fits`' rows (`linear` over
+    the first `n_points` lags, `power_law` over the first `alpha_points`)
+    with their `level` intervals."""
+    alpha_points = n_points if alpha_points is None else alpha_points
+    fits = ensemble_msd_fits(ens, n_points, offset, level, alpha_points)
     panels = []
     for name, curve in ens.means.items():
         rows = {r["model"]: r for r in fits.filter(pl.col("group") == name).iter_rows(named=True)}
@@ -963,6 +1081,7 @@ def ensemble_msd_panels(ens: EnsembleMSD, n_points: int, offset: str, level: flo
             "name": name,
             "n_tracks": ens.n_units[name],
             "n_points": n_points,
+            "alpha_points": alpha_points,
             "offset": offset,
             "level": level,
             "tau_s": np.asarray(curve.tau_s, float),
@@ -1115,9 +1234,7 @@ def analysis_summary(
     ids: Optional[set],
     by_class: Optional[dict],
     *,
-    msd_comparison: bool,
-    msd_max_lag: Optional[int] = None,
-    msd_lag_fraction: Optional[float] = None,
+    msd: Optional[MSDWindow] = None,
 ) -> dict:
     """`diffusion_summary.json`'s settings and population numbers (the
     caller adds the filter record and provenance). Flat keys with units in
@@ -1133,15 +1250,8 @@ def analysis_summary(
         # diffusionkit script can repeat it: GridPostOptions(**grid, ...).
         "grid": grid_record(analysis.options),
         "D_grid_um2_s": [float(analysis.D_grid_um2_s[0]), float(analysis.D_grid_um2_s[-1]), analysis.options.n_D],
-        "msd_comparison": msd_comparison,
-        # The window: a fraction of each track when one was set, else lags.
-        **(
-            {"msd_lag_fraction": msd_lag_fraction}
-            if msd_comparison and msd_lag_fraction is not None
-            else {"msd_max_lag": msd_max_lag}
-            if msd_comparison and msd_max_lag
-            else {}
-        ),
+        # The per-track MSD fits' windows and estimators, when they ran.
+        "msd": msd.record() if msd is not None else None,
         "tracks_sha256": analysis.tracks_sha256,
         **summarize(analysis, ids),
     }
@@ -1267,7 +1377,7 @@ def restore_analysis(
 
     msd_cols = [c for c in ("D_msd_um2_s", "K_msd_um2_s_alpha", "alpha_msd") if c in ran.columns]
     msd = None
-    if summary.get("msd_comparison") and msd_cols:
+    if summary.get("msd") and msd_cols:
         msd = ran.select(pl.col("track_id").cast(pl.Int64), *msd_cols).filter(
             pl.any_horizontal(pl.col(c).is_not_null() for c in msd_cols)
         )
