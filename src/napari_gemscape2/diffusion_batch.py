@@ -34,6 +34,7 @@ from napari_gemscape2.diffusion import (
     MSDWindow,
     msd_fits_blur_free,
     msd_track_table,
+    partially_pooled_table,
     passing_track_ids,
     posterior_options,
     posterior_results_table,
@@ -205,6 +206,8 @@ def analyze_bundle(
     joined = base.join(results, on="track_id", how="left")
     ids = passing_track_ids(joined, settings.min_track_length, settings.filters)
     by_class = region_class_groups(base, ids)
+    # Each track's E[D] under its population goes in the file, not the filters.
+    results = results.join(partially_pooled_table(analysis, ids, by_class), on="track_id", how="left")
     table = tracks_summary_table(
         base, results, result_id=result_dir.name, pixel_size_um=pixel_size_um, passing_ids=ids
     )

@@ -366,7 +366,7 @@ exposure_s = 0.01       # optional: overrides each bundle's recorded exposure
 # Which tracks pass (`passes_filters`) and so make up the ensemble -- the
 # diffusion widget's tracks-pane cuts, on any per-track column.
 min_track_length = 5
-filters = { flux_mean = [800.0, inf], D_median_um2_s = [0.001, inf] }
+filters = { flux_mean = [800.0, inf], D_info_bits = [1.0, inf] }
 ```
 
 The ensemble's deconvolution has no settings: its smoothness is chosen by the
@@ -382,10 +382,22 @@ In the widget, **Pool analyses…** in the experiment list does the same over th
 folder's movies that have a saved analysis: name each one's sample (*Samples
 from names* takes a trailing replicate number off: `wt_1`, `wt_2` → `wt`), and
 it writes the tables below, a `pool.toml` that re-runs it headless, and shows D
-by sample beside the distances between samples and between replicates.
+by sample with each movie's own estimate beside it.
+
+Pooling makes one population of each sample: the tracks of all its movies
+in one fit, their log-likelihoods added -- the ensemble a sample makes when
+each movie has only a few tracks (small cells such as yeast). It is read
+the three ways a single movie's Ensemble is: the log-normal (median D,
+spread σ, mean D), the deconvolved distribution as the check on its shape,
+and the shared D. One fit per sample assumes its movies share one
+population, so where a sample has several movies each is also read on its
+own, and the figure shows whether they agree. Samples are drawn side by
+side, not tested against each other: comparing samples is left to analysis
+outside the GUI, with the movie (or cell), not the track, as the replicate,
+starting from `pooled_lognormal_draws_D.csv`.
 
 Replicates of one sample are pooled from what `diffusion` saved: each
-bundle's posteriors and the filters it was saved with are read back, so
+bundle's likelihoods and the filters it was saved with are read back, so
 nothing is refitted and only tracks that passed those filters are pooled.
 Give the replicates a shared `sample` (default: the bundle's own name), and
 optionally a `[pool]` table:
@@ -420,12 +432,16 @@ n_boot = 200                  # bootstrap resamples of tracks
 It writes, to the output folder:
 
 ```
-pooled_distributions_D.csv   the D distribution per sample (by = "sample") and, where a
-                             sample has replicates, per bundle (by = "experiment"):
-                             n_tracks, D_um2_s, deconvolved and its band
-pooled_distances_D.csv       the W1 distance in ln D between every pair of samples and of
-                             bundles (median and credible interval over the draws);
-                             same_sample marks replicate pairs
+pooled_distributions_D.csv   the D population per sample (by = "sample") and, where a
+                             sample has replicates, per bundle (by = "experiment") on the
+                             D grid: n_tracks, D_um2_s, lognormal and deconvolved, each
+                             with its band (_low, _high)
+pooled_populations_D.csv     one row per sample (and per bundle): the log-normal's median
+                             D, spread σ and mean D with intervals, lognormal_problem,
+                             and the shared D
+pooled_lognormal_draws_D.csv posterior draws of the log-normal's (mu_ln_D, sigma_ln_D)
+                             per sample and per bundle: the input to comparing samples
+                             outside the GUI
 pooled_ensemble_msd.csv      the ensemble-averaged MSD per sample and lag (pair-weighted)
 pooled_ensemble_msd_fits.csv linear/Brownian D (and the localization SD when the offset
                              is fitted) and the log-log power law of the averaged curve,
@@ -434,9 +450,10 @@ pooled_summary.json          which bundles make up each sample, the grid, packag
 ```
 
 A sample's population weighs every track equally, whichever movie it came
-from. Two draws of one population are still some distance apart, so read the
-distance between samples against the distances between their replicates
-(`same_sample`), not against zero. The ensemble MSD treats the exposure as 0,
+from, and its interval knows nothing of how much movies differ: where they
+do (the movie rows disagree), a sample's interval is too narrow for comparing
+samples, which is why that comparison treats the movie as the replicate. The
+ensemble MSD treats the exposure as 0,
 like the widget's MSD comparison (the MSD estimators have no blur model), and
 its intervals resample tracks: they do not cover shared drift or
 miscalibrated localization errors. The bundles must share one D grid, and a
@@ -459,7 +476,7 @@ Posterior tab shows: *D min*/*D max* (µm²/s) and *D points* set the D grid,
 whose range is the flat prior's support (by default 10⁻⁵ to 10 µm²/s, so
 tracks that can't be told from still fall into a low tail, read as upper
 bounds). A track whose posterior is cut by an edge
-is marked `D_at_grid_edge` (its numbers move with the edge — near-immobile
+is marked in `D_grid_edge` with the end that cuts it (its numbers move with the edge — near-immobile
 tracks reach *D min* this way), and the summary counts them. The grid is
 saved with the analysis, so `GridPostOptions(**summary["grid"])` in a
 diffusionkit script reproduces the widget's numbers exactly. Tracks are fitted on
@@ -589,9 +606,10 @@ this track": it was excluded, too short, or that analysis was off.
 | `x_um`, `y_um` / `x_px`, `y_px` | µm / px | Track centroid |
 | **D (one frame interval)** | | |
 | `posterior_status` | | `ok`, `excluded` (shorter than `min_frames`), or `invalid_input` |
-| `D_median_um2_s` | µm²/s | D, Brownian model, exposure blur included |
+| `D_mean_um2_s` | µm²/s | The track's one point estimate: its posterior mean E[D], Brownian model, exposure blur included. The summary a grid edge barely moves; under the flat prior it reads high for short tracks (about 1/(n − 2) for n frames), so don't average it — the population numbers are the average |
 | `D_low_um2_s`, `D_high_um2_s` | µm²/s | 90% credible interval on D |
-| `D_at_grid_edge` | | The posterior is cut off by the D grid's range. Treat the D as a bound, not a value |
+| `D_grid_edge` | | Which end of the D grid cuts the posterior: `low` (the data only bound D from above — read the row as upper bounds), `high` (lower bounds), `both` (no information), empty when it isn't cut |
+| `D_partially_pooled_um2_s` | µm²/s | The track's E[D] with its population (the log-normal of its region class, or of all passing tracks) as the prior: ignores the grid's edges and averages to the population's mean, but moves with the population, so it is in the saved file only, not the filter panel. Empty for tracks outside the filters |
 | `D_info_bits` | bits | How much the track narrowed D from the flat prior. Only comparable on the same grid |
 | `D_floor_um2_s` | µm²/s | Localization floor: the D at which motion per frame equals localization noise, ⟨σ²⟩ / (dt − exposure/3) from the track's SDs. A reference scale, not a threshold |
 | **Optional fits** | | |

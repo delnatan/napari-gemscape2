@@ -190,7 +190,7 @@ def diffusion(
         # msd_alpha_lag_fraction = 0.5
         exposure_s = 0.01       # optional: overrides each bundle's recorded one
         min_track_length = 1    # which tracks pass (passes_filters, ensemble)
-        filters = { D_median_um2_s = [0.001, inf], flux_mean = [800.0, inf] }
+        filters = { D_info_bits = [1.0, inf], flux_mean = [800.0, inf] }
     The ensemble's deconvolution has no settings: its smoothness is chosen
     by the data (diffusionkit's `gridpost.deconvolve`).
     An [[inputs]] entry's own `exposure_s` wins over both.
@@ -264,12 +264,15 @@ def diffusion(
 def pool(
     config: Path = typer.Argument(..., help="The same TOML config diffusion ran"),
 ) -> None:
-    """Pool the saved diffusion analyses of CONFIG's bundles by sample: the D populations of replicates
-    together, the distances between samples and replicates, and optionally the ensemble-averaged MSD.
+    """Pool the saved diffusion analyses of CONFIG's bundles by sample: each sample's movies in one D
+    population (log-normal, deconvolved, shared D; per movie too where a sample has several), and
+    optionally the ensemble-averaged MSD. Samples are not compared here: the written (mu, sigma) draws
+    are for that, outside.
 
     Nothing is refitted: each bundle's saved posteriors (`gemscape2 diffusion` first) and the filters it
     was saved with are read back, and only tracks that passed them are pooled. Writes
-    pooled_distributions_D.csv, pooled_distances_D.csv, pooled_summary.json (and the ensemble MSD tables)
+    pooled_distributions_D.csv, pooled_populations_D.csv, pooled_lognormal_draws_D.csv,
+    pooled_summary.json (and the ensemble MSD tables)
     to `<results_root>/pooled/`, or to `[pool] output`. Bundles are grouped by their `sample`:
         [[inputs]]
         path = "data/wt_1.tif"

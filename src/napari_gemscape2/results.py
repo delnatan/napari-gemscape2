@@ -21,8 +21,9 @@ and, once the diffusion widget has saved an analysis of it
     <result_dir>/diffusion_summary.json   settings + population numbers
 
 Across bundles, `gemscape2 pool` writes one more directory (`write_pooled_results`), by default
-`<results_root>/pooled/`: the D populations per sample (and per bundle where a sample has replicates), the
-distances between them, and optionally the ensemble-averaged MSD, all read from the saved analyses above.
+`<results_root>/pooled/`: the D population of each sample (and of each bundle where a sample has replicates),
+the draws a comparison outside the GUI starts from, and optionally the ensemble-averaged MSD, all read from the
+saved analyses above.
 
 Points and tracks are the atomic data, and stay parquet: everything else
 is derived from them. The per-track summary and the distributions are the
@@ -283,7 +284,10 @@ def write_diffusion_results(
 
 
 POOLED_DISTRIBUTIONS_FILENAME = "pooled_distributions_D.csv"
-POOLED_DISTANCES_FILENAME = "pooled_distances_D.csv"
+POOLED_POPULATIONS_FILENAME = "pooled_populations_D.csv"
+POOLED_DRAWS_FILENAME = "pooled_lognormal_draws_D.csv"
+# Written by earlier versions; removed so the folder is always one pooling.
+_STALE_POOLED_FILES = ("pooled_distances_D.csv",)
 POOLED_ENSEMBLE_MSD_FILENAME = "pooled_ensemble_msd.csv"
 POOLED_ENSEMBLE_MSD_FITS_FILENAME = "pooled_ensemble_msd_fits.csv"
 POOLED_SUMMARY_FILENAME = "pooled_summary.json"
@@ -293,7 +297,8 @@ def write_pooled_results(
     out_dir: str | Path,
     *,
     distributions_D: pl.DataFrame,
-    distances_D: pl.DataFrame,
+    populations_D: pl.DataFrame,
+    lognormal_draws_D: pl.DataFrame,
     summary: dict,
     ensemble_msd: Optional[pl.DataFrame] = None,
     ensemble_msd_fits: Optional[pl.DataFrame] = None,
@@ -304,7 +309,10 @@ def write_pooled_results(
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / POOLED_SUMMARY_FILENAME).write_text(json.dumps(summary, indent=2))
     distributions_D.write_csv(out_dir / POOLED_DISTRIBUTIONS_FILENAME)
-    distances_D.write_csv(out_dir / POOLED_DISTANCES_FILENAME)
+    populations_D.write_csv(out_dir / POOLED_POPULATIONS_FILENAME)
+    lognormal_draws_D.write_csv(out_dir / POOLED_DRAWS_FILENAME)
+    for filename in _STALE_POOLED_FILES:
+        (out_dir / filename).unlink(missing_ok=True)
     for table, filename in (
         (ensemble_msd, POOLED_ENSEMBLE_MSD_FILENAME),
         (ensemble_msd_fits, POOLED_ENSEMBLE_MSD_FITS_FILENAME),

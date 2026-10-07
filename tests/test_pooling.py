@@ -51,17 +51,27 @@ def _config(root, pool=""):
     return path
 
 
-def test_replicates_are_closer_than_samples(project):
+def test_each_sample_is_one_population_of_all_its_movies(project):
     result = CliRunner().invoke(app, ["pool", str(_config(project))])
     assert result.exit_code == 0, result.output
     out = project / "results" / "pooled"
-    dist = pl.read_csv(out / "pooled_distances_D.csv")
-    replicate = dist.filter(pl.col("same_sample"))["W1_ln_D_median"].item()
-    between = dist.filter(pl.col("by") == "sample")["W1_ln_D_median"].item()
-    assert replicate < 0.5 < 2 < between
-    pops = pl.read_csv(out / "pooled_distributions_D.csv")
-    n = pops.group_by("by", "group").agg(pl.col("n_tracks").first()).filter(pl.col("by") == "sample")
-    assert dict(zip(n["group"], n["n_tracks"])) == {"wt": 100, "mut": 50}
+    pops = pl.read_csv(out / "pooled_populations_D.csv")
+    samples = pops.filter(pl.col("by") == "sample")
+    assert dict(zip(samples["group"], samples["n_tracks"])) == {"wt": 100, "mut": 50}
+    # The bundles hold instantaneous positions but declare a 10 ms exposure, which the posterior models as
+    # blur: it reads D * dt / (dt - exposure / 3).
+    blur = DT / (DT - 0.01 / 3)
+    for name, D in (("wt", 0.05 * blur), ("mut", 0.5 * blur)):
+        row = samples.filter(pl.col("group") == name).row(0, named=True)
+        assert row["lognormal_D_median_low_um2_s"] < D < row["lognormal_D_median_high_um2_s"]
+        assert row["lognormal_sigma_ln_D_high"] < 0.5  # one D per sample: sigma near 0
+    # A sample has several movies, so each movie is also read on its own, with its sample named.
+    movies = pops.filter(pl.col("by") == "experiment")
+    assert dict(zip(movies["group"], movies["sample"])) == {"wt_1": "wt", "wt_2": "wt", "mut_1": "mut"}
+    draws = pl.read_csv(out / "pooled_lognormal_draws_D.csv")
+    assert draws.columns == ["by", "group", "draw", "mu_ln_D", "sigma_ln_D"]
+    assert set(draws["group"]) == {"wt", "mut", "wt_1", "wt_2", "mut_1"}
+    assert not (out / "pooled_distances_D.csv").exists()  # comparing samples is left outside the GUI
     assert not (out / "pooled_ensemble_msd.csv").exists()
 
 
@@ -94,19 +104,30 @@ def test_a_bundle_without_an_analysis_stops_the_pooling(project, tmp_path):
     assert "gemscape2 diffusion" in result.output
 
 
-def test_the_cdf_and_its_band_are_cumulative(project):
-    # The CDF is the deconvolution's mode summed; its band is the draws' own
-    # CDFs' quantiles (not the density band summed), so each is a CDF.
+def test_the_distributions_are_the_log_normal_and_the_deconvolution_with_bands(project):
     result = CliRunner().invoke(app, ["pool", str(_config(project))])
     assert result.exit_code == 0, result.output
     pops = pl.read_csv(project / "results" / "pooled" / "pooled_distributions_D.csv")
     for (_by, _group), rows in pops.group_by("by", "group", maintain_order=True):
-        rows = rows.sort("D_um2_s")
-        assert np.allclose(rows["cumulative"].to_numpy(), np.cumsum(rows["deconvolved"].to_numpy()))
-        for column in ("cumulative", "cumulative_low", "cumulative_high"):
-            values = rows[column].to_numpy()
-            assert np.all(np.diff(values) >= -1e-9) and values[-1] == pytest.approx(1.0)
-        assert np.all(rows["cumulative_low"].to_numpy() <= rows["cumulative_high"].to_numpy())
+        for column in ("lognormal", "deconvolved"):
+            assert rows[column].sum() == pytest.approx(1.0)
+            assert np.all(rows[f"{column}_low"].to_numpy() <= rows[f"{column}_high"].to_numpy() + 1e-12)
+
+
+def test_the_pooled_figure_draws(project):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    from napari_gemscape2.joint_plot import plot_pooled_populations
+    from napari_gemscape2.pooling import load_pooled_bundle, run_pooling, PoolSettings
+
+    bundles = [load_pooled_bundle(project / "results" / name, sample)
+               for name, sample in (("wt_1", "wt"), ("wt_2", "wt"), ("mut_1", "mut"))]
+    result = run_pooling(bundles, PoolSettings())
+    fig = plot_pooled_populations(result.distributions, result.populations, result.summary["samples"],
+                                  result.summary["credible_level"])
+    fig.canvas.draw()
+    assert len(fig.axes) == 3
 
 
 def test_a_config_written_for_a_pooling_reruns_it(project):

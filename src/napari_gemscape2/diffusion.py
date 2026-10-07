@@ -15,14 +15,20 @@ log-likelihood on the D grid (what every population read is built from and
 what the bundle saves), and every grid comes from the one `GridPostOptions`
 the run is given -- the same object a diffusionkit script would pass, so the
 two agree number for number. The D grid's range is the flat prior's support:
-a posterior cut by an edge is flagged in `D_at_grid_edge`.
+a posterior cut by an edge is flagged in `D_grid_edge` ("low": read the
+track's numbers as upper bounds; "high": as lower bounds; "both": no
+information).
 
 Tracks are combined by adding their log-likelihoods under a model of the
 population (diffusionkit's docs/gridpost.md, "Combining tracks"), never by
 averaging their posteriors or histogramming their medians:
 
-  - **per track** (no pooling): the posterior median of D and its
-    equal-tailed 90% interval (`D_low`/`D_high` = the 5% and 95% quantiles);
+  - **per track** (no pooling): one point estimate, the posterior mean
+    E[D] (`D_mean`, the summary a grid edge barely moves), and the
+    equal-tailed 90% interval (`D_low`/`D_high` = the 5% and 95% quantiles).
+    E[D] leans high for short tracks under the flat prior, so the column is
+    not averaged: averages come from the population models below, and
+    `partially_pooled_table` gives each track's E[D] under the population;
   - **shared** (complete pooling, `gridpost.fit_shared_D`): one D for every
     track. When the tracks differ it lands near their mean D, with an
     interval far too narrow;
@@ -81,7 +87,6 @@ from diffusionkit.gridpost import GridLikelihoods, GridPostOptions, LengthCompos
 from diffusionkit.gridpost import analyze_tracks as dk_analyze_tracks
 from diffusionkit.gridpost import deconvolve as dk_deconvolve
 from diffusionkit.gridpost import lognormal as dk_lognormal
-from diffusionkit.gridpost import posterior as dk_post
 
 from napari_gemscape2.pipeline import filter_mask
 
@@ -164,7 +169,7 @@ _QC_SKIP_COLUMNS = frozenset(
 # min/max are what actually replaced the old per-point "Data Explorer": its
 # rule was "keep a track only if EVERY one of its points passes this range",
 # which is `col_min >= lo and col_max <= hi` -- the same cut, expressed as a
-# track property, so it can sit in the same filter panel as `D_median_um2_s` and be
+# track property, so it can sit in the same filter panel as `D_mean_um2_s` and be
 # read against the same table. The mean is the plain descriptive statistic
 # the min/max pair does not imply, and the one to filter on when the
 # question is about the track's typical quality rather than its worst point.
@@ -249,10 +254,12 @@ FIT_SCHEMA = {
     "n_frames": pl.Int64,
     "posterior_status": pl.String,
     "message": pl.String,
-    "D_median_um2_s": pl.Float64,
+    "D_mean_um2_s": pl.Float64,
     "D_low_um2_s": pl.Float64,
     "D_high_um2_s": pl.Float64,
-    "D_at_grid_edge": pl.Boolean,
+    # Which grid edge cuts the posterior: "low" (the data only bound D from
+    # above -- read the row as upper bounds), "high", "both", or null.
+    "D_grid_edge": pl.String,
     # What the track taught about D (KL from the flat prior, in bits --
     # relative to the grid's range, so comparable only on one grid).
     "D_info_bits": pl.Float64,
@@ -264,8 +271,10 @@ FIT_SCHEMA = {
 # The localization floor's band on a plot: these quantiles of the tracks'
 # own floors, around their median.
 FLOOR_BAND = (0.1, 0.9)
+# `D_grid_edge`'s values (null when the posterior is not cut).
+GRID_EDGES = ("low", "high", "both")
 # Columns whose scale is the localization floor, `D_floor_um2_s`.
-FLOOR_COLUMNS = ("D_median_um2_s", "D_low_um2_s", "D_high_um2_s", "D_msd_um2_s")
+FLOOR_COLUMNS = ("D_mean_um2_s", "D_low_um2_s", "D_high_um2_s", "D_msd_um2_s", "D_partially_pooled_um2_s")
 # How the by-length split counts tracks (`gridpost.by_track_length`): once
 # each, or once per frame (the composition of the spots seen in focus).
 LENGTH_WEIGHTS = ("tracks", "detections")
@@ -324,14 +333,6 @@ class PosteriorAnalysis:
         return np.flatnonzero(np.isin(self.fitted_ids, list(track_ids)))
 
 
-def _at_grid_edge(loglik_D: np.ndarray) -> np.ndarray:
-    """Per row of `loglik_D`: is that track's flat-prior posterior cut by a
-    grid edge (diffusionkit's `posterior.edge_ratios` over its threshold)?"""
-    return np.array(
-        [max(dk_post.edge_ratios(np.exp(ll))) > dk_post.EDGE_RATIO_WARN for ll in loglik_D], dtype=bool
-    )
-
-
 def analyze_posteriors(
     tracks: pl.DataFrame,
     acquisition: Acquisition,
@@ -358,23 +359,19 @@ def analyze_posteriors(
     else:
         result = dk_analyze_tracks(tracks, acquisition, options, progress=progress, keep_likelihoods=True)
     lik = result.likelihoods
-    edge = pl.DataFrame(
-        {"track_id": lik.track_ids, "D_at_grid_edge": _at_grid_edge(lik.loglik_D)},
-        schema={"track_id": pl.Int64, "D_at_grid_edge": pl.Boolean},
-    )
     fits = (
         result.fits.select(
             "track_id",
             "n_frames",
             pl.col("status").alias("posterior_status"),
             "message",
-            pl.col("D_post_median_um2_s").alias("D_median_um2_s"),
+            pl.col("D_post_mean_um2_s").alias("D_mean_um2_s"),
             pl.col("D_post_lo_um2_s").alias("D_low_um2_s"),
             pl.col("D_post_hi_um2_s").alias("D_high_um2_s"),
+            "D_grid_edge",
             pl.col("D_post_info_bits").alias("D_info_bits"),
             "D_floor_um2_s",
         )
-        .join(edge, on="track_id", how="left")
         .select(FIT_SCHEMA.keys())
         .cast(FIT_SCHEMA)
     )
@@ -515,21 +512,29 @@ def _grid_mode(weights: np.ndarray, grid: np.ndarray) -> float:
 _LOGNORMAL_KEYS = (("D_median", "_um2_s"), ("sigma_ln_D", ""), ("D_mean", "_um2_s"))
 
 
-def lognormal_summary(ens: Ensemble, level: float) -> dict:
-    """`Ensemble.lognormal`'s numbers as flat keys: `lognormal_D_median_um2_s`
+def lognormal_summary_of(fit: dk_lognormal.LogNormal, level: float) -> dict:
+    """A diffusionkit `LogNormal`'s numbers as flat keys: `lognormal_D_median_um2_s`
     (the population's median D) with `lognormal_D_median_low_um2_s` /
     `_high_um2_s`, and likewise `lognormal_sigma_ln_D` (its spread in ln D)
-    and `lognormal_D_mean_um2_s`; `lognormal_problem` when the fit reached
-    a prior bound."""
-    summary = ens.lognormal.summary(level)
+    and `lognormal_D_mean_um2_s`; `lognormal_problem`, the fit's reason its
+    numbers depend on a prior bound, or None."""
+    summary = fit.summary(level)
     out = {}
     for name, unit in _LOGNORMAL_KEYS:
         values = summary[name + unit]
         out[f"lognormal_{name}{unit}"] = values["median"]
         out[f"lognormal_{name}_low{unit}"] = values["lo"]
         out[f"lognormal_{name}_high{unit}"] = values["hi"]
-    if ens.lognormal.problem:
-        out["lognormal_problem"] = ens.lognormal.problem
+    out["lognormal_problem"] = fit.problem or None
+    return out
+
+
+def lognormal_summary(ens: Ensemble, level: float) -> dict:
+    """`lognormal_summary_of` the ensemble's log-normal, `lognormal_problem`
+    left out when there is none."""
+    out = lognormal_summary_of(ens.lognormal, level)
+    if out["lognormal_problem"] is None:
+        del out["lognormal_problem"]
     return out
 
 
@@ -538,8 +543,9 @@ def summarize(analysis: PosteriorAnalysis, track_ids: Optional[set] = None) -> d
     with units in their names so the saved JSON reads on its own.
 
     Counts are by diffusionkit's own statuses (`n_ok`, `n_excluded`,
-    `n_invalid_input`), plus `n_D_at_grid_edge`: fitted tracks whose D
-    posterior is cut by the grid's range, so their numbers depend on it.
+    `n_invalid_input`), plus `n_D_grid_edge_low` / `_high` / `_both`: fitted
+    tracks whose D posterior is cut by that end of the grid's range, so their
+    numbers depend on it (`D_grid_edge`).
     `n_detections` counts the fitted tracks' frames. The population is the
     tracks' log-likelihoods combined (`Ensemble`), never a statistic of
     their per-track medians: `lognormal_*` (`lognormal_summary`: the
@@ -561,7 +567,7 @@ def summarize(analysis: PosteriorAnalysis, track_ids: Optional[set] = None) -> d
         "n_frames_min": _scalar(ok["n_frames"].min()),
         "n_frames_median": _scalar(ok["n_frames"].median()),
         "n_frames_max": _scalar(ok["n_frames"].max()),
-        "n_D_at_grid_edge": int(ok["D_at_grid_edge"].sum()),
+        **{f"n_D_grid_edge_{edge}": int((ok["D_grid_edge"] == edge).sum()) for edge in GRID_EDGES},
     }
     floors = ok["D_floor_um2_s"].drop_nulls()
     if floors.len():
@@ -593,6 +599,34 @@ def summarize_by_group(analysis: PosteriorAnalysis, groups: pl.DataFrame) -> dic
         name: summarize(analysis, set(groups.filter(pl.col("group") == name)["track_id"].to_list()))
         for name in names
     }
+
+
+def partially_pooled_table(
+    analysis: PosteriorAnalysis, ids: Optional[set], by_class: Optional[dict[str, set]] = None
+) -> pl.DataFrame:
+    """`track_id`, `D_partially_pooled_um2_s`: each fitted track's E[D] with
+    its population as the prior -- the log-normal (`Ensemble.lognormal`) of
+    its region class when there are several (`by_class`), else of all the
+    tracks passing the filters (`ids`, None for all). Tracks outside those
+    are left out.
+
+    It borrows from the population: it does not lean on the grid's edges or
+    on the flat prior, and averages to the population's mean, but it moves
+    with which tracks make up the population -- so it is written with a
+    saved analysis, not offered as a column to filter on."""
+    parts = []
+    for gids in (by_class or {"all": ids}).values():
+        ens = ensemble(analysis, gids)
+        if ens is None:
+            continue
+        rows = analysis.rows_for(gids)
+        parts.append(pl.DataFrame({
+            "track_id": analysis.fitted_ids[rows],
+            "D_partially_pooled_um2_s": ens.lognormal.partially_pooled_means(analysis.loglik_D[rows]),
+        }, schema={"track_id": pl.Int64, "D_partially_pooled_um2_s": pl.Float64}))
+    if not parts:
+        return pl.DataFrame(schema={"track_id": pl.Int64, "D_partially_pooled_um2_s": pl.Float64})
+    return pl.concat(parts)
 
 
 def _scalar(value) -> Optional[float]:
@@ -696,7 +730,8 @@ def track_posterior(analysis: PosteriorAnalysis, track_id: int) -> Optional[dict
         "n_frames": fit["n_frames"],
         "d_grid": analysis.D_grid_um2_s,
         "d_weights": np.exp(analysis.loglik_D[rows[0]]),
-        "d_interval": (fit["D_low_um2_s"], fit["D_median_um2_s"], fit["D_high_um2_s"]),
+        "d_interval": (fit["D_low_um2_s"], fit["D_mean_um2_s"], fit["D_high_um2_s"]),
+        "d_grid_edge": fit["D_grid_edge"],
         "d_floor": fit["D_floor_um2_s"],
     }
     return out
@@ -1122,7 +1157,7 @@ def tracks_summary_table(
 
     `base` is the diffusion widget's per-track table (length, centroid in
     px, shape, `region_class`, per-point detection QC aggregated per
-    track); `results` the per-track analysis columns (posterior medians and
+    track); `results` the per-track analysis columns (posterior means and
     bounds, and any MSD or NUTS columns), or None before a run. Kept from
     `base`: every column except the per-point min/max. Added: `result_id`
     (which experiment -- so pooling is a plain concat), the centroid in

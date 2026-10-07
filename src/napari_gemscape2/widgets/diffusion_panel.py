@@ -33,7 +33,7 @@ pointed at a selection you could not see.
   of their own) and moves the time slider to the track's last frame, so
   its tail is drawn in full inside the box.
 - **Posterior** -- `diffusion.analyze_posteriors` (diffusionkit.gridpost):
-  per track, the posterior median of D and its 5%/95% quantiles, with the
+  per track, the posterior mean E[D] and its 5%/95% quantiles, with the
   camera exposure's blur modelled -- and the ensemble over whatever the
   tracks pane passes, per region class, also split by track length. See
   `_PosteriorTab`.
@@ -164,6 +164,7 @@ from napari_gemscape2.diffusion import (
     StaleAnalysisError,
     analysis_summary,
     analysis_tables,
+    partially_pooled_table,
     analyze_posteriors,
     base_track_table,
     ensemble,
@@ -329,7 +330,7 @@ class _UnitHeaderModel(ColumnTableModel):
     The tracks pane's table is where this pipeline's two unit systems
     meet: `se_x_max` is in pixels, `se_x_um_max` and
     `mean_step_um` in µm, `flux_mean` in camera counts,
-    `D_median_um2_s` in µm²/s -- 40-odd columns whose unit is a naming
+    `D_mean_um2_s` in µm²/s -- 40-odd columns whose unit is a naming
     convention at best (`_um`) and absent at worst (`flux`, `se_x`,
     `fit_sigma`). So each header shows `napari_gemscape2.units.header` (the
     name with its unit bracketed, the unit stated once) and each header's
@@ -383,7 +384,7 @@ class _ProgressRelay(QObject):
 # (`_layer_track_table`) -- otherwise they would come back as "detection
 # QC" columns.
 _TRACK_COLOR_EXPRESSIONS = {
-    "log10_D_median": pl.col("D_median_um2_s").log10(),
+    "log10_D_mean": pl.col("D_mean_um2_s").log10(),
     "D_info_bits": pl.col("D_info_bits"),
 }
 _TRACK_COLOR_COLUMNS = tuple(_TRACK_COLOR_EXPRESSIONS)
@@ -503,7 +504,7 @@ class _TracksPane(QWidget):
     Before any fit that is `track_length`/`duration_s`/`mean_step_um` plus
     the per-point detection quality aggregated to the track (`flux_min`,
     `se_x_max`, ... -- see `diffusion.qc_aggregate_table`); after a posterior run
-    it is also `D_median_um2_s`, `D_low_um2_s`, `D_info_bits` and the
+    it is also `D_mean_um2_s`, `D_low_um2_s`, `D_info_bits` and the
     rest. So "drop the tracks with a bad worst-point localization
     error, then keep the ones whose D is below 0.01 µm²/s, and look at
     where they are" is three drags in one panel, against one table, at one
@@ -882,9 +883,12 @@ _POSTERIOR_HELP = (
     "<br><br><b>Grid</b>: each posterior is evaluated on a grid in ln D, and the flat "
     "prior is zero outside its range &mdash; so <i>D min</i>/<i>D max</i> are part of "
     "the analysis, not a numerical detail. A track whose posterior is cut by an edge is "
-    "marked <i>D_at_grid_edge</i>: its median and interval move if the edge does. "
-    "Near-immobile tracks reach <i>D min</i> this way, since localization error only "
-    "lets the data bound D from above. These are diffusionkit's <tt>GridPostOptions</tt> "
+    "marked in <i>D_grid_edge</i> with the edge that cuts it: <i>low</i> means read its "
+    "numbers as upper bounds, <i>high</i> as lower bounds. Near-immobile tracks reach "
+    "<i>D min</i> this way, since localization error only lets the data bound D from "
+    "above. Each track's one point estimate is its posterior mean <i>D_mean</i>, the "
+    "summary a grid edge barely moves; under the flat prior it reads high for short "
+    "tracks, so don't average it &mdash; the Ensemble is the average. These are diffusionkit's <tt>GridPostOptions</tt> "
     "fields, saved with the analysis, so a script can repeat the run exactly."
     "<br><br><b>Ensemble</b>: the population is the tracks' log-likelihoods added up "
     "under a model of how D is spread across them &mdash; never a histogram of their "
@@ -1039,7 +1043,7 @@ class _PosteriorTab(QWidget):
         d_range_tip = (
             "The range of D (µm²/s) the posterior is evaluated over -- the flat\n"
             "prior's support, so it is part of the analysis: a track whose\n"
-            "posterior reaches an edge is cut there (and flagged D_at_grid_edge).\n"
+            "posterior reaches an edge is cut there (and flagged in D_grid_edge).\n"
             f"diffusionkit's default: {grid_default.D_min_um2_s:g} to {grid_default.D_max_um2_s:g}."
         )
         self._grid_D_min = _LogSpinBox(grid_default.D_min_um2_s, 1e-9, 1e4, tooltip=d_range_tip)
@@ -1539,7 +1543,8 @@ def _format_posterior_summary(summary: dict, analysis: Optional[PosteriorAnalysi
         key[2:]: value
         for key, value in summary.items()
         if key.startswith("n_")
-        and key not in ("n_tracks", "n_ok", "n_detections", "n_D_at_grid_edge")
+        and key not in ("n_tracks", "n_ok", "n_detections")
+        and not key.startswith("n_D_grid_edge")
         and not key.startswith("n_frames")
     }
     counts = f"{summary.get('n_ok', 0)} fitted"
@@ -1553,11 +1558,14 @@ def _format_posterior_summary(summary: dict, analysis: Optional[PosteriorAnalysi
             f"length {summary['n_frames_min']:.0f} / {summary['n_frames_median']:.0f} / "
             f"{summary['n_frames_max']:.0f} {units.POINTS} (min / median / max)"
         )
-    if summary.get("n_D_at_grid_edge"):
-        lines.append(
-            f"{summary['n_D_at_grid_edge']} cut by the D grid's edge (D_at_grid_edge) — "
-            "their numbers depend on the grid range"
-        )
+    edges = {
+        "low": "at the low edge (upper bounds)",
+        "high": "at the high edge (lower bounds)",
+        "both": "at both edges (no information)",
+    }
+    cut = [f"{summary[f'n_D_grid_edge_{e}']} {what}" for e, what in edges.items() if summary.get(f"n_D_grid_edge_{e}")]
+    if cut:
+        lines.append(f"cut by the D grid (D_grid_edge): {', '.join(cut)} — their numbers depend on the grid range")
     if summary.get("lognormal_D_median_um2_s") is not None:
         lines.append(
             f"population (log-normal): median D {units.fmt(summary['lognormal_D_median_um2_s'], 'D_um2_s')} "
@@ -2369,7 +2377,7 @@ class DiffusionAnalysisWidget(QWidget):
         column here, and every D and K fitted from them, is those two
         numbers. A layer that carries neither still gets 1.0 for both
         (see `viewer.layer_units_metadata`) because the conversion has to
-        run on something -- and then `D_median_um2_s` is really px²/frame
+        run on something -- and then `D_mean_um2_s` is really px²/frame
         under a µm²/s name. That case gets said out loud rather than
         rendered identically to a calibrated one."""
         layer = self._tracks_layer
@@ -2583,10 +2591,10 @@ class DiffusionAnalysisWidget(QWidget):
         self._rebuild_track_table()
         self._tracks_pane.set_plot_columns(
             self._joined_track_df,
-            prefer_x="D_median_um2_s",
+            prefer_x="D_mean_um2_s",
             prefer_y="track_length",
         )
-        self._map_tab.on_spatial_source_registered("D_median_um2_s")
+        self._map_tab.on_spatial_source_registered("D_mean_um2_s")
         self._update_save_enabled()
 
     def set_msd_results(self, msd_df: pl.DataFrame, window: MSDWindow) -> None:
@@ -2875,9 +2883,17 @@ class DiffusionAnalysisWidget(QWidget):
         result_id = self._result_dir.name if self._result_dir is not None else None
         if result_id is None and self._tracks_layer is not None:
             result_id = self._tracks_layer.name
+        results = self._per_track_results()
+        if results is not None and self._posterior is not None:
+            # Each track's E[D] under its population, for the file only: it
+            # moves with the filters, so it is never a column to filter on.
+            ids = self.combined_filtered_track_ids()
+            pooled = partially_pooled_table(self._posterior, ids, self.group_track_ids(ids))
+            results = results.join(pooled.with_columns(pl.col("track_id").cast(results.schema["track_id"])),
+                                   on="track_id", how="left")
         return tracks_summary_table(
             self._base_track_df,
-            self._per_track_results(),
+            results,
             result_id=result_id,
             pixel_size_um=self.pixel_size_um,
             passing_ids=self._passing_track_ids(),

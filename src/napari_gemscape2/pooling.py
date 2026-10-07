@@ -5,13 +5,19 @@ Each bundle that `gemscape2 diffusion` (or the widget's Save analysis) wrote hol
 over D (`loglik_D.parquet`) and which tracks passed the filters. Pooling reads those back -- nothing is
 refitted -- and hands them to diffusionkit's batch layer:
 
-- the D populations (`GridPostBatch.populations`): one per sample (the bundles that are replicates of each
-  other), and one per bundle when a sample has several, with the distances between them;
+- the D population of each sample (the bundles that are replicates of each other): the tracks of all its
+  movies in one fit, their log-likelihoods added -- the ensemble a sample makes when each movie has only a
+  few tracks (small cells). Each is read three ways, as in a single movie's Ensemble: the log-normal
+  (`gridpost.lognormal_tracks`: median D, spread, mean D), the deconvolved distribution as the check on its
+  shape, and the shared D. One fit per sample assumes its movies share one population, so where a sample has
+  several, each movie is also read on its own, to see whether they do;
 - optionally the ensemble-averaged MSD (`classic.ensemble_msd`) of each sample, recomputed from the tracks,
   with D and alpha each fitted over an explicit number of lags.
 
-Only tracks that passed the filters when each bundle was saved enter either. The posteriors must share one D
-grid. The ensemble MSD runs with the exposure treated as 0, as the widget's MSD comparison does: the MSD
+Only tracks that passed the filters when each bundle was saved enter either. The likelihoods must share one D
+grid. Comparing samples is left to analysis outside the GUI: the per-sample and per-movie draws of the
+log-normal's (mu, sigma) are written for it, and the movie (or cell) -- not the track -- is the unit such a
+comparison must treat as the replicate. The ensemble MSD runs with the exposure treated as 0, as the widget's MSD comparison does: the MSD
 estimators have no blur model, so it is labelled as that wherever it shows.
 """
 
@@ -19,8 +25,8 @@ from __future__ import annotations
 
 import json
 import re
+import warnings
 from dataclasses import dataclass, fields
-from itertools import combinations
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -28,7 +34,7 @@ import numpy as np
 import polars as pl
 from diffusionkit import Acquisition, Experiment
 from diffusionkit.classic import EnsembleMSD
-from diffusionkit.gridpost import GridLikelihoods, GridPosteriorAnalysis, GridPostBatch, cdf_distance
+from diffusionkit.gridpost import GridLikelihoods, GridPosteriorAnalysis, GridPostBatch
 from diffusionkit.gridpost.workflow import FIT_SCHEMA as DK_FIT_SCHEMA
 
 from napari_gemscape2.batch import _relative
@@ -39,6 +45,7 @@ from napari_gemscape2.diffusion import (
     ensemble_msd_blur_free,
     ensemble_msd_fits,
     grid_record,
+    lognormal_summary_of,
     restore_analysis,
     tracks_to_diffusionkit_df,
 )
@@ -47,7 +54,7 @@ from napari_gemscape2.results import load_diffusion_results, load_result, packag
 from napari_gemscape2.viewer import layer_units_metadata
 
 OFFSETS = ENSEMBLE_MSD_OFFSETS
-# The unit of draws the pooled distributions and distances are read from.
+# Posterior draws of each pooled population: its bands and the written (mu, sigma) draws.
 POPULATION_DRAWS = 1000
 
 
@@ -136,9 +143,9 @@ def to_gridpost(analysis: PosteriorAnalysis, ids: Optional[set]) -> GridPosterio
         pl.lit("posterior_D").alias("model"), pl.lit("grid_posterior").alias("method"),
         pl.col("posterior_status").alias("status"), "message",
         pl.lit("credible_interval").alias("uncertainty_method"),
-        pl.col("D_median_um2_s").alias("D_post_median_um2_s"), pl.col("D_low_um2_s").alias("D_post_lo_um2_s"),
+        pl.col("D_mean_um2_s").alias("D_post_mean_um2_s"), pl.col("D_low_um2_s").alias("D_post_lo_um2_s"),
         pl.col("D_high_um2_s").alias("D_post_hi_um2_s"), pl.col("D_info_bits").alias("D_post_info_bits"),
-        "D_floor_um2_s",
+        "D_floor_um2_s", "D_grid_edge",
     ).select(DK_FIT_SCHEMA.keys()).cast(DK_FIT_SCHEMA)
     rows = analysis.rows_for(ids)
     return GridPosteriorAnalysis(
@@ -157,38 +164,54 @@ def pooled_batch(bundles: list[PooledBundle]) -> GridPostBatch:
     )
 
 
-def population_tables(batch: GridPostBatch, level: float, n_samples: int = POPULATION_DRAWS) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """`(distributions, distances)` of the batch's D populations.
+def population_tables(
+    batch: GridPostBatch, level: float, n_samples: int = POPULATION_DRAWS
+) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    """`(distributions, populations, draws)` of the batch's D populations, per sample (`by` = "sample") and,
+    when some sample has several bundles, per bundle (`by` = "experiment").
 
-    distributions: long by `by` ("sample", plus "experiment" when some sample has several) and `group`:
-    `n_tracks`, `n_excluded`, `D_um2_s`, `deconvolved` (weights summing to 1 over the grid, the same quantity
-    as `distributions_D.csv`) and its pointwise `level` band, and `cumulative` (the CDF) with its own band --
-    a CDF's band is not the running sum of the density's, so it is drawn from the draws too.
-    distances: the W1 distance in ln D between every pair of groups of one kind, as the median of its draws
-    with the `level` interval (`gridpost.cdf_distance`); `same_sample` is set for experiment pairs. Two draws
-    of one population are still apart, so read a sample pair against the same-sample experiment pairs."""
+    distributions: long on the D grid, by `by` and `group`: `n_tracks`, `n_excluded`, `D_um2_s`, `lognormal`
+    (the log-normal at its posterior mode) and `deconvolved` (weights summing to 1 over the grid, as in
+    `distributions_D.csv`), each with its pointwise `level` band (`_low`, `_high`).
+    populations: one row per group: `sample`, the counts, the log-normal's numbers
+    (`diffusion.lognormal_summary_of`: `lognormal_D_median_um2_s`, `lognormal_sigma_ln_D`,
+    `lognormal_D_mean_um2_s`, each with `_low`/`_high`, and `lognormal_problem`) and the shared D
+    (`shared_D_median_um2_s` with `_low`/`_high`).
+    draws: `by`, `group`, `draw`, `mu_ln_D`, `sigma_ln_D`: the log-normal's posterior draws, what a comparison
+    of samples outside the GUI starts from (with the movie as the replicate).
+
+    Warnings from fits of few tracks are kept in `lognormal_problem` rather than raised."""
     kinds = ["sample"] + (["experiment"] if len(batch.acquisitions) > len(set(batch.samples.values())) else [])
-    q = [(1 - level) / 2, .5, (1 + level) / 2]
-    parts, rows, grid = [], [], np.exp(batch.options.u_D())
+    grid = np.exp(batch.options.u_D())
+    dist_parts, rows, draw_parts = [], [], []
     for by in kinds:
-        pops = batch.populations(by, n_samples=n_samples)
-        for name, pop in pops.items():
-            lo, hi = pop.band(level)
-            c_lo, c_hi = pop.band(level, cumulative=True)
-            parts.append(pl.DataFrame({
-                "by": by, "group": name, "n_tracks": pop.n_tracks, "n_excluded": pop.n_excluded,
-                "D_um2_s": grid, "deconvolved": pop.weights, "deconvolved_low": lo, "deconvolved_high": hi,
-                "cumulative": np.cumsum(pop.weights), "cumulative_low": c_lo, "cumulative_high": c_hi,
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            lognormals = batch.populations(by, n_samples=n_samples, model="lognormal")
+            deconvolved = batch.populations(by, n_samples=n_samples)
+            shared = batch.shared_D(by)
+        for name, logn in lognormals.items():
+            dec = deconvolved[name]
+            ln_lo, ln_hi = logn.band(level)
+            dec_lo, dec_hi = dec.band(level)
+            dist_parts.append(pl.DataFrame({
+                "by": by, "group": name, "n_tracks": logn.n_tracks, "n_excluded": logn.n_excluded, "D_um2_s": grid,
+                "lognormal": logn.weights, "lognormal_low": ln_lo, "lognormal_high": ln_hi,
+                "deconvolved": dec.weights, "deconvolved_low": dec_lo, "deconvolved_high": dec_hi,
             }))
-        for a, b in combinations(pops, 2):
-            lo_d, med, hi_d = np.quantile(cdf_distance(pops[a], pops[b]), q)
-            rows.append({"by": by, "a": a, "b": b,
-                         "same_sample": batch.samples[a] == batch.samples[b] if by == "experiment" else None,
-                         "W1_ln_D_median": float(med), "W1_ln_D_low": float(lo_d), "W1_ln_D_high": float(hi_d)})
-    distances = pl.DataFrame(rows, schema={
-        "by": pl.String, "a": pl.String, "b": pl.String, "same_sample": pl.Boolean,
-        "W1_ln_D_median": pl.Float64, "W1_ln_D_low": pl.Float64, "W1_ln_D_high": pl.Float64})
-    return pl.concat(parts), distances
+            sh = shared[name].summary(level)
+            rows.append({
+                "by": by, "group": name, "sample": name if by == "sample" else batch.samples[name],
+                "n_tracks": logn.n_tracks, "n_excluded": logn.n_excluded,
+                **lognormal_summary_of(logn, level),
+                "shared_D_median_um2_s": sh["median"], "shared_D_low_um2_s": sh["lo"], "shared_D_high_um2_s": sh["hi"],
+            })
+            draw_parts.append(pl.DataFrame({
+                "by": by, "group": name, "draw": np.arange(len(logn.draws)),
+                "mu_ln_D": logn.draws[:, 0], "sigma_ln_D": logn.draws[:, 1],
+            }))
+    populations = pl.DataFrame(rows).with_columns(pl.col("lognormal_problem").cast(pl.String))
+    return pl.concat(dist_parts), populations, pl.concat(draw_parts)
 
 
 def pooled_ensemble_msd(bundles: list[PooledBundle], settings: PoolSettings) -> tuple[EnsembleMSD, pl.DataFrame]:
@@ -220,7 +243,8 @@ class PoolResult:
     """Everything one pooling found: what `write_pool` saves and the pooling dialog draws."""
 
     distributions: pl.DataFrame  # `population_tables`
-    distances: pl.DataFrame
+    populations: pl.DataFrame
+    draws: pl.DataFrame
     summary: dict  # pooled_summary.json
     ensemble: Optional[EnsembleMSD] = None  # with `settings.ensemble_msd`
     ensemble_fits: Optional[pl.DataFrame] = None
@@ -229,13 +253,13 @@ class PoolResult:
 def run_pooling(
     bundles: list[PooledBundle], settings: PoolSettings, progress: Optional[Callable[[str], None]] = None
 ) -> PoolResult:
-    """Pool `bundles` (from `load_pooled_bundle`) by their samples: the D populations and distances, and the
-    ensemble MSD when `settings` ask for it. `progress` is told each stage. Raises ValueError for bundles that
+    """Pool `bundles` (from `load_pooled_bundle`) by their samples: the D populations, and the ensemble MSD
+    when `settings` ask for it. `progress` is told each stage. Raises ValueError for bundles that
     cannot be pooled (repeated names, different D grids)."""
     report = progress or (lambda _stage: None)
-    report("deconvolving the D populations")
+    report("fitting the D populations")
     level = bundles[0].analysis.level
-    distributions, distances = population_tables(pooled_batch(bundles), level)
+    distributions, populations, draws = population_tables(pooled_batch(bundles), level)
     ens = fits = None
     if settings.ensemble_msd:
         report("averaging the MSD over tracks")
@@ -248,7 +272,8 @@ def run_pooling(
     for b in bundles:
         samples.setdefault(b.sample, []).append(b.result_id)
     summary = {
-        "analysis": "diffusionkit.gridpost populations pooled over saved posteriors (flat prior in ln D)",
+        "analysis": "diffusionkit.gridpost populations: each sample's tracks, from all its movies, combined by "
+        "their log-likelihoods (log-normal, deconvolved, shared D); per movie too where a sample has several",
         "samples": samples,
         "tracks_pooled": {b.result_id: n_pooled(b) for b in bundles},
         "credible_level": level,
@@ -262,7 +287,7 @@ def run_pooling(
         ),
         "packages": package_provenance(diffusionkit, napari_gemscape2),
     }
-    return PoolResult(distributions, distances, summary, ens, fits)
+    return PoolResult(distributions, populations, draws, summary, ens, fits)
 
 
 def write_pool(out_dir: str | Path, result: PoolResult) -> None:
@@ -270,7 +295,8 @@ def write_pool(out_dir: str | Path, result: PoolResult) -> None:
     write_pooled_results(
         out_dir,
         distributions_D=result.distributions,
-        distances_D=result.distances,
+        populations_D=result.populations,
+        lognormal_draws_D=result.draws,
         summary=result.summary,
         ensemble_msd=None if result.ensemble is None else result.ensemble.curves,
         ensemble_msd_fits=result.ensemble_fits,

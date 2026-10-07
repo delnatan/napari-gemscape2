@@ -46,7 +46,7 @@ import polars as pl
 import seaborn as sns
 from matplotlib.colors import LinearSegmentedColormap, LogNorm, Normalize
 from matplotlib.figure import Figure
-from matplotlib.ticker import FuncFormatter, LogLocator, MaxNLocator, NullFormatter
+from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
 
 from napari_gemscape2 import units
 
@@ -690,82 +690,93 @@ _SAMPLE_COLORS = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#00830
 
 
 def plot_pooled_populations(
-    distributions: pl.DataFrame, distances: pl.DataFrame, samples: dict[str, list[str]], level: float
+    distributions: pl.DataFrame, populations: pl.DataFrame, samples: dict[str, list[str]], level: float
 ) -> Figure:
-    """`pooling.population_tables` drawn: each sample's D distribution as a
-    CDF with its `level` band (each replicate's own CDF thin, in its
-    sample's color), and the W1 distance in ln D between every pair of
-    samples beside the distances between replicates of one sample.
-    `samples` maps each sample to its bundles. Two draws of one population
-    are still apart, so a sample pair reads against the replicate pairs'
-    spread (shaded), not against zero. Samples past the eighth color are
-    left to the tables, with a note."""
+    """`pooling.population_tables` drawn, one sample per hue (`samples`
+    maps each to its bundles; past the eighth color they are left to the
+    tables, with a note).
+
+    Left, each sample's population over log10 D: the log-normal of all its
+    movies' tracks in one fit, with its `level` band, the deconvolved
+    distribution dotted (the check on its shape), and each movie's own
+    log-normal thin. Right, the log-normal's median D and spread sigma with
+    their intervals, the sample's (filled) above each of its movies'
+    (hollow): one fit per sample assumes its movies share a population,
+    and the movies' rows show whether they do. Samples are drawn side by
+    side, not tested against each other -- that comparison, with the movie
+    as the replicate, belongs outside the GUI (`pooled_lognormal_draws_D.csv`)."""
     by_sample = distributions.filter(pl.col("by") == "sample")
     names = list(dict.fromkeys(by_sample["group"].to_list()))
     shown = names[: len(_SAMPLE_COLORS)]
     color = dict(zip(shown, _SAMPLE_COLORS))
     sample_of = {bundle: sample for sample, bundles in samples.items() for bundle in bundles}
-    pairs = distances.filter(
-        (pl.col("by") == "sample") | ((pl.col("by") == "experiment") & pl.col("same_sample").fill_null(False))
-    )
-    fig = Figure(figsize=(9.6, max(3.6, 1.4 + 0.24 * pairs.height)), layout="constrained")
-    ax_cdf, ax_dist = fig.subplots(1, 2, width_ratios=(1.15, 1))
-    for ax in (ax_cdf, ax_dist):
+    per_movie = distributions.filter(pl.col("by") == "experiment")
+
+    rows = []  # (label, row, filled, color) in drawing order, top to bottom
+    for name in shown:
+        rows.append((f"{name}", populations.filter((pl.col("by") == "sample") & (pl.col("group") == name)).row(0, named=True),
+                     True, color[name]))
+        for bundle in samples.get(name, []):
+            movie = populations.filter((pl.col("by") == "experiment") & (pl.col("group") == bundle))
+            if movie.height:
+                rows.append((f"   {bundle}", movie.row(0, named=True), False, color[name]))
+
+    fig = Figure(figsize=(11.0, max(3.8, 1.6 + 0.26 * len(rows))), layout="constrained")
+    ax_dens, ax_med, ax_sig = fig.subplots(1, 3, width_ratios=(1.35, 1, 0.75))
+    for ax in (ax_dens, ax_med, ax_sig):
         _style_axis(ax)
 
     spans = []
-    for i, name in enumerate(shown):
-        rows = by_sample.filter(pl.col("group") == name)
-        D, cdf = rows["D_um2_s"].to_numpy(), rows["cumulative"].to_numpy()
-        ax_cdf.fill_between(D, rows["cumulative_low"].to_numpy(), rows["cumulative_high"].to_numpy(),
-                            color=color[name], alpha=0.2, lw=0)
-        ax_cdf.plot(D, cdf, color=color[name], lw=2, label=f"{name} · {rows['n_tracks'][0]} tracks")
-        spans.append(_mass_range(rows["deconvolved"].to_numpy(), np.log10(D), tail=0.005))
-        # A direct label on each curve, each at its own height so none collide.
-        y = 0.2 + 0.6 * (i + 0.5) / len(shown)
-        j = min(int(np.searchsorted(cdf, y)), len(D) - 1)
-        ax_cdf.annotate(name, (D[j], y), xytext=(5, 0), textcoords="offset points", fontsize=8, color=_INK,
-                        va="center")
-    for (bundle,), rows in distributions.filter(pl.col("by") == "experiment").group_by("group", maintain_order=True):
+    for name in shown:
+        rows_s = by_sample.filter(pl.col("group") == name)
+        x = np.log10(rows_s["D_um2_s"].to_numpy())
+        band = (rows_s["lognormal_low"].to_numpy(), rows_s["lognormal_high"].to_numpy())
+        _draw_band_curve(ax_dens, x, rows_s["lognormal"].to_numpy(), band, color[name],
+                         f"{name} · {rows_s['n_tracks'][0]} tracks", lw=2.2)
+        ax_dens.plot(x, _density(rows_s["deconvolved"].to_numpy(), x), ":", color=color[name], lw=1.2)
+        for key in ("lognormal", "deconvolved"):
+            spans.append(_mass_range(rows_s[key].to_numpy(), x, tail=0.005))
+    for (bundle,), rows_m in per_movie.group_by("group", maintain_order=True):
         if sample_of.get(bundle) in color:
-            ax_cdf.plot(rows["D_um2_s"].to_numpy(), rows["cumulative"].to_numpy(), color=color[sample_of[bundle]],
-                        lw=0.8, alpha=0.7)
-    ax_cdf.set_xscale("log")
-    _plain_log_ticks(ax_cdf)
-    ax_cdf.yaxis.set_major_locator(MaxNLocator(5))
-    ax_cdf.yaxis.set_major_formatter(FuncFormatter(lambda v, _pos: f"{v:g}"))
+            x = np.log10(rows_m["D_um2_s"].to_numpy())
+            ax_dens.plot(x, _density(rows_m["lognormal"].to_numpy(), x), color=color[sample_of[bundle]], lw=0.8,
+                         alpha=0.7)
+    ax_dens.plot([], [], ":", color=_MUTED_INK, lw=1.2, label="dotted: deconvolved (any shape)")
+    if per_movie.height:
+        ax_dens.plot([], [], color=_MUTED_INK, lw=0.8, label="thin: each movie's own log-normal")
     if spans:
-        ax_cdf.set_xlim(10 ** (min(lo for lo, _ in spans) - _LOG_D_PAD), 10 ** (max(hi for _, hi in spans) + _LOG_D_PAD))
-    ax_cdf.set_ylim(0, 1)
-    ax_cdf.set_xlabel("D (µm²/s)", fontsize=9)
-    ax_cdf.set_ylabel("fraction of tracks below D", fontsize=9)
-    ax_cdf.legend(fontsize=7, frameon=False, loc="upper left")
-    replicates_drawn = distributions.filter(pl.col("by") == "experiment").height > 0
-    note = f"band {level:.0%} · every track weighs the same" + (" · thin: each replicate" if replicates_drawn else "")
+        ax_dens.set_xlim(min(lo for lo, _ in spans) - _LOG_D_PAD, max(hi for _, hi in spans) + _LOG_D_PAD)
+    ax_dens.set_ylim(bottom=0)
+    ax_dens.set_xlabel(units.mpl_log_label("D_um2_s"), fontsize=9)
+    ax_dens.set_ylabel(r"density per $\log_{10} D$", fontsize=8, color=_MUTED_INK)
+    note = f"each sample's movies in one log-normal fit, {level:.0%} band"
     if len(names) > len(shown):
         note += f" · {len(names) - len(shown)} more samples in the tables only"
-    ax_cdf.set_title(f"D by sample, deconvolved\n{note}", fontsize=9, loc="left", color=_INK)
+    ax_dens.set_title(f"D by sample\n{note}", fontsize=9, loc="left", color=_INK)
+    ax_dens.legend(fontsize=7, frameon=False, loc="upper left")
 
-    labels = []
-    for y, row in enumerate(pairs.iter_rows(named=True)):
-        replicate = row["by"] == "experiment"
-        tone = _MUTED_INK if replicate else _INK
-        ax_dist.plot([row["W1_ln_D_low"], row["W1_ln_D_high"]], [y, y], color=tone, lw=1.4)
-        ax_dist.plot(row["W1_ln_D_median"], y, "o", ms=5, color=tone, mfc="white" if replicate else tone, zorder=3)
-        labels.append(f"{row['a']} – {row['b']}" + (f"  ({sample_of.get(row['a'], '?')})" if replicate else ""))
-    within = pairs.filter(pl.col("by") == "experiment")
-    if within.height:
-        ax_dist.axvspan(within["W1_ln_D_low"].min(), within["W1_ln_D_high"].max(), color=_HIST_COLOR, alpha=0.4,
-                        lw=0, label="replicates' spread")
-        ax_dist.legend(fontsize=7, frameon=False, loc="lower right")
-    ax_dist.set_yticks(range(len(labels)), labels, fontsize=8)
-    ax_dist.set_ylim(len(labels) - 0.5, -0.5)
-    ax_dist.set_xlim(left=0)
-    ax_dist.set_xlabel("W1 distance in ln D", fontsize=9)
-    ax_dist.set_title(
-        f"How far apart (median, {level:.0%} interval)\nfilled: two samples · hollow: two replicates of one",
-        fontsize=9, loc="left", color=_INK,
-    )
+    ys = np.arange(len(rows))
+    for y, (_label, row, filled, tone) in zip(ys, rows):
+        for ax, key in ((ax_med, "lognormal_D_median"), (ax_sig, "lognormal_sigma_ln_D")):
+            unit = "_um2_s" if key.endswith("median") else ""
+            mid, lo, hi = row[f"{key}{unit}"], row[f"{key}_low{unit}"], row[f"{key}_high{unit}"]
+            if mid is None:
+                continue
+            ax.plot([lo, hi], [y, y], color=tone, lw=2 if filled else 1.2, solid_capstyle="round")
+            ax.plot([mid], [y], "o", ms=6 if filled else 5, color=tone, mfc=tone if filled else "white", mew=1.4,
+                    zorder=3)
+    ax_med.set_xscale("log")
+    _plain_log_ticks(ax_med)
+    ax_med.set_yticks(ys, [label for label, *_ in rows], fontsize=8)
+    ax_sig.set_yticks(ys, [""] * len(rows))
+    for ax in (ax_med, ax_sig):
+        ax.set_ylim(len(rows) - 0.5, -0.5)
+    ax_sig.set_xlim(left=0)
+    ax_med.set_xlabel("median D (µm²/s)", fontsize=9)
+    ax_sig.set_xlabel("spread σ (ln D)", fontsize=9)
+    ax_med.set_title(f"log-normal, {level:.0%} intervals\nfilled: sample · hollow: one movie", fontsize=9,
+                     loc="left", color=_INK)
+    ax_sig.set_title("σ near 0: one D\ndescribes the tracks", fontsize=9, loc="left", color=_INK)
     return fig
 
 
@@ -776,20 +787,22 @@ def plot_track_posterior(
     d_interval: tuple[float, float, float],
     n_frames: int | None = None,
     d_floor: float | None = None,
+    d_grid_edge: str | None = None,
 ) -> Figure:
-    """One track's posterior over log10 D, with its median and the shaded
+    """One track's posterior over log10 D, with its mean E[D] and the shaded
     90% interval and its localization floor. A short track's posterior is
-    wide, and that width is the answer, not a defect."""
+    wide, and that width is the answer, not a defect. A posterior cut by a
+    grid edge (`d_grid_edge`) is read as a bound, and the title says so."""
     fig = Figure(figsize=(4.2, 2.8), layout="constrained")
     ax = fig.subplots()
     _style_axis(ax)
     x = np.log10(d_grid)
-    low, median, high = (np.log10(v) for v in d_interval)
+    low, mean, high = (np.log10(v) for v in d_interval)
     dens = _density(d_weights, x)
     inside = (x >= low) & (x <= high)
     ax.fill_between(x, dens, where=inside, color=_DECONVOLVED_COLOR, alpha=0.18, lw=0)
     ax.plot(x, dens, color=_DECONVOLVED_COLOR, lw=1.8)
-    ax.axvline(median, color=_INK, lw=1)
+    ax.axvline(mean, color=_INK, lw=1)
     ax.set_xlabel(units.mpl_log_label("D_um2_s"), fontsize=9)
     ax.set_ylim(bottom=0)
     lo, hi = _mass_range(d_weights, x)
@@ -801,7 +814,11 @@ def plot_track_posterior(
         lo, hi = min(lo, floor), max(hi, floor)
     ax.set_xlim(lo - _LOG_D_PAD, hi + _LOG_D_PAD)
     ax.set_ylabel("posterior density", fontsize=8, color=_MUTED_INK)
-    low, median, high = d_interval
+    low, mean, high = d_interval
     head = f"track {track_id}" + (f" · {n_frames} frames" if n_frames else "")
-    ax.set_title(f"{head}\nD = {median:.3g} µm²/s [{low:.3g}, {high:.3g}]", fontsize=9, loc="left", color=_INK)
+    reading = {"low": f"D < {high:.3g} µm²/s (cut at the grid's low edge: an upper bound)",
+               "high": f"D > {low:.3g} µm²/s (cut at the grid's high edge: a lower bound)",
+               "both": "no information about D (cut at both grid edges)"}.get(d_grid_edge)
+    line = reading or f"E[D] = {mean:.3g} µm²/s [{low:.3g}, {high:.3g}]"
+    ax.set_title(f"{head}\n{line}", fontsize=9, loc="left", color=_INK)
     return fig

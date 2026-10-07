@@ -847,7 +847,7 @@ class ExperimentListWidget(QWidget):
             (
                 "Pooled: D by sample",
                 plot_pooled_populations(
-                    result.distributions, result.distances, samples, result.summary["credible_level"]
+                    result.distributions, result.populations, samples, result.summary["credible_level"]
                 ),
             )
         ]
