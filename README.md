@@ -4,8 +4,9 @@ Batch orchestration and napari visualization for single-particle tracking, conne
 
 - [`spotsolve`](https://github.com/delnatan/spotsolve) — 2D localization after u-track's
   detector, with overlapping spots fitted jointly, plus frame-to-frame linking. Runs in Rust.
-- [`diffusionkit`](https://github.com/delnatan/diffusionkit) — per-track grid posteriors over D, their
-  ensemble (summed and deconvolved, also by track length), classic MSD fits, and per-track NUTS.
+- [`diffusionkit`](https://github.com/delnatan/diffusionkit) — per-track grid posteriors over D, the
+  population they make (a shared D, a log-normal, and a deconvolved distribution, also by track
+  length), classic MSD fits, and per-track NUTS.
 
 ## Install
 
@@ -463,14 +464,21 @@ tracks reach *D min* this way), and the summary counts them. The grid is
 saved with the analysis, so `GridPostOptions(**summary["grid"])` in a
 diffusionkit script reproduces the widget's numbers exactly. Tracks are fitted on
 a thread pool: about 20 s for ~10,000 tracks. The **Ensemble**
-plot reads them across the tracks the filters pass, per region class: the
-per-track medians, the *deconvolved* distribution of D with its 90% band (each
-track's own uncertainty removed; a smooth density whose smoothness the data
-choose by Laplace evidence, so there is nothing to tune -- a peak narrower than
-the tracks resolve comes out as wide as that resolution, and the band widens
-below the localization floor), and the *shared* posterior (one D shared by
-every track). The **By length** plot splits the mean posterior and the
-deconvolved distribution by track length (`gridpost.by_track_length`), stacked
+plot reads them across the tracks the filters pass, per region class, by
+adding the tracks' log-likelihoods under a model of the population -- never by
+histogramming their medians (a short track's median sits where the prior puts
+it) or averaging their posteriors. The *log-normal* population is the
+headline: ln D normal across tracks, its median D and spread σ (in ln D) each
+with an interval, every track's own measurement noise in the model rather than
+in σ. The *deconvolved* distribution, with its 90% band, is the same tracks
+under a smooth density of any shape (its smoothness chosen by Laplace evidence,
+so there is nothing to tune -- a peak narrower than the tracks resolve comes out
+as wide as that resolution, and the band widens below the localization floor);
+two modes there mean the log-normal's numbers describe the wrong shape. The
+*shared* D is one D for every track: when the tracks differ it lands near their
+mean D with an interval far too narrow, which σ tells you. The **By length**
+plot splits the tracks' own posteriors (unpooled) and their posteriors under the
+deconvolved distribution (partially pooled) by track length (`gridpost.by_track_length`), stacked
 so the groups add up to the whole, beside each length's own distribution. Fast
 particles leave the focal depth within a few frames, so short tracks come
 mostly from fast particles and long ones from slow particles. Its window counts
@@ -487,8 +495,8 @@ which a track's motion per frame equals its localization noise, ⟨σ²⟩ /
 their 10–90% band. It is a scale to read D against, not a cut, and it moves
 with the square of any error in the SDs.
 The **Posteriors** plot shows every track's posterior as one row of a heat map,
-sorted by median, beside the *mean* of the tracks' posteriors, the histogram of
-medians and the deconvolved distribution. The plots and summary follow the
+sorted by where its likelihood peaks, beside the population reads of the
+Ensemble plot. The plots and summary follow the
 filters without a re-run; each group's deconvolution takes a second or two, on
 a worker thread, so they update shortly after a change. The **Track** plot shows
 the selected track's posterior; the **Map** tab colors each track's localizations
@@ -523,33 +531,37 @@ Opening a bundle with a saved analysis — saved from the widget, a batch, or
 settings, with no fit re-run. It is restored only if the tracks it was fitted on
 are still the bundle's, vertex for vertex (`tracks_sha256` in the summary);
 after a re-track or a new pixel size the saved numbers show as text and Run
-re-fits. Analyses saved before the fingerprint existed, or with the α
-posterior of earlier versions, need one re-run.
+re-fits. Analyses saved before the fingerprint existed, with the α
+posterior of earlier versions, or as `posterior_D.parquet` (before the
+likelihoods were saved as `loglik_D.parquet`), need one re-run.
 
 *Save analysis* writes into the bundle:
 
 ```
 tracks_summary.csv        one row per track (below)
-posterior_D.parquet       every fitted track's log posterior: track_id, D_um2_s, log_posterior
-distributions_D.csv       the ensemble on the D grid, long by group ("all", then each
-                          region class): shared_log_posterior (summed log posteriors,
-                          0 at the peak), shared_posterior (one D for every track; with
-                          many tracks narrower than a grid cell -- the summary's
-                          shared_D_* interval is read below the grid step),
-                          mean_posterior (the tracks' posteriors averaged), deconvolved
-                          with its pointwise band at the credible level
-                          (deconvolved_low, deconvolved_high)
+loglik_D.parquet          every fitted track's log-likelihood over D: track_id, D_um2_s,
+                          loglik (normalized, so also its flat-prior posterior); what
+                          every population read is built from
+distributions_D.csv       the population on the D grid, long by group ("all", then each
+                          region class): shared_loglik (the tracks' log-likelihoods
+                          summed, 0 at the peak: one D for every track -- the summary's
+                          shared_D_* interval is read below the grid step), lognormal
+                          (the log-normal population at its posterior mode) and
+                          deconvolved, each with its pointwise band at the credible
+                          level (_low, _high)
 distributions_D_by_length.csv
                           the same split by track length, long by group, weight
                           (tracks or detections) and length (length_min, length_max
                           in frames; length_max empty for the open last group):
-                          n_tracks, n_detections, mean_posterior and deconvolved
-                          (with deconvolved_low/_high), each the length's share of
+                          n_tracks, n_detections, unpooled (the tracks' own
+                          posteriors) and partially_pooled (under the deconvolved
+                          distribution, with _low/_high), each the length's share of
                           all the tracks or detections, so a weight's rows sum to 1
 diffusion_summary.json    settings (dt, exposure, grid -- GridPostOptions' fields --,
-                          level), population numbers per group
-                          (with each deconvolution's evidence-chosen smoothness,
-                          deconvolved_*_lambda),
+                          level), population numbers per group (lognormal_D_median_*,
+                          lognormal_sigma_ln_D*, lognormal_D_mean_*, shared_D_*,
+                          deconvolved_* with its evidence-chosen smoothness,
+                          deconvolved_D_lambda),
                           the tracks-pane filters,
                           the fitted tracks' fingerprint (tracks_sha256), and packages
                           (diffusionkit's and napari-gemscape2's version and git SHA)

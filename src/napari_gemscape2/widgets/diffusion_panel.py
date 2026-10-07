@@ -51,7 +51,7 @@ pointed at a selection you could not see.
   its corner plot; needs the optional `[bayes]` extra. See `_NutsTab`.
 
 Saving writes the per-track summary (`tracks_summary.csv`), every
-track's posterior (`posterior_D.parquet`), the ensemble distributions
+track's log-likelihood over D (`loglik_D.parquet`), the ensemble distributions
 (`distributions_D.csv`, `distributions_D_by_length.csv`) and the settings and
 population numbers (`diffusion_summary.json`) into the layer's bundle --
 see `results.py`. Picking a layer whose bundle has a saved analysis
@@ -886,19 +886,24 @@ _POSTERIOR_HELP = (
     "Near-immobile tracks reach <i>D min</i> this way, since localization error only "
     "lets the data bound D from above. These are diffusionkit's <tt>GridPostOptions</tt> "
     "fields, saved with the analysis, so a script can repeat the run exactly."
-    "<br><br><b>Ensemble</b>: <i>shared</i> adds every track's log posterior &mdash; "
-    "the posterior of one D shared by all of them. It is sharp, but only meaningful "
-    "if they really do share a D. <i>Deconvolved</i> is how D is distributed across "
-    "tracks, with each track's own uncertainty taken out: a smooth density whose "
-    "smoothness the data choose (Laplace evidence), shaded with its pointwise 90% band. "
-    "A peak narrower than the tracks can resolve comes out as wide as that resolution, "
-    "and below the localization floor the band widens because the tracks cannot tell "
-    "those D apart. It takes a second or two per group, so the summary and figures "
-    "update shortly after a filter change. The <i>mean "
-    "posterior</i> averages the tracks' posteriors: where they put D, blurred by each "
-    "one's own uncertainty."
-    "<br><br><b>By length</b>: the mean posterior and the deconvolved distribution, "
-    "stacked by track length. Fast particles leave the focal depth within a few frames, "
+    "<br><br><b>Ensemble</b>: the population is the tracks' log-likelihoods added up "
+    "under a model of how D is spread across them &mdash; never a histogram of their "
+    "medians (a short track's median sits where the prior puts it) or an average of "
+    "their posteriors. <i>Log-normal</i>: ln D is normal across tracks; its median D "
+    "and spread σ (in ln D) come with intervals, and each track's own measurement "
+    "noise is taken out by the model, not counted as spread. σ near 0 means one "
+    "shared D describes the tracks. <i>Shared D</i>: one D for every track. When the "
+    "tracks differ it lands near their mean D with an interval far too narrow, so read "
+    "it with σ. <i>Deconvolved</i>: a smooth density of any shape whose smoothness the "
+    "data choose (Laplace evidence), with its pointwise 90% band &mdash; the check on "
+    "the log-normal's shape: two modes there mean the log-normal's numbers describe the "
+    "wrong shape. A peak narrower than the tracks can resolve comes out as wide as that "
+    "resolution, and below the localization floor the band widens because the tracks "
+    "cannot tell those D apart. It takes a second or two per group, so the summary and "
+    "figures update shortly after a filter change."
+    "<br><br><b>By length</b>: the tracks' own posteriors (unpooled) and their "
+    "posteriors under the deconvolved distribution (partially pooled), stacked by track "
+    "length. Fast particles leave the focal depth within a few frames, "
     "so short tracks come mostly from fast particles and long ones from slow particles. "
     "Its window counts <i>each track once</i> (the default, and the usual per-trajectory "
     "reading: the stack is the deconvolved distribution of D across tracks) or <i>each "
@@ -1064,9 +1069,9 @@ class _PosteriorTab(QWidget):
 
         self._ensemble_button = QPushButton("Ensemble")
         self._ensemble_button.setToolTip(
-            "Per-track medians, the deconvolved distribution and the shared-D\n"
-            "posterior against the localization floor, over the tracks\n"
-            "the filters pass, one row per region class."
+            "The log-normal population (median D and spread), the deconvolved\n"
+            "distribution and the shared D against the localization floor,\n"
+            "over the tracks the filters pass, one row per region class."
         )
         self._ensemble_button.clicked.connect(self._show_ensemble)
         self._track_button = QPushButton("Track")
@@ -1076,15 +1081,16 @@ class _PosteriorTab(QWidget):
         self._track_button.clicked.connect(self._show_track)
         self._posteriors_button = QPushButton("Posteriors")
         self._posteriors_button.setToolTip(
-            "Every track's posterior as one row of a heat map, sorted by its\n"
-            "median, beside the mean of the posteriors, the histogram of medians and\n"
-            "the deconvolved distribution -- over the tracks the filters pass."
+            "Every track's posterior as one row of a heat map, sorted by where\n"
+            "its likelihood peaks, beside the population reads of the Ensemble\n"
+            "plot -- over the tracks the filters pass."
         )
         self._posteriors_button.clicked.connect(self._show_posteriors)
         self._length_button = QPushButton("By length")
         self._length_button.setToolTip(
-            "The mean posterior and the deconvolved distribution stacked by\n"
-            "track length, and each length's own distribution -- which tracks\n"
+            "The tracks' own posteriors and their posteriors under the deconvolved\n"
+            "distribution stacked by track length, and each length's own\n"
+            "distribution -- which tracks\n"
             "each part of the distribution comes from -- over the tracks the\n"
             "filters pass, one row per region class."
         )
@@ -1505,7 +1511,7 @@ class _PosteriorTab(QWidget):
 
 
 def _format_by_group(by_group: Optional[dict]) -> str:
-    """One line per region class under the pooled summary: each region was
+    """One line per region class under the overall summary: each region was
     linked on its own, and whether its motion differs is why it was drawn."""
     if not by_group:
         return ""
@@ -1513,8 +1519,10 @@ def _format_by_group(by_group: Optional[dict]) -> str:
     for name, summary in by_group.items():
         line = (
             f"  {name}: {summary['n_tracks']} · median D "
-            f"{units.fmt(summary.get('median_D_um2_s'), 'D_um2_s')}"
+            f"{units.fmt(summary.get('lognormal_D_median_um2_s'), 'D_um2_s')}"
         )
+        if summary.get("lognormal_sigma_ln_D") is not None:
+            line += f" · σ {summary['lognormal_sigma_ln_D']:.2f}"
         if summary.get("shared_D_median_um2_s") is not None:
             line += f" · shared {summary['shared_D_median_um2_s']:.3g}"
         if summary.get("D_floor_median_um2_s") is not None:
@@ -1550,16 +1558,20 @@ def _format_posterior_summary(summary: dict, analysis: Optional[PosteriorAnalysi
             f"{summary['n_D_at_grid_edge']} cut by the D grid's edge (D_at_grid_edge) — "
             "their numbers depend on the grid range"
         )
-    if summary.get("median_D_um2_s") is not None:
+    if summary.get("lognormal_D_median_um2_s") is not None:
         lines.append(
-            f"median D {units.fmt(summary['median_D_um2_s'], 'D_um2_s')} "
-            f"(IQR {summary['q25_D_um2_s']:.3g}–{summary['q75_D_um2_s']:.3g})"
+            f"population (log-normal): median D {units.fmt(summary['lognormal_D_median_um2_s'], 'D_um2_s')} "
+            f"[{summary['lognormal_D_median_low_um2_s']:.3g}, {summary['lognormal_D_median_high_um2_s']:.3g}] · "
+            f"σ(ln D) {summary['lognormal_sigma_ln_D']:.2f} "
+            f"[{summary['lognormal_sigma_ln_D_low']:.2f}, {summary['lognormal_sigma_ln_D_high']:.2f}]"
         )
+        if summary.get("lognormal_problem"):
+            lines.append(f"log-normal: {summary['lognormal_problem']}")
     if summary.get("shared_D_median_um2_s") is not None:
         lines.append(
             f"shared D {summary['shared_D_median_um2_s']:.3g} "
-            f"[{summary['shared_D_low_um2_s']:.3g}, {summary['shared_D_high_um2_s']:.3g}] · "
-            f"deconvolved mode {summary['deconvolved_D_mode_um2_s']:.3g}"
+            f"[{summary['shared_D_low_um2_s']:.3g}, {summary['shared_D_high_um2_s']:.3g}] "
+            "(one D for every track)"
         )
     if summary.get("D_floor_median_um2_s") is not None:
         lines.append(
@@ -1934,7 +1946,7 @@ class DiffusionAnalysisWidget(QWidget):
         self._save_button = QPushButton("Save analysis")
         self._save_button.setToolTip(
             f"Write the per-track summary ({TRACKS_SUMMARY_FILENAME}), every\n"
-            "track's posterior (posterior_D.parquet), the ensemble\n"
+            "track's log-likelihood over D (loglik_D.parquet), the ensemble\n"
             "distributions (distributions_D.csv and, by track length,\n"
             "distributions_D_by_length.csv, over the tracks the\n"
             "filters pass) and the settings and population summary\n"

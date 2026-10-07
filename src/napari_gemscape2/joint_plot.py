@@ -15,10 +15,11 @@ drawn as points instead, so outliers stay visible one track at a time.
 
 The posterior figures (`plot_d_ensemble`, `plot_d_posteriors`,
 `plot_d_by_length`, `plot_track_posterior`) follow one color assignment by
-role, not by series: per-track medians are a neutral histogram, the
-deconvolved distribution is blue, the shared-value posterior is orange, the
-mean of the tracks' posteriors is aqua, and the per-track heat map is one
-blue ramp. Track-length groups are ordered, so they are steps of one ramp,
+role, not by series: the log-normal population is aqua, the deconvolved
+distribution is blue, the shared D is orange, and the per-track heat map is
+one blue ramp. The population is always the tracks' log-likelihoods combined
+under a model of it -- never a histogram of their medians or an average of
+their posteriors (see `diffusion`). Track-length groups are ordered, so they are steps of one ramp,
 light for short tracks and dark for long ones. Every D axis carries the localization floor -- the D at which a track's
 motion per frame equals its localization noise -- as a dotted line at the
 tracks' median floor over a band of their 10-90% range: a scale to read D
@@ -216,7 +217,7 @@ def numeric_columns(df: pl.DataFrame, exclude: tuple[str, ...] = ("track_id",)) 
 _HIST_COLOR = "#c9c8c2"
 _DECONVOLVED_COLOR = "#2a78d6"
 _SHARED_COLOR = "#eb6834"
-_MEAN_POSTERIOR_COLOR = "#1baf7a"
+_LOGNORMAL_COLOR = "#1baf7a"
 # One hue, light to dark, its zero end receding into the figure's surface:
 # the per-track heat map is magnitude, not identity.
 _POSTERIOR_CMAP = LinearSegmentedColormap.from_list(
@@ -265,9 +266,9 @@ def _density(weights: np.ndarray, x: np.ndarray) -> np.ndarray:
     return weights / np.gradient(x)
 
 
-def _draw_deconvolved(ax, x, weights, band, level, lw: float) -> float:
-    """The deconvolved distribution as a density over `x`, with its
-    pointwise band shaded (absent for None); returns the curve's maximum.
+def _draw_band_curve(ax, x, weights, band, color, label, lw: float, band_alpha: float = 0.2) -> float:
+    """Grid weights as a density over `x`, with their pointwise band shaded
+    (absent for None); returns the curve's maximum.
 
     The band does not set the y scale: a peak narrower than the tracks
     resolve has an unidentified height, and its band would dwarf the curve,
@@ -275,10 +276,39 @@ def _draw_deconvolved(ax, x, weights, band, level, lw: float) -> float:
     dens = _density(weights, x)
     if band is not None:
         lo, hi = (_density(b, x) for b in band)
-        ax.fill_between(x, lo, hi, color=_DECONVOLVED_COLOR, alpha=0.2, lw=0,
-                        label=f"deconvolved, {level:.0%} band")
-    ax.plot(x, dens, color=_DECONVOLVED_COLOR, lw=lw, label="deconvolved")
+        ax.fill_between(x, lo, hi, color=color, alpha=band_alpha, lw=0)
+    ax.plot(x, dens, color=color, lw=lw, label=label)
     return dens.max()
+
+
+def _draw_population(ax, x, panel: dict) -> float:
+    """One panel's population reads on a density axis over log10 D: the
+    log-normal (the headline, with its band), the deconvolved distribution
+    (thinner: any shape, the check on the log-normal's), and the shared D
+    as a marker with its interval above both -- far narrower than either,
+    it would flatten them as a curve. Returns the y top it set."""
+    level = panel.get("level", 0.9)
+    top = _draw_band_curve(ax, x, panel["lognormal"], panel.get("lognormal_band"), _LOGNORMAL_COLOR,
+                           f"log-normal population, {level:.0%} band", lw=2.2)
+    top = max(top, _draw_band_curve(ax, x, panel["deconvolved"], panel.get("deconvolved_band"), _DECONVOLVED_COLOR,
+                                    "deconvolved (any shape)", lw=1.2, band_alpha=0.1))
+    if panel.get("floor") is not None:
+        _draw_floor(ax, tuple(np.log10(panel["floor"])), label=_floor_label(panel["floor"]))
+    low, median, high = (np.log10(v) for v in panel["shared_interval"])
+    _interval_marker(ax, low, median, high, top * 1.08, _SHARED_COLOR)
+    ax.plot([], [], "o-", color=_SHARED_COLOR, lw=2, ms=5, label=f"shared D, {level:.0%}")
+    ax.set_ylim(0, top * 1.18)
+    return top
+
+
+def _population_title(panel: dict) -> str:
+    """The log-normal's numbers, and on a second line the shared D's, as a panel title."""
+    sm = panel["summary"]
+    return (
+        f"median D {_with_interval(sm['lognormal_D_median_um2_s'], sm['lognormal_D_median_low_um2_s'], sm['lognormal_D_median_high_um2_s'])}"
+        f" µm²/s · σ(ln D) {_with_interval(sm['lognormal_sigma_ln_D'], sm['lognormal_sigma_ln_D_low'], sm['lognormal_sigma_ln_D_high'], '.2f')}"
+        f"\nshared D {_with_interval(*np.array(panel['shared_interval'])[[1, 0, 2]])} µm²/s (one D for every track)"
+    )
 
 
 def _mass_range(weights: np.ndarray, x: np.ndarray, tail: float = 1e-3) -> tuple[float, float]:
@@ -287,8 +317,6 @@ def _mass_range(weights: np.ndarray, x: np.ndarray, tail: float = 1e-3) -> tuple
     return float(np.interp(tail, cdf, x)), float(np.interp(1 - tail, cdf, x))
 
 
-# Histogram bin width on a log10-D axis: about 12% in D, a few grid cells.
-_LOG_D_BIN = 0.05
 # Padding around the plotted D range, in decades.
 _LOG_D_PAD = 0.25
 
@@ -299,17 +327,14 @@ def _interval_marker(ax, low: float, median: float, high: float, y: float, color
 
 
 def _log_d_range(panels: list[dict], x: np.ndarray) -> tuple[float, float]:
-    """One log10-D range for every panel: wherever any panel has medians,
-    deconvolved mass or its localization floor, rather than the whole grid, which spans five
-    decades and would squeeze the data into a sliver."""
+    """One log10-D range for every panel: wherever any panel's populations
+    have mass, or its localization floor is, rather than the whole grid,
+    which spans five decades and would squeeze the data into a sliver."""
     spans = []
     for panel in panels:
-        # Not the mean posterior: short tracks give it a tail decades long.
-        spans.append(_mass_range(panel["deconvolved"], x, tail=0.01))
-        medians = np.asarray(panel["medians"], dtype=float)
-        medians = medians[medians > 0]
-        if len(medians):
-            spans.append((np.log10(medians.min()), np.log10(medians.max())))
+        for key in ("lognormal", "deconvolved"):
+            spans.append(_mass_range(panel[key], x, tail=0.005))
+        spans.append(tuple(np.log10([panel["shared_interval"][0], panel["shared_interval"][2]])))
         if panel.get("floor") is not None:  # always in view: it is what D is read against
             spans.append((np.log10(panel["floor"][0]), np.log10(panel["floor"][2])))
     x_lo = max(min(lo for lo, _ in spans) - _LOG_D_PAD, x[0])
@@ -319,54 +344,27 @@ def _log_d_range(panels: list[dict], x: np.ndarray) -> tuple[float, float]:
 
 def plot_d_ensemble(d_grid: np.ndarray, panels: list[dict], title: str | None = None) -> Figure:
     """The population read of a posterior run: one row per panel (a region
-    class, or "all"), over log10 D.
+    class, or "all"), over log10 D (`diffusion.ensemble_panels`).
 
-    Each panel dict holds `name`, `n_tracks`, `medians` (per-track D
-    posterior medians), `deconvolved` (weights on `d_grid`) with its
-    pointwise `deconvolved_band` (low, high weights) at credible `level`,
-    `shared_interval` (low, median, high) and `floor` (the localization
-    floor's (10%, median, 90%) or None) (`diffusion.ensemble_panels`).
-
-    On one density axis: the histogram of per-track medians (what the
-    typical track says), and the deconvolved distribution (how D is spread
-    across tracks, with each track's own uncertainty removed -- widths
-    are resolution-limited). The shared posterior -- one D shared by every
-    track -- is far narrower than either, so rather than a curve that
-    would flatten the other two it is a marker with its 90% interval
-    above them. The localization floor sits behind all three.
-    """
+    On one density axis, the tracks' log-likelihoods combined three ways:
+    the log-normal population (its median D and spread in the title), the
+    deconvolved distribution (any shape: where it shows two modes, the
+    log-normal's numbers describe the wrong shape), and the shared D (one D
+    for every track) as a marker with its interval. The localization floor
+    sits behind all three."""
     n = len(panels)
-    fig = Figure(figsize=(6.0, 1.2 + 2.3 * n), layout="constrained")
+    fig = Figure(figsize=(6.4, 1.2 + 2.5 * n), layout="constrained")
     axes = fig.subplots(n, 1, squeeze=False, sharex="col")
     x = np.log10(d_grid)
     x_lo, x_hi = _log_d_range(panels, x)
-    bins = np.arange(x_lo, x_hi + _LOG_D_BIN, _LOG_D_BIN)
     for row, panel in enumerate(panels):
         ax = axes[row][0]
         _style_axis(ax)
-        medians = np.asarray(panel["medians"], dtype=float)
-        medians = np.log10(medians[medians > 0])
-        hist_top = 0.0
-        if len(medians):
-            counts, _, _ = ax.hist(medians, bins=bins, density=True, color=_HIST_COLOR, edgecolor="white",
-                                   lw=0.5, label="per-track medians")
-            hist_top = counts.max()
-        dens_top = _draw_deconvolved(ax, x, panel["deconvolved"], panel.get("deconvolved_band"),
-                                     panel.get("level", 0.9), lw=1.8)
-        if panel.get("floor") is not None:
-            _draw_floor(ax, tuple(np.log10(panel["floor"])), label=_floor_label(panel["floor"]))
-        top = max(dens_top, hist_top)
-        low, median, high = (np.log10(v) for v in panel["shared_interval"])
-        _interval_marker(ax, low, median, high, top * 1.08, _SHARED_COLOR)
-        ax.plot([], [], "o-", color=_SHARED_COLOR, lw=2, ms=5, label="shared D, 90%")
-        ax.set_ylim(0, top * 1.18)
+        _draw_population(ax, x, panel)
         ax.set_xlim(x_lo, x_hi)
-        ax.set_ylabel("density", fontsize=8, color=_MUTED_INK)
-        ax.set_title(
-            f"{panel['name']} · {panel['n_tracks']} tracks · shared D = "
-            f"{panel['shared_interval'][1]:.3g} µm²/s",
-            fontsize=9, loc="left", color=_INK,
-        )
+        ax.set_ylabel(r"density per $\log_{10} D$", fontsize=8, color=_MUTED_INK)
+        ax.set_title(f"{panel['name']} · {panel['n_tracks']} tracks\n{_population_title(panel)}",
+                     fontsize=9, loc="left", color=_INK)
         if row == 0:
             ax.legend(fontsize=7, frameon=False, loc="upper left")
     axes[-1][0].set_xlabel(units.mpl_log_label("D_um2_s"), fontsize=9)
@@ -379,22 +377,17 @@ def plot_d_posteriors(d_grid: np.ndarray, panels: list[dict], title: str | None 
     """Every track's posterior next to what the population makes of them:
     one row per panel (`ensemble_panels(..., track_posteriors=True)`).
 
-    Left, a heat map with one row per track, sorted by its posterior
-    median: a well-determined track is a short bright streak, a short or
-    noisy one a long faint smear. Right, on one density axis: the mean of
-    the tracks' posteriors (where they put D, blurred by each one's
-    uncertainty), the histogram of per-track medians, and the deconvolved
-    distribution (that blur removed). The shared posterior -- one D
-    shared by every track -- is far narrower than any of them, so it is
-    the marker with its 90% interval above the curves, as in
-    `plot_d_ensemble`. The localization floor is on both panels."""
+    Left, a heat map with one row per track (its flat-prior posterior),
+    sorted by where its likelihood peaks: a well-determined track is a
+    short bright streak, a short or noisy one a long faint smear. Right,
+    the population reads as in `plot_d_ensemble`. The localization floor
+    is on both panels."""
     n = len(panels)
     fig = Figure(figsize=(10.5, 1.0 + 3.4 * n), layout="constrained")
     axes = fig.subplots(n, 2, squeeze=False, sharex=True, gridspec_kw={"width_ratios": [1, 1.1]})
     x = np.log10(d_grid)
     dx = float(np.mean(np.diff(x)))
     x_lo, x_hi = _log_d_range(panels, x)
-    bins = np.arange(x_lo, x_hi + _LOG_D_BIN, _LOG_D_BIN)
     # One color scale for every heat map, so rows of different panels
     # compare; the top 0.5% saturate rather than wash the rest out.
     all_dens = np.concatenate([p["track_posteriors"].ravel() for p in panels]) / dx
@@ -408,7 +401,7 @@ def plot_d_posteriors(d_grid: np.ndarray, panels: list[dict], title: str | None 
             posts / dx, aspect="auto", origin="lower", cmap=_POSTERIOR_CMAP, interpolation="nearest",
             extent=[x[0] - dx / 2, x[-1] + dx / 2, 0, len(posts)], vmin=0, vmax=vmax,
         )
-        ax_map.set_ylabel("tracks, by posterior median", fontsize=8, color=_MUTED_INK)
+        ax_map.set_ylabel("tracks, by likelihood peak", fontsize=8, color=_MUTED_INK)
         ax_map.set_title(
             f"{panel['name']} · {panel['n_tracks']} tracks' posteriors (one row each)",
             fontsize=9, loc="left", color=_INK,
@@ -421,28 +414,9 @@ def plot_d_posteriors(d_grid: np.ndarray, panels: list[dict], title: str | None 
         colorbar.outline.set_visible(False)
 
         _style_axis(ax)
-        medians = np.asarray(panel["medians"], dtype=float)
-        medians = np.log10(medians[medians > 0])
-        hist_top = 0.0
-        if len(medians):
-            counts, _, _ = ax.hist(medians, bins=bins, density=True, color=_HIST_COLOR, edgecolor="white",
-                                   lw=0.5, label="per-track medians")
-            hist_top = counts.max()
-        mean_posterior = _density(panel["mean_posterior"], x)
-        ax.plot(x, mean_posterior, color=_MEAN_POSTERIOR_COLOR, lw=2, label="mean of track posteriors")
-        deconvolved_top = _draw_deconvolved(ax, x, panel["deconvolved"], panel.get("deconvolved_band"),
-                                            panel.get("level", 0.9), lw=2)
-        if panel.get("floor") is not None:
-            _draw_floor(ax, tuple(np.log10(panel["floor"])), label=_floor_label(panel["floor"]))
-        top = max(mean_posterior.max(), deconvolved_top, hist_top)
-        low, median, high = (np.log10(v) for v in panel["shared_interval"])
-        _interval_marker(ax, low, median, high, top * 1.08, _SHARED_COLOR)
-        ax.plot([], [], "o-", color=_SHARED_COLOR, lw=2, ms=5, label="shared D, 90%")
-        ax.set_ylim(0, top * 1.18)
+        _draw_population(ax, x, panel)
         ax.set_ylabel(r"density per $\log_{10} D$", fontsize=8, color=_MUTED_INK)
-        ax.set_title(
-            f"shared D = {panel['shared_interval'][1]:.3g} µm²/s", fontsize=9, loc="left", color=_INK
-        )
+        ax.set_title(_population_title(panel), fontsize=9, loc="left", color=_INK)
         if row == 0:
             ax.legend(fontsize=7, frameon=False, loc="upper left")
     axes[-1][0].set_xlim(x_lo, x_hi)
@@ -458,9 +432,9 @@ def plot_d_by_length(panels: list[dict], title: str | None = None) -> Figure:
     per panel (`diffusion.length_panels`: `name`, `composition` -- a
     diffusionkit `LengthComposition` -- and `floor`).
 
-    Left, the mean of the tracks' posteriors and, middle, the deconvolved
-    distribution (each track's posterior under it, mean over its draws),
-    both stacked by track-length group: each group's band is its share of
+    Left, the tracks' own flat-prior posteriors (unpooled) and, middle,
+    each track's posterior under the deconvolved distribution (partially
+    pooled, mean over its draws), both stacked by track-length group: each group's band is its share of
     all the tracks (or detections, as the composition was weighted), so
     the stack is the whole distribution. Right, each group's own
     deconvolved distribution, scaled to its peak, with its tracks and
@@ -474,7 +448,7 @@ def plot_d_by_length(panels: list[dict], title: str | None = None) -> Figure:
         comp = panel["composition"]
         x = comp.u / np.log(10)
         dx = float(np.mean(np.diff(x)))
-        mean = comp.deconvolved.mean(axis=0)
+        mean = comp.partially_pooled.mean(axis=0)
         lo, hi = _mass_range(mean.sum(axis=0), x, tail=0.005)
         if panel.get("floor") is not None:
             lo, hi = min(lo, np.log10(panel["floor"][0])), max(hi, np.log10(panel["floor"][2]))
@@ -483,7 +457,7 @@ def plot_d_by_length(panels: list[dict], title: str | None = None) -> Figure:
         labels = comp.labels()
         colors = _LENGTH_CMAP(np.linspace(0.15, 1.0, len(labels)))
         top = 0.0
-        for col, (contrib, what) in enumerate(((comp.pooled, "mean of track posteriors"), (mean, "deconvolved"))):
+        for col, (contrib, what) in enumerate(((comp.unpooled, "unpooled"), (mean, "partially pooled"))):
             ax = axes[row][col]
             _style_axis(ax)
             bottom = np.zeros(len(x))

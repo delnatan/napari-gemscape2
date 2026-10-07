@@ -15,7 +15,7 @@ it, and a movie without one is analyzed over the whole field.
 and, once the diffusion widget has saved an analysis of it
 (`write_diffusion_results`):
     <result_dir>/tracks_summary.csv       one row per track
-    <result_dir>/posterior_D.parquet      every track's log posterior over D
+    <result_dir>/loglik_D.parquet         every track's log-likelihood over D
     <result_dir>/distributions_D.csv      the ensemble on the D grid
     <result_dir>/distributions_D_by_length.csv  the same split by track length
     <result_dir>/diffusion_summary.json   settings + population numbers
@@ -27,9 +27,8 @@ distances between them, and optionally the ensemble-averaged MSD, all read from 
 Points and tracks are the atomic data, and stay parquet: everything else
 is derived from them. The per-track summary and the distributions are the
 tables people open in a spreadsheet or Prism, so they are CSV. The
-posteriors share one grid per quantity and run to hundreds of rows per
-track, so they are long-format parquet (`track_id`, grid value,
-`log_posterior`).
+likelihoods share one grid and run to hundreds of rows per track, so they
+are long-format parquet (`track_id`, `D_um2_s`, `loglik`).
 
 Detection and tracking are two files, saved by two different actions
 (`write_result` for both, `write_detection_result` for points alone) -- a
@@ -72,13 +71,14 @@ DIFFUSION_SUMMARY_FILENAME = "diffusion_summary.json"
 # experiment's tracks from and to pool across experiments
 # (`diffusion.tracks_summary_table`).
 TRACKS_SUMMARY_FILENAME = "tracks_summary.csv"
-POSTERIOR_D_FILENAME = "posterior_D.parquet"
+LOGLIK_D_FILENAME = "loglik_D.parquet"
 DISTRIBUTIONS_D_FILENAME = "distributions_D.csv"
 DISTRIBUTIONS_D_BY_LENGTH_FILENAME = "distributions_D_by_length.csv"
 # Written by earlier versions of the diffusion widget; removed on the next
 # save so a bundle never mixes two analyses.
 _STALE_DIFFUSION_FILES = (
     "diffusion_fits.parquet", "tracks_summary.parquet", "posterior_alpha.parquet", "distributions_alpha.csv",
+    "posterior_D.parquet",
 )
 
 
@@ -253,7 +253,7 @@ def write_diffusion_results(
     *,
     tracks_summary: pl.DataFrame,
     summary: dict,
-    posterior_D: Optional[pl.DataFrame] = None,
+    loglik_D: Optional[pl.DataFrame] = None,
     distributions_D: Optional[pl.DataFrame] = None,
     distributions_D_by_length: Optional[pl.DataFrame] = None,
 ) -> None:
@@ -266,10 +266,10 @@ def write_diffusion_results(
     result_dir.mkdir(parents=True, exist_ok=True)
     tracks_summary.write_csv(result_dir / TRACKS_SUMMARY_FILENAME)
     (result_dir / DIFFUSION_SUMMARY_FILENAME).write_text(json.dumps(summary, indent=2))
-    if posterior_D is None:
-        (result_dir / POSTERIOR_D_FILENAME).unlink(missing_ok=True)
+    if loglik_D is None:
+        (result_dir / LOGLIK_D_FILENAME).unlink(missing_ok=True)
     else:
-        posterior_D.write_parquet(result_dir / POSTERIOR_D_FILENAME)
+        loglik_D.write_parquet(result_dir / LOGLIK_D_FILENAME)
     for table, filename in (
         (distributions_D, DISTRIBUTIONS_D_FILENAME),
         (distributions_D_by_length, DISTRIBUTIONS_D_BY_LENGTH_FILENAME),
@@ -324,20 +324,20 @@ def load_diffusion_summary(result_dir: str | Path) -> Optional[dict]:
 
 def load_diffusion_results(result_dir: str | Path) -> Optional[dict]:
     """What `write_diffusion_results` wrote, under its keyword names
-    (`summary`, `tracks_summary`, `posterior_D`) -- or None when there is
+    (`summary`, `tracks_summary`, `loglik_D`) -- or None when there is
     no saved posterior analysis to read back."""
     result_dir = Path(result_dir)
     summary = load_diffusion_summary(result_dir)
-    posterior_d_path = result_dir / POSTERIOR_D_FILENAME
+    loglik_path = result_dir / LOGLIK_D_FILENAME
     summary_path = result_dir / TRACKS_SUMMARY_FILENAME
-    if summary is None or not posterior_d_path.exists() or not summary_path.exists():
+    if summary is None or not loglik_path.exists() or not summary_path.exists():
         return None
     return {
         "summary": summary,
         # Every row read before typing a column: one that is empty for the
         # first thousand tracks (MSD, NUTS) would otherwise be a string.
         "tracks_summary": pl.read_csv(summary_path, infer_schema_length=None),
-        "posterior_D": pl.read_parquet(posterior_d_path),
+        "loglik_D": pl.read_parquet(loglik_path),
     }
 
 

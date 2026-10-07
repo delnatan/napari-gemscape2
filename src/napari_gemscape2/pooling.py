@@ -2,7 +2,7 @@
 experiment list's "Pool analyses…" do, through `run_pooling` and `write_pool`.
 
 Each bundle that `gemscape2 diffusion` (or the widget's Save analysis) wrote holds its tracks' posteriors
-over D (`posterior_D.parquet`) and which tracks passed the filters. Pooling reads those back -- nothing is
+over D (`loglik_D.parquet`) and which tracks passed the filters. Pooling reads those back -- nothing is
 refitted -- and hands them to diffusionkit's batch layer:
 
 - the D populations (`GridPostBatch.populations`): one per sample (the bundles that are replicates of each
@@ -28,7 +28,7 @@ import numpy as np
 import polars as pl
 from diffusionkit import Acquisition, Experiment
 from diffusionkit.classic import EnsembleMSD
-from diffusionkit.gridpost import GridPosteriorAnalysis, GridPostBatch, GridPosteriors, cdf_distance
+from diffusionkit.gridpost import GridLikelihoods, GridPosteriorAnalysis, GridPostBatch, cdf_distance
 from diffusionkit.gridpost.workflow import FIT_SCHEMA as DK_FIT_SCHEMA
 
 from napari_gemscape2.batch import _relative
@@ -129,7 +129,7 @@ def guess_sample(name: str) -> str:
 
 def to_gridpost(analysis: PosteriorAnalysis, ids: Optional[set]) -> GridPosteriorAnalysis:
     """diffusionkit's `GridPosteriorAnalysis` of this analysis's tracks `ids` (None: all): the GUI's column names
-    mapped back to diffusionkit's, the posteriors of the fitted ones."""
+    mapped back to diffusionkit's, the log-likelihoods of the fitted ones."""
     fits = analysis.fits if ids is None else analysis.fits.filter(pl.col("track_id").is_in(list(ids)))
     dk_fits = fits.select(
         "track_id", "n_frames",
@@ -143,7 +143,7 @@ def to_gridpost(analysis: PosteriorAnalysis, ids: Optional[set]) -> GridPosterio
     rows = analysis.rows_for(ids)
     return GridPosteriorAnalysis(
         dk_fits, analysis.acquisition, analysis.options,
-        GridPosteriors(analysis.fitted_ids[rows], analysis.fitted_frames[rows], analysis.log_post_D[rows]),
+        GridLikelihoods(analysis.fitted_ids[rows], analysis.fitted_frames[rows], analysis.loglik_D[rows]),
     )
 
 

@@ -167,7 +167,7 @@ def diffusion(
     the "Diffusion analysis" widget's Run + Save analysis, headless.
 
     Reads `<results_root>/<result_id>/` for each [[inputs]] entry and
-    writes the widget's files there (tracks_summary.csv, posterior_D.parquet,
+    writes the widget's files there (tracks_summary.csv, loglik_D.parquet,
     distributions_D.csv, distributions_D_by_length.csv,
     diffusion_summary.json), so the result reopens
     in the widget as if saved from it.

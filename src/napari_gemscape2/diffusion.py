@@ -11,27 +11,33 @@ The analysis is `diffusionkit.gridpost`: for each track, the exact Gaussian
 displacement likelihood evaluated on a grid in ln D, with the camera
 exposure's motion blur modelled. `analyze_posteriors`
 is diffusionkit's own `gridpost.analyze_tracks`, asked to keep each track's
-posterior vector (what the ensemble is built from and what the bundle
-saves), and every grid comes from the one `GridPostOptions` the run is
-given -- the same object a diffusionkit script would pass, so the two agree
-number for number. The D grid's range is the flat prior's support: a
-posterior cut by an edge is flagged in `D_at_grid_edge`.
+log-likelihood on the D grid (what every population read is built from and
+what the bundle saves), and every grid comes from the one `GridPostOptions`
+the run is given -- the same object a diffusionkit script would pass, so the
+two agree number for number. The D grid's range is the flat prior's support:
+a posterior cut by an edge is flagged in `D_at_grid_edge`.
 
-  - **per track**: the posterior median of D and its equal-tailed 90%
-    interval (`D_low`/`D_high` = the 5% and 95% quantiles);
-  - **shared**: the per-track log posteriors added up -- the posterior of
-    one value shared by every track. Sharp, but only honest when the
-    tracks really do share it;
-  - **mean posterior**: the tracks' posteriors averaged -- where they put
-    the value, blurred by each track's own uncertainty and prior;
-  - **deconvolved**: `gridpost.deconvolve`, how D is
-    distributed across tracks, with each track's own uncertainty taken out
-    rather than averaged in: a smooth log density whose smoothness the data
-    choose (Laplace evidence), with a pointwise band from posterior draws
-    of the whole distribution. A peak narrower than the tracks can resolve
-    comes out as wide as that resolution;
-  - **by track length**: `gridpost.by_track_length`, the mean posterior
-    and the deconvolved distribution split into track-length groups, per
+Tracks are combined by adding their log-likelihoods under a model of the
+population (diffusionkit's docs/gridpost.md, "Combining tracks"), never by
+averaging their posteriors or histogramming their medians:
+
+  - **per track** (no pooling): the posterior median of D and its
+    equal-tailed 90% interval (`D_low`/`D_high` = the 5% and 95% quantiles);
+  - **shared** (complete pooling, `gridpost.fit_shared_D`): one D for every
+    track. When the tracks differ it lands near their mean D, with an
+    interval far too narrow;
+  - **log-normal** (partial pooling, `gridpost.fit_lognormal`): ln D ~
+    N(mu, sigma) across tracks -- the population's median D, its spread
+    sigma in ln D and its mean D, each with an interval. sigma near 0 means
+    one shared D describes the tracks;
+  - **deconvolved** (partial pooling, any shape, `gridpost.deconvolve`): a
+    smooth log density whose smoothness the data choose (Laplace evidence),
+    with a pointwise band from posterior draws. A second view, against
+    which the log-normal's shape is checked: two modes here mean the
+    log-normal's numbers describe the wrong shape;
+  - **by track length**: `gridpost.by_track_length`, the tracks' own
+    posteriors (unpooled) and their posteriors under the deconvolved
+    distribution (partially pooled) split into track-length groups, per
     track or per detection. Fast particles leave the focal depth within a
     few frames, so short tracks come mostly from fast particles and long
     tracks from slow ones;
@@ -71,12 +77,11 @@ from diffusionkit.classic import (
 )
 from diffusionkit.classic import analyze_tracks as analyze_msd
 from diffusionkit.classic.batch import FIT_SCHEMA as ENSEMBLE_FIT_SCHEMA
-from diffusionkit.gridpost import GridPosteriors, GridPostOptions, LengthComposition, by_track_length
+from diffusionkit.gridpost import GridLikelihoods, GridPostOptions, LengthComposition, by_track_length
 from diffusionkit.gridpost import analyze_tracks as dk_analyze_tracks
 from diffusionkit.gridpost import deconvolve as dk_deconvolve
+from diffusionkit.gridpost import lognormal as dk_lognormal
 from diffusionkit.gridpost import posterior as dk_post
-from scipy.interpolate import CubicSpline
-from scipy.special import logsumexp
 
 from napari_gemscape2.pipeline import filter_mask
 
@@ -275,11 +280,11 @@ class PosteriorAnalysis:
 
     `fits` has a row for every input track, including the `excluded`
     (too short) and `invalid_input` ones, with the reason in `message`.
-    The posterior arrays hold only the tracks that were fitted, in the
-    order of `fitted_ids`, as normalized log posteriors (flat prior, so
-    each row is also the track's log likelihood up to a constant):
-    `log_post_D` over `D_grid_um2_s`, `options`' grid, with each track's
-    frames in `fitted_frames`. `tracks_sha256` is `tracks_fingerprint` of
+    The likelihood arrays hold only the tracks that were fitted, in the
+    order of `fitted_ids`: `loglik_D`, each track's log-likelihood over
+    `D_grid_um2_s` (`options`' grid), normalized so each row's logsumexp is
+    0 -- under the flat prior that is also the track's posterior -- with
+    each track's frames in `fitted_frames`. `tracks_sha256` is `tracks_fingerprint` of
     the tracks it was run on.
     """
 
@@ -288,7 +293,7 @@ class PosteriorAnalysis:
     options: GridPostOptions
     fitted_ids: np.ndarray
     fitted_frames: np.ndarray
-    log_post_D: np.ndarray
+    loglik_D: np.ndarray
     tracks_sha256: Optional[str] = None
     # `ensemble`'s results by track ids: the summary, the figures and the
     # saved tables all read the same few, and each costs a deconvolution
@@ -312,22 +317,18 @@ class PosteriorAnalysis:
         return np.exp(self.options.u_D())
 
     def rows_for(self, track_ids: Optional[set]) -> np.ndarray:
-        """Row indices into the posterior arrays for `track_ids`, or all
+        """Row indices into the likelihood arrays for `track_ids`, or all
         rows for None."""
         if track_ids is None:
             return np.arange(len(self.fitted_ids))
         return np.flatnonzero(np.isin(self.fitted_ids, list(track_ids)))
 
 
-def _normalized_log(log_weights: np.ndarray) -> np.ndarray:
-    return log_weights - logsumexp(log_weights)
-
-
-def _at_grid_edge(log_post_D: np.ndarray) -> np.ndarray:
-    """Per row of `log_post_D`: is that posterior cut by a grid edge
-    (diffusionkit's `posterior.edge_ratios` over its threshold)?"""
+def _at_grid_edge(loglik_D: np.ndarray) -> np.ndarray:
+    """Per row of `loglik_D`: is that track's flat-prior posterior cut by a
+    grid edge (diffusionkit's `posterior.edge_ratios` over its threshold)?"""
     return np.array(
-        [max(dk_post.edge_ratios(np.exp(lp))) > dk_post.EDGE_RATIO_WARN for lp in log_post_D], dtype=bool
+        [max(dk_post.edge_ratios(np.exp(ll))) > dk_post.EDGE_RATIO_WARN for ll in loglik_D], dtype=bool
     )
 
 
@@ -344,7 +345,7 @@ def analyze_posteriors(
     `tracks` is `tracks_to_diffusionkit_df`'s table. This is
     `diffusionkit.gridpost.analyze_tracks` itself -- same statuses, same
     numbers -- reshaped to one row per track, with each fitted track's
-    posterior vector kept. Tracks are fitted on a pool of `threads`
+    log-likelihood row kept. Tracks are fitted on a pool of `threads`
     (default: one per CPU; diffusionkit's linear algebra releases the GIL),
     with the result identical to a serial run. `progress(done, total)` is
     called from the calling thread."""
@@ -352,13 +353,13 @@ def analyze_posteriors(
     if threads > 1:
         with ThreadPoolExecutor(threads) as pool:
             result = dk_analyze_tracks(
-                tracks, acquisition, options, progress=progress, keep_posteriors=True, map_fn=pool.map
+                tracks, acquisition, options, progress=progress, keep_likelihoods=True, map_fn=pool.map
             )
     else:
-        result = dk_analyze_tracks(tracks, acquisition, options, progress=progress, keep_posteriors=True)
-    post = result.posteriors
+        result = dk_analyze_tracks(tracks, acquisition, options, progress=progress, keep_likelihoods=True)
+    lik = result.likelihoods
     edge = pl.DataFrame(
-        {"track_id": post.track_ids, "D_at_grid_edge": _at_grid_edge(post.log_post_D)},
+        {"track_id": lik.track_ids, "D_at_grid_edge": _at_grid_edge(lik.loglik_D)},
         schema={"track_id": pl.Int64, "D_at_grid_edge": pl.Boolean},
     )
     fits = (
@@ -381,9 +382,9 @@ def analyze_posteriors(
         fits=fits,
         acquisition=acquisition,
         options=options,
-        fitted_ids=post.track_ids,
-        fitted_frames=post.n_frames,
-        log_post_D=post.log_post_D,
+        fitted_ids=lik.track_ids,
+        fitted_frames=lik.n_frames,
+        loglik_D=lik.loglik_D,
         tracks_sha256=tracks_fingerprint(tracks),
     )
 
@@ -393,28 +394,28 @@ def analyze_posteriors(
 
 @dataclass(frozen=True)
 class Ensemble:
-    """The population read of one set of tracks' posteriors, on the D grid.
+    """The population read of one set of tracks, on the D grid: their
+    log-likelihoods combined under three models of the population.
 
-    `shared_log_D` is the sum of the tracks' normalized log posteriors,
-    shifted to 0 at its peak (its absolute level, a sum over n tracks, is
-    thousands below 0 and means nothing), and `shared_D` the same thing
-    as grid weights: the posterior of one value shared by every track.
-    With many tracks it is narrower than a grid cell, so its weights sit
-    in a cell or two; `_shared_summary` reads it below the grid step.
-    `mean_posterior_D` is the average of the tracks' posteriors -- where
-    the tracks put the value, blurred by each track's own uncertainty and
-    prior. `deconvolved_D` is `gridpost.deconvolve`'s distribution across
-    the tracks, that blur removed, with `deconvolved_D_band` its pointwise
+    `shared` is complete pooling (diffusionkit's `SharedD`): the posterior
+    of one D for every track, resolved below the grid step. `shared_loglik_D`
+    is the same thing on the grid -- the tracks' log-likelihoods summed,
+    0 at the peak (its absolute level, a sum over n tracks, means nothing).
+    `lognormal` is partial pooling with ln D ~ N(mu, sigma) across tracks
+    (diffusionkit's `LogNormal`: the posterior over (mu, sigma), the
+    distribution at its mode as `weights` and draws of it as `samples`).
+    `deconvolved_D` is partial pooling with a smooth density of any shape
+    (`gridpost.deconvolve`), `deconvolved_D_band` its pointwise
     equal-tailed band at the analysis's credible level and
     `deconvolved_D_lambda` the smoothness its evidence chose;
-    `deconvolved_D_fit` is the whole fit, its posterior draws included
-    (what `length_composition` splits by track length). All weights sum
-    to 1 over the grid."""
+    `deconvolved_D_fit` is the whole fit, draws included (what
+    `length_composition` splits by track length). Weights sum to 1 over the
+    grid."""
 
     n_tracks: int
-    shared_log_D: np.ndarray
-    shared_D: np.ndarray
-    mean_posterior_D: np.ndarray
+    shared: dk_lognormal.SharedD
+    shared_loglik_D: np.ndarray
+    lognormal: dk_lognormal.LogNormal
     deconvolved_D: np.ndarray
     deconvolved_D_band: tuple[np.ndarray, np.ndarray]
     deconvolved_D_lambda: float
@@ -448,16 +449,14 @@ def _ensemble(analysis: PosteriorAnalysis, track_ids: Optional[set]) -> Optional
     rows = analysis.rows_for(track_ids)
     if len(rows) == 0:
         return None
-    log_post = analysis.log_post_D[rows]
-    shared_log = log_post.sum(axis=0)
-    shared_log = shared_log - shared_log.max()
-    # Flat prior: each row is the track's log likelihood up to a constant.
-    fit = dk_deconvolve.deconvolve(log_post, analysis.u_D)
+    lls = analysis.loglik_D[rows]
+    total = lls.sum(axis=0)
+    fit = dk_deconvolve.deconvolve(lls, analysis.u_D)
     return Ensemble(
         n_tracks=len(rows),
-        shared_log_D=shared_log,
-        shared_D=np.exp(_normalized_log(shared_log)),
-        mean_posterior_D=np.exp(log_post).mean(axis=0),
+        shared=dk_lognormal.fit_shared_D(lls, analysis.u_D),
+        shared_loglik_D=total - total.max(),
+        lognormal=dk_lognormal.fit_lognormal(lls, analysis.u_D),
         deconvolved_D=fit.weights,
         deconvolved_D_band=fit.band(analysis.level),
         deconvolved_D_lambda=float(fit.lam),
@@ -466,7 +465,7 @@ def _ensemble(analysis: PosteriorAnalysis, track_ids: Optional[set]) -> Optional
 
 
 # Draws of the deconvolved distribution the by-length split is computed
-# under: each costs one pass over every track's posterior (~0.04 s for ten
+# under: each costs one pass over every track's likelihood (~0.04 s for ten
 # thousand tracks), and 50 are enough for a 90% band.
 LENGTH_DRAWS = 50
 
@@ -474,8 +473,9 @@ LENGTH_DRAWS = 50
 def length_composition(
     analysis: PosteriorAnalysis, track_ids: Optional[set] = None, weight: str = "tracks"
 ) -> Optional[LengthComposition]:
-    """`gridpost.by_track_length` over `track_ids` (all for None): the mean
-    posterior and the deconvolved distribution split into track-length
+    """`gridpost.by_track_length` over `track_ids` (all for None): the
+    tracks' own posteriors (unpooled) and their posteriors under the
+    deconvolved distribution (partially pooled) split into track-length
     groups, each track counted once (`weight="tracks"`) or once per frame
     ("detections"). None when no track was fitted. Cached on `analysis`."""
 
@@ -484,8 +484,8 @@ def length_composition(
         if ens is None:
             return None
         rows = analysis.rows_for(track_ids)
-        posteriors = GridPosteriors(analysis.fitted_ids[rows], analysis.fitted_frames[rows], analysis.log_post_D[rows])
-        return by_track_length(posteriors, analysis.u_D, ens.deconvolved_D_fit, weight=weight, n_draws=LENGTH_DRAWS)
+        likelihoods = GridLikelihoods(analysis.fitted_ids[rows], analysis.fitted_frames[rows], analysis.loglik_D[rows])
+        return by_track_length(likelihoods, analysis.u_D, ens.deconvolved_D_fit, weight=weight, n_draws=LENGTH_DRAWS)
 
     return _cached(analysis, ("length", _ids_key(track_ids), weight), compute)
 
@@ -501,38 +501,36 @@ def _grid_summary(weights: np.ndarray, grid: np.ndarray, level: float, log_grid:
     return {"low": float(q[0]), "median": float(q[1]), "high": float(q[2])}
 
 
-# The shared posterior's summary is read off a cubic spline of its log
-# through the cells within `_SHARED_WINDOW` (log units) of its peak, at
-# `_SHARED_REFINE` points per grid cell.
-_SHARED_WINDOW = 40.0
-_SHARED_REFINE = 64
-
-
-def _shared_summary(shared_log: np.ndarray, grid: np.ndarray, level: float, log_grid: bool) -> dict:
-    """Median and equal-tailed interval of the shared posterior
-    (`Ensemble.shared_log_D`), resolved below the grid step.
-
-    With many tracks the shared posterior is narrower than a grid cell, so
-    `_grid_summary` of its weights returns the peak cell and about one
-    cell either side, whatever its real width. Its log is a sum of smooth
-    per-track log likelihoods -- close to a parabola near the peak, which
-    the spline's not-a-knot ends reproduce -- so it is interpolated on
-    the grid it is smooth on (ln D) and summarized there."""
-    x = np.log(grid) if log_grid else np.asarray(grid, dtype=float)
-    near = np.flatnonzero(shared_log >= shared_log.max() - _SHARED_WINDOW)
-    lo, hi = max(near[0] - 2, 0), min(near[-1] + 2, len(x) - 1)
-    while hi - lo < 3 and (lo > 0 or hi < len(x) - 1):  # a cubic needs four points
-        lo, hi = max(lo - 1, 0), min(hi + 1, len(x) - 1)
-    if hi - lo < 3:
-        return _grid_summary(np.exp(_normalized_log(shared_log)), grid, level, log_grid)
-    fine = np.linspace(x[lo], x[hi], (hi - lo) * _SHARED_REFINE + 1)
-    log_w = CubicSpline(x[lo : hi + 1], shared_log[lo : hi + 1])(fine)
-    out = _grid_summary(np.exp(_normalized_log(log_w)), fine, level, log_grid=False)
-    return {k: float(np.exp(v)) for k, v in out.items()} if log_grid else out
+def _low_high(interval: dict) -> dict:
+    """diffusionkit's `{median, lo, hi}` as this module's `{low, median, high}`."""
+    return {"low": interval["lo"], "median": interval["median"], "high": interval["hi"]}
 
 
 def _grid_mode(weights: np.ndarray, grid: np.ndarray) -> float:
     return float(grid[int(np.argmax(weights))])
+
+
+# `summarize`'s log-normal keys: diffusionkit's summary names, each with its
+# interval as `_low`/`_high` before the unit.
+_LOGNORMAL_KEYS = (("D_median", "_um2_s"), ("sigma_ln_D", ""), ("D_mean", "_um2_s"))
+
+
+def lognormal_summary(ens: Ensemble, level: float) -> dict:
+    """`Ensemble.lognormal`'s numbers as flat keys: `lognormal_D_median_um2_s`
+    (the population's median D) with `lognormal_D_median_low_um2_s` /
+    `_high_um2_s`, and likewise `lognormal_sigma_ln_D` (its spread in ln D)
+    and `lognormal_D_mean_um2_s`; `lognormal_problem` when the fit reached
+    a prior bound."""
+    summary = ens.lognormal.summary(level)
+    out = {}
+    for name, unit in _LOGNORMAL_KEYS:
+        values = summary[name + unit]
+        out[f"lognormal_{name}{unit}"] = values["median"]
+        out[f"lognormal_{name}_low{unit}"] = values["lo"]
+        out[f"lognormal_{name}_high{unit}"] = values["hi"]
+    if ens.lognormal.problem:
+        out["lognormal_problem"] = ens.lognormal.problem
+    return out
 
 
 def summarize(analysis: PosteriorAnalysis, track_ids: Optional[set] = None) -> dict:
@@ -542,14 +540,15 @@ def summarize(analysis: PosteriorAnalysis, track_ids: Optional[set] = None) -> d
     Counts are by diffusionkit's own statuses (`n_ok`, `n_excluded`,
     `n_invalid_input`), plus `n_D_at_grid_edge`: fitted tracks whose D
     posterior is cut by the grid's range, so their numbers depend on it.
-    `n_detections` counts the fitted tracks' frames. `median_D_um2_s`/`q25`/`q75` are over the per-track
-    posterior medians -- the typical track. `shared_D_*` is the shared-D
-    posterior's median and 90% interval (resolved below the grid step,
-    `_shared_summary`), and `deconvolved_D_*` the deconvolved
-    distribution's median and 90% range (a spread across tracks, not an
-    uncertainty), its mode, and the smoothness (`lambda`) its evidence
-    chose. `D_floor_*_um2_s` are the median and 10%/90% quantiles of the
-    tracks' localization floors."""
+    `n_detections` counts the fitted tracks' frames. The population is the
+    tracks' log-likelihoods combined (`Ensemble`), never a statistic of
+    their per-track medians: `lognormal_*` (`lognormal_summary`: the
+    population's median D, spread and mean D), `shared_D_*` (one D for
+    every track: its median and interval), and `deconvolved_D_*` the
+    deconvolved distribution's median and 90% range (a spread across
+    tracks, not an uncertainty), its mode, and the smoothness (`lambda`) its
+    evidence chose. `D_floor_*_um2_s` are the median and 10%/90% quantiles
+    of the tracks' localization floors."""
     fits = analysis.fits
     if track_ids is not None:
         fits = fits.filter(pl.col("track_id").is_in(list(track_ids)))
@@ -562,9 +561,6 @@ def summarize(analysis: PosteriorAnalysis, track_ids: Optional[set] = None) -> d
         "n_frames_min": _scalar(ok["n_frames"].min()),
         "n_frames_median": _scalar(ok["n_frames"].median()),
         "n_frames_max": _scalar(ok["n_frames"].max()),
-        "median_D_um2_s": _scalar(ok["D_median_um2_s"].median()),
-        "q25_D_um2_s": _scalar(ok["D_median_um2_s"].quantile(0.25)),
-        "q75_D_um2_s": _scalar(ok["D_median_um2_s"].quantile(0.75)),
         "n_D_at_grid_edge": int(ok["D_at_grid_edge"].sum()),
     }
     floors = ok["D_floor_um2_s"].drop_nulls()
@@ -576,10 +572,11 @@ def summarize(analysis: PosteriorAnalysis, track_ids: Optional[set] = None) -> d
         )
     ens = ensemble(analysis, track_ids)
     if ens is not None:
-        shared = _shared_summary(ens.shared_log_D, analysis.D_grid_um2_s, analysis.level, log_grid=True)
+        shared = _low_high(ens.shared.summary(analysis.level))
         spread = _grid_summary(ens.deconvolved_D, analysis.D_grid_um2_s, analysis.level, log_grid=True)
         out.update(
-            {f"shared_D_{k}_um2_s": v for k, v in shared.items()},
+            lognormal_summary(ens, analysis.level),
+            **{f"shared_D_{k}_um2_s": v for k, v in shared.items()},
             **{f"deconvolved_D_{k}_um2_s": v for k, v in spread.items()},
             deconvolved_D_mode_um2_s=_grid_mode(ens.deconvolved_D, analysis.D_grid_um2_s),
             deconvolved_D_lambda=ens.deconvolved_D_lambda,
@@ -610,10 +607,15 @@ def ensemble_panels(
 ) -> list[dict]:
     """What `joint_plot.plot_d_ensemble` and `plot_d_posteriors` draw, one
     dict per group (default one group, "all"); groups with no fitted track
-    are left out. `track_posteriors` adds every track's posterior weights
-    as rows sorted by their median (`track_posteriors`), for the heat map.
-    `floor` is the tracks' localization floor as (10%, median, 90%), None
-    when no track has one."""
+    are left out. Each holds the three population reads (`Ensemble`):
+    `lognormal` (weights on the grid) with its pointwise `lognormal_band`
+    and its numbers (`lognormal_summary`'s keys, under `summary`),
+    `deconvolved` with its `deconvolved_band`, and `shared_interval`
+    (low, median, high), all at credible `level`. `track_posteriors` adds
+    every track's flat-prior posterior as rows sorted by where its
+    likelihood peaks -- not by its median, which a wide posterior's prior
+    sets -- for the heat map. `floor` is the tracks' localization floor as
+    (10%, median, 90%), None when no track has one."""
     fits = analysis.fits.filter(pl.col("posterior_status") == "ok")
     panels = []
     for name, ids in (groups or {"all": None}).items():
@@ -621,23 +623,23 @@ def ensemble_panels(
         if ens is None:
             continue
         rows = fits if ids is None else fits.filter(pl.col("track_id").is_in(list(ids)))
-        shared = _shared_summary(ens.shared_log_D, analysis.D_grid_um2_s, analysis.level, log_grid=True)
+        shared = _low_high(ens.shared.summary(analysis.level))
         panel = {
             "name": name,
             "n_tracks": ens.n_tracks,
-            "medians": rows["D_median_um2_s"].to_numpy(),
+            "level": analysis.level,
+            "lognormal": ens.lognormal.weights,
+            "lognormal_band": ens.lognormal.band(analysis.level),
+            "summary": lognormal_summary(ens, analysis.level),
             "deconvolved": ens.deconvolved_D,
             "deconvolved_band": ens.deconvolved_D_band,
-            "level": analysis.level,
-            "mean_posterior": ens.mean_posterior_D,
             "shared_interval": (shared["low"], shared["median"], shared["high"]),
             "floor": floor_band(rows["D_floor_um2_s"]),
         }
         if track_posteriors:
-            weights = np.exp(analysis.log_post_D[analysis.rows_for(ids)])
-            # Each row's median grid cell: where its CDF first reaches 1/2.
-            order = np.argsort((np.cumsum(weights, axis=1) >= 0.5).argmax(axis=1), kind="stable")
-            panel["track_posteriors"] = weights[order]
+            lls = analysis.loglik_D[analysis.rows_for(ids)]
+            order = np.argsort(lls.argmax(axis=1), kind="stable")
+            panel["track_posteriors"] = np.exp(lls[order])
         panels.append(panel)
     return panels
 
@@ -683,7 +685,7 @@ def floor_references(table: pl.DataFrame, columns) -> dict[str, tuple[float, flo
 
 
 def track_posterior(analysis: PosteriorAnalysis, track_id: int) -> Optional[dict]:
-    """One fitted track's posterior weights and intervals, for
+    """One fitted track's flat-prior posterior weights and intervals, for
     `joint_plot.plot_track_posterior`; None if it wasn't fitted."""
     rows = np.flatnonzero(analysis.fitted_ids == track_id)
     if len(rows) == 0:
@@ -693,7 +695,7 @@ def track_posterior(analysis: PosteriorAnalysis, track_id: int) -> Optional[dict
         "track_id": track_id,
         "n_frames": fit["n_frames"],
         "d_grid": analysis.D_grid_um2_s,
-        "d_weights": np.exp(analysis.log_post_D[rows[0]]),
+        "d_weights": np.exp(analysis.loglik_D[rows[0]]),
         "d_interval": (fit["D_low_um2_s"], fit["D_median_um2_s"], fit["D_high_um2_s"]),
         "d_floor": fit["D_floor_um2_s"],
     }
@@ -703,32 +705,33 @@ def track_posterior(analysis: PosteriorAnalysis, track_id: int) -> Optional[dict
 # --- tables the bundle saves --------------------------------------------
 
 
-def posterior_long_table(analysis: PosteriorAnalysis) -> pl.DataFrame:
-    """Every fitted track's log posterior, one row per (track, grid point):
-    `track_id`, `D_um2_s`, `log_posterior` (normalized: logsumexp over a
-    track's rows is 0)."""
+def loglik_long_table(analysis: PosteriorAnalysis) -> pl.DataFrame:
+    """Every fitted track's log-likelihood over D, one row per (track, grid
+    point): `track_id`, `D_um2_s`, `loglik` (normalized: logsumexp over a
+    track's rows is 0, which makes it also the track's flat-prior posterior).
+    What every population read is built from, so a bundle reopens -- and
+    pools -- without refitting."""
     ids, grid = analysis.fitted_ids, analysis.D_grid_um2_s
     n_grid = len(grid)
     return pl.DataFrame(
         {
             "track_id": np.repeat(ids, n_grid),
             "D_um2_s": np.tile(grid, len(ids)),
-            "log_posterior": analysis.log_post_D.reshape(-1),
+            "loglik": analysis.loglik_D.reshape(-1),
         },
-        schema={"track_id": pl.Int64, "D_um2_s": pl.Float64, "log_posterior": pl.Float64},
+        schema={"track_id": pl.Int64, "D_um2_s": pl.Float64, "loglik": pl.Float64},
     )
 
 
 def distributions_table(
     analysis: PosteriorAnalysis, groups: Optional[dict[str, Optional[set]]] = None
 ) -> Optional[pl.DataFrame]:
-    """The ensemble distributions on the D grid, long by group: `group`,
-    `n_tracks`, `D_um2_s`, and `Ensemble`'s four reads --
-    `shared_log_posterior` (the summed log posteriors, 0 at their peak),
-    `shared_posterior` (the same as weights: one value shared by every
-    track, often within a cell or two), `mean_posterior` (the tracks'
-    posteriors averaged) and `deconvolved` (weights; each sums to 1 over
-    the grid within a group), with `deconvolved_low`/`deconvolved_high` its
+    """The population reads on the D grid, long by group: `group`,
+    `n_tracks`, `D_um2_s`, and `Ensemble`'s three models --
+    `shared_loglik` (the tracks' log-likelihoods summed, 0 at the peak: one
+    D for every track), `lognormal` (the log-normal population at its
+    posterior mode) and `deconvolved` (weights; each sums to 1 over the
+    grid within a group), each population with `_low`/`_high`, its
     pointwise band at the credible level.
 
     `groups` maps a group name to its track ids; the default is one group,
@@ -739,15 +742,17 @@ def distributions_table(
         if ens is None:
             continue
         n_grid = len(analysis.D_grid_um2_s)
+        lognormal_band = ens.lognormal.band(analysis.level)
         parts.append(
             pl.DataFrame(
                 {
                     "group": [name] * n_grid,
                     "n_tracks": [ens.n_tracks] * n_grid,
                     "D_um2_s": analysis.D_grid_um2_s,
-                    "shared_log_posterior": ens.shared_log_D,
-                    "shared_posterior": ens.shared_D,
-                    "mean_posterior": ens.mean_posterior_D,
+                    "shared_loglik": ens.shared_loglik_D,
+                    "lognormal": ens.lognormal.weights,
+                    "lognormal_low": lognormal_band[0],
+                    "lognormal_high": lognormal_band[1],
                     "deconvolved": ens.deconvolved_D,
                     "deconvolved_low": ens.deconvolved_D_band[0],
                     "deconvolved_high": ens.deconvolved_D_band[1],
@@ -765,12 +770,12 @@ def length_distributions_table(
     `length_min`/`length_max` (the group's track lengths in frames, both
     ends included; `length_max` empty for the open-ended last group),
     `n_tracks`, `n_detections`,
-    `D_um2_s`, `mean_posterior` (the flat-prior posteriors) and
-    `deconvolved` (each track's posterior under the deconvolved
-    distribution, mean over its draws), with `deconvolved_low`/`_high` the
-    pointwise band at the credible level. Each is that length group's share
-    of all the group's tracks (or detections): summed over lengths and the
-    grid, a weight's rows add up to 1."""
+    `D_um2_s`, `unpooled` (the tracks' own flat-prior posteriors) and
+    `partially_pooled` (each track's posterior under the deconvolved
+    distribution, mean over its draws), with `partially_pooled_low`/`_high`
+    the pointwise band at the credible level. Each is that length group's
+    share of all the group's tracks (or detections): summed over lengths
+    and the grid, a weight's rows add up to 1."""
     parts = []
     for name, ids in (groups or {"all": None}).items():
         for weight in LENGTH_WEIGHTS:
@@ -778,7 +783,7 @@ def length_distributions_table(
             if comp is None:
                 continue
             lo, hi = comp.band(analysis.level)
-            mean = comp.deconvolved.mean(axis=0)
+            mean = comp.partially_pooled.mean(axis=0)
             n_grid = len(comp.u)
             upper = [int(e) - 1 for e in comp.edges[1:]] + [None]
             for j in range(len(comp.edges)):
@@ -792,10 +797,10 @@ def length_distributions_table(
                             "n_tracks": [int(comp.n_tracks[j])] * n_grid,
                             "n_detections": [int(comp.n_detections[j])] * n_grid,
                             "D_um2_s": np.exp(comp.u),
-                            "mean_posterior": comp.pooled[j],
-                            "deconvolved": mean[j],
-                            "deconvolved_low": lo[j],
-                            "deconvolved_high": hi[j],
+                            "unpooled": comp.unpooled[j],
+                            "partially_pooled": mean[j],
+                            "partially_pooled_low": lo[j],
+                            "partially_pooled_high": hi[j],
                         }
                     )
                 )
@@ -1218,12 +1223,12 @@ def analysis_tables(
     ids: Optional[set],
     by_class: Optional[dict],
 ) -> dict:
-    """The posterior and distribution tables, as `write_diffusion_results`
+    """The likelihood and distribution tables, as `write_diffusion_results`
     keyword arguments. The ensemble is over the tracks passing the filters
     (`ids`), split by region class when there are several."""
     groups = {"all": ids, **(by_class or {})}
     return dict(
-        posterior_D=posterior_long_table(analysis),
+        loglik_D=loglik_long_table(analysis),
         distributions_D=distributions_table(analysis, groups),
         distributions_D_by_length=length_distributions_table(analysis, groups),
     )
@@ -1241,7 +1246,8 @@ def analysis_summary(
     their names, so the JSON reads on its own and the widget can label
     each when it is reopened."""
     summary = {
-        "analysis": "diffusionkit.gridpost grid posteriors, flat prior in ln D over the D grid",
+        "analysis": "diffusionkit.gridpost grid posteriors, flat prior in ln D over the D grid; "
+        "population: the tracks' log-likelihoods combined (shared D, log-normal, deconvolved)",
         "dt_s": analysis.acquisition.dt_s,
         "exposure_s": analysis.acquisition.exposure_s,
         "min_frames": analysis.min_frames,
@@ -1282,13 +1288,13 @@ def posterior_results_table(analysis: PosteriorAnalysis, msd: Optional[pl.DataFr
 
 class StaleAnalysisError(ValueError):
     """The bundle has a saved analysis, but not of the tracks loaded now
-    (or its posteriors don't lie on the grid its summary records): it has
+    (or its likelihoods don't lie on the grid its summary records): it has
     to be re-run."""
 
 
 @dataclass(frozen=True)
 class SavedAnalysis:
-    """A saved analysis, restored: the posteriors, the MSD comparison's
+    """A saved analysis, restored: the likelihoods, the MSD comparison's
     columns and the NUTS fits' rows when they were saved, and the
     `diffusion_summary.json` settings they were run and summarized with."""
 
@@ -1298,16 +1304,16 @@ class SavedAnalysis:
     summary: dict = field(default_factory=dict)
 
 
-def _posterior_matrix(table: pl.DataFrame, grid_col: str, grid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """`posterior_long_table`'s table back to `(track ids, log posteriors)`."""
+def _loglik_matrix(table: pl.DataFrame, grid_col: str, grid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """`loglik_long_table`'s table back to `(track ids, log-likelihood rows)`."""
     table = table.sort("track_id", grid_col)
     ids = table["track_id"].unique(maintain_order=True).to_numpy().astype(np.int64)
     n_grid = len(grid)
     if table.height != len(ids) * n_grid or not np.allclose(
         table[grid_col].to_numpy()[:n_grid], grid, rtol=1e-12, atol=0
     ):
-        raise StaleAnalysisError(f"its {grid_col} posteriors are not on the grid its summary records")
-    return ids, table["log_posterior"].to_numpy().reshape(len(ids), n_grid)
+        raise StaleAnalysisError(f"its {grid_col} likelihoods are not on the grid its summary records")
+    return ids, table["loglik"].to_numpy().reshape(len(ids), n_grid)
 
 
 def _saved_options(summary: dict) -> GridPostOptions:
@@ -1326,7 +1332,7 @@ def restore_analysis(
     *,
     summary: dict,
     tracks_summary: pl.DataFrame,
-    posterior_D: pl.DataFrame,
+    loglik_D: pl.DataFrame,
 ) -> SavedAnalysis:
     """Rebuild the saved analysis (`results.load_diffusion_results`'s
     tables) over `tracks`, the `tracks_to_diffusionkit_df` table loaded
@@ -1348,7 +1354,7 @@ def restore_analysis(
         raise StaleAnalysisError("its tracks differ from the ones loaded (re-tracked or rescaled since)")
 
     options = _saved_options(summary)
-    fitted_ids, log_post_D = _posterior_matrix(posterior_D, "D_um2_s", np.exp(options.u_D()))
+    fitted_ids, loglik_D = _loglik_matrix(loglik_D, "D_um2_s", np.exp(options.u_D()))
 
     acquisition = Acquisition(dt_s=summary["dt_s"], exposure_s=summary["exposure_s"])
     fits = (
@@ -1371,7 +1377,7 @@ def restore_analysis(
         options=options,
         fitted_ids=fitted_ids,
         fitted_frames=np.array([frames[i] for i in fitted_ids], dtype=np.int64),
-        log_post_D=log_post_D,
+        loglik_D=loglik_D,
         tracks_sha256=saved_sha,
     )
 

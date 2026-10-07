@@ -144,7 +144,7 @@ _EXACT: dict[str, Optional[str]] = {
     "D_at_grid_edge": None,
     # What a track's D posterior gained over the flat prior.
     "D_info_bits": BITS,
-    "log_posterior": None,
+    "loglik": None,
     "posterior": None,
     "weight": None,
     # diffusionkit's count of observations actually used for a track --
