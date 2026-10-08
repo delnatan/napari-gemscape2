@@ -30,6 +30,10 @@ uv run gemscape2 --help # headless batch runs (see Usage)
 
 To update, run `git pull && uv sync`.
 
+You don't need to create a virtual environment first. `uv sync` makes
+`.venv` inside the clone. uv chooses any installed Python 3.13 or newer, or
+downloads one. To use a particular version, run `uv sync --python 3.14`.
+
 `uv sync` installs exactly what `uv.lock` pins, so every machine gets the same
 spotsolve, diffusionkit and qtkit. spotsolve arrives as a prebuilt wheel from
 its GitHub release for macOS (Apple silicon and Intel), Linux (x86-64 and
