@@ -212,7 +212,7 @@ from napari_gemscape2.widgets.msd_widgets import fit_window_to_figure
 from napari_gemscape2.widgets.params_panel import _compact_form, _ispin
 
 # Look for the two viewer overlays this widget owns -- kept visually
-# distinct from DETECTED_POINTS_STYLE's magenta "+" (viewer.py) so a
+# distinct from DETECTED_POINTS_STYLE's magenta rings (viewer.py) so a
 # highlighted/mapped track never gets mistaken for a raw detection.
 #
 # The selected track is one rotated rectangle (`oriented_track_box`)
@@ -917,9 +917,12 @@ _POSTERIOR_HELP = (
     "track. Tracks shorter than <i>min points</i> are in neither."
     "<br><br><b>Localization floor</b> (<i>D_floor_um2_s</i>): the D at which a track's "
     "motion per frame equals its localization noise, &lt;σ²&gt; / (dt &minus; exposure/3) "
-    "from its own SDs. Every D axis shows it (median over the tracks, 10&ndash;90% band) "
-    "as the scale to read D against &mdash; not a cut: D below it is still measured, with "
-    "less information per step. It moves with the square of any error in the SDs."
+    "from its own SDs. Every D axis shows it as a thin dotted line at the tracks' median. "
+    "It is not a resolution limit: information on D accumulates over a track's steps, "
+    "and over the tracks a population pools, so D below it is still resolved. What it "
+    "marks is accuracy: below it most of each step's variance is localization noise "
+    "being subtracted, so D leans on the SDs being right &mdash; it moves with the "
+    "square of any error in them, a bias that more frames do not average away."
     "<br><br>The classic MSD analysis is on the <b>MSD</b> tab."
 
 )
@@ -1074,7 +1077,7 @@ class _PosteriorTab(QWidget):
         self._ensemble_button = QPushButton("Ensemble")
         self._ensemble_button.setToolTip(
             "The log-normal population (median D and spread), the deconvolved\n"
-            "distribution and the shared D against the localization floor,\n"
+            "distribution and the shared D, with the localization floor,\n"
             "over the tracks the filters pass, one row per region class."
         )
         self._ensemble_button.clicked.connect(self._show_ensemble)
@@ -2633,6 +2636,7 @@ class DiffusionAnalysisWidget(QWidget):
     def set_map_contrast_limits(self, vmin: float, vmax: float) -> None:
         if self._live(self._spatial_map_layer) is not None and vmin < vmax:
             self._spatial_map_layer.face_contrast_limits = (vmin, vmax)
+            self._spatial_map_layer.border_contrast_limits = (vmin, vmax)
 
     def set_nuts_result(self, row: dict) -> None:
         self._nuts_rows.append(row)
@@ -2819,11 +2823,21 @@ class DiffusionAnalysisWidget(QWidget):
                 face_color=color_by,
                 face_colormap="viridis",
                 symbol="disc",
-                # Small and border-free on purpose: this sits directly on
-                # top of the tracks layer, and a size-6+bordered marker
-                # was obscuring the trajectory it's meant to annotate.
+                # Small on purpose: this sits directly on top of the
+                # tracks layer, and a size-6 marker was obscuring the
+                # trajectory it's meant to annotate.
                 size=2.5,
                 border_width=0.0,
+                # Zoomed out, vispy clamps each marker up to the minimum
+                # canvas size and widens its border to half that -- so the
+                # border, not the face, is what shows. Colored by the same
+                # feature and colormap as the face (and kept on the same
+                # contrast limits, `set_map_contrast_limits`), so a
+                # clamped dot keeps its color instead of turning into
+                # napari's default gray.
+                border_color=color_by,
+                border_colormap="viridis",
+                canvas_size_limits=(4, 10000),
             )
             callback = self._make_spatial_map_click_callback()
             self._spatial_map_layer.mouse_drag_callbacks.append(callback)
@@ -2832,6 +2846,8 @@ class DiffusionAnalysisWidget(QWidget):
             self._spatial_map_layer.features = {color_by: values, "track_id": track_ids}
             self._spatial_map_layer.face_color = color_by
             self._spatial_map_layer.face_colormap = "viridis"
+            self._spatial_map_layer.border_color = color_by
+            self._spatial_map_layer.border_colormap = "viridis"
 
     def _make_spatial_map_click_callback(self):
         """Click a point on the spatial map -> select its track --

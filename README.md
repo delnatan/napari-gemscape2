@@ -505,9 +505,13 @@ Every D axis — the ensemble,
 the posteriors, the track plot, and the joint plot when an axis is D at one
 frame interval — shows the **localization floor** `D_floor_um2_s`, the D at
 which a track's motion per frame equals its localization noise, ⟨σ²⟩ /
-(dt − exposure/3) from its own SDs, as a dotted line at the tracks' median over
-their 10–90% band. It is a scale to read D against, not a cut, and it moves
-with the square of any error in the SDs.
+(dt − exposure/3) from its own SDs, as a thin dotted line at the tracks'
+median. It is not a resolution limit: information on D accumulates over a
+track's steps, and over the tracks a population pools, so D below the floor is
+still resolved. It marks accuracy instead: below it most of each step's
+variance is localization noise being subtracted, so D leans on the SDs being
+calibrated. It moves with the square of any error in them, a bias that more
+frames do not average away.
 The **Posteriors** plot shows every track's posterior as one row of a heat map,
 sorted by where its likelihood peaks, beside the population reads of the
 Ensemble plot. The plots and summary follow the
@@ -608,7 +612,7 @@ this track": it was excluded, too short, or that analysis was off.
 | `D_grid_edge` | | Which end of the D grid cuts the posterior: `low` (the data only bound D from above — read the row as upper bounds), `high` (lower bounds), `both` (no information), empty when it isn't cut |
 | `D_partially_pooled_um2_s` | µm²/s | The track's E[D] with its population (the log-normal of its region class, or of all passing tracks) as the prior: ignores the grid's edges and averages to the population's mean, but moves with the population, so it is in the saved file only, not the filter panel. Empty for tracks outside the filters |
 | `D_info_bits` | bits | How much the track narrowed D from the flat prior. Only comparable on the same grid |
-| `D_floor_um2_s` | µm²/s | Localization floor: the D at which motion per frame equals localization noise, ⟨σ²⟩ / (dt − exposure/3) from the track's SDs. A reference scale, not a threshold |
+| `D_floor_um2_s` | µm²/s | Localization floor: the D at which motion per frame equals localization noise, ⟨σ²⟩ / (dt − exposure/3) from the track's SDs. Not a resolution limit or a threshold: below it, D depends on the SDs being calibrated |
 | **Optional fits** | | |
 | `D_msd_um2_s`, `K_msd_um2_s_alpha`, `alpha_msd` | µm²/s, µm²/s^α, – | Classical MSD fits (D over D's window, α by log-log over its own), when they ran; no uncertainties |
 | `*_nuts*` | | Full-posterior NUTS fit, for tracks fitted in the NUTS tab |

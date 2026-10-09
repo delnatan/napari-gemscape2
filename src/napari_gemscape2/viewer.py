@@ -45,36 +45,56 @@ TRACKS_COLOR_BY = "track_length"
 # layer this app adds.
 IMAGE_COLORMAP = "viridis"
 
-# Percentile stretch for the initial contrast limits. napari's default is
-# the full min..max of the data, which on a 16-bit camera stack with a few
-# hot pixels renders as a near-black frame the user has to hand-adjust
-# every single time. The low cut is deliberately gentle (0.1, not 1) --
-# for sparse single molecules the vast majority of pixels ARE background,
-# so cutting a whole percent off the bottom would start clipping it.
+# Initial contrast limits, set from the background's own statistics:
+# median - IMAGE_NOISE_BELOW*sigma .. median + IMAGE_NOISE_ABOVE*sigma, with
+# sigma the robust (MAD) noise. napari's default is the full min..max of
+# the data, which on a 16-bit camera stack with a few hot pixels renders
+# as a near-black frame. A plain percentile stretch is no better for
+# sparse single molecules: spots cover well under 1% of the pixels, so
+# even the 99th percentile lands inside the background noise -- the
+# background renders speckled and every spot saturates. The noise-based
+# window does not depend on how many spots are in the field, and hot
+# pixels cannot drag it. One sigma below the median keeps the background
+# dark gray rather than clipped black, so its texture stays readable.
+IMAGE_NOISE_BELOW = 1.0
+IMAGE_NOISE_ABOVE = 12.0
+
+# Frames sampled when estimating those limits (and every
+# IMAGE_STATS_PIXEL_STRIDE-th pixel along y and x within each): the
+# median of a (2000, 2048, 2048) stack is seconds of work for a number
+# that a subsample pins down just as well, and this runs on every
+# selection change.
+IMAGE_STATS_FRAMES = 8
+IMAGE_STATS_PIXEL_STRIDE = 2
+
+# Fallback stretch for an image without measurable noise (MAD of 0:
+# clipped, binary, or synthetic data).
 IMAGE_PERCENTILES = (0.1, 99.0)
 
-# Frames sampled when estimating those limits: a full percentile over a
-# (2000, 2048, 2048) stack is seconds of work for a number that a handful
-# of frames pins down just as well, and this runs on every selection
-# change.
-IMAGE_PERCENTILE_FRAMES = 8
-
 # Shared look for every "detected spot" Points layer (the final "points"
-# layer here, and experiment_list.py's stepwise "points (preview)") --
-# a "+" so spots that are close together stay distinguishable at any
-# zoom level, instead of overlapping discs merging into a blob. Size is
-# in data pixels, so the marker keeps its scale relative to the image as
-# you zoom; napari's "cross" symbol is a filled plus whose arms are a
-# third of that wide, which at size 4 is thin enough to read the PSF
-# through. Transparent border so only the "+" face is visible; magenta
-# since it's a hue absent from both viridis and gray (this app's two
-# expected image colormaps), so markers stay visible regardless of which
-# one the image layer is using.
+# layer here, and experiment_list.py's stepwise "points (preview)") -- a
+# thin hollow circle centered on the fit. Nothing covers the center, so
+# the PSF peak shows through, and the eye finds a circle's center to
+# well under a pixel. (napari's "cross" is a *filled* plus with arms
+# size/3 wide, which covers most of the very pixel you want to see.)
+#
+# Size is in data pixels and the border is a fraction of it, so both
+# scale with zoom. When zoomed out, vispy clamps each marker up to
+# canvas_size_limits[0] screen pixels and widens its border to at least
+# half that -- i.e. the ring fills in to a solid dot, which keeps every
+# spot visible in a full-frame view. (It is also why a transparent
+# border made markers vanish when zoomed out: the clamped border ate the
+# whole marker.) Magenta since it's a hue absent from both viridis and
+# gray (this app's two expected image colormaps), so markers stay
+# visible regardless of which one the image layer is using.
 DETECTED_POINTS_STYLE = dict(
-    symbol="cross",
-    size=4,
-    face_color="magenta",
-    border_color="transparent",
+    symbol="disc",
+    size=2,
+    face_color="transparent",
+    border_color="magenta",
+    border_width=0.08,
+    border_width_is_relative=True,
+    canvas_size_limits=(5, 10000),
 )
 
 # Display properties carried across a layer swap (see
@@ -143,19 +163,36 @@ def _positive_or_none(value) -> Optional[float]:
     return number if np.isfinite(number) and number > 0 else None
 
 
-def percentile_contrast_limits(image, percentiles=IMAGE_PERCENTILES) -> tuple[float, float]:
-    """`(low, high)` intensity cuts at `percentiles` of `image`, sampled
-    over at most `IMAGE_PERCENTILE_FRAMES` evenly-spaced frames of a
-    (T, Y, X) stack. Falls back to a unit-wide window on a flat image, so
-    the returned pair is always a valid (strictly increasing) contrast
-    range for napari."""
+def _stats_sample(image) -> np.ndarray:
+    """The finite pixels of at most `IMAGE_STATS_FRAMES` evenly-spaced
+    frames of a (T, Y, X) stack, strided by `IMAGE_STATS_PIXEL_STRIDE`
+    along y and x -- what the contrast estimate is computed on."""
     arr = np.asarray(image)
-    if arr.ndim > 2 and arr.shape[0] > IMAGE_PERCENTILE_FRAMES:
-        arr = arr[:: max(1, arr.shape[0] // IMAGE_PERCENTILE_FRAMES)]
-    finite = arr[np.isfinite(arr)] if not np.all(np.isfinite(arr)) else arr
-    if finite.size == 0:
+    if arr.ndim > 2 and arr.shape[0] > IMAGE_STATS_FRAMES:
+        arr = arr[:: max(1, arr.shape[0] // IMAGE_STATS_FRAMES)]
+    if arr.ndim >= 2 and min(arr.shape[-2:]) >= 64:
+        arr = arr[..., ::IMAGE_STATS_PIXEL_STRIDE, ::IMAGE_STATS_PIXEL_STRIDE]
+    arr = arr.astype(np.float64, copy=False).ravel()
+    return arr if np.all(np.isfinite(arr)) else arr[np.isfinite(arr)]
+
+
+def initial_contrast_limits(image) -> tuple[float, float]:
+    """`(low, high)` = median -/+ (`IMAGE_NOISE_BELOW`,
+    `IMAGE_NOISE_ABOVE`) robust noise sigmas of `image`, from a subsample
+    (`_stats_sample`). Falls back to the `IMAGE_PERCENTILES` stretch when
+    the noise is unmeasurable (MAD of 0), and to a unit-wide window on a
+    flat image, so the returned pair is always a valid (strictly
+    increasing) contrast range for napari."""
+    sample = _stats_sample(image)
+    if sample.size == 0:
         return 0.0, 1.0
-    low, high = (float(v) for v in np.percentile(finite, percentiles))
+    median = float(np.median(sample))
+    sigma = 1.4826 * float(np.median(np.abs(sample - median)))
+    if sigma > 0:
+        low = median - IMAGE_NOISE_BELOW * sigma
+        high = median + IMAGE_NOISE_ABOVE * sigma
+    else:
+        low, high = (float(v) for v in np.percentile(sample, IMAGE_PERCENTILES))
     if not high > low:
         high = low + 1.0
     return low, high
@@ -170,7 +207,7 @@ def image_display_carryover(viewer, name: str) -> dict:
     re-deriving the contrast there would throw away a stretch the user
     hand-tuned -- for no reason, since it's the same pixels. Empty dict
     when there's no such layer, i.e. a genuinely new image, which then
-    gets the percentile default."""
+    gets the noise-based default."""
     from napari.layers import Image
 
     layer = viewer.layers[name] if name in viewer.layers else None
@@ -180,14 +217,14 @@ def image_display_carryover(viewer, name: str) -> dict:
 
 
 def add_image_layer(viewer, image, name: str, **kwargs):
-    """`viewer.add_image` with this app's colormap and a percentile
+    """`viewer.add_image` with this app's colormap and a noise-based
     contrast stretch, so a freshly-loaded stack is readable without a trip
     to the layer controls. Any explicit kwarg (e.g. one carried over by
     `image_display_carryover`) wins over the defaults."""
     display = dict(colormap=IMAGE_COLORMAP)
     display.update(kwargs)
     if "contrast_limits" not in display:
-        display["contrast_limits"] = percentile_contrast_limits(image)
+        display["contrast_limits"] = initial_contrast_limits(image)
     return viewer.add_image(image, name=name, **display)
 
 
@@ -328,8 +365,8 @@ class ResultDisplay:
 
 def load_image_display(image_path: str | Path, channel: int = 0, z_index: int = 0) -> ImageDisplay:
     """Read a stack and its initial contrast. Touches no viewer, so it is
-    safe to run in a worker thread -- the read and the percentile are the
-    slow part of showing an image, and doing them on the GUI thread froze
+    safe to run in a worker thread -- the read and the contrast estimate are
+    the slow part of showing an image, and doing them on the GUI thread froze
     the file list on every row change."""
     image_path = Path(image_path)
     image, metadata = load_stack(image_path, channel=channel, z_index=z_index)
@@ -337,7 +374,7 @@ def load_image_display(image_path: str | Path, channel: int = 0, z_index: int = 
         path=image_path,
         image=image,
         metadata=metadata,
-        contrast_limits=percentile_contrast_limits(image),
+        contrast_limits=initial_contrast_limits(image),
     )
 
 

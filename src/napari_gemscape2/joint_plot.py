@@ -21,9 +21,13 @@ one blue ramp. The population is always the tracks' log-likelihoods combined
 under a model of it -- never a histogram of their medians or an average of
 their posteriors (see `diffusion`). Track-length groups are ordered, so they are steps of one ramp,
 light for short tracks and dark for long ones. Every D axis carries the localization floor -- the D at which a track's
-motion per frame equals its localization noise -- as a dotted line at the
-tracks' median floor over a band of their 10-90% range: a scale to read D
-against, not a cut. Region classes are separate panels stacked on one
+motion per frame equals its localization noise -- as a thin dotted line at
+the tracks' median floor. It marks accuracy, not resolution: information on
+D accumulates over a track's steps (and over the tracks a population pools),
+so D below the floor is resolved all the same, but most of each step's
+variance there is the localization noise being subtracted, so D leans on
+the SDs being calibrated -- a bias more frames do not average away. Hence
+a line and no shaded band, which read as a limit D cannot go below. Region classes are separate panels stacked on one
 shared x axis rather than more hues, so every panel reads the same way.
 
 Axis labels default to `napari_gemscape2.units.mpl_label(column)` rather than
@@ -80,8 +84,9 @@ def plot_property_joint(
     """`style` is "points" (scatter over a KDE), "density" (2D histogram,
     sparse bins as points), or "auto": density from `DENSITY_MIN_POINTS`
     tracks up. `references` maps an axis column to a (low, mid, high)
-    band drawn across the plot at that axis's value -- the localization
-    floor on a D axis (`diffusion.floor_references`)."""
+    band whose mid is drawn as a line across the plot at that axis's
+    value -- the localization floor on a D axis
+    (`diffusion.floor_references`)."""
     if style not in JOINT_STYLES:
         raise ValueError(f"style must be one of {JOINT_STYLES}, not {style!r}")
     sub = df.select(x_col, y_col).drop_nulls()
@@ -238,16 +243,16 @@ _MUTED_INK = "#52514e"
 
 def _draw_floor(ax, band: tuple[float, float, float], *, vertical: bool = True, label: str | None = None) -> None:
     """The localization floor on `ax`, in the axis's own coordinates
-    (already log10 on a log10-D axis): a band over (low, high) and a
-    dotted line at mid."""
-    low, mid, high = band
-    span, line = (ax.axvspan, ax.axvline) if vertical else (ax.axhspan, ax.axhline)
-    span(low, high, color=_MUTED_INK, alpha=0.08, lw=0, zorder=0)
-    line(mid, color=_MUTED_INK, lw=1, ls=":", zorder=1, label=label)
+    (already log10 on a log10-D axis): a thin dotted line at the band's
+    mid (the tracks' median). Its 10-90% spread is left out on purpose:
+    a shaded band reads as a region D cannot be resolved in, which it is
+    not (see the module docstring)."""
+    line = ax.axvline if vertical else ax.axhline
+    line(band[1], color=_MUTED_INK, lw=0.8, ls=":", zorder=1, label=label)
 
 
 def _floor_label(band: tuple[float, float, float]) -> str:
-    return f"localization floor {band[1]:.2g} µm²/s (10–90% of tracks)"
+    return f"localization floor {band[1]:.2g} µm²/s · below it, D rests on the SDs"
 
 
 def _style_axis(ax) -> None:
@@ -328,7 +333,7 @@ def _interval_marker(ax, low: float, median: float, high: float, y: float, color
 
 def _log_d_range(panels: list[dict], x: np.ndarray) -> tuple[float, float]:
     """One log10-D range for every panel: wherever any panel's populations
-    have mass, or its localization floor is, rather than the whole grid,
+    have mass, or its median localization floor is, rather than the whole grid,
     which spans five decades and would squeeze the data into a sliver."""
     spans = []
     for panel in panels:
@@ -336,7 +341,7 @@ def _log_d_range(panels: list[dict], x: np.ndarray) -> tuple[float, float]:
             spans.append(_mass_range(panel[key], x, tail=0.005))
         spans.append(tuple(np.log10([panel["shared_interval"][0], panel["shared_interval"][2]])))
         if panel.get("floor") is not None:  # always in view: it is what D is read against
-            spans.append((np.log10(panel["floor"][0]), np.log10(panel["floor"][2])))
+            spans.append((np.log10(panel["floor"][1]),) * 2)
     x_lo = max(min(lo for lo, _ in spans) - _LOG_D_PAD, x[0])
     x_hi = min(max(hi for _, hi in spans) + _LOG_D_PAD, x[-1])
     return x_lo, x_hi
@@ -351,7 +356,7 @@ def plot_d_ensemble(d_grid: np.ndarray, panels: list[dict], title: str | None = 
     deconvolved distribution (any shape: where it shows two modes, the
     log-normal's numbers describe the wrong shape), and the shared D (one D
     for every track) as a marker with its interval. The localization floor
-    sits behind all three."""
+    is a thin line behind all three."""
     n = len(panels)
     fig = Figure(figsize=(6.4, 1.2 + 2.5 * n), layout="constrained")
     axes = fig.subplots(n, 1, squeeze=False, sharex="col")
@@ -451,7 +456,7 @@ def plot_d_by_length(panels: list[dict], title: str | None = None) -> Figure:
         mean = comp.partially_pooled.mean(axis=0)
         lo, hi = _mass_range(mean.sum(axis=0), x, tail=0.005)
         if panel.get("floor") is not None:
-            lo, hi = min(lo, np.log10(panel["floor"][0])), max(hi, np.log10(panel["floor"][2]))
+            lo, hi = min(lo, np.log10(panel["floor"][1])), max(hi, np.log10(panel["floor"][1]))
         x_lo = lo if x_lo is None else min(x_lo, lo)
         x_hi = hi if x_hi is None else max(x_hi, hi)
         labels = comp.labels()
@@ -482,7 +487,7 @@ def plot_d_by_length(panels: list[dict], title: str | None = None) -> Figure:
         ax.imshow(own, aspect="auto", origin="lower", cmap=_POSTERIOR_CMAP, interpolation="nearest",
                   extent=[x[0] - dx / 2, x[-1] + dx / 2, -0.5, len(labels) - 0.5], vmin=0, vmax=1)
         if panel.get("floor") is not None:
-            ax.axvline(np.log10(panel["floor"][1]), color=_INK, lw=1, ls=":")
+            ax.axvline(np.log10(panel["floor"][1]), color=_INK, lw=0.8, ls=":")
         ax.set_yticks(range(len(labels)), labels)
         for j in range(len(labels)):
             ax.text(1.01, j, f"{comp.n_tracks[j]} / {comp.n_detections[j]}", transform=ax.get_yaxis_transform(),
