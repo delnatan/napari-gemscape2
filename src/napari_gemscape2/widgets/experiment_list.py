@@ -63,10 +63,7 @@ other movies ticked in the dialog. That keeps the filter histograms'
 role: the cuts are chosen by looking at one movie, then reused, never
 set blind. The batch goes through the same `batch.detect_track_bundle`
 and `diffusion_batch.analyze_bundle` as the `gemscape2` CLI, and writes
-the CLI config that re-runs it. "Pool analyses…" (`widgets/pool_dialog.py`)
-then pools the movies' saved analyses by sample, through the same
-`pooling.run_pooling` as `gemscape2 pool`, and likewise writes the config
-that re-runs it.
+the CLI config that re-runs it.
 
 Regions are painted per movie, so a folder can be masked first and
 batched after: leaving a row that has no results yet saves its mask to
@@ -187,14 +184,6 @@ from napari_gemscape2.widgets.batch_dialog import (
     run_batch_worker,
 )
 from napari_gemscape2.widgets.params_panel import PipelineParamsWidget
-from napari_gemscape2.widgets.pool_dialog import (
-    PoolDialog,
-    PoolEmitter,
-    PoolPlan,
-    has_saved_analysis,
-    pool_config_path,
-    run_pool_worker,
-)
 
 
 def _package_provenance() -> dict:
@@ -524,21 +513,9 @@ class ExperimentListWidget(QWidget):
             "saved diffusion analysis) over other movies in this folder."
         )
         self.batch_button.clicked.connect(self._open_batch_dialog)
-        self.pool_button = QPushButton("Pool analyses…")
-        self.pool_button.setToolTip(
-            "Pool the saved diffusion analyses of movies in this folder by\n"
-            "sample (replicates together): D by sample and how far apart the\n"
-            "samples are, against their replicates -- what `gemscape2 pool` does."
-        )
-        self.pool_button.clicked.connect(self._open_pool_dialog)
         button_row = QHBoxLayout()
         button_row.addWidget(self.open_button)
         button_row.addWidget(self.batch_button)
-        button_row.addWidget(self.pool_button)
-        # The last pooling's figures, one window each, reused.
-        self._pool_windows: dict = {}
-        self._pool_plan: Optional[PoolPlan] = None
-        self._pool_config_note = ""
         # The running batch: its plan, cancel flag and one line per movie
         # (shown when it ends). `self._worker` holds the worker itself, so
         # everything that waits on a step run also waits on a batch.
@@ -711,7 +688,6 @@ class ExperimentListWidget(QWidget):
         self.list_view.setEnabled(not running)
         self.open_button.setEnabled(not running)
         self.batch_button.setEnabled(not running)
-        self.pool_button.setEnabled(not running)
         self.params_panel.setEnabled(not running)
         self.batch_cancel_button.setVisible(running)
         self.batch_cancel_button.setEnabled(running)
@@ -776,103 +752,6 @@ class ExperimentListWidget(QWidget):
         self._finish_step_worker()
         self._set_batch_running(False)
         self._batch_plan = None
-
-    # -- Pool the saved analyses of several movies --
-
-    def _open_pool_dialog(self) -> None:
-        if self._worker is not None:
-            self.progress_label.setText("a run is in progress -- wait for it to finish")
-            return
-        entries = [
-            (item.entry.image_path, item.entry.result_dir)
-            for item in self.list_view.items()
-            if has_saved_analysis(item.entry.result_dir)
-        ]
-        if not entries:
-            QMessageBox.information(
-                self,
-                "Pool analyses",
-                "No movie in this folder has a saved diffusion analysis yet. Analyze one in the "
-                "Diffusion analysis widget and press Save analysis (or batch the others from it).",
-            )
-            return
-        dialog = PoolDialog(self.list_view.results_root, entries, parent=self)
-        if dialog.exec() != PoolDialog.DialogCode.Accepted:
-            return
-        self._start_pool(dialog.plan())
-
-    def _start_pool(self, plan: PoolPlan) -> None:
-        from napari_gemscape2.pooling import write_pool_config
-
-        if not plan.inputs:
-            return
-        self._pool_plan = plan
-        self._pool_config_note = ""
-        if plan.write_config:
-            config_path = pool_config_path(plan.results_root)
-            try:
-                plan.results_root.mkdir(parents=True, exist_ok=True)
-                write_pool_config(
-                    config_path,
-                    results_root=plan.results_root,
-                    inputs=[(image, result_dir.name, sample) for image, result_dir, sample in plan.inputs],
-                    settings=plan.settings,
-                    output=None if plan.out_dir == plan.results_root / "pooled" else plan.out_dir,
-                )
-                self._pool_config_note = f"\nconfig: {config_path.name}"
-            except Exception as exc:
-                self._pool_config_note = f"\n! config not written: {exc}"
-        emitter = PoolEmitter(self)
-        emitter.stage.connect(self.progress_label.setText)
-        worker = run_pool_worker(plan, emitter)
-        worker.finished.connect(emitter.deleteLater)
-        self._set_batch_running(True)
-        # Pooling has no checkpoints to stop at; it takes seconds per sample.
-        self.batch_cancel_button.setVisible(False)
-        self._start_step_worker(worker, self._on_pool_done, indeterminate=True, on_error=self._on_pool_error)
-
-    def _on_pool_done(self, result) -> None:
-        from qtkit.plot import PlotWindow
-
-        from napari_gemscape2.diffusion import ensemble_msd_panels
-        from napari_gemscape2.joint_plot import plot_ensemble_msd, plot_pooled_populations
-
-        plan = self._pool_plan
-        self._end_pool()
-        samples = result.summary["samples"]
-        self.progress_label.setText(
-            f"pooled {len(plan.inputs)} movies into {len(samples)} samples → {plan.out_dir}{self._pool_config_note}"
-        )
-        figures = [
-            (
-                "Pooled: D by sample",
-                plot_pooled_populations(
-                    result.distributions, result.populations, samples, result.summary["credible_level"]
-                ),
-            )
-        ]
-        if result.ensemble is not None:
-            settings = plan.settings
-            panels = ensemble_msd_panels(
-                result.ensemble, settings.ensemble_n_points, settings.ensemble_offset,
-                alpha_points=settings.ensemble_alpha_points,
-            )
-            figures.append(("Pooled: ensemble MSD", plot_ensemble_msd(panels)))
-        for title, figure in figures:
-            window = self._pool_windows.get(title)
-            if window is None:
-                window = self._pool_windows[title] = PlotWindow(title, parent=self)
-            window.show_figure(figure)
-
-    def _on_pool_error(self, exc: Exception) -> None:
-        self._end_pool()
-        self.progress_label.setText(f"pooling stopped: {exc}")
-        QMessageBox.warning(self, "Pool analyses", f"Pooling stopped: {exc}")
-
-    def _end_pool(self) -> None:
-        self._finish_step_worker()
-        self._set_batch_running(False)
-        self._pool_plan = None
 
     def _open_folder_dialog(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Select folder of timelapses")
@@ -1305,6 +1184,31 @@ class ExperimentListWidget(QWidget):
         labels = labels.astype(np.uint16, copy=True)
         return labels > 0, labels, copy.deepcopy(regions)
 
+    def _renamed_regions(self, session: PipelineSession, df: Optional[pl.DataFrame]) -> Optional[Regions]:
+        """The regions layer's current names, when they differ from the
+        `region_class` column of `df` (a table of `session`'s) -- regions
+        renamed in the table since Detect, which only reads names off the
+        layer once. None when nothing was renamed, or when the layer no
+        longer holds the labels `session` was detected with (repainted, or
+        another layer picked): then its names may mean other regions."""
+        if session.labels is None or df is None or "region_class" not in df.columns:
+            return None
+        layer = self._regions_layer
+        if layer is None or not np.array_equal(np.asarray(layer.data), session.labels):
+            return None
+        current = copy.deepcopy(self.params_panel.regions_panel.regions())
+        relabeled = label_points(df.select("y", "x"), session.labels, current)["region_class"]
+        return None if relabeled.equals(df["region_class"]) else current
+
+    def _take_region_names(self, session: PipelineSession) -> None:
+        """Rename `session`'s regions and its detections' `region_class` to
+        what the regions table says now (see `_renamed_regions`), so a rename
+        made after Detect reaches Track and the saved bundle."""
+        current = self._renamed_regions(session, session.points_df)
+        if current is not None:
+            session.regions = current
+            session.points_df = label_points(session.points_df, session.labels, current)
+
     def _start_step_worker(
         self, worker, on_finished, indeterminate: bool = False, on_error: Optional[Callable] = None
     ) -> None:
@@ -1427,7 +1331,7 @@ class ExperimentListWidget(QWidget):
     def _region_count_text(session: PipelineSession) -> str:
         """Per-class detection counts for the Detect status line, for a
         run over more than one region, e.g. `nucleus: 412 · cytoplasm:
-        1030 (6 cells)`."""
+        1030  (6 regions)`."""
         df = session.points_df
         if session.regions is None or df is None or "region_class" not in df.columns:
             return ""
@@ -1435,8 +1339,7 @@ class ExperimentListWidget(QWidget):
             return ""
         counts = dict(df.group_by("region_class").len().iter_rows())
         parts = [f"{name}: {counts.get(name, 0)}" for name in session.regions.class_names()]
-        n_cells = len({r.cell for r in session.regions.table.values()})
-        return "\n" + " · ".join(parts) + f"  ({n_cells} cell{'s' if n_cells != 1 else ''})"
+        return "\n" + " · ".join(parts) + f"  ({len(session.regions.table)} regions)"
 
     @staticmethod
     def _region_track_text(session: PipelineSession) -> str:
@@ -1474,6 +1377,9 @@ class ExperimentListWidget(QWidget):
         if session.points_df is None:
             self.params_panel.set_track_status("error: run detect first", level="error")
             return
+        # Each region class is linked with its own fitted parameters, so the
+        # names linking groups by are the ones in the table now.
+        self._take_region_names(session)
         self.progress_label.setText(f"Linking: {item.entry.image_path.name}")
         emitter = _ProgressEmitter()
         emitter.updated.connect(self._on_progress)
@@ -1792,6 +1698,15 @@ class ExperimentListWidget(QWidget):
             self.params_panel.set_save_status("nothing to save — run tracking first", level="error")
             return False
 
+        # The tracks were linked per region class under the names they carry;
+        # a rename since could merge or split classes, so it needs a re-link.
+        if self._renamed_regions(session, session.tracks_df) is not None:
+            self.params_panel.set_save_status(
+                "regions were renamed since Track — press Track again to link under the new names",
+                level="error",
+            )
+            return False
+
         tracks_df = self._filtered_tracks()
         if tracks_df is None or tracks_df.height == 0:
             self.params_panel.set_save_status(
@@ -1864,6 +1779,7 @@ class ExperimentListWidget(QWidget):
             return False
 
         session.point_filters_used = self.params_panel.get_point_filters() or None
+        self._take_region_names(session)
 
         entry = item.entry
         manifest_params = session_manifest_extra(session)

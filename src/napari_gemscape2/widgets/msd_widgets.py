@@ -1,10 +1,9 @@
-"""Widgets the MSD tab and the pool dialog share: `labelled`,
+"""Widgets for the MSD tab: `labelled`,
 `percent_box`, `fit_window_to_figure`, and `EnsembleWindowControls`, the
 ensemble MSD's window as one row of controls -- how far each track's MSD
 runs before the tracks are averaged, the share of that curve D is fitted
 over, the share alpha is fitted over, and where the localization offset
-comes from. The MSD tab's Ensemble window and the experiment list's pool
-dialog both use it, so the two say it the same way.
+comes from, as the MSD tab's Ensemble window shows it.
 
 D and alpha get separate windows because they want different ones: D the
 first, best-measured lags (the 25-40% rule), alpha a span of lags wide

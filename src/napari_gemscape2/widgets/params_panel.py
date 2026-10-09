@@ -83,7 +83,7 @@ point, vs. blindly running a batch job) practical: a frame-range pair
 (`get_frame_range`) and the regions controls (`regions_panel`, a
 `widgets.regions_panel.RegionsPanel`): a "restrict to regions" checkbox,
 the Labels layer the regions are painted on, and the table naming each
-label's class and cell (see `napari_gemscape2.regions`). The "cores" spinbox
+label's name (see `napari_gemscape2.regions`). The "cores" spinbox
 (`get_n_threads`, under Expert) is `localize_stack`'s `n_threads`,
 defaulted to every core (see `pipeline.run_detect_step`'s
 docstring for why this speeds up even the interactively-watched run, not

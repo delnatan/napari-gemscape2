@@ -382,12 +382,6 @@ the widget like any other.
 
 ### Pooling replicates: `gemscape2 pool`
 
-In the widget, **Pool analyses…** in the experiment list does the same over the
-folder's movies that have a saved analysis: name each one's sample (*Samples
-from names* takes a trailing replicate number off: `wt_1`, `wt_2` → `wt`), and
-it writes the tables below, a `pool.toml` that re-runs it headless, and shows D
-by sample with each movie's own estimate beside it.
-
 Pooling makes one population of each sample: the tracks of all its movies
 in one fit, their log-likelihoods added -- the ensemble a sample makes when
 each movie has only a few tracks (small cells such as yeast). It is read
@@ -395,9 +389,8 @@ the three ways a single movie's Ensemble is: the log-normal (median D,
 spread σ, mean D), the deconvolved distribution as the check on its shape,
 and the shared D. One fit per sample assumes its movies share one
 population, so where a sample has several movies each is also read on its
-own, and the figure shows whether they agree. Samples are drawn side by
-side, not tested against each other: comparing samples is left to analysis
-outside the GUI, with the movie (or cell), not the track, as the replicate,
+own, and its rows show whether they agree. Samples are not tested against
+each other: comparing samples is left to analysis outside this package, with the movie (or cell), not the track, as the replicate,
 starting from `pooled_lognormal_draws_D.csv`.
 
 Replicates of one sample are pooled from what `diffusion` saved: each

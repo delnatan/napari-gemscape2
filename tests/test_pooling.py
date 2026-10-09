@@ -114,22 +114,6 @@ def test_the_distributions_are_the_log_normal_and_the_deconvolution_with_bands(p
             assert np.all(rows[f"{column}_low"].to_numpy() <= rows[f"{column}_high"].to_numpy() + 1e-12)
 
 
-def test_the_pooled_figure_draws(project):
-    import matplotlib
-
-    matplotlib.use("Agg")
-    from napari_gemscape2.joint_plot import plot_pooled_populations
-    from napari_gemscape2.pooling import load_pooled_bundle, run_pooling, PoolSettings
-
-    bundles = [load_pooled_bundle(project / "results" / name, sample)
-               for name, sample in (("wt_1", "wt"), ("wt_2", "wt"), ("mut_1", "mut"))]
-    result = run_pooling(bundles, PoolSettings())
-    fig = plot_pooled_populations(result.distributions, result.populations, result.summary["samples"],
-                                  result.summary["credible_level"])
-    fig.canvas.draw()
-    assert len(fig.axes) == 3
-
-
 def test_a_config_written_for_a_pooling_reruns_it(project):
     from napari_gemscape2.pooling import PoolSettings, guess_sample, write_pool_config
 
