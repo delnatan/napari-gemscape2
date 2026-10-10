@@ -87,10 +87,10 @@ def test_erasing_the_mask_is_recorded(tmp_path):
     assert mask_is_stale(tmp_path)
 
 
-def test_results_mask_stands_in_without_a_saved_mask(tmp_path):
-    # A result dir from before masks were saved on their own.
+def test_results_mask_is_not_the_movies_mask(tmp_path):
+    # Results made with a mask that was never saved as the movie's.
     labels, regions = _mask()
     _write_results(tmp_path, labels, regions)
-    assert has_mask(tmp_path)
-    assert np.array_equal(load_mask(tmp_path)[0], labels)
-    assert not mask_is_stale(tmp_path)
+    assert not has_mask(tmp_path)
+    assert load_mask(tmp_path) == (None, None)
+    assert mask_is_stale(tmp_path)

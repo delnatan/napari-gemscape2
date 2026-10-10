@@ -19,9 +19,8 @@ to the latter (`load_mask`), and a movie without one is analyzed over the
 whole field. When the two differ the results are out of date
 (`mask_is_stale`): the mask was edited since they were made. An empty
 `mask.json` (no `mask.tif`) records a mask erased on purpose, so that
-too can make results out of date. A result dir with no `mask.json` --
-from before masks were saved on their own -- has its results' mask as
-the movie's mask.
+too can make results out of date; with no `mask.json` at all the movie
+has no mask.
 
 and, once the diffusion widget has saved an analysis of it
 (`write_diffusion_results`):
@@ -244,12 +243,11 @@ def save_mask(result_dir: str | Path, labels: np.ndarray | None, regions: Region
 
 def load_mask(result_dir: str | Path) -> tuple[np.ndarray | None, Regions | None]:
     """The movie's mask `(labels, regions)` -- what a run of it is
-    restricted to -- or `(None, None)`: `save_mask`'s files, else the
-    results' mask (`load_regions`) when no mask was ever saved on its own."""
+    restricted to -- or `(None, None)` without one."""
     result_dir = Path(result_dir)
     json_path = result_dir / MASK_REGIONS_FILENAME
     if not json_path.exists():
-        return load_regions(result_dir)
+        return None, None
     regions = Regions.from_json(json.loads(json_path.read_text()))
     tif_path = result_dir / MASK_LABELS_FILENAME
     if not regions.table or not tif_path.exists():
@@ -261,16 +259,13 @@ def has_mask(result_dir: str | Path) -> bool:
     """Whether the movie has a mask (`load_mask` isn't `(None, None)`),
     without reading the image."""
     result_dir = Path(result_dir)
-    if not (result_dir / MASK_REGIONS_FILENAME).exists():
-        return has_regions(result_dir)
-    return (result_dir / MASK_LABELS_FILENAME).exists()
+    return (result_dir / MASK_REGIONS_FILENAME).exists() and (result_dir / MASK_LABELS_FILENAME).exists()
 
 
 def mask_is_stale(result_dir: str | Path) -> bool:
     """Whether results are saved here but the movie's mask has changed
     since they were made: painted, repainted, renamed or erased."""
-    result_dir = Path(result_dir)
-    if not has_result(result_dir) or not (result_dir / MASK_REGIONS_FILENAME).exists():
+    if not has_result(result_dir):
         return False
     return not _same_mask(load_mask(result_dir), load_regions(result_dir))
 
