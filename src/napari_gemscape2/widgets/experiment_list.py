@@ -65,11 +65,15 @@ set blind. The batch goes through the same `batch.detect_track_bundle`
 and `diffusion_batch.analyze_bundle` as the `gemscape2` CLI, and writes
 the CLI config that re-runs it.
 
-Regions are painted per movie, so a folder can be masked first and
-batched after: leaving a row that has no results yet saves its mask to
-its result dir (`_autosave_regions`), the batch restricts each movie to
-its own saved mask (whole field without one), and the row shows a mask
-glyph while it has one (`ExperimentEntry.has_regions`).
+Regions are painted per movie, and each movie's mask is saved to its
+result dir as it is painted (`_autosave_regions`, a second after the last
+edit, and again on leaving the row or opening the batch) -- before or
+after it has results. So a folder can be masked first and batched after,
+or batched, then masked where needed and batched again: the batch
+restricts each movie to its own saved mask (whole field without one), the
+row shows a mask glyph while it has one (`ExperimentEntry.has_regions`),
+and the glyph turns amber when the mask was edited after the results were
+saved (`ExperimentEntry.mask_stale`) -- those are the movies to re-run.
 
 Runs write **nothing** until "Save results" is pressed
 (`_save_result`). The filter histograms on both tabs are the reason:
@@ -134,12 +138,13 @@ from napari_gemscape2.batch import write_batch_config
 from napari_gemscape2.results import (
     build_manifest,
     result_dir_for,
-    has_regions,
+    has_mask,
     has_result,
-    load_regions,
+    load_mask,
+    mask_is_stale,
     package_provenance,
     load_manifest,
-    save_regions,
+    save_mask,
     write_detection_result,
     write_result,
 )
@@ -229,9 +234,16 @@ class ExperimentEntry:
     # while it is set asks first (`_confirm_leave_session`). Cleared by a
     # save, or by choosing to discard.
     has_unsaved_session: bool = False
-    # True while its result dir holds a regions mask (`results.has_regions`)
+    # True while its result dir holds a regions mask (`results.has_mask`)
     # -- painted as a mask glyph, since it decides what a batch analyzes.
     has_regions: bool = False
+    # True while its results were made with a mask other than the one
+    # saved now (`results.mask_is_stale`) -- the glyph turns amber.
+    mask_stale: bool = False
+
+    def refresh_mask_state(self) -> None:
+        self.has_regions = has_mask(self.result_dir)
+        self.mask_stale = mask_is_stale(self.result_dir)
 
 
 class ExperimentItem(QListWidgetItem):
@@ -241,6 +253,11 @@ class ExperimentItem(QListWidgetItem):
         self.setToolTip(str(entry.image_path))
 
     def data(self, role):
+        if role == Qt.ItemDataRole.ToolTipRole and self.entry.mask_stale:
+            return (
+                f"{self.entry.image_path}\nmask changed since the results were saved: "
+                "run it again (or batch it) to apply it"
+            )
         if role == Qt.ItemDataRole.ToolTipRole and self.entry.has_regions:
             return f"{self.entry.image_path}\nregions mask saved: runs are restricted to it"
         return super().data(role)
@@ -253,13 +270,15 @@ class ExperimentItem(QListWidgetItem):
 
 class ExperimentItemDelegate(QStyledItemDelegate):
     """Paints a status dot + filename (+ track count once known), and a
-    mask glyph at the right edge for a movie with saved regions."""
+    mask glyph at the right edge for a movie with saved regions -- amber,
+    and hollow if the mask was erased, when its results are out of date."""
 
     DOT_DIAMETER = 8
     PADDING = 8
     ROW_HEIGHT = 26
     MASK_SIZE = 10
     MASK_COLOR = QColor("#38bdf8")
+    STALE_MASK_COLOR = QColor("#f59e0b")
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
         list_widget = self.parent()
@@ -290,7 +309,7 @@ class ExperimentItemDelegate(QStyledItemDelegate):
             painter.drawEllipse(dot_rect.adjusted(-3, -3, 3, 3))
 
         right = self.PADDING
-        if entry.has_regions:
+        if entry.has_regions or entry.mask_stale:
             # A framed patch: an outline with a translucent fill.
             mask_rect = QRect(
                 option.rect.right() - self.PADDING - self.MASK_SIZE,
@@ -298,9 +317,10 @@ class ExperimentItemDelegate(QStyledItemDelegate):
                 self.MASK_SIZE,
                 self.MASK_SIZE,
             )
-            fill = QColor(self.MASK_COLOR)
-            fill.setAlpha(90)
-            painter.setPen(QPen(self.MASK_COLOR, 1.5))
+            color = self.STALE_MASK_COLOR if entry.mask_stale else self.MASK_COLOR
+            fill = QColor(color)
+            fill.setAlpha(90 if entry.has_regions else 0)
+            painter.setPen(QPen(color, 1.5))
             painter.setBrush(fill)
             painter.drawRoundedRect(mask_rect, 2, 2)
             right += self.MASK_SIZE + self.PADDING
@@ -413,7 +433,7 @@ class _ExperimentListView(QListWidget):
 
             result_dir = result_dir_for(self.results_root, file_path)
             entry = ExperimentEntry(image_path=file_path, result_dir=result_dir)
-            entry.has_regions = has_regions(result_dir)
+            entry.refresh_mask_state()
             item = ExperimentItem(entry)
 
             if has_result(result_dir):
@@ -476,6 +496,12 @@ class ExperimentListWidget(QWidget):
         # tracks layer -- so it lands once the typing stops, on a longer
         # fuse than a filter drag (which is a gesture, not an edit).
         self._scale_change = _debounce_timer(self, self._apply_image_scale_change, msec=300)
+        # The movie's mask is saved a second after the last edit to it --
+        # a brush stroke is a burst of paint events, and each save rewrites
+        # the whole image.
+        self._mask_save = _debounce_timer(
+            self, lambda: self._autosave_regions(self.list_view.currentItem()), msec=1000
+        )
 
         # Showing a row's image (or bundle) runs in a worker, started after
         # a short pause in row changes so that arrowing down the list does
@@ -532,6 +558,7 @@ class ExperimentListWidget(QWidget):
         regions_panel = self.params_panel.regions_panel
         regions_panel.newLayerRequested.connect(self._on_new_regions_layer_requested)
         regions_panel.layerChosen.connect(self._on_region_layer_chosen)
+        regions_panel.regionsEdited.connect(self._mask_save.start)
         # Keep the regions picker showing the viewer's Labels layers.
         # Adding/removing/reordering layers is caught on the layer list
         # itself; a *rename* is an event on the layer, so
@@ -635,6 +662,9 @@ class ExperimentListWidget(QWidget):
                 "batch runs on the others.",
             )
             return
+        # The rows left earlier saved theirs on the way out; this one may
+        # still have an edit waiting on `_mask_save`.
+        self._autosave_regions(item)
         template = item.entry.result_dir
         entries = [
             (other.entry.image_path, other.entry.result_dir, other.entry.status is Status.SKIP)
@@ -717,6 +747,7 @@ class ExperimentListWidget(QWidget):
         item = self._batch_item(index)
         if item is not None:
             item.set_status(Status.COMPLETE, n_tracks=n_tracks)
+            item.entry.refresh_mask_state()
             self.list_view.viewport().update()
 
     def _on_batch_job_finished(self, index: int, ok: bool, message: str) -> None:
@@ -883,20 +914,22 @@ class ExperimentListWidget(QWidget):
         return True
 
     def _autosave_regions(self, item: Optional[ExperimentItem]) -> None:
-        """Save the mask painted on `item` to its result dir as it is left,
-        so masks can be painted across a folder and batched afterwards
-        (`batch.detect_track_bundle` reads them). Only before the movie
-        has results: after that its saved mask is the one those results
-        were made with, and it is saved with them (`_save_result`).
+        """Save the mask painted on `item` to its result dir as the movie's
+        mask (`results.save_mask`), so masks can be painted across a folder
+        and batched afterwards (`batch.detect_track_bundle` reads them).
+        Runs a second after each edit (`_mask_save`), on leaving the row and
+        on opening the batch. Results already saved keep the mask they were
+        made with; if this one differs, the row is marked out of date.
 
         Left as it is on disk when "restrict to regions" is off or there's
-        no regions layer; removed when every region was."""
+        no regions layer; saved as empty when every region was erased."""
+        self._mask_save.stop()
         if item is None or self._loaded is None or self._loaded[0] is not item:
             return
         entry = item.entry
         panel = self.params_panel.regions_panel
         layer = self._regions_layer
-        if has_result(entry.result_dir) or not panel.get_use_mask():
+        if not panel.get_use_mask():
             return
         if layer is None or not any(layer is l for l in self.viewer.layers):
             return
@@ -905,14 +938,11 @@ class ExperimentListWidget(QWidget):
             return
         regions = panel.regions()
         try:
-            if regions.table:
-                save_regions(entry.result_dir, labels.astype(np.uint16), regions)
-            else:
-                save_regions(entry.result_dir, None, None)
+            save_mask(entry.result_dir, labels.astype(np.uint16), regions)
+            entry.refresh_mask_state()
         except Exception as exc:
             self.progress_label.setText(f"could not save the mask of {entry.image_path.name}: {exc}")
             return
-        entry.has_regions = bool(regions.table)
         self.list_view.viewport().update()
 
     # -- Showing a row (off the GUI thread) --
@@ -1010,15 +1040,22 @@ class ExperimentListWidget(QWidget):
         for attr, name in (("_points_layer", "points"), ("_tracks_layer", "tracks")):
             layer = self.viewer.layers[name] if name in self.viewer.layers else None
             setattr(self, attr, layer)
-        if loaded.labels is not None:
+        if loaded.mask_labels is not None:
             self._pick_regions_layer(REGIONS_LAYER_NAME)
 
         n_points = session.points_df.height
-        self.params_panel.set_detect_status(
-            f"{n_points} points from the saved bundle — Track links them as they are"
-            + self._region_count_text(session),
-            level="ok" if n_points else "error",
-        )
+        if item.entry.mask_stale:
+            self.params_panel.set_detect_status(
+                f"{n_points} points from the saved bundle, made with an earlier mask"
+                " — Detect again to apply the mask as it is now",
+                level="error",
+            )
+        else:
+            self.params_panel.set_detect_status(
+                f"{n_points} points from the saved bundle — Track links them as they are"
+                + self._region_count_text(session),
+                level="ok" if n_points else "error",
+            )
         self.params_panel.set_detect_save_enabled(False)
         self._update_points_layer()
         if session.tracks_df is not None:
@@ -1743,7 +1780,8 @@ class ExperimentListWidget(QWidget):
         n_tracks = manifest_params["n_tracks"]
         item.set_status(Status.COMPLETE, n_tracks=n_tracks)
         item.entry.has_unsaved_session = False
-        item.entry.has_regions = session.labels is not None
+        self._autosave_regions(item)
+        item.entry.refresh_mask_state()
         self.list_view.viewport().update()
         self.params_panel.set_save_status(
             f"saved {n_tracks} tracks → {entry.result_dir.name}", level="ok"
@@ -1803,7 +1841,8 @@ class ExperimentListWidget(QWidget):
 
         n_points = session.points_df.height
         item.set_status(Status.COMPLETE, n_tracks=None)
-        item.entry.has_regions = session.labels is not None
+        self._autosave_regions(item)
+        item.entry.refresh_mask_state()
         # An unsaved link result, if any, is still unsaved -- only the
         # detections just got written.
         item.entry.has_unsaved_session = session.tracks_df is not None and session.tracks_df.height > 0
@@ -1935,7 +1974,7 @@ def _load_item_worker(image_path: Path, result_dir: Path):
     GUI thread, shown by `ExperimentListWidget._on_item_loaded`."""
     if has_result(result_dir):
         return load_result_display(result_dir)
-    return load_image_display(image_path), load_regions(result_dir)
+    return load_image_display(image_path), load_mask(result_dir)
 
 
 @thread_worker(start_thread=False)

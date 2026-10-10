@@ -13,8 +13,10 @@ point/track filters from its manifest, and the diffusion analysis
 settings from its `diffusion_summary.json` (written by the Diffusion
 analysis widget's "Save analysis"). Regions are per movie, not the
 template's: a movie with a mask saved in its result dir (painted in the
-widget, see `results.save_regions`) is restricted to it, and one without
+widget, see `results.save_mask`) is restricted to it, and one without
 is analyzed over the whole field -- the movie list marks which is which.
+Movies with no results, and those whose mask changed since their results
+were saved (`results.mask_is_stale`), are ticked to start with.
 """
 
 from __future__ import annotations
@@ -43,8 +45,9 @@ from napari_gemscape2.pipeline import (
     detect_track_params_from_manifest,
 )
 from napari_gemscape2.results import (
-    has_regions,
+    has_mask,
     has_result,
+    mask_is_stale,
     load_diffusion_summary,
     load_manifest,
     package_provenance,
@@ -159,13 +162,23 @@ class BatchDialog(QDialog):
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, (image_path, result_dir))
             has_bundle = has_result(result_dir)
-            tags = [tag for tag, on in (("masked", has_regions(result_dir)), ("has results", has_bundle)) if on]
+            stale = mask_is_stale(result_dir)
+            tags = [
+                tag
+                for tag, on in (
+                    ("masked", has_mask(result_dir)),
+                    ("mask changed since results", stale),
+                    ("has results", has_bundle and not stale),
+                )
+                if on
+            ]
             item.setText(image_path.name + (f"   ({', '.join(tags)})" if tags else ""))
             item.setToolTip(str(image_path))
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            # Unanalyzed, unskipped movies are the usual batch; re-running
-            # an analyzed one is a deliberate tick.
-            checked = not has_bundle and not skipped
+            # Unanalyzed, unskipped movies are the usual batch, and so are
+            # those masked since they were analyzed; re-running any other
+            # analyzed one is a deliberate tick.
+            checked = (not has_bundle or stale) and not skipped
             item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
             self.file_list.addItem(item)
 

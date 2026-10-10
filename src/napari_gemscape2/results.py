@@ -7,10 +7,21 @@ A results bundle is a directory:
     <result_dir>/labels.tif     (optional -- only if regions were used)
     <result_dir>/regions.json   (alongside labels.tif)
 
-The regions pair can also sit in a result dir on its own, with no
-manifest: a movie's mask painted ahead of analysis (`save_regions`). Any
-run of that movie -- the GUI's, a batch's, the CLI's -- is restricted to
-it, and a movie without one is analyzed over the whole field.
+and, once a mask has been painted for the movie (`save_mask`):
+    <result_dir>/mask.json      the movie's mask: its regions table
+    <result_dir>/mask.tif       (alongside mask.json, unless it is empty)
+
+`labels.tif`/`regions.json` are the mask the results were made with,
+written with them; `mask.tif`/`mask.json` are the movie's mask as it is
+painted now, saved on every edit whether or not there are results yet.
+Any run of the movie -- the GUI's, a batch's, the CLI's -- is restricted
+to the latter (`load_mask`), and a movie without one is analyzed over the
+whole field. When the two differ the results are out of date
+(`mask_is_stale`): the mask was edited since they were made. An empty
+`mask.json` (no `mask.tif`) records a mask erased on purpose, so that
+too can make results out of date. A result dir with no `mask.json` --
+from before masks were saved on their own -- has its results' mask as
+the movie's mask.
 
 and, once the diffusion widget has saved an analysis of it
 (`write_diffusion_results`):
@@ -40,10 +51,11 @@ that: it returns an empty `tracks_df` rather than raising when
 
 The source image is referenced by path in the manifest, not copied.
 
-`labels.tif` is the painted regions image (uint16, 0 = background) and
-`regions.json` names each of its labels (`regions.Regions.to_json`) -- see
-`napari_gemscape2.regions`. Reloading a bundle (`viewer.show_result`) adds the
-image back as a Labels layer, so the same regions can be reused or edited.
+`labels.tif`/`mask.tif` are painted regions images (uint16, 0 =
+background) and `regions.json`/`mask.json` name each of their labels
+(`regions.Regions.to_json`) -- see `napari_gemscape2.regions`. Reloading a
+bundle (`viewer.show_result`) adds the movie's mask back as a Labels layer,
+so it can be reused or edited.
 """
 
 from __future__ import annotations
@@ -66,6 +78,8 @@ TRACKS_FILENAME = "tracks.parquet"
 MANIFEST_FILENAME = "manifest.json"
 LABELS_FILENAME = "labels.tif"
 REGIONS_FILENAME = "regions.json"
+MASK_LABELS_FILENAME = "mask.tif"
+MASK_REGIONS_FILENAME = "mask.json"
 DIFFUSION_SUMMARY_FILENAME = "diffusion_summary.json"
 # One row per track: identity, size, position, shape, mean detection QC
 # and the posterior D (median, low, high) -- the table to read an
@@ -196,27 +210,76 @@ def write_detection_result(
     (result_dir / TRACKS_FILENAME).unlink(missing_ok=True)
 
 
-def save_regions(result_dir: str | Path, labels: np.ndarray | None, regions: Regions | None) -> None:
-    """A movie's mask on its own, ahead of any results: `labels.tif` +
-    `regions.json`, or -- with no labels -- neither."""
-    result_dir = Path(result_dir)
-    if labels is not None:
-        result_dir.mkdir(parents=True, exist_ok=True)
-    _write_regions(result_dir, labels, regions)
-
-
 def has_regions(result_dir: str | Path) -> bool:
+    """Whether the results here were made with a mask (`labels.tif` +
+    `regions.json`)."""
     return (Path(result_dir) / LABELS_FILENAME).exists() and (Path(result_dir) / REGIONS_FILENAME).exists()
 
 
 def load_regions(result_dir: str | Path) -> tuple[np.ndarray | None, Regions | None]:
-    """`(labels, regions)` saved in `result_dir`, or `(None, None)`."""
+    """`(labels, regions)` the results in `result_dir` were made with, or
+    `(None, None)`."""
     result_dir = Path(result_dir)
     if not has_regions(result_dir):
         return None, None
     labels = tifffile.imread(result_dir / LABELS_FILENAME).astype(LABELS_DTYPE, copy=False)
     regions = Regions.from_json(json.loads((result_dir / REGIONS_FILENAME).read_text()))
     return labels, regions
+
+
+def save_mask(result_dir: str | Path, labels: np.ndarray | None, regions: Regions | None) -> None:
+    """The movie's mask as painted now: `mask.tif` + `mask.json`, or --
+    with no labels or no regions -- an empty `mask.json` alone, recording
+    that it has none. Results already here are left as they are."""
+    result_dir = Path(result_dir)
+    result_dir.mkdir(parents=True, exist_ok=True)
+    tif_path = result_dir / MASK_LABELS_FILENAME
+    if labels is None or regions is None or not regions.table:
+        tif_path.unlink(missing_ok=True)
+        regions = Regions()
+    else:
+        tifffile.imwrite(tif_path, np.asarray(labels, dtype=LABELS_DTYPE), compression="zlib")
+    (result_dir / MASK_REGIONS_FILENAME).write_text(json.dumps(regions.to_json(), indent=2))
+
+
+def load_mask(result_dir: str | Path) -> tuple[np.ndarray | None, Regions | None]:
+    """The movie's mask `(labels, regions)` -- what a run of it is
+    restricted to -- or `(None, None)`: `save_mask`'s files, else the
+    results' mask (`load_regions`) when no mask was ever saved on its own."""
+    result_dir = Path(result_dir)
+    json_path = result_dir / MASK_REGIONS_FILENAME
+    if not json_path.exists():
+        return load_regions(result_dir)
+    regions = Regions.from_json(json.loads(json_path.read_text()))
+    tif_path = result_dir / MASK_LABELS_FILENAME
+    if not regions.table or not tif_path.exists():
+        return None, None
+    return tifffile.imread(tif_path).astype(LABELS_DTYPE, copy=False), regions
+
+
+def has_mask(result_dir: str | Path) -> bool:
+    """Whether the movie has a mask (`load_mask` isn't `(None, None)`),
+    without reading the image."""
+    result_dir = Path(result_dir)
+    if not (result_dir / MASK_REGIONS_FILENAME).exists():
+        return has_regions(result_dir)
+    return (result_dir / MASK_LABELS_FILENAME).exists()
+
+
+def mask_is_stale(result_dir: str | Path) -> bool:
+    """Whether results are saved here but the movie's mask has changed
+    since they were made: painted, repainted, renamed or erased."""
+    result_dir = Path(result_dir)
+    if not has_result(result_dir) or not (result_dir / MASK_REGIONS_FILENAME).exists():
+        return False
+    return not _same_mask(load_mask(result_dir), load_regions(result_dir))
+
+
+def _same_mask(a: tuple, b: tuple) -> bool:
+    (labels_a, regions_a), (labels_b, regions_b) = a, b
+    if labels_a is None or labels_b is None:
+        return labels_a is None and labels_b is None
+    return np.array_equal(labels_a, labels_b) and regions_a.to_json() == regions_b.to_json()
 
 
 def _write_regions(result_dir: Path, labels: np.ndarray | None, regions: Regions | None) -> None:

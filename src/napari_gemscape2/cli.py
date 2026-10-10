@@ -16,7 +16,7 @@ import typer
 from napari_gemscape2 import units
 from napari_gemscape2.batch import detect_track_bundle
 from napari_gemscape2.results import (
-    has_regions,
+    has_mask,
     has_result,
     load_diffusion_summary,
     load_manifest,
@@ -126,8 +126,8 @@ def detect_track(
 
         typer.echo(f"[{result_id}] {image_path}")
         result_dir = results_root / result_id
-        if has_regions(result_dir):
-            typer.echo("  restricted to its saved regions mask (labels.tif)")
+        if has_mask(result_dir):
+            typer.echo("  restricted to its saved regions mask")
         manifest_extra = detect_track_bundle(
             image_path,
             result_dir,

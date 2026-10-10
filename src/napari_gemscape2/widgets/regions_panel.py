@@ -25,6 +25,8 @@ region, and a name pools them as one class.
 Like `params_panel`, this stays viewer-agnostic: `ExperimentListWidget`
 fills the layer picker (`set_layer_choices`), creates new layers on
 `newLayerRequested`, and hands the chosen layer back with `set_layer`.
+`regionsEdited` tells it the regions changed -- painted, erased or
+renamed -- so it can save the movie's mask.
 """
 
 from __future__ import annotations
@@ -77,6 +79,7 @@ class _RegionsTable(QTableWidget):
 class RegionsPanel(QWidget):
     newLayerRequested = Signal()
     layerChosen = Signal(str)
+    regionsEdited = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -215,6 +218,7 @@ class RegionsPanel(QWidget):
 
     def _on_layer_painted(self, event=None) -> None:
         self._refresh_timer.start()
+        self.regionsEdited.emit()
 
     def refresh(self, force: bool = False) -> None:
         """Rebuild the table from the layer: one row per painted label,
@@ -281,6 +285,7 @@ class RegionsPanel(QWidget):
         name = name.strip()
         if name and self._layer is not None and label in layer_regions(self._layer).table:
             layer_regions(self._layer).table[label].class_ = name
+            self.regionsEdited.emit()
 
     def _refresh_name_choices(self) -> None:
         """Offer every row the names in use now, after one was edited."""

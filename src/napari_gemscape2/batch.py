@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from napari_gemscape2.pipeline import DetectTrackParams, ProgressCallback, run_detect_track
-from napari_gemscape2.results import build_manifest, load_regions, write_result
+from napari_gemscape2.results import build_manifest, load_mask, write_result
 
 
 def detect_track_bundle(
@@ -36,10 +36,10 @@ def detect_track_bundle(
     """Detect+track one movie and write its bundle to `result_dir`.
     Returns the manifest's `params` (units, their sources, counts).
 
-    A mask already saved in `result_dir` (`results.save_regions`, painted
+    The movie's mask saved in `result_dir` (`results.save_mask`, painted
     in the widget) restricts the run to its regions and is kept in the
-    bundle; without one the whole field is analyzed."""
-    labels, regions = load_regions(result_dir)
+    bundle as the results' mask; without one the whole field is analyzed."""
+    labels, regions = load_mask(result_dir)
     points_df, tracks_df, manifest_extra = run_detect_track(
         image_path,
         params,

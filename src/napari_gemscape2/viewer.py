@@ -29,7 +29,7 @@ import numpy as np
 import polars as pl
 
 from napari_gemscape2.io_formats import StackMetadata
-from napari_gemscape2.results import load_result
+from napari_gemscape2.results import load_mask, load_result
 from napari_gemscape2.pipeline import load_stack, track_features_df
 from napari_gemscape2.regions import LABELS_DTYPE, Regions
 
@@ -359,8 +359,15 @@ class ResultDisplay:
     points_df: pl.DataFrame
     tracks_df: pl.DataFrame
     manifest: dict
+    # The mask the results were made with (`results.load_regions`) -- what
+    # the rows' `region` labels refer to.
     labels: np.ndarray | None
     regions: Regions | None
+    # The movie's mask as painted now (`results.load_mask`): the one shown,
+    # edited, and used by the next run. Differs from the above once it has
+    # been edited since the results were saved.
+    mask_labels: np.ndarray | None = None
+    mask_regions: Regions | None = None
 
 
 def load_image_display(image_path: str | Path, channel: int = 0, z_index: int = 0) -> ImageDisplay:
@@ -388,7 +395,10 @@ def load_result_display(bundle_dir: str | Path) -> ResultDisplay:
         channel=params.get("channel", 0),
         z_index=params.get("z_index", 0),
     )
-    return ResultDisplay(Path(bundle_dir), image, points_df, tracks_df, manifest, labels, regions)
+    mask_labels, mask_regions = load_mask(bundle_dir)
+    return ResultDisplay(
+        Path(bundle_dir), image, points_df, tracks_df, manifest, labels, regions, mask_labels, mask_regions
+    )
 
 
 def show_image(viewer, loaded: ImageDisplay):
@@ -433,9 +443,9 @@ def add_regions_layer(viewer, labels: np.ndarray, regions: Regions | None = None
 
 def show_result(viewer, loaded: ResultDisplay) -> None:
     """Clear `viewer` and add the image/points/tracks/regions layers for
-    one loaded bundle -- saved regions (see `napari_gemscape2.regions`) come
-    back as a Labels layer, so the regions used for detection are visible
-    again (and reusable, or editable), not just the results."""
+    one loaded bundle -- the movie's mask (see `napari_gemscape2.regions`)
+    comes back as a Labels layer, so its regions are visible again (and
+    reusable, or editable), not just the results."""
     show_image(viewer, loaded.image)
     result_dir = loaded.bundle_dir
     points_df, tracks_df = loaded.points_df, loaded.tracks_df
@@ -449,8 +459,8 @@ def show_result(viewer, loaded: ResultDisplay) -> None:
     # What each `region` label on the rows is (`regions.label_points`).
     layer_metadata["region_classes"] = region_classes(loaded.regions)
 
-    if loaded.labels is not None:
-        add_regions_layer(viewer, loaded.labels, loaded.regions)
+    if loaded.mask_labels is not None:
+        add_regions_layer(viewer, loaded.mask_labels, loaded.mask_regions)
     add_points_layer(viewer, points_df, "points", layer_metadata)
     add_tracks_layer(viewer, tracks_df, pixel_size_um, dt_s, "tracks", layer_metadata)
 

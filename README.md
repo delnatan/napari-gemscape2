@@ -99,8 +99,10 @@ results/<result_id>/
     points.parquet
     tracks.parquet
     manifest.json
-    labels.tif             (optional — only if regions were used)
+    labels.tif             (optional — the mask the results were made with)
     regions.json           (alongside labels.tif)
+    mask.tif               (optional — the movie's mask as painted now)
+    mask.json              (its region names; empty if the mask was erased)
 ```
 
 `points.parquet` is `spotsolve.loctable`'s localization table verbatim — one row
@@ -123,15 +125,19 @@ per class (the manifest carries `track_summary_by_class`). The Diffusion panel c
 reports the classical D summary (and z, when computed) per class. Bundles from
 before this change keep their `rois.json`, but its polygons are no longer read.
 
-A movie's mask is saved to its result folder when you move to another movie
-(until it has results, after which the mask is saved with them), and its row in
-the list is marked with a mask glyph. So you can paint masks across a whole
-folder first, then batch it: masked movies are restricted to their regions, and
-the rest are analyzed over the whole field.
+A movie's mask is saved to its result folder as you paint it (`mask.tif` +
+`mask.json`, a second after the last edit), whether or not the movie has
+results yet, and its row in the list is marked with a mask glyph. So you can
+paint masks across a whole folder first, then batch it: masked movies are
+restricted to their regions, and the rest are analyzed over the whole field.
+Results keep the mask they were made with (`labels.tif` + `regions.json`); when
+the mask is edited after that -- repainted, renamed, or erased -- the glyph turns
+amber, and the batch dialog ticks that movie to be run again. So you can also
+batch first, then mask the movies that need it and batch again.
 
 Reopening a row that already has a bundle resumes it: the saved points are the
 session's detections, so Track links them without re-running detect, and the
-saved regions come back as the picked regions layer.
+movie's mask comes back as the picked regions layer.
 
 Nothing a QC decision rejects is deleted. spotsolve reports every fit with its
 `FitFlag`s; the Track tab chooses which flags keep a fit away from the linker
@@ -310,9 +316,9 @@ save it (*Save results*, then *Save analysis*), and name that bundle as the
 and `diffusion` reuses those in its `diffusion_summary.json`, with nothing
 copied by hand. Any key written under `[params]` or `[diffusion]` overrides
 the template's. Regions are per movie, not the template's: an input whose result
-folder already holds a painted mask (`labels.tif` + `regions.json`, saved when
-you leave the movie in the widget) is restricted to it, and one without is
-analyzed over the whole field.
+folder already holds a painted mask (`mask.tif` + `mask.json`, saved as you
+paint it in the widget) is restricted to it, and one without is analyzed over
+the whole field.
 
 ```toml
 results_root = "results"
