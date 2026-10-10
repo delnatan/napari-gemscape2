@@ -30,10 +30,10 @@ a visible prompt to add it here.
 
 Resolution order for a column name (see `unit_of`): an exact entry, then
 with a per-track aggregate suffix (`_min`/`_mean`/`_max`, added by
-`widgets/diffusion_panel._qc_aggregate_table`) stripped, then a
+`diffusion.qc_aggregate_table`) stripped, then a
 unit-bearing name suffix (`_um2_s`, `_um`, `_s`, `_rad`, ...), then a
-statistic suffix (`_median`/`_lo`/`_hi`/`_stderr`) or a fit-variant suffix
-(`_map`/`_mle`/`_msd`/`_track_fit`) stripped, and finally the unitless and
+statistic suffix (`_median`/`_low`/`_high`/...) or a fit-variant suffix
+(`_msd`/`_nuts`/`_est`) stripped, and finally the unitless and
 pixel-space registries below.
 """
 
@@ -117,14 +117,15 @@ _EXACT: dict[str, Optional[str]] = {
     "sigma_px": PX,
     "max_step_px": PX,
     "rms_step_px": PX,
-    "sigma_ci_px": PX,
-    "mean_localization_offset_um2": UM2,
     # Dimensionless by construction, listed so they read as "known with no
     # unit" rather than "unknown".
     "alpha": None,
     "sigma_ratio": None,
-    "flux_ratio": None,
     "flux_snr": None,
+    # spotsolve's detection score, sqrt(2 * likelihood ratio) of the
+    # emitter against background alone (at least the threshold `u` that
+    # `fp_per_mpx` sets).
+    "z": None,
     # spotsolve's per-fit diagnostics: a `FitFlag` bitmask.
     "flags": None,
     "n_locs": None,
@@ -136,7 +137,6 @@ _EXACT: dict[str, Optional[str]] = {
     # says and nothing it had to infer.
     "dispersion": ADU,
     "r2": None,
-    "r_squared": None,
     # diffusionkit's grid posteriors: per-track statuses, and the
     # posterior's own summaries are named `<quantity>_<median|low|high>`,
     # resolved through the statistic suffixes above.
@@ -188,14 +188,8 @@ _STATISTIC_SUFFIXES = (
     "_low",
     "_high",
     "_nuts",
-    "_stderr",
-    "_map",
     "_msd",
     "_est",
-    "_link",
-    "_arith_mean",
-    "_par",
-    "_perp",
 )
 
 # Greek/italic forms for the quantity part of a matplotlib label, so an
@@ -205,8 +199,6 @@ _MPL_TOKENS = {
     "D": r"$D$",
     "K": r"$K$",
     "alpha": r"$\alpha$",
-    "eps": r"$\epsilon$",
-    "psi": r"$\psi$",
     "sigma": r"$\sigma$",
     "tau": r"$\tau$",
     "z": r"$z$",
@@ -259,7 +251,7 @@ def is_known(column: str) -> bool:
     if unit_of(column) is not None:
         return True
     # A dimensionless column's aggregate or statistic is equally
-    # dimensionless, and equally *known*: `flux_snr_mean` and `eps_median`
+    # dimensionless, and equally *known*: `flux_snr_mean` and `alpha_median`
     # resolve to a registered `None`, not to "never heard of it".
     base = _strip_suffix(column, _AGGREGATE_SUFFIXES)
     if base is not None and is_known(base):
@@ -302,7 +294,7 @@ def headers(columns) -> dict[str, str]:
 
     `header` states the unit once by dropping the name's own unit token,
     which means two columns of the same quantity in different units --
-    `se_x_max` (px) and `se_x_um_max` (µm), both in the tracks pane --
+    say `se_x_max` (px) and `se_x_um_max` (µm) in one table --
     would otherwise display as the same `se_x_max`, distinguished only by
     the bracket. Where that happens, both keep their full column name and
     the unit is simply appended, so the pair reads

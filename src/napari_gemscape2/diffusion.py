@@ -161,8 +161,16 @@ def tracks_fingerprint(tracks: pl.DataFrame) -> str:
 # `loc_id` is a detection's serial number: its min/mean/max are three
 # columns of pure noise in a table that already runs past fifty.
 # `flags` is a bitmask: its min/mean/max are not quantities.
+# `t`, `y_um`/`x_um` are frame/y/x again in seconds and µm -- coordinates,
+# not detection quality (the summary's own `x_um`/`y_um` is the centroid).
+# `se_y_um`/`se_x_um` are `se_y`/`se_x` times the pixel size, the same
+# number twice. `sigma` is the detector's search width, a setting that
+# every detection in the movie shares.
 _QC_SKIP_COLUMNS = frozenset(
-    {"track_id", "loc_id", "frame", "y", "x", "track_length", "region", "cell", "flags"}
+    {
+        "track_id", "loc_id", "frame", "y", "x", "t", "y_um", "x_um",
+        "se_y_um", "se_x_um", "sigma", "track_length", "region", "flags",
+    }
 )
 
 # How each genuinely per-point column is collapsed to one number per track.

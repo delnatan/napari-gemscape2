@@ -55,7 +55,7 @@ class FeatureFilterPanel(FilterPanel):
     (`napari_gemscape2.units.tooltip`). A row's column picker shows the bare
     column name -- that is the base widget's, and the name is the one the
     cut is recorded under in `manifest.json`, so it should stay literal --
-    but the tracks table offers `se_x_max` (px) and `se_x_um_max` (µm)
+    but the tracks table offers `se_x_max` (px) and `mean_step_um` (µm)
     side by side, and dragging a handle to "0.03" means two different
     things depending on which one is in front of you.
 

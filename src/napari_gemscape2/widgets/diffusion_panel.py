@@ -97,7 +97,7 @@ here shows a bare number:
 
   - the tracks pane's headers carry each column's unit
     (`_UnitHeaderModel` over `napari_gemscape2.units`), since `se_x_max` (px)
-    and `se_x_um_max` (µm) are adjacent columns of the same quantity;
+    and `mean_step_um` (µm) are adjacent columns;
   - each fit readout formats through `units.fmt`, including the NUTS fit,
     whose parameters are a D, a K, an alpha and a localization sigma with
     four different units (`_PARAM_COLUMNS`);
@@ -328,7 +328,7 @@ class _UnitHeaderModel(ColumnTableModel):
     """`qtkit.ColumnTableModel` with the units in the header.
 
     The tracks pane's table is where this pipeline's two unit systems
-    meet: `se_x_max` is in pixels, `se_x_um_max` and
+    meet: `se_x_max` is in pixels,
     `mean_step_um` in µm, `flux_mean` in camera counts,
     `D_mean_um2_s` in µm²/s -- 40-odd columns whose unit is a naming
     convention at best (`_um`) and absent at worst (`flux`, `se_x`,
@@ -338,8 +338,8 @@ class _UnitHeaderModel(ColumnTableModel):
     filtered under.
 
     Headers are resolved for the table as a whole (`units.headers`), not
-    column by column, so a pair like `se_x_max`/`se_x_um_max` doesn't come
-    out as the same word twice.
+    column by column, so a px/µm pair of one quantity (`se_x_max`/
+    `se_x_um_max`) wouldn't come out as the same word twice.
 
     Only the header is relabelled: `column_names`/`row_dict`/`find_row`
     and every caller that reaches for `track_id` still see the real
