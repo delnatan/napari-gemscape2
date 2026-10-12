@@ -497,8 +497,8 @@ as wide as that resolution, and the band widens below the localization floor);
 two modes there mean the log-normal's numbers describe the wrong shape. The
 *shared* D is one D for every track: when the tracks differ it lands near their
 mean D with an interval far too narrow, which σ tells you. The **By length**
-plot splits the tracks' own posteriors (unpooled) and their posteriors under the
-deconvolved distribution (partially pooled) by track length (`gridpost.by_track_length`), stacked
+plot splits the tracks' own posteriors (unpooled) by track length
+(`gridpost.by_track_length`), stacked
 so the groups add up to the whole, beside each length's own distribution. Fast
 particles leave the focal depth within a few frames, so short tracks come
 mostly from fast particles and long ones from slow particles. Its window counts
@@ -577,9 +577,8 @@ distributions_D_by_length.csv
                           the same split by track length, long by group, weight
                           (tracks or detections) and length (length_min, length_max
                           in frames; length_max empty for the open last group):
-                          n_tracks, n_detections, unpooled (the tracks' own
-                          posteriors) and partially_pooled (under the deconvolved
-                          distribution, with _low/_high), each the length's share of
+                          n_tracks, n_detections and unpooled (the tracks' own
+                          posteriors), each the length's share of
                           all the tracks or detections, so a weight's rows sum to 1
 diffusion_summary.json    settings (dt, exposure, grid -- GridPostOptions' fields --,
                           level), population numbers per group (lognormal_D_median_*,
@@ -616,7 +615,6 @@ this track": it was excluded, too short, or that analysis was off.
 | `D_mean_um2_s` | µm²/s | The track's one point estimate: its posterior mean E[D], Brownian model, exposure blur included. The summary a grid edge barely moves; under the flat prior it reads high for short tracks (about 1/(n − 2) for n frames), so don't average it — the population numbers are the average |
 | `D_low_um2_s`, `D_high_um2_s` | µm²/s | 90% credible interval on D |
 | `D_grid_edge` | | Which end of the D grid cuts the posterior: `low` (the data only bound D from above — read the row as upper bounds), `high` (lower bounds), `both` (no information), empty when it isn't cut |
-| `D_partially_pooled_um2_s` | µm²/s | The track's E[D] with its population (the log-normal of its region class, or of all passing tracks) as the prior: ignores the grid's edges and averages to the population's mean, but moves with the population, so it is in the saved file only, not the filter panel. Empty for tracks outside the filters |
 | `D_info_bits` | bits | How much the track narrowed D from the flat prior. Only comparable on the same grid |
 | `D_floor_um2_s` | µm²/s | Localization floor: the D at which motion per frame equals localization noise, ⟨σ²⟩ / (dt − exposure/3) from the track's SDs. Not a resolution limit or a threshold: below it, D depends on the SDs being calibrated |
 | **Optional fits** | | |

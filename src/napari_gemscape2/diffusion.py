@@ -27,24 +27,25 @@ averaging their posteriors or histogramming their medians:
     E[D] (`D_mean`, the summary a grid edge barely moves), and the
     equal-tailed 90% interval (`D_low`/`D_high` = the 5% and 95% quantiles).
     E[D] leans high for short tracks under the flat prior, so the column is
-    not averaged: averages come from the population models below, and
-    `partially_pooled_table` gives each track's E[D] under the population;
+    not averaged: averages come from the population models below. No
+    track's numbers are recomputed with a fitted population as its prior
+    (partial pooling, empirical Bayes): per-track numbers stay the track's
+    own;
   - **shared** (complete pooling, `gridpost.fit_shared_D`): one D for every
     track. When the tracks differ it lands near their mean D, with an
     interval far too narrow;
-  - **log-normal** (partial pooling, `gridpost.fit_lognormal`): ln D ~
+  - **log-normal** (a population, `gridpost.fit_lognormal`): ln D ~
     N(mu, sigma) across tracks -- the population's median D, its spread
     sigma in ln D and its mean D, each with an interval. sigma near 0 means
     one shared D describes the tracks;
-  - **deconvolved** (partial pooling, any shape, `gridpost.deconvolve`): a
+  - **deconvolved** (a population of any shape, `gridpost.deconvolve`): a
     smooth log density whose smoothness the data choose (Laplace evidence),
     with a pointwise band from posterior draws. A second view, against
     which the log-normal's shape is checked: two modes here mean the
     log-normal's numbers describe the wrong shape;
   - **by track length**: `gridpost.by_track_length`, the tracks' own
-    posteriors (unpooled) and their posteriors under the deconvolved
-    distribution (partially pooled) split into track-length groups, per
-    track or per detection. Fast particles leave the focal depth within a
+    posteriors (unpooled) split into track-length groups, per track or per
+    detection. Fast particles leave the focal depth within a
     few frames, so short tracks come mostly from fast particles and long
     tracks from slow ones;
   - **localization floor** (`D_floor_um2_s`, diffusionkit's
@@ -282,7 +283,7 @@ FLOOR_BAND = (0.1, 0.9)
 # `D_grid_edge`'s values (null when the posterior is not cut).
 GRID_EDGES = ("low", "high", "both")
 # Columns whose scale is the localization floor, `D_floor_um2_s`.
-FLOOR_COLUMNS = ("D_mean_um2_s", "D_low_um2_s", "D_high_um2_s", "D_msd_um2_s", "D_partially_pooled_um2_s")
+FLOOR_COLUMNS = ("D_mean_um2_s", "D_low_um2_s", "D_high_um2_s", "D_msd_um2_s")
 # How the by-length split counts tracks (`gridpost.by_track_length`): once
 # each, or once per frame (the composition of the spots seen in focus).
 LENGTH_WEIGHTS = ("tracks", "detections")
@@ -406,16 +407,14 @@ class Ensemble:
     of one D for every track, resolved below the grid step. `shared_loglik_D`
     is the same thing on the grid -- the tracks' log-likelihoods summed,
     0 at the peak (its absolute level, a sum over n tracks, means nothing).
-    `lognormal` is partial pooling with ln D ~ N(mu, sigma) across tracks
+    `lognormal` is a population with ln D ~ N(mu, sigma) across tracks
     (diffusionkit's `LogNormal`: the posterior over (mu, sigma), the
     distribution at its mode as `weights` and draws of it as `samples`).
-    `deconvolved_D` is partial pooling with a smooth density of any shape
+    `deconvolved_D` is a population with a smooth density of any shape
     (`gridpost.deconvolve`), `deconvolved_D_band` its pointwise
     equal-tailed band at the analysis's credible level and
-    `deconvolved_D_lambda` the smoothness its evidence chose;
-    `deconvolved_D_fit` is the whole fit, draws included (what
-    `length_composition` splits by track length). Weights sum to 1 over the
-    grid."""
+    `deconvolved_D_lambda` the smoothness its evidence chose. Weights sum
+    to 1 over the grid."""
 
     n_tracks: int
     shared: dk_lognormal.SharedD
@@ -424,7 +423,6 @@ class Ensemble:
     deconvolved_D: np.ndarray
     deconvolved_D_band: tuple[np.ndarray, np.ndarray]
     deconvolved_D_lambda: float
-    deconvolved_D_fit: dk_deconvolve.Deconvolution
 
 
 _ENSEMBLE_CACHE_SIZE = 32
@@ -465,32 +463,23 @@ def _ensemble(analysis: PosteriorAnalysis, track_ids: Optional[set]) -> Optional
         deconvolved_D=fit.weights,
         deconvolved_D_band=fit.band(analysis.level),
         deconvolved_D_lambda=float(fit.lam),
-        deconvolved_D_fit=fit,
     )
-
-
-# Draws of the deconvolved distribution the by-length split is computed
-# under: each costs one pass over every track's likelihood (~0.04 s for ten
-# thousand tracks), and 50 are enough for a 90% band.
-LENGTH_DRAWS = 50
 
 
 def length_composition(
     analysis: PosteriorAnalysis, track_ids: Optional[set] = None, weight: str = "tracks"
 ) -> Optional[LengthComposition]:
     """`gridpost.by_track_length` over `track_ids` (all for None): the
-    tracks' own posteriors (unpooled) and their posteriors under the
-    deconvolved distribution (partially pooled) split into track-length
-    groups, each track counted once (`weight="tracks"`) or once per frame
+    tracks' own posteriors (unpooled) split into track-length groups, each
+    track counted once (`weight="tracks"`) or once per frame
     ("detections"). None when no track was fitted. Cached on `analysis`."""
 
     def compute():
-        ens = ensemble(analysis, track_ids)
-        if ens is None:
-            return None
         rows = analysis.rows_for(track_ids)
         likelihoods = GridLikelihoods(analysis.fitted_ids[rows], analysis.fitted_frames[rows], analysis.loglik_D[rows])
-        return by_track_length(likelihoods, analysis.u_D, ens.deconvolved_D_fit, weight=weight, n_draws=LENGTH_DRAWS)
+        return by_track_length(likelihoods, analysis.u_D, weight=weight)
+        if len(rows) == 0:
+            return None
 
     return _cached(analysis, ("length", _ids_key(track_ids), weight), compute)
 
@@ -607,34 +596,6 @@ def summarize_by_group(analysis: PosteriorAnalysis, groups: pl.DataFrame) -> dic
         name: summarize(analysis, set(groups.filter(pl.col("group") == name)["track_id"].to_list()))
         for name in names
     }
-
-
-def partially_pooled_table(
-    analysis: PosteriorAnalysis, ids: Optional[set], by_class: Optional[dict[str, set]] = None
-) -> pl.DataFrame:
-    """`track_id`, `D_partially_pooled_um2_s`: each fitted track's E[D] with
-    its population as the prior -- the log-normal (`Ensemble.lognormal`) of
-    its region class when there are several (`by_class`), else of all the
-    tracks passing the filters (`ids`, None for all). Tracks outside those
-    are left out.
-
-    It borrows from the population: it does not lean on the grid's edges or
-    on the flat prior, and averages to the population's mean, but it moves
-    with which tracks make up the population -- so it is written with a
-    saved analysis, not offered as a column to filter on."""
-    parts = []
-    for gids in (by_class or {"all": ids}).values():
-        ens = ensemble(analysis, gids)
-        if ens is None:
-            continue
-        rows = analysis.rows_for(gids)
-        parts.append(pl.DataFrame({
-            "track_id": analysis.fitted_ids[rows],
-            "D_partially_pooled_um2_s": ens.lognormal.partially_pooled_means(analysis.loglik_D[rows]),
-        }, schema={"track_id": pl.Int64, "D_partially_pooled_um2_s": pl.Float64}))
-    if not parts:
-        return pl.DataFrame(schema={"track_id": pl.Int64, "D_partially_pooled_um2_s": pl.Float64})
-    return pl.concat(parts)
 
 
 def _scalar(value) -> Optional[float]:
@@ -812,21 +773,16 @@ def length_distributions_table(
     track-length group: `group`, `weight` ("tracks" or "detections"),
     `length_min`/`length_max` (the group's track lengths in frames, both
     ends included; `length_max` empty for the open-ended last group),
-    `n_tracks`, `n_detections`,
-    `D_um2_s`, `unpooled` (the tracks' own flat-prior posteriors) and
-    `partially_pooled` (each track's posterior under the deconvolved
-    distribution, mean over its draws), with `partially_pooled_low`/`_high`
-    the pointwise band at the credible level. Each is that length group's
-    share of all the group's tracks (or detections): summed over lengths
-    and the grid, a weight's rows add up to 1."""
+    `n_tracks`, `n_detections`, `D_um2_s` and `unpooled` (the tracks' own
+    flat-prior posteriors), that length group's share of all the group's
+    tracks (or detections): summed over lengths and the grid, a weight's
+    rows add up to 1."""
     parts = []
     for name, ids in (groups or {"all": None}).items():
         for weight in LENGTH_WEIGHTS:
             comp = length_composition(analysis, ids, weight)
             if comp is None:
                 continue
-            lo, hi = comp.band(analysis.level)
-            mean = comp.partially_pooled.mean(axis=0)
             n_grid = len(comp.u)
             upper = [int(e) - 1 for e in comp.edges[1:]] + [None]
             for j in range(len(comp.edges)):
@@ -841,9 +797,6 @@ def length_distributions_table(
                             "n_detections": [int(comp.n_detections[j])] * n_grid,
                             "D_um2_s": np.exp(comp.u),
                             "unpooled": comp.unpooled[j],
-                            "partially_pooled": mean[j],
-                            "partially_pooled_low": lo[j],
-                            "partially_pooled_high": hi[j],
                         }
                     )
                 )

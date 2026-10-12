@@ -47,7 +47,7 @@ def test_the_tables_name_their_models(analysis):
     assert dist["lognormal"].sum() == pytest.approx(1.0)
     assert dist["shared_loglik"].max() == 0.0
     by_length = dfn.length_distributions_table(analysis)
-    assert {"unpooled", "partially_pooled", "partially_pooled_low", "partially_pooled_high"} <= set(by_length.columns)
+    assert "unpooled" in by_length.columns and not any("pooled_" in c for c in by_length.columns)
     loglik = dfn.loglik_long_table(analysis)
     assert loglik.columns == ["track_id", "D_um2_s", "loglik"]
     per_track = loglik.group_by("track_id").agg(pl.col("loglik").exp().sum())
@@ -91,14 +91,3 @@ def test_a_track_below_the_floor_is_cut_at_the_low_edge():
                           "y_um": pos[:, 1], "sigma_x_um": sd[:, 0], "sigma_y_um": sd[:, 1], "track_length": n})
     fit = dfn.analyze_posteriors(table, Acquisition(DT), dfn.posterior_options(), threads=1).fits.row(0, named=True)
     assert fit["D_grid_edge"] == "low"
-
-
-def test_partially_pooled_means_cover_the_passing_tracks_and_average_to_the_population(analysis):
-    ids = set(range(200))
-    table = dfn.partially_pooled_table(analysis, ids)
-    assert set(table["track_id"]) == ids & set(analysis.fitted_ids.tolist())
-    ens = dfn.ensemble(analysis, ids)
-    population_mean = ens.lognormal.summary(0.9)["D_mean_um2_s"]["median"]
-    assert table["D_partially_pooled_um2_s"].mean() == pytest.approx(population_mean, rel=0.15)
-    by_class = {"a": set(range(100)), "b": set(range(100, 200))}
-    assert set(dfn.partially_pooled_table(analysis, ids, by_class)["track_id"]) == ids

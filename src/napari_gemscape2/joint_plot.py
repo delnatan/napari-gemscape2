@@ -437,53 +437,47 @@ def plot_d_by_length(panels: list[dict], title: str | None = None) -> Figure:
     per panel (`diffusion.length_panels`: `name`, `composition` -- a
     diffusionkit `LengthComposition` -- and `floor`).
 
-    Left, the tracks' own flat-prior posteriors (unpooled) and, middle,
-    each track's posterior under the deconvolved distribution (partially
-    pooled, mean over its draws), both stacked by track-length group: each group's band is its share of
-    all the tracks (or detections, as the composition was weighted), so
-    the stack is the whole distribution. Right, each group's own
-    deconvolved distribution, scaled to its peak, with its tracks and
+    Left, the tracks' own flat-prior posteriors (unpooled), stacked by
+    track-length group: each group's band is its share of all the tracks
+    (or detections, as the composition was weighted), so the stack is the
+    whole distribution. Right, each group's own distribution, scaled to its
+    peak, with its tracks and
     detections at the right: short tracks come mostly from fast particles,
     which leave the focal depth within a few frames."""
     n = len(panels)
-    fig = Figure(figsize=(12.0, 1.0 + 3.0 * n), layout="constrained")
-    axes = fig.subplots(n, 3, squeeze=False, sharex=True, gridspec_kw={"width_ratios": [1, 1, 1.15]})
+    fig = Figure(figsize=(8.5, 1.0 + 3.0 * n), layout="constrained")
+    axes = fig.subplots(n, 2, squeeze=False, sharex=True, gridspec_kw={"width_ratios": [1, 1.15]})
     x_lo = x_hi = None
     for row, panel in enumerate(panels):
         comp = panel["composition"]
         x = comp.u / np.log(10)
         dx = float(np.mean(np.diff(x)))
-        mean = comp.partially_pooled.mean(axis=0)
-        lo, hi = _mass_range(mean.sum(axis=0), x, tail=0.005)
+        contrib = comp.unpooled
+        lo, hi = _mass_range(contrib.sum(axis=0), x, tail=0.005)
         if panel.get("floor") is not None:
             lo, hi = min(lo, np.log10(panel["floor"][1])), max(hi, np.log10(panel["floor"][1]))
         x_lo = lo if x_lo is None else min(x_lo, lo)
         x_hi = hi if x_hi is None else max(x_hi, hi)
         labels = comp.labels()
         colors = _LENGTH_CMAP(np.linspace(0.15, 1.0, len(labels)))
-        top = 0.0
-        for col, (contrib, what) in enumerate(((comp.unpooled, "unpooled"), (mean, "partially pooled"))):
-            ax = axes[row][col]
-            _style_axis(ax)
-            bottom = np.zeros(len(x))
-            for j, label in enumerate(labels):
-                upper = bottom + contrib[j] / dx
-                ax.fill_between(x, bottom, upper, color=colors[j], lw=0, label=label)
-                bottom = upper
-            top = max(top, bottom.max())
-            if panel.get("floor") is not None:
-                _draw_floor(ax, tuple(np.log10(panel["floor"])))
-            ax.set_title(f"{panel['name']} · {what}, by track length", fontsize=9, loc="left", color=_INK)
-            ax.set_ylabel(f"{comp.weight} per $\\log_{{10}} D$", fontsize=8, color=_MUTED_INK)
-        for col in (0, 1):
-            axes[row][col].set_ylim(0, top * 1.05)
-        axes[row][1].legend(title="frames", fontsize=7, title_fontsize=7, frameon=False, loc="upper left",
-                            reverse=True)
+        ax = axes[row][0]
+        _style_axis(ax)
+        bottom = np.zeros(len(x))
+        for j, label in enumerate(labels):
+            upper = bottom + contrib[j] / dx
+            ax.fill_between(x, bottom, upper, color=colors[j], lw=0, label=label)
+            bottom = upper
+        if panel.get("floor") is not None:
+            _draw_floor(ax, tuple(np.log10(panel["floor"])))
+        ax.set_title(f"{panel['name']} · unpooled, by track length", fontsize=9, loc="left", color=_INK)
+        ax.set_ylabel(f"{comp.weight} per $\\log_{{10}} D$", fontsize=8, color=_MUTED_INK)
+        ax.set_ylim(0, bottom.max() * 1.05)
+        ax.legend(title="frames", fontsize=7, title_fontsize=7, frameon=False, loc="upper left", reverse=True)
 
-        ax = axes[row][2]
+        ax = axes[row][1]
         _style_axis(ax)
         ax.grid(False)
-        own = mean / np.maximum(mean.max(axis=1, keepdims=True), 1e-300)
+        own = contrib / np.maximum(contrib.max(axis=1, keepdims=True), 1e-300)
         ax.imshow(own, aspect="auto", origin="lower", cmap=_POSTERIOR_CMAP, interpolation="nearest",
                   extent=[x[0] - dx / 2, x[-1] + dx / 2, -0.5, len(labels) - 0.5], vmin=0, vmax=1)
         if panel.get("floor") is not None:
@@ -500,7 +494,7 @@ def plot_d_by_length(panels: list[dict], title: str | None = None) -> Figure:
         ax.set_xlabel(units.mpl_log_label("D_um2_s"), fontsize=9)
     if title is None:
         title = (
-            "counted per track: each track once -- the stack is the deconvolved distribution of D across tracks"
+            "counted per track: each track once -- the stack is the sum of the tracks' own posteriors"
             if panels[0]["composition"].weight == "tracks"
             else "counted per detection: each track once per frame, so long (often slow) tracks weigh more -- "
             "the make-up of the spots in focus"

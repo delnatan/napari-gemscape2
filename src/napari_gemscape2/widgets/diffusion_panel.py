@@ -164,7 +164,6 @@ from napari_gemscape2.diffusion import (
     StaleAnalysisError,
     analysis_summary,
     analysis_tables,
-    partially_pooled_table,
     analyze_posteriors,
     base_track_table,
     ensemble,
@@ -311,8 +310,7 @@ def _ensemble_worker(analysis: PosteriorAnalysis, id_sets: list) -> None:
 @thread_worker(start_thread=False)
 def _length_worker(analysis: PosteriorAnalysis, id_sets: list, weight: str) -> None:
     """Every `diffusion.length_composition` over `id_sets` at `weight`, off
-    the GUI thread: each is one pass over every track's posterior per draw
-    of the deconvolved distribution, a second or more."""
+    the GUI thread: each is one pass over every track's posterior."""
     for ids in id_sets:
         length_composition(analysis, ids, weight)
 
@@ -905,12 +903,11 @@ _POSTERIOR_HELP = (
     "resolution, and below the localization floor the band widens because the tracks "
     "cannot tell those D apart. It takes a second or two per group, so the summary and "
     "figures update shortly after a filter change."
-    "<br><br><b>By length</b>: the tracks' own posteriors (unpooled) and their "
-    "posteriors under the deconvolved distribution (partially pooled), stacked by track "
+    "<br><br><b>By length</b>: the tracks' own posteriors (unpooled), stacked by track "
     "length. Fast particles leave the focal depth within a few frames, "
     "so short tracks come mostly from fast particles and long ones from slow particles. "
     "Its window counts <i>each track once</i> (the default, and the usual per-trajectory "
-    "reading: the stack is the deconvolved distribution of D across tracks) or <i>each "
+    "reading: the stack is the sum of the tracks' own posteriors) or <i>each "
     "detection</i> (a track once per frame, so long tracks weigh more: the make-up of the "
     "spots seen in focus at a moment). Neither is the share of particles: a fast particle "
     "leaves the focus and may come back as another track, a slow one stays as one long "
@@ -1108,7 +1105,7 @@ class _PosteriorTab(QWidget):
             self._length_weight.addItem(label, weight)
         self._length_weight.setToolTip(
             "Each track once: every particle track is one sample, and the stack\n"
-            "is the deconvolved distribution of D across tracks -- the usual\n"
+            "is the sum of the tracks' own posteriors -- the usual\n"
             "per-trajectory reading. Each detection: a track counts once per\n"
             "frame, so long tracks weigh more -- the make-up of the spots seen in\n"
             "focus at a moment, where fast particles (short tracks, out of focus\n"
@@ -2900,13 +2897,6 @@ class DiffusionAnalysisWidget(QWidget):
         if result_id is None and self._tracks_layer is not None:
             result_id = self._tracks_layer.name
         results = self._per_track_results()
-        if results is not None and self._posterior is not None:
-            # Each track's E[D] under its population, for the file only: it
-            # moves with the filters, so it is never a column to filter on.
-            ids = self.combined_filtered_track_ids()
-            pooled = partially_pooled_table(self._posterior, ids, self.group_track_ids(ids))
-            results = results.join(pooled.with_columns(pl.col("track_id").cast(results.schema["track_id"])),
-                                   on="track_id", how="left")
         return tracks_summary_table(
             self._base_track_df,
             results,
