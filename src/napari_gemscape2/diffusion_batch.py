@@ -1,10 +1,11 @@
 """Headless diffusion analysis of a saved results bundle -- what the
-"Diffusion analysis" widget's Posterior and MSD runs + "Save analysis" do,
+"Diffusion analysis" widget's D, α · D and MSD runs + "Save analysis" do,
 without napari.
 
 `analyze_bundle` rebuilds the table the widget reads off the "tracks"
-layer (`bundle_track_table`), runs the same posteriors and per-track MSD
-fits (always both: the MSD fits take seconds), and writes the same files
+layer (`bundle_track_table`), runs the same D posteriors and per-track MSD
+fits (always both: the MSD fits take seconds), the α · D posteriors when
+`alpha_D_tau_ref_s` is set (a template saved with them sets it), and writes the same files
 through the same `diffusion` functions, so a bundle analyzed by
 `gemscape2 diffusion` reopens in the widget exactly like one analyzed
 there.
@@ -41,6 +42,7 @@ from napari_gemscape2.diffusion import (
     tracks_summary_table,
     tracks_to_diffusionkit_df,
 )
+from napari_gemscape2.fbm import analyze_fbm, fbm_options, fbm_record
 from napari_gemscape2.pipeline import FilterSpec, track_features_df
 from napari_gemscape2.regions import Regions
 from napari_gemscape2.results import load_result, package_provenance, write_diffusion_results
@@ -49,7 +51,7 @@ from napari_gemscape2.viewer import layer_units_metadata, region_classes
 
 @dataclass
 class DiffusionSettings:
-    """The widget's Posterior- and MSD-tab controls and tracks-pane filters."""
+    """The widget's D-, α · D- and MSD-tab controls and tracks-pane filters."""
 
     min_frames: int = MIN_FRAMES
     # The posterior grid (`diffusion.GRID_FIELDS`, `GridPostOptions`'
@@ -64,6 +66,9 @@ class DiffusionSettings:
     # over `msd_lag_fraction` (the 25-40% rule), alpha over the other.
     msd_lag_fraction: Optional[float] = None
     msd_alpha_lag_fraction: float = MSD_ALPHA_LAG_FRACTION
+    # When set, also run the α · D (fBm) posteriors, D_ref at this lag in
+    # seconds (`fbm`). None: don't.
+    alpha_D_tau_ref_s: Optional[float] = None
     # Overrides the bundle's recorded exposure. None: use the manifest's.
     exposure_s: Optional[float] = None
     # Which tracks `passes_filters` marks and the ensemble is over. Every
@@ -98,6 +103,7 @@ def settings_from_summary(summary: dict) -> dict:
         # records alpha's grid, which no run here has any more.
         "grid": {k: v for k, v in summary["grid"].items() if k in GRID_FIELDS} if summary.get("grid") else None,
         **{k: v for k, v in (summary.get("msd") or {}).items() if k.startswith("msd_")},
+        "alpha_D_tau_ref_s": (summary.get("alpha_D") or {}).get("tau_ref_s"),
         "min_track_length": record.get("min_track_length"),
         "filters": (
             {col: tuple(bounds) for col, bounds in record["ranges"].items()}
@@ -145,7 +151,7 @@ def bundle_track_table(
 
 def run_exposure(exposure_s: Optional[float], dt_s: float) -> float:
     """The exposure to run with -- the widget's rule
-    (`_PosteriorTab._exposure_for_run`): required, and at most the frame
+    (`_AcquisitionRow._exposure_for_run`): required, and at most the frame
     interval, a hair over being read as equal to it."""
     if exposure_s is None:
         raise ValueError(
@@ -176,6 +182,8 @@ def analyze_bundle(
 ) -> BundleReport:
     """Run the grid posteriors over one bundle's tracks and save the
     analysis into it (`results.write_diffusion_results`)."""
+    if settings.alpha_D_tau_ref_s is not None:
+        fbm_options(settings.min_frames, settings.alpha_D_tau_ref_s)  # validates before any work
     result_dir = Path(result_dir)
     _points, tracks_df, manifest, _labels, regions = load_result(result_dir)
     if tracks_df.height == 0 or "track_id" not in tracks_df.columns:
@@ -196,11 +204,15 @@ def analyze_bundle(
     diffkit_tracks = tracks_to_diffusionkit_df(track_points, pixel_size_um, dt_s)
     base, _hideable = base_track_table(diffkit_tracks, track_points)
 
-    analysis = analyze_posteriors(
-        diffkit_tracks, Acquisition(dt_s=dt_s, exposure_s=exposure_s), settings.options(), progress=progress
-    )
+    acquisition = Acquisition(dt_s=dt_s, exposure_s=exposure_s)
+    analysis = analyze_posteriors(diffkit_tracks, acquisition, settings.options(), progress=progress)
     msd = msd_track_table(msd_fits_blur_free(diffkit_tracks, dt_s, settings.min_frames, settings.msd_window))
     results = posterior_results_table(analysis, msd)
+    fbm = None
+    if settings.alpha_D_tau_ref_s is not None:
+        fbm = analyze_fbm(diffkit_tracks, acquisition, fbm_options(settings.min_frames, settings.alpha_D_tau_ref_s),
+                          progress=progress)
+        results = results.join(fbm.columns(), on="track_id", how="left")
 
     joined = base.join(results, on="track_id", how="left")
     ids = passing_track_ids(joined, settings.min_track_length, settings.filters)
@@ -209,6 +221,8 @@ def analyze_bundle(
         base, results, result_id=result_dir.name, pixel_size_um=pixel_size_um, passing_ids=ids
     )
     summary = analysis_summary(analysis, ids, by_class, msd=settings.msd_window)
+    if fbm is not None:
+        summary["alpha_D"] = fbm_record(fbm, ids, by_class)
     summary["tracks_summary_filters"] = filter_record(settings.min_track_length, settings.filters)
     import diffusionkit
     import napari_gemscape2

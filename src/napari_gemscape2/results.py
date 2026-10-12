@@ -407,6 +407,12 @@ def load_diffusion_results(result_dir: str | Path) -> Optional[dict]:
     }
 
 
+def load_tracks_summary(result_dir: str | Path) -> Optional[pl.DataFrame]:
+    """The saved `tracks_summary.csv`, or None if there is none."""
+    path = Path(result_dir) / TRACKS_SUMMARY_FILENAME
+    return pl.read_csv(path, infer_schema_length=None) if path.exists() else None
+
+
 def load_manifest(result_dir: str | Path) -> dict:
     """Just the manifest -- what a folder scan needs (`params.n_tracks`)
     without reading either table."""

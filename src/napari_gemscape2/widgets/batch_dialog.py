@@ -99,6 +99,8 @@ def _diffusion_summary_text(settings: dict) -> str:
     from napari_gemscape2.diffusion import MSDWindow
 
     parts.append(f"MSD {MSDWindow.from_settings(settings).text()}")
+    if settings.get("alpha_D_tau_ref_s") is not None:
+        parts.append(f"α · D at τ_ref {settings['alpha_D_tau_ref_s']:g} s")
     if settings.get("filters"):
         parts.append(f"filters: {', '.join(sorted(settings['filters']))}")
     return " · ".join(parts)

@@ -54,9 +54,11 @@ averaging their posteriors or histogramming their medians:
     reference scale (its median over the tracks, and their 10-90% band),
     not as a threshold anything is classified by.
 
-There is no per-track shape metric (alpha, radius of gyration,
-straightness, ...): short tracks cannot pin one down. alpha stays in the
-MSD comparison (`diffusionkit.classic`), which is labelled as such.
+The motion's shape is not part of this posterior. Per-track alpha is a
+second, separate posterior (`napari_gemscape2.fbm`, diffusionkit's
+`fbmpost`), whose D_ref is not this module's D; the MSD comparison
+(`diffusionkit.classic`) also fits an alpha, labelled as such. There is
+no other shape metric (radius of gyration, straightness, ...).
 """
 
 from __future__ import annotations
@@ -476,10 +478,10 @@ def length_composition(
 
     def compute():
         rows = analysis.rows_for(track_ids)
-        likelihoods = GridLikelihoods(analysis.fitted_ids[rows], analysis.fitted_frames[rows], analysis.loglik_D[rows])
-        return by_track_length(likelihoods, analysis.u_D, weight=weight)
         if len(rows) == 0:
             return None
+        likelihoods = GridLikelihoods(analysis.fitted_ids[rows], analysis.fitted_frames[rows], analysis.loglik_D[rows])
+        return by_track_length(likelihoods, analysis.u_D, weight=weight)
 
     return _cached(analysis, ("length", _ids_key(track_ids), weight), compute)
 
@@ -675,16 +677,23 @@ def floor_band(floors) -> Optional[tuple[float, float, float]]:
     return float(lo), float(mid), float(hi)
 
 
+# The alpha-D run's D_ref columns, whose scale is its own floor, `D_ref_floor_um2_s`.
+D_REF_FLOOR_COLUMNS = ("D_ref_mean_um2_s", "D_ref_low_um2_s", "D_ref_high_um2_s")
+
+
 def floor_references(table: pl.DataFrame, columns) -> dict[str, tuple[float, float, float]]:
     """`{column: floor_band}` for those of `columns` that are a D with a
-    floor (`FLOOR_COLUMNS`), from `table`'s `D_floor_um2_s`, for the joint
+    floor -- `FLOOR_COLUMNS` against `table`'s `D_floor_um2_s`,
+    `D_REF_FLOOR_COLUMNS` against its `D_ref_floor_um2_s` -- for the joint
     plot, over the tracks it draws."""
-    if "D_floor_um2_s" not in table.columns:
-        return {}
-    band = floor_band(table["D_floor_um2_s"])
-    if band is None:
-        return {}
-    return {c: band for c in columns if c in FLOOR_COLUMNS}
+    out = {}
+    for floor_column, floored in (("D_floor_um2_s", FLOOR_COLUMNS), ("D_ref_floor_um2_s", D_REF_FLOOR_COLUMNS)):
+        if floor_column not in table.columns:
+            continue
+        band = floor_band(table[floor_column])
+        if band is not None:
+            out.update({c: band for c in columns if c in floored})
+    return out
 
 
 def track_posterior(analysis: PosteriorAnalysis, track_id: int) -> Optional[dict]:

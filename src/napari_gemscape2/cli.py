@@ -188,6 +188,9 @@ def diffusion(
         # or shares of each track's longest lag (replace both lag counts):
         # msd_lag_fraction = 0.3
         # msd_alpha_lag_fraction = 0.5
+        # Also run the alpha-D (fBm) posteriors, D_ref at this lag (s); a
+        # template saved with them sets it. D_ref is not a Brownian D.
+        alpha_D_tau_ref_s = 0.1
         exposure_s = 0.01       # optional: overrides each bundle's recorded one
         min_track_length = 1    # which tracks pass (passes_filters, ensemble)
         filters = { D_info_bits = [1.0, inf], flux_mean = [800.0, inf] }

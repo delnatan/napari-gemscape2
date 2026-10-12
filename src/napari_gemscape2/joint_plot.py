@@ -724,3 +724,145 @@ def plot_track_posterior(
     line = reading or f"E[D] = {mean:.3g} µm²/s [{low:.3g}, {high:.3g}]"
     ax.set_title(f"{head}\n{line}", fontsize=9, loc="left", color=_INK)
     return fig
+
+
+# --- alpha and D_ref (fBm posteriors, `napari_gemscape2.fbm`) -------------
+
+# Below this many bits a track's alpha is mostly its flat prior (`fbm.MIN_BITS`).
+_ALPHA_MIN_BITS = 0.5
+_UNINFORMATIVE_COLOR = "#b9b8b3"
+
+
+def _d_ref_label(tau_ref_s: float) -> str:
+    return rf"$\log_{{10}}$ $D_{{ref}}$ at $\tau_{{ref}}$ = {tau_ref_s:g} s ($\mu$m$^2$/s) · not a Brownian D"
+
+
+def _ellipse_shapes(var_x, var_y, cov_xy):
+    """Full width, height and angle (degrees) of the 1-SD ellipses of 2x2 covariances."""
+    C = np.stack([np.stack([var_x, cov_xy], -1), np.stack([cov_xy, var_y], -1)], -2)
+    ev, evec = np.linalg.eigh(C)
+    ev = np.clip(ev, 0, None)
+    return 2 * np.sqrt(ev[:, 1]), 2 * np.sqrt(ev[:, 0]), np.degrees(np.arctan2(evec[:, 1, 1], evec[:, 0, 1]))
+
+
+def plot_alpha_D(panels: list[dict], max_ellipses: int = 150, seed: int = 0, title: str | None = None) -> Figure:
+    """Every fitted track's alpha against its D_ref, one panel per group
+    (`fbm.scatter_panels`: `name`, `fits`, `floor`, `tau_ref_s`), with a
+    1-SD posterior ellipse as each track's error bar.
+
+    An ellipse's projections on the axes are +-1 marginal SD, and its tilt
+    is the track's own correlation between alpha and log10 D_ref, which
+    crosses would hide. Ellipses are drawn for a random `max_ellipses` of a
+    panel's tracks, with opacity falling as 1/area, so every track puts
+    about the same ink on the page and wide (uninformative) ones recede.
+    Tracks with less than `_ALPHA_MIN_BITS` on alpha are grey points: their
+    alpha is mostly the flat prior. A track whose amplitude posterior is
+    cut at its low edge only bounds D_ref from above: it is drawn as a
+    grey "<" at its upper bound, without an ellipse, and doesn't set the
+    axis. The dotted line is the median D_ref floor. This is per-track
+    posteriors side by side -- not a population."""
+    from matplotlib.collections import EllipseCollection
+    from matplotlib.colors import to_rgba
+
+    n = len(panels)
+    fig = Figure(figsize=(5.6, 0.6 + 3.4 * n), layout="constrained")
+    axes = fig.subplots(n, 1, squeeze=False, sharex=True, sharey=True)[:, 0]
+    rng = np.random.default_rng(seed)
+    measured = [p["fits"].filter(pl.col("D_ref_grid_edge").is_null()) for p in panels]
+    xs = np.concatenate([m["log10_D_ref_mean"].drop_nulls().to_numpy() for m in measured])
+    x_lo, x_hi = (np.quantile(xs, [0.005, 0.995]) if len(xs) else (-3.0, 0.0))
+    for ax, panel in zip(axes, panels):
+        _style_axis(ax)
+        fits = panel["fits"].filter(pl.col("alpha_mean").is_not_null() & pl.col("log10_D_ref_mean").is_not_null())
+        bound = fits.filter(pl.col("D_ref_grid_edge") == "low")
+        ok = fits.filter(pl.col("D_ref_grid_edge").is_null() | (pl.col("D_ref_grid_edge") != "low"))
+        x, y = ok["log10_D_ref_mean"].to_numpy(), ok["alpha_mean"].to_numpy()
+        informative = ok["alpha_info_bits"].to_numpy() >= _ALPHA_MIN_BITS
+        if panel.get("floor") is not None:
+            _draw_floor(ax, tuple(np.log10(panel["floor"])), label=f"D_ref floor {panel['floor'][1]:.2g} µm²/s (median)")
+            x_lo, x_hi = min(x_lo, np.log10(panel["floor"][1])), max(x_hi, np.log10(panel["floor"][1]))
+        ax.axhline(1, color=_MUTED_INK, lw=0.6, ls=(0, (2, 3)), zorder=1)
+        ax.scatter(x[~informative], y[~informative], s=4, color=_UNINFORMATIVE_COLOR, lw=0, zorder=2,
+                   label=f"< {_ALPHA_MIN_BITS:g} bit on α (mostly prior)")
+        ax.scatter(x[informative], y[informative], s=4, color=_DECONVOLVED_COLOR, alpha=0.5, lw=0, zorder=2,
+                   label=f"≥ {_ALPHA_MIN_BITS:g} bit on α")
+        if bound.height:
+            ax.scatter(np.log10(bound["D_ref_high_um2_s"].to_numpy()), bound["alpha_mean"].to_numpy(), s=9,
+                       marker=4, color=_UNINFORMATIVE_COLOR, lw=0.6, zorder=2,
+                       label="D_ref upper bound only (at its 95% bound)")
+        pick = np.arange(ok.height) if ok.height <= max_ellipses else rng.choice(ok.height, max_ellipses, replace=False)
+        sd_a = ok["alpha_sd"].to_numpy()[pick]
+        sd_d = ok["log10_D_ref_sd"].to_numpy()[pick]
+        corr = np.nan_to_num(ok["alpha_D_ref_corr"].to_numpy()[pick])
+        w, h, angle = _ellipse_shapes(sd_d**2, sd_a**2, corr * sd_a * sd_d)
+        opacity = 0.5 * np.minimum(1, 0.03 / np.maximum(np.pi / 4 * w * h, 1e-12))
+        rgba = np.tile(to_rgba(_DECONVOLVED_COLOR), (len(pick), 1))
+        face, edge = rgba.copy(), rgba.copy()
+        face[:, 3], edge[:, 3] = 0.5 * opacity, np.minimum(1, 1.5 * opacity)
+        ax.add_collection(EllipseCollection(w, h, angle, units="xy", offsets=np.c_[x[pick], y[pick]],
+                                            offset_transform=ax.transData, facecolors=face, edgecolors=edge,
+                                            linewidths=0.4, zorder=3))
+        n_inf = int(informative.sum())
+        ax.set_title(f"{panel['name']} · {fits.height} tracks, {n_inf} with ≥ {_ALPHA_MIN_BITS:g} bit on α"
+                     + (f", {bound.height} bounding D_ref from above" if bound.height else ""),
+                     fontsize=9, loc="left", color=_INK)
+        ax.set_ylabel(r"$\alpha$ (posterior mean)", fontsize=9)
+        ax.set_ylim(0, 2)
+    axes[0].legend(fontsize=7, frameon=False, loc="upper right", markerscale=2.5)
+    axes[-1].set_xlim(x_lo - _LOG_D_PAD, x_hi + _LOG_D_PAD)
+    axes[-1].set_xlabel(_d_ref_label(panels[0]["tau_ref_s"]), fontsize=9)
+    fig.suptitle(title or "per-track posteriors (fBm), 1-SD ellipses — not a population",
+                 fontsize=9, color=_MUTED_INK, x=0.01, ha="left")
+    return fig
+
+
+def plot_fbm_track(panel: dict) -> Figure:
+    """One track's joint posterior over (log10 D_ref, alpha) (`fbm.track_panel`),
+    with both margins: alpha's beside the flat prior it started from, so a
+    track that says little about alpha visibly *is* its prior."""
+    fit = panel["fit"]
+    fig = Figure(figsize=(5.4, 4.4), layout="constrained")
+    gs = fig.add_gridspec(2, 2, width_ratios=[4, 1.3], height_ratios=[1.2, 4])
+    ax = fig.add_subplot(gs[1, 0])
+    top = fig.add_subplot(gs[0, 0], sharex=ax)
+    side = fig.add_subplot(gs[1, 1], sharey=ax)
+    x, a = panel["log10_D_ref"], panel["alphas"]
+    dx, da = x[1] - x[0], a[1] - a[0]
+    ax.imshow(panel["density"], origin="lower", aspect="auto", cmap=_POSTERIOR_CMAP, interpolation="nearest",
+              extent=[x[0] - dx / 2, x[-1] + dx / 2, a[0] - da / 2, a[-1] + da / 2])
+    ax.plot([fit["log10_D_ref_mean"]], [fit["alpha_mean"]], "o", color=_INK, ms=4, mec="white", mew=0.8)
+    ax.axhline(1, color=_MUTED_INK, lw=0.6, ls=(0, (2, 3)))
+    floor = fit.get("D_ref_floor_um2_s")
+    for axis in (ax, top):
+        _style_axis(axis)
+        axis.grid(False)
+        if floor:
+            axis.axvline(np.log10(floor), color=_MUTED_INK, lw=0.8, ls=":")
+    if floor and x[0] <= np.log10(floor) <= x[-1]:
+        top.text(np.log10(floor), 0.98, " floor", transform=top.get_xaxis_transform(), ha="left", va="top",
+                 fontsize=7, color=_MUTED_INK)
+    ax.set_xlim(x[0], x[-1])
+    ax.set_ylim(0, 2)
+    ax.set_xlabel(_d_ref_label(panel["tau_ref_s"]), fontsize=8)
+    ax.set_ylabel(r"$\alpha$", fontsize=9)
+    top.plot(x, panel["p_D_ref"], color=_DECONVOLVED_COLOR, lw=1.6)
+    top.set_ylim(bottom=0)
+    top.set_ylabel("posterior", fontsize=7, color=_MUTED_INK)
+    top.tick_params(labelbottom=False)
+    _style_axis(side)
+    side.grid(False)
+    side.plot(panel["p_alpha"], a, color=_DECONVOLVED_COLOR, lw=1.6, label="posterior")
+    side.axvline(panel["prior_alpha"], color=_MUTED_INK, lw=1, ls="--", label="flat prior")
+    side.set_xlim(left=0)
+    side.tick_params(labelleft=False)
+    side.set_xlabel("density", fontsize=7, color=_MUTED_INK)
+    side.legend(fontsize=6.5, frameon=False, loc="upper right")
+    fig.add_subplot(gs[0, 1]).axis("off")
+    bound = " (D_ref: upper bound)" if fit.get("D_ref_grid_edge") == "low" else ""
+    fig.suptitle(
+        f"track {panel['track_id']} · {panel['n_frames']} frames · {fit['alpha_info_bits']:.2f} bits on α\n"
+        f"α {fit['alpha_mean']:.2f} [{fit['alpha_low']:.2f}, {fit['alpha_high']:.2f}] · "
+        f"D_ref {fit['D_ref_mean_um2_s']:.3g} µm²/s [{fit['D_ref_low_um2_s']:.3g}, {fit['D_ref_high_um2_s']:.3g}]{bound}",
+        fontsize=9, color=_INK, x=0.01, ha="left",
+    )
+    return fig

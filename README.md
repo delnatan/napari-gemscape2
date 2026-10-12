@@ -6,7 +6,8 @@ Batch orchestration and napari visualization for single-particle tracking, conne
   detector, with overlapping spots fitted jointly, plus frame-to-frame linking. Runs in Rust.
 - [`diffusionkit`](https://github.com/delnatan/diffusionkit) — per-track grid posteriors over D, the
   population they make (a shared D, a log-normal, and a deconvolved distribution, also by track
-  length), classic MSD fits, and per-track NUTS.
+  length), per-track posteriors over α and D_ref under fractional Brownian motion, classic MSD
+  fits, and per-track NUTS.
 
 ## Install
 
@@ -372,6 +373,9 @@ msd_alpha_max_lag = 10
 # or shares of each track's longest lag, replacing both lag counts:
 # msd_lag_fraction = 0.3        # D: the usual 25-40% rule
 # msd_alpha_lag_fraction = 0.5  # alpha
+# Also run the α · D (fBm) posteriors, D_ref at this lag in seconds. A
+# template saved after an α · D run sets it. D_ref is not a Brownian D.
+alpha_D_tau_ref_s = 0.1
 exposure_s = 0.01       # optional: overrides each bundle's recorded exposure
 # Which tracks pass (`passes_filters`) and so make up the ensemble -- the
 # diffusion widget's tracks-pane cuts, on any per-track column.
@@ -469,13 +473,16 @@ detection knobs, then filters on what it found, where `fit_sigma` settles the
 width) and **Track**
 (link, optionally with flux as a second link cue, then filters on the
 tracks), pressing *Save results* when the result is worth keeping. The "Diffusion analysis" widget then reads the tracks layer for
-diffusionkit's grid posteriors: for each track, the posterior over D (flat
-prior in ln D, the exposure's blur modelled) summarized as its median and 5%/95%
-quantiles. D is the one per-track quantity reported: no shape metric (α, a ratio
-of D at two timescales, radius of gyration, straightness) can be pinned down by
-short tracks. α stays in the labelled MSD comparison and the NUTS tab. The run
+diffusionkit's grid posteriors. Above its tabs sit the two run inputs every
+posterior shares: the camera **exposure** (pre-filled from the layer; the runs
+stay off until it has a value) and **min points**, the shortest track fitted.
+
+The **D** tab is the standard quantification: for each track, the Brownian
+posterior over D (flat prior in ln D, the exposure's blur modelled) summarized
+as its mean E[D] and 5%/95% quantiles. The motion's shape (α) is a separate
+posterior, on the **α · D** tab (below). The run
 is diffusionkit's own `gridpost.analyze_tracks` with the `GridPostOptions` the
-Posterior tab shows: *D min*/*D max* (µm²/s) and *D points* set the D grid,
+D tab shows: *D min*/*D max* (µm²/s) and *D points* set the D grid,
 whose range is the flat prior's support (by default 10⁻⁵ to 10 µm²/s, so
 tracks that can't be told from still fall into a low tail, read as upper
 bounds). A track whose posterior is cut by an edge
@@ -503,7 +510,7 @@ so the groups add up to the whole, beside each length's own distribution. Fast
 particles leave the focal depth within a few frames, so short tracks come
 mostly from fast particles and long ones from slow particles. Its window counts
 *each track once* (the default and the usual per-trajectory reading: the stack
-is the deconvolved distribution of D across tracks) or *each detection* (a track
+is the sum of the tracks' own posteriors) or *each detection* (a track
 once per frame, so long tracks weigh more: the make-up of the spots seen in
 focus at a moment). Neither is the share of particles, since a fast particle can
 leave the focus and return as another track.
@@ -526,6 +533,43 @@ a worker thread, so they update shortly after a change. The **Track** plot shows
 the selected track's posterior; the **Map** tab colors each track's localizations
 by any per-track value (track length from the start, then any result); the **NUTS** tab fits the selected track's full posterior with the
 same exposure (needs `--extra bayes`).
+
+The **α · D** tab runs a second per-track posterior, diffusionkit's
+`fbmpost`: the joint posterior of the anomalous exponent α and an amplitude
+under fractional Brownian motion, with the same exposure blur and
+localization SDs (at α = 1 its likelihood is the D tab's). Every number on it
+is a posterior under stated priors: α flat on 0.02–1.98, the amplitude flat in
+ln SNR. A track that carries no information on α returns that prior (mean 1),
+and `alpha_info_bits` near 0 says so.
+
+- **Run α · D posteriors** adds the `alpha_*` and `D_ref_*` columns (about
+  10 s for 2,000 tracks of ~20 frames), so the Map tab can color tracks by α and
+  the filters can cut on `alpha_info_bits`.
+- **α–D** draws every fitted track's α against its D_ref with its 1-SD
+  posterior ellipse, one panel per region class. Within a track α and D_ref
+  trade off, so an ellipse, not a cross, is the error bar. Tracks with less
+  than 0.5 bit on α are grey (mostly prior); tracks that only bound D_ref from
+  above are grey "<" marks at their upper bound.
+- **Track** draws the selected track's joint posterior with both margins, α's
+  beside the flat prior it started from.
+
+> **D_ref is not a Brownian D.** It is the fBm amplitude expressed as
+> D_ref = MSD₁D(τ_ref) / (2 τ_ref), the true motion's apparent D at one lag
+> τ_ref (default 0.1 s, set on the tab). It has the units of D only so the
+> scatter has a readable axis. It equals a Brownian D only at α = 1; otherwise
+> it changes with τ_ref (at α = 0.3, going from 0.1 s to 1 s divides it by 5),
+> so compare D_ref only at the same τ_ref. Its interval inherits the α prior:
+> below its floor (`D_ref_floor_um2_s`) read it as an upper bound. Never
+> compare it with `D_mean_um2_s` or an MSD D, and never pair `D_mean_um2_s`
+> with this tab's α. For how fast tracks move, and for populations of D, use
+> the D tab.
+
+There is no population of α in the widget. A track's α curve is a posterior,
+not a likelihood: it carries the amplitude's prior, so tracks don't combine by
+adding their curves (in simulation, a deconvolution of them was badly biased).
+The α–D plot is per-track posteriors side by side, not a population. The
+population of α comes from the 2D deconvolution of the tracks' joint (α, D)
+likelihoods, an analysis of pooled bundles outside the widget.
 
 The classical MSD analysis has its own **MSD** tab. It needs only tracks, and it
 is a labelled comparison, run with the exposure treated as 0 (diffusionkit's
@@ -555,7 +599,8 @@ Opening a bundle with a saved analysis — saved from the widget, a batch, or
 settings, with no fit re-run. It is restored only if the tracks it was fitted on
 are still the bundle's, vertex for vertex (`tracks_sha256` in the summary);
 after a re-track or a new pixel size the saved numbers show as text and Run
-re-fits. Analyses saved before the fingerprint existed, with the α
+re-fits. The D and α · D runs are restored independently, each by its own
+fingerprint. Analyses saved before the fingerprint existed, with the α
 posterior of earlier versions, or as `posterior_D.parquet` (before the
 likelihoods were saved as `loglik_D.parquet`), need one re-run.
 
@@ -587,14 +632,17 @@ diffusion_summary.json    settings (dt, exposure, grid -- GridPostOptions' field
                           deconvolved_D_lambda),
                           the tracks-pane filters,
                           the fitted tracks' fingerprint (tracks_sha256), and packages
-                          (diffusionkit's and napari-gemscape2's version and git SHA)
+                          (diffusionkit's and napari-gemscape2's version and git SHA);
+                          after an α · D run, an "alpha_D" entry: its settings (tau_ref_s,
+                          the alpha and SNR priors), counts and fingerprint (its
+                          per-track numbers are columns of tracks_summary.csv)
 ```
 
 Points and tracks stay parquet (the atomic data); the tables people open in a
 spreadsheet are CSV. `tracks_summary.csv` — the table to read an experiment's
 tracks from and to pool across experiments (*Export CSV…* writes the same table
 anywhere) — has every track as a row, filtered-out and excluded ones included.
-Point estimates are posterior **medians**, and `_low`/`_high` are the 5% and
+Point estimates are posterior **means**, and `_low`/`_high` are the 5% and
 95% quantiles (a 90% credible interval). Empty cells mean "not computed for
 this track": it was excluded, too short, or that analysis was off.
 
@@ -617,6 +665,15 @@ this track": it was excluded, too short, or that analysis was off.
 | `D_grid_edge` | | Which end of the D grid cuts the posterior: `low` (the data only bound D from above — read the row as upper bounds), `high` (lower bounds), `both` (no information), empty when it isn't cut |
 | `D_info_bits` | bits | How much the track narrowed D from the flat prior. Only comparable on the same grid |
 | `D_floor_um2_s` | µm²/s | Localization floor: the D at which motion per frame equals localization noise, ⟨σ²⟩ / (dt − exposure/3) from the track's SDs. Not a resolution limit or a threshold: below it, D depends on the SDs being calibrated |
+| **α and D_ref (fBm), after an α · D run** | | |
+| `fbm_status` | | `ok`, `excluded` (shorter than `min_frames`), or `invalid_input` |
+| `alpha_mean`, `alpha_low`, `alpha_high`, `alpha_sd` | | α's posterior mean, 90% credible interval and SD (flat prior on 0.02–1.98) |
+| `alpha_info_bits` | bits | How much the track narrowed α from its flat prior; near 0, α is the prior's |
+| `alpha_p_below_1` | | Posterior probability that α < 1 |
+| `D_ref_mean_um2_s`, `D_ref_low_um2_s`, `D_ref_high_um2_s` | µm²/s | D_ref = MSD₁D(τ_ref) / (2 τ_ref) at the run's τ_ref (in `diffusion_summary.json`): mean and 90% interval. **Not a Brownian D** (see above) |
+| `log10_D_ref_mean`, `log10_D_ref_sd`, `alpha_D_ref_corr` | | The error ellipse: log10 D_ref's mean and SD and its correlation with α |
+| `D_ref_floor_um2_s` | µm²/s | The D_ref at which the motion's MSD at τ_ref equals the localization noise's, ⟨σ²⟩ / τ_ref |
+| `D_ref_grid_edge` | | `low` when the amplitude posterior reaches the prior's low end: the track only bounds D_ref from above |
 | **Optional fits** | | |
 | `D_msd_um2_s`, `K_msd_um2_s_alpha`, `alpha_msd` | µm²/s, µm²/s^α, – | Classical MSD fits (D over D's window, α by log-log over its own), when they ran; no uncertainties |
 | `*_nuts*` | | Full-posterior NUTS fit, for tracks fitted in the NUTS tab |
