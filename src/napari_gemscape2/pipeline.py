@@ -8,9 +8,8 @@ and its batch subprocess script each reimplemented the pipeline.
 
 Detection and linking are `spotsolve`'s: `spotsolve.localize`/
 `localize_stack` (u-track's detector: each seed fitted on its own window,
-every emitter kept by a likelihood ratio at a threshold set by
-`fp_per_mpx`, the expected false emitters per 10^6 pixels of pure noise)
-and
+every emitter kept where its probability of being real rather than
+noise, fitted per movie, reaches `p_real`) and
 `spotsolve.link` (frame to frame within a required `max_step`, each track
 held to its own diffusion scale, learned from its own steps).
 `spotsolve.loctable` defines the table that passes between them, and this
@@ -26,6 +25,9 @@ Two things the previous sfwloc-based pipeline did are gone because
     several emitters per window, so neighbours are fitted rather than
     biasing each other -- right for crowded and sparse fields alike) or
     "single" (one emitter per window: faster, for well-separated spots).
+    With mixtures, `motion_blur` reports a close pair as one elongated
+    spot unless two fit better, for exposures long enough that emitters
+    streak.
   - Linking takes one number, `max_step` (px): the largest step a
     particle may take between consecutive frames, set for the fastest
     particles of interest. The linker learns each track's diffusion scale
@@ -89,17 +91,21 @@ DEFAULT_CAMERA_KWARGS = dict(
 # Forwarded to `spotsolve.localize`/`localize_stack` as **kwargs, mirroring
 # that function's own defaults (`spotsolve.native`).
 #
-# `fp_per_mpx` is the detector's one threshold, stated as what it costs:
-# an upper bound on the expected number of false emitters per 10^6 pixels
-# of pure Gaussian noise (derived, not fitted; see spotsolve's
-# docs/DETECTION.md). Lower it for fewer false positives, raise it for dim
-# data.
+# `p_real` is the detector's one threshold: the least probability that a
+# reported emitter is real rather than noise, from the movie's own
+# distribution of detection scores (see spotsolve's docs/DETECTION.md).
+# Higher is stricter.
 #
 # `width` is the range of widths an emitter is reported at, as multiples
 # of `sigma`; wider light is fitted as out-of-focus background.
+#
+# `motion_blur` (mixtures only) tests each close pair against one
+# elongated spot, as an emitter moving within the exposure is; off, close
+# pairs are resolved.
 DEFAULT_DETECT_KWARGS = dict(
-    fp_per_mpx=spotsolve.FP_PER_MPX,
+    p_real=spotsolve.P_REAL,
     width=spotsolve.WIDTH,
+    motion_blur=False,
 )
 
 # `detect_kwargs` keys older spotsolve versions took and the current one
@@ -108,6 +114,7 @@ DEFAULT_DETECT_KWARGS = dict(
 _OBSOLETE_DETECT_KWARGS = frozenset({
     "k_max", "threshold", "selection", "count_penalty", "band",  # 0.1
     "slack", "significance", "boxsize", "itermax",  # 0.2-0.3
+    "fp_per_mpx",  # 0.4-0.5
 })
 
 # The detectors `run_detect_step` runs: spotsolve's `fit_mixtures` on or

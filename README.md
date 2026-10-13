@@ -62,14 +62,18 @@ you'll publish, use the clone.
 
 Both halves of the problem are handled by `spotsolve` rather than tuned around:
 
-- **Detection** fits each candidate spot on its own window with a Poisson
-  model, every emitter at its own width. With the default "mixtures" detector a
-  window takes as many emitters as the likelihood ratio supports, so
-  overlapping spots are resolved instead of being merged into one bright
-  centroid; "single" fits one per window, faster for well-separated spots. One
-  knob sets the threshold: `fp_per_mpx`, the false spots admitted per 10⁶
-  pixels of pure noise (default 16; the Detect tab restates it per frame of the
-  image at hand).
+- **Detection** fits each candidate spot on its own window, every emitter at
+  its own width, with each pixel's noise from the camera's noise curve
+  (gain and read noise, both measured from the movie). With the default
+  "mixtures" detector a window takes as many emitters as the likelihood ratio
+  supports, so overlapping spots are resolved instead of being merged into one
+  bright centroid; "single" fits one per window, faster for well-separated
+  spots. One knob sets the threshold: `p_real`, the least probability that a
+  reported spot is real rather than noise, fitted to each movie's detection
+  scores (default 0.9). For exposures long enough that moving emitters streak,
+  turn on "motion blur" (mixtures only): a close pair is then one elongated
+  spot, flagged `ELONGATED`, unless two round ones fit better; off, close pairs
+  are resolved.
 - **Linking** holds each track to its own diffusion scale: between consecutive
   frames a link is scored by the step density the track predicts from its own
   steps, against the cost of ending the track, which spotsolve reads from the
@@ -349,9 +353,10 @@ min_track_length = 2
 camera_kwargs = { offset = 100.0 }
 # "mixtures" (default: several emitters per fit window) or "single".
 detector = "mixtures"
-# The detector's one threshold: expected false spots per 10^6 pixels of
-# pure noise. Lower is stricter.
-detect_kwargs = { fp_per_mpx = 16.0 }
+# The detector's one threshold: the least probability that a reported spot
+# is real. Higher is stricter. `motion_blur` (mixtures only) reports a close
+# pair as one elongated spot unless two fit better.
+detect_kwargs = { p_real = 0.9, motion_blur = false }
 # The same QC cuts the UI's histogram filters produce, as {column = [lo, hi]}.
 # Applied to what the linker sees and to which tracks are kept -- never to
 # points.parquet, which holds every detection either way. TOML has no null:

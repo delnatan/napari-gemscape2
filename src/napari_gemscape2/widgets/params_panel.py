@@ -61,11 +61,13 @@ tuning; the rest collapse under a per-tab "Expert settings"
 pages within one keep the dock panel's height bounded to a single step
 rather than to the whole form.
 
-`spotsolve`'s detector has one threshold, stated as the false positives it
-admits (`fp_per_mpx`), and its linker one distance (`max_step`), so what's
-left to expose is the camera, the PSF width, those two numbers, and the
-"detector" choice: mixtures (several emitters per window, the default) or
-single fits (one per window, faster for well-separated spots).
+`spotsolve`'s detector has one threshold, the least probability that a
+reported spot is real (`p_real`), and its linker one distance
+(`max_step`), so what's left to expose is the camera, the PSF width, those
+two numbers, and the "detector" choice: mixtures (several emitters per
+window, the default) or single fits (one per window, faster for
+well-separated spots), with mixtures' "motion blur" switch for exposures
+long enough that emitters streak.
 
 Each tab owns its stage's "Run" button and a one-line status label, wired
 to `PipelineParamsWidget`'s `detectRequested`/`trackRequested`/
@@ -235,10 +237,10 @@ class _DetectTab(QWidget):
 
     Core: `sigma`, `offset` (the one camera fact `spotsolve` takes -- gain
     and read noise are measured from each frame), the `detector` dropdown
-    (mixtures or single fits), `fp_per_mpx` -- the one threshold, as the
-    false emitters it admits per 10^6 pixels of pure noise, restated per
-    frame of the current image underneath -- a frame range and the regions
-    controls. Expert: `width`, the reported widths as a multiple of `sigma`
+    (mixtures or single fits) with mixtures' `motion_blur` checkbox,
+    `p_real` -- the one threshold, the least probability that a reported
+    spot is real, restated as a noise fraction underneath -- a frame range
+    and the regions controls. Expert: `width`, the reported widths as a multiple of `sigma`
     (echoed in px), and the thread count."""
 
     runRequested = Signal()
@@ -269,6 +271,20 @@ class _DetectTab(QWidget):
             "Single: one emitter per window. Faster; use it only where spots\n"
             "are farther apart than about 6 sigma."
         )
+        # Mixtures only: spotsolve ignores it for single fits, so it is
+        # greyed out there.
+        self.motion_blur = QCheckBox("motion blur")
+        self.motion_blur.setChecked(bool(d["motion_blur"]))
+        self.motion_blur.setToolTip(
+            "Mixtures only. On: a close pair is reported as one elongated\n"
+            "spot (flagged ELONGATED) unless two round spots fit better --\n"
+            "for exposures long enough that a moving emitter streaks.\n\n"
+            "Off (default): close pairs are resolved; right where emitters\n"
+            "stay round within the exposure. Pairs closer than about\n"
+            "2 sigma are merged when it is on."
+        )
+        self.detector.currentIndexChanged.connect(self._update_motion_blur)
+        self._update_motion_blur()
 
         # --- PSF width ----------------------------------------------------
         self.sigma = _dspin(
@@ -285,33 +301,29 @@ class _DetectTab(QWidget):
         self.sigma.valueChanged.connect(self._update_width_note)
 
         # --- detection knob --------------------------------------------
-        # The detector's one threshold, in the currency it
-        # costs: false emitters per 10^6 pixels of pure noise. A rate per
-        # megapixel is hard to feel, so `_update_fp_note` restates it per
-        # frame of the image at hand.
-        self.fp_per_mpx = _dspin(
-            d["fp_per_mpx"], 0.1, 10_000.0, 1.0, decimals=1,
-            tooltip="Expected false spots per million pixels of pure noise -- the\n"
-            "detector's one threshold. Lower it for fewer false positives\n"
-            "(e.g. 4), raise it for dim data.\n\n"
-            f"spotsolve's default: {spotsolve.FP_PER_MPX:g}.",
+        # The detector's one threshold: the least probability that a
+        # reported spot is real rather than noise, which spotsolve fits to
+        # the movie's own detection scores. `_update_p_note` restates it as
+        # the noise fraction it admits.
+        self.p_real = _dspin(
+            d["p_real"], 0.5, 0.999, 0.01, decimals=3,
+            tooltip="Least probability that a reported spot is real rather than\n"
+            "noise -- the detector's one threshold, fitted to each movie's\n"
+            "own detection scores. Higher is stricter.\n\n"
+            f"spotsolve's default: {spotsolve.P_REAL:g}.",
         )
-        self._frame_px: Optional[int] = None
-        self._fp_note = note_label("")
-        self.fp_per_mpx.valueChanged.connect(self._update_fp_note)
-        self._update_fp_note()
+        self._p_note = note_label("")
+        self.p_real.valueChanged.connect(self._update_p_note)
+        self._update_p_note()
 
         self.core_form = core_form = _compact_form(QFormLayout())
         core_form.setContentsMargins(0, 0, 0, 0)
         core_form.addRow("sigma (px)", self.sigma)
         core_form.addRow("detector", self.detector)
+        core_form.addRow("", self.motion_blur)
         core_form.addRow("offset (ADU)", self.offset)
-        # Row labels carry the unit the same way "offset (ADU)" and
-        # "sigma (px)" do -- a rate is exactly the kind of
-        # thing a bare number invites getting wrong -- kept short so the
-        # column stays narrow.
-        core_form.addRow("false spots / Mpx", self.fp_per_mpx)
-        core_form.addRow(self._fp_note)
+        core_form.addRow("P(real) at least", self.p_real)
+        core_form.addRow(self._p_note)
 
         # What gets analyzed, not how -- kept in core (not expert) since
         # these are exactly the knobs that let one image be explored
@@ -446,26 +458,16 @@ class _DetectTab(QWidget):
     def get_detector(self) -> str:
         return self.detector.currentData()
 
-    def _update_fp_note(self) -> None:
-        """Restate `fp_per_mpx` per frame of the current image -- the
-        scale a person actually reads a detection count at."""
-        rate = self.fp_per_mpx.value()
-        if self._frame_px is None:
-            self._fp_note.setText("in pure noise; lower is stricter.")
-            return
-        self._fp_note.setText(
-            f"≈ {rate * self._frame_px / 1e6:.2g} per {self._frame_shape_text} frame "
-            "of pure noise."
-        )
+    def _update_motion_blur(self) -> None:
+        self.motion_blur.setEnabled(self.get_detector() == "mixtures")
 
-    def set_frame_shape(self, shape: Optional[tuple[int, int]]) -> None:
-        """The current image's `(H, W)`, or None -- for `_update_fp_note`."""
-        if shape is None:
-            self._frame_px = None
-        else:
-            self._frame_px = int(shape[0]) * int(shape[1])
-            self._frame_shape_text = f"{shape[1]} × {shape[0]}"
-        self._update_fp_note()
+    def _update_p_note(self) -> None:
+        """Restate `p_real` as the share of reported spots that may be
+        noise."""
+        self._p_note.setText(
+            f"at most {1 - self.p_real.value():.1%} of reported spots expected "
+            "to be noise; higher is stricter."
+        )
 
     def _on_run_button_clicked(self) -> None:
         if self._running:
@@ -539,8 +541,9 @@ class _DetectTab(QWidget):
 
     def get_detect_kwargs(self) -> dict:
         return dict(
-            fp_per_mpx=self.fp_per_mpx.value(),
+            p_real=self.p_real.value(),
             width=(self.width_lo.value(), self.width_hi.value()),
+            motion_blur=self.motion_blur.isChecked(),
         )
 
 
@@ -937,6 +940,8 @@ _FLAG_TOOLTIPS = {
     "Fits without a usable position error are never linked anyway.",
     spotsolve.FitFlag.AT_BOUND: "The fitted level, flux or position sits on an\n"
     "optimization bound.",
+    spotsolve.FitFlag.ELONGATED: "One elongated spot (motion blur) rather than the\n"
+    "close pair that tiled it; its width is the geometric mean of the axes.",
 }
 
 
@@ -1341,10 +1346,7 @@ class PipelineParamsWidget(QWidget):
 
     def set_stack_shape(self, shape: Optional[tuple[int, int, int]]) -> None:
         """The current image's `(T, H, W)`, or None between images: `T`
-        bounds the frame range, `(H, W)` is what the Detect tab states its
-        false-positive rate per."""
+        bounds the frame range."""
         if shape is None:
-            self._detect.set_frame_shape(None)
             return
         self._detect.set_frame_bounds(shape[0])
-        self._detect.set_frame_shape(shape[1:])

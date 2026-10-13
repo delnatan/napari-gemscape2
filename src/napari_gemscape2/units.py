@@ -55,6 +55,7 @@ PX2 = "px²"
 PER_PX2 = "px⁻²"
 PER_UM2 = "µm⁻²"
 ADU = "ADU"
+ADU2 = "ADU²"
 RAD = "rad"
 FRAMES = "frames"
 POINTS = "points"
@@ -124,18 +125,21 @@ _EXACT: dict[str, Optional[str]] = {
     "flux_snr": None,
     # spotsolve's detection score, sqrt(2 * likelihood ratio) of the
     # emitter against background alone (at least the threshold `u` that
-    # `fp_per_mpx` sets).
+    # `p_real` sets), and the probability the emitter is real.
     "z": None,
+    "p_real": None,
     # spotsolve's per-fit diagnostics: a `FitFlag` bitmask.
     "flags": None,
     "n_locs": None,
     "n_flagged": None,
     "crowding_ratio": None,
-    # Variance per unit signal, which spotsolve's own schema labels ADU
-    # (it is gain-like: ADU² per ADU). Taken from there rather than
-    # re-derived, on the principle that this table states what upstream
-    # says and nothing it had to infer.
+    # The camera's measured gain, variance per unit signal, which
+    # spotsolve's own schema labels ADU (ADU² per ADU), and its read
+    # variance. Taken from there rather than re-derived, on the principle
+    # that this table states what upstream says and nothing it had to
+    # infer.
     "dispersion": ADU,
+    "read_variance": ADU2,
     "r2": None,
     # diffusionkit's grid posteriors: per-track statuses, and the
     # posterior's own summaries are named `<quantity>_<median|low|high>`,
