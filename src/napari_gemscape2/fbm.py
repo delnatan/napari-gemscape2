@@ -24,26 +24,34 @@ otherwise changes with tau_ref (at alpha = 0.3, from 0.1 s to 1 s divides it by
 read it as an upper bound. So it is never compared with `D_mean_um2_s` or an
 MSD D, and `D_mean_um2_s` is never paired with `alpha_mean`.
 
-There is no population of alpha here. A track's alpha curve is a posterior, not
-a likelihood, so tracks do not combine by adding these curves: a 1D
-deconvolution of them was biased in simulation. An alpha population comes from
-the 2D deconvolution of the tracks' joint (alpha, D) likelihoods, an analysis
-of pooled bundles outside this UI.
+**The population of alpha** (`alpha_population`) is diffusionkit's 2D
+deconvolution of the tracks' joint (alpha, log10 D_ref) likelihoods
+(`fbmpost.deconvolve_tracks`), kept per track by the run (`JointLikelihoods`)
+and saved in `loglik_alpha_D.parquet`. A track's alpha curve is a posterior,
+not a likelihood: its amplitude prior tilts it near the floor, so tracks do not
+combine by adding those curves (a 1D deconvolution of them was biased in
+simulation). The joint likelihoods carry no prior, and the D_ref population the
+alpha population is marginalized under is fitted with it. Below the D_ref floor
+the tracks barely tell D_ref values apart, and alpha there is mostly the
+smoothness prior's continuation of alpha above it, so the summary also gives
+the reads above the floor and the share of the population below it.
 """
 
 from __future__ import annotations
 
 import os
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 import numpy as np
 import polars as pl
 from diffusionkit import Acquisition
-from diffusionkit.fbmpost import FbmPostOptions
+from diffusionkit.fbmpost import AlphaDPopulation, FbmPostOptions, JointLikelihoods
 from diffusionkit.fbmpost import analyze_tracks as dk_analyze_fbm
+from diffusionkit.fbmpost import deconvolve_tracks as dk_deconvolve_alpha_D
 from diffusionkit.fbmpost import posterior as fbm_posterior
+from diffusionkit.fbmpost.population import informative_range
 
 from napari_gemscape2.diffusion import LEVEL, MIN_FRAMES, StaleAnalysisError, floor_band, tracks_fingerprint
 
@@ -109,12 +117,17 @@ def fbm_options(min_frames: int = MIN_FRAMES, tau_ref_s: float = TAU_REF_S) -> F
 @dataclass(frozen=True)
 class FbmAnalysis:
     """One run of `analyze_fbm`: a row per input track (`FBM_SCHEMA`, plus
-    `n_frames`), what it ran with, and `tracks_fingerprint` of its tracks."""
+    `n_frames`), what it ran with, `tracks_fingerprint` of its tracks, and
+    each fitted track's joint likelihood (`likelihoods`, None for a run saved
+    without them), what `alpha_population` deconvolves."""
 
     fits: pl.DataFrame
     acquisition: Acquisition
     options: FbmPostOptions
     tracks_sha256: Optional[str] = None
+    likelihoods: Optional[JointLikelihoods] = field(default=None, compare=False, repr=False)
+    # `alpha_population`'s results by track ids: ~10 s each for a thousand tracks.
+    _populations: dict = field(default_factory=dict, compare=False, repr=False)
 
     @property
     def tau_ref_s(self) -> float:
@@ -138,15 +151,28 @@ def analyze_fbm(
     threads: Optional[int] = None,
 ) -> FbmAnalysis:
     """`diffusionkit.fbmpost.analyze_tracks` on `tracks` (`tracks_to_diffusionkit_df`'s
-    table), on a pool of `threads` (default: one per CPU), reshaped to `FBM_SCHEMA`."""
+    table), on a pool of `threads` (default: one per CPU), reshaped to `FBM_SCHEMA`,
+    with each fitted track's joint likelihood kept over the D_ref cells some
+    track tells apart (`fbmpost.population.informative_range`)."""
     threads = threads or os.cpu_count() or 1
     if threads > 1:
         with ThreadPoolExecutor(threads) as pool:
-            result = dk_analyze_fbm(tracks, acquisition, options, progress=progress, map_fn=pool.map)
+            result = dk_analyze_fbm(tracks, acquisition, options, progress=progress, keep_likelihoods=True,
+                                    map_fn=pool.map)
     else:
-        result = dk_analyze_fbm(tracks, acquisition, options, progress=progress)
+        result = dk_analyze_fbm(tracks, acquisition, options, progress=progress, keep_likelihoods=True)
     fits = result.fits.rename(_RENAME).select("n_frames", *FBM_SCHEMA.keys()).cast(FBM_SCHEMA)
-    return FbmAnalysis(fits, acquisition, options, tracks_fingerprint(tracks))
+    return FbmAnalysis(fits, acquisition, options, tracks_fingerprint(tracks), _cropped(result.likelihoods))
+
+
+def _cropped(lik: JointLikelihoods) -> Optional[JointLikelihoods]:
+    """`lik` over its informative D_ref cells: a subset's range lies inside it, and the rest is
+    either flat (below detection) or negligible for every track."""
+    if not len(lik.track_ids):
+        return None
+    keep = informative_range(lik)
+    return JointLikelihoods(lik.track_ids, lik.n_frames, lik.D_ref_floor_um2_s, lik.alphas,
+                            lik.log10_D_ref[keep], lik.loglik[:, :, keep])
 
 
 def _rows(analysis: FbmAnalysis, ids: Optional[set]) -> pl.DataFrame:
@@ -157,7 +183,7 @@ def _rows(analysis: FbmAnalysis, ids: Optional[set]) -> pl.DataFrame:
 def summarize_fbm(analysis: FbmAnalysis, ids: Optional[set] = None) -> dict:
     """Counts over the tracks `ids` (None: all): by status, how many carry at
     least `MIN_BITS` on alpha, how many only bound D_ref from above, and the
-    D_ref floor. No population numbers -- see the module docstring."""
+    D_ref floor. The population's numbers are `population_summary`'s."""
     rows = _rows(analysis, ids)
     ok = rows.filter(pl.col("fbm_status") == "ok")
     out = {
@@ -173,9 +199,81 @@ def summarize_fbm(analysis: FbmAnalysis, ids: Optional[set] = None) -> dict:
     return out
 
 
+# A population needs this many fitted tracks; fewer say little beyond their own posteriors.
+MIN_POPULATION_TRACKS = 20
+_POPULATION_CACHE_SIZE = 16
+
+
+def alpha_population(analysis: FbmAnalysis, ids: Optional[set] = None) -> Optional[AlphaDPopulation]:
+    """The population of (alpha, log10 D_ref) over the tracks `ids` (None: all
+    fitted), `fbmpost.deconvolve_tracks` of their joint likelihoods -- or None
+    without likelihoods or with fewer than `MIN_POPULATION_TRACKS` fitted
+    tracks. ~10 s for a thousand tracks; cached on `analysis`."""
+    lik = analysis.likelihoods
+    if lik is None:
+        return None
+    key = None if ids is None else frozenset(ids)
+    if key in analysis._populations:
+        return analysis._populations[key]
+    rows = np.arange(len(lik.track_ids)) if ids is None else np.flatnonzero(np.isin(lik.track_ids, list(ids)))
+    pop = dk_deconvolve_alpha_D(lik.rows(rows)) if len(rows) >= MIN_POPULATION_TRACKS else None
+    if len(analysis._populations) >= _POPULATION_CACHE_SIZE:
+        analysis._populations.clear()
+    analysis._populations[key] = pop
+    return pop
+
+
+def population_is_cached(analysis: FbmAnalysis, ids: Optional[set] = None) -> bool:
+    """Whether `alpha_population(analysis, ids)` would return without computing."""
+    return analysis.likelihoods is None or (None if ids is None else frozenset(ids)) in analysis._populations
+
+
+def _interval(draws: np.ndarray, level: float) -> list[float]:
+    tail = (1 - level) / 2
+    return [float(v) for v in np.quantile(draws, [0.5, tail, 1 - tail])]
+
+
+def population_summary(pop: AlphaDPopulation, level: float = LEVEL) -> dict:
+    """An `AlphaDPopulation`'s numbers, each [median, low, high] over its draws
+    at `level`: alpha's mean and SD across tracks, P(alpha < 1), the
+    alpha-D_ref correlation, the same reads above the D_ref floor, and the
+    share of the population below it."""
+    return {
+        "n_tracks": pop.n_tracks,
+        "alpha_mean": _interval(pop.alpha_mean(), level),
+        "alpha_sd": _interval(pop.alpha_sd(), level),
+        "p_alpha_below_1": _interval(pop.p_alpha_below(1.0), level),
+        "alpha_D_ref_corr": _interval(pop.corr(), level),
+        "share_below_floor": _interval(pop.mass_below_floor(), level),
+        "above_floor": {
+            "alpha_mean": _interval(pop.alpha_mean(above_floor=True), level),
+            "alpha_sd": _interval(pop.alpha_sd(above_floor=True), level),
+            "p_alpha_below_1": _interval(pop.p_alpha_below(1.0, above_floor=True), level),
+        },
+        "D_ref_floor_um2_s": float(10**pop.log10_floor),
+        "lambda": list(pop.lam),
+    }
+
+
+def population_panels(analysis: FbmAnalysis, groups: dict[str, Optional[set]]) -> list[dict]:
+    """What `joint_plot.plot_alpha_population` draws, one dict per group with
+    a population: `name`, the `AlphaDPopulation` (`population`), its summary,
+    the credible level and tau_ref."""
+    panels = []
+    for name, ids in groups.items():
+        pop = alpha_population(analysis, ids)
+        if pop is not None:
+            panels.append({"name": name, "population": pop, "summary": population_summary(pop, analysis.options.level),
+                           "level": analysis.options.level, "tau_ref_s": analysis.tau_ref_s})
+    return panels
+
+
 def fbm_record(analysis: FbmAnalysis, ids: Optional[set], by_class: Optional[dict]) -> dict:
     """`diffusion_summary.json`'s "alpha_D" entry: what the run was, its
-    settings, and `summarize_fbm` over the tracks the filters pass."""
+    settings, `summarize_fbm` over the tracks the filters pass and, under
+    "population", `population_summary` of their `alpha_population` (each
+    region class's under "by_region_class"). A population not yet computed
+    is computed here: warm the cache off the GUI thread first."""
     o = analysis.options
     record = {
         "analysis": "diffusionkit.fbmpost grid posteriors under blurred fBm: flat prior on alpha, "
@@ -190,15 +288,67 @@ def fbm_record(analysis: FbmAnalysis, ids: Optional[set], by_class: Optional[dic
         "tracks_sha256": analysis.tracks_sha256,
         **summarize_fbm(analysis, ids),
     }
+    pop = alpha_population(analysis, ids)
+    if pop is not None:
+        record["population"] = population_summary(pop, o.level)
     if by_class:
-        record["by_region_class"] = {name: summarize_fbm(analysis, gids) for name, gids in by_class.items()}
+        record["by_region_class"] = {}
+        for name, gids in by_class.items():
+            entry = summarize_fbm(analysis, gids)
+            pop = alpha_population(analysis, gids)
+            if pop is not None:
+                entry["population"] = population_summary(pop, o.level)
+            record["by_region_class"][name] = entry
     return record
 
 
-def restore_fbm(tracks: pl.DataFrame, record: dict, tracks_summary: pl.DataFrame) -> FbmAnalysis:
-    """A saved alpha-D run back from `diffusion_summary.json`'s "alpha_D" entry and
-    `tracks_summary.csv`'s columns. Raises `StaleAnalysisError` unless its tracks
-    are, vertex for vertex, among `tracks` (as `diffusion.restore_analysis`)."""
+def loglik_long_table(analysis: FbmAnalysis) -> Optional[pl.DataFrame]:
+    """Every fitted track's joint likelihood, one row per (track, cell):
+    `track_id`, `alpha`, `log10_D_ref`, `loglik` (each track's maximum 0) --
+    what `alpha_population` deconvolves, so a bundle reopens without
+    refitting. Also the track's frames and D_ref floor, repeated per row.
+    None without likelihoods."""
+    lik = analysis.likelihoods
+    if lik is None:
+        return None
+    n, n_a, n_d = lik.loglik.shape
+    return pl.DataFrame(
+        {
+            "track_id": np.repeat(lik.track_ids, n_a * n_d),
+            "n_frames": np.repeat(lik.n_frames, n_a * n_d),
+            "D_ref_floor_um2_s": np.repeat(lik.D_ref_floor_um2_s, n_a * n_d),
+            "alpha": np.tile(np.repeat(lik.alphas, n_d), n),
+            "log10_D_ref": np.tile(lik.log10_D_ref, n * n_a),
+            "loglik": lik.loglik.reshape(-1).astype(np.float32),
+        },
+        schema={"track_id": pl.Int64, "n_frames": pl.Int64, "D_ref_floor_um2_s": pl.Float64, "alpha": pl.Float64,
+                "log10_D_ref": pl.Float64, "loglik": pl.Float32},
+    )
+
+
+def _likelihoods_from(table: pl.DataFrame) -> JointLikelihoods:
+    """`loglik_long_table`'s table back to `JointLikelihoods`."""
+    table = table.sort("track_id", "alpha", "log10_D_ref")
+    alphas = np.unique(table["alpha"].to_numpy())
+    D = np.unique(table["log10_D_ref"].to_numpy())
+    per_track = table.group_by("track_id", maintain_order=True).agg(
+        pl.col("n_frames").first(), pl.col("D_ref_floor_um2_s").first(), pl.len().alias("n_cells"))
+    if (per_track["n_cells"] != len(alphas) * len(D)).any():
+        raise ValueError("loglik_alpha_D: every track needs one row per (alpha, log10_D_ref) cell")
+    return JointLikelihoods(
+        per_track["track_id"].to_numpy(), per_track["n_frames"].to_numpy(),
+        per_track["D_ref_floor_um2_s"].to_numpy(), alphas, D,
+        table["loglik"].cast(pl.Float64).to_numpy().reshape(per_track.height, len(alphas), len(D)),
+    )
+
+
+def restore_fbm(tracks: pl.DataFrame, record: dict, tracks_summary: pl.DataFrame,
+                loglik: Optional[pl.DataFrame] = None) -> FbmAnalysis:
+    """A saved alpha-D run back from `diffusion_summary.json`'s "alpha_D" entry,
+    `tracks_summary.csv`'s columns and, when saved, `loglik_alpha_D.parquet`
+    (`loglik_long_table`; without it the run has no population). Raises
+    `StaleAnalysisError` unless its tracks are, vertex for vertex, among
+    `tracks` (as `diffusion.restore_analysis`)."""
     if "fbm_status" not in tracks_summary.columns:
         raise StaleAnalysisError("its per-track table has no alpha-D columns")
     ran = tracks_summary.filter(pl.col("fbm_status").is_not_null())
@@ -218,7 +368,13 @@ def restore_fbm(tracks: pl.DataFrame, record: dict, tracks_summary: pl.DataFrame
           for c, dtype in FBM_SCHEMA.items()),
     ).sort("track_id")
     acquisition = Acquisition(dt_s=record["dt_s"], exposure_s=record["exposure_s"])
-    return FbmAnalysis(fits, acquisition, options, record["tracks_sha256"])
+    likelihoods = None
+    if loglik is not None and loglik.height:
+        likelihoods = _likelihoods_from(loglik)
+        ok_ids = set(fits.filter(pl.col("fbm_status") == "ok")["track_id"].to_list())
+        if set(likelihoods.track_ids.tolist()) != ok_ids:
+            raise StaleAnalysisError("its joint likelihoods are not those of its fitted tracks")
+    return FbmAnalysis(fits, acquisition, options, record["tracks_sha256"], likelihoods)
 
 
 def scatter_panels(analysis: FbmAnalysis, groups: dict[str, Optional[set]]) -> list[dict]:

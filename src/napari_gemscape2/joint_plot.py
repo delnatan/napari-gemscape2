@@ -866,3 +866,61 @@ def plot_fbm_track(panel: dict) -> Figure:
         fontsize=9, color=_INK, x=0.01, ha="left",
     )
     return fig
+
+
+def _fmt_interval(v: list[float], digits: int = 2) -> str:
+    return f"{v[0]:.{digits}f} [{v[1]:.{digits}f}, {v[2]:.{digits}f}]"
+
+
+def plot_alpha_population(panels: list[dict]) -> Figure:
+    """The population of (alpha, D_ref), one row per group (`fbm.population_panels`):
+    left, the fitted distribution g over (log10 D_ref, alpha) with the D_ref
+    floor; right, alpha's distribution across tracks with its pointwise band at
+    the run's credible level, and alpha's distribution above the floor
+    (dashed), where the tracks tell D_ref values apart. Below the floor g's
+    alpha is mostly the smoothness prior's continuation of alpha above."""
+    n = len(panels)
+    fig = Figure(figsize=(7.2, 0.4 + 3.3 * n), layout="constrained")
+    rows = fig.subfigures(n, 1, squeeze=False)[:, 0]
+    for i, (sub, panel) in enumerate(zip(rows, panels)):
+        pop, sm = panel["population"], panel["summary"]
+        a, x = pop.alphas, pop.log10_D_ref
+        da, dx = a[1] - a[0], x[1] - x[0]
+        ax, side = sub.subplots(1, 2, width_ratios=[3, 2], sharey=True)
+        for axis in (ax, side):
+            _style_axis(axis)
+            axis.grid(False)
+        ax.imshow(pop.weights / (da * dx), origin="lower", aspect="auto", cmap=_POSTERIOR_CMAP,
+                  interpolation="nearest", extent=[x[0] - dx / 2, x[-1] + dx / 2, a[0] - da / 2, a[-1] + da / 2])
+        ax.axvline(pop.log10_floor, color=_MUTED_INK, lw=0.8, ls=":")
+        ax.text(pop.log10_floor, 1.96, " floor", ha="left", va="top", fontsize=7, color=_MUTED_INK)
+        ax.axhline(1, color=_MUTED_INK, lw=0.6, ls=(0, (2, 3)))
+        seen = x[pop.weights.sum(axis=0) > 1e-3 * pop.weights.sum(axis=0).max()]
+        ax.set_xlim(min(seen.min(), pop.log10_floor) - 2 * _LOG_D_PAD, max(seen.max(), pop.log10_floor) + 2 * _LOG_D_PAD)
+        ax.set_ylim(0, 2)
+        ax.set_ylabel(r"$\alpha$", fontsize=9)
+        ax.set_xlabel(_d_ref_label(panel["tau_ref_s"]), fontsize=8)
+        lo, hi = pop.alpha_band(panel["level"])
+        side.fill_betweenx(a, lo / da, hi / da, color=_DECONVOLVED_COLOR, alpha=0.18, lw=0,
+                           label=f"{panel['level']:.0%} band")
+        side.plot(pop.alpha_weights() / da, a, color=_DECONVOLVED_COLOR, lw=1.6, label="all tracks")
+        side.plot(pop.alpha_weights(above_floor=True) / da, a, color=_DECONVOLVED_COLOR, lw=1.1, ls="--",
+                  label="above the floor")
+        side.axhline(1, color=_MUTED_INK, lw=0.6, ls=(0, (2, 3)))
+        side.set_xlim(left=0)
+        side.tick_params(labelleft=False)
+        side.set_xlabel("density across tracks", fontsize=7, color=_MUTED_INK)
+        if i == 0:
+            side.legend(fontsize=6.5, frameon=False, loc="upper right")
+        up = sm["above_floor"]
+        sub.suptitle(
+            f"{panel['name']} · {sm['n_tracks']} tracks\n"
+            f"P(α<1) {_fmt_interval(sm['p_alpha_below_1'])} · mean α {_fmt_interval(sm['alpha_mean'])}"
+            f" · SD of α {_fmt_interval(sm['alpha_sd'])}\n"
+            f"above the D_ref floor: P(α<1) {_fmt_interval(up['p_alpha_below_1'])} · mean α "
+            f"{_fmt_interval(up['alpha_mean'])} · {sm['share_below_floor'][0]:.0%} of the population below it",
+            fontsize=8, x=0.01, ha="left", color=_INK,
+        )
+    fig.suptitle("population of α and D_ref: 2D deconvolution of the tracks' joint likelihoods (fBm)",
+                 fontsize=9, color=_MUTED_INK, x=0.01, ha="left")
+    return fig

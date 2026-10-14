@@ -42,7 +42,7 @@ from napari_gemscape2.diffusion import (
     tracks_summary_table,
     tracks_to_diffusionkit_df,
 )
-from napari_gemscape2.fbm import analyze_fbm, fbm_options, fbm_record
+from napari_gemscape2.fbm import analyze_fbm, fbm_options, fbm_record, loglik_long_table as fbm_loglik_table
 from napari_gemscape2.pipeline import FilterSpec, track_features_df
 from napari_gemscape2.regions import Regions
 from napari_gemscape2.results import load_result, package_provenance, write_diffusion_results
@@ -229,7 +229,8 @@ def analyze_bundle(
 
     summary["packages"] = package_provenance(diffusionkit, napari_gemscape2)
     write_diffusion_results(
-        result_dir, tracks_summary=table, summary=summary, **analysis_tables(analysis, ids, by_class)
+        result_dir, tracks_summary=table, summary=summary, **analysis_tables(analysis, ids, by_class),
+        loglik_alpha_D=None if fbm is None else fbm_loglik_table(fbm),
     )
     return BundleReport(
         n_tracks=base.height,

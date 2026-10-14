@@ -41,8 +41,9 @@ pointed at a selection you could not see.
   also split by track length. See `_PosteriorTab`.
 - **α · D** -- `fbm.analyze_fbm` (diffusionkit.fbmpost): per track, the
   joint posterior of alpha and D_ref under fractional Brownian motion,
-  drawn as a scatter with error ellipses. D_ref is not a Brownian D, and
-  there is no population here. See `widgets.fbm_tab.FbmTab`.
+  drawn as a scatter with error ellipses, and the population of alpha:
+  the 2D deconvolution of the tracks' joint likelihoods. D_ref is not a
+  Brownian D. See `widgets.fbm_tab.FbmTab`.
 - **MSD** -- diffusionkit.classic: per-track MSD fits (D over the first
   lags, alpha by log-log over a wider window) with their own Run, and the
   selected track's and the ensemble-averaged MSD. A labelled comparison:
@@ -60,7 +61,8 @@ Saving writes the per-track summary (`tracks_summary.csv`), every
 track's log-likelihood over D (`loglik_D.parquet`), the ensemble distributions
 (`distributions_D.csv`, `distributions_D_by_length.csv`) and the settings and
 population numbers (`diffusion_summary.json`, with an "alpha_D" entry for
-an α · D run, whose per-track columns are in the summary table) into the
+an α · D run, whose per-track columns are in the summary table and whose
+joint likelihoods are in `loglik_alpha_D.parquet`) into the
 layer's bundle -- see `results.py`. Picking a layer whose bundle has a saved
 analysis restores it (`diffusion.restore_analysis`, `fbm.restore_fbm`,
 each on its own) when the tracks it was fitted on are still the layer's,
@@ -193,11 +195,13 @@ from napari_gemscape2.diffusion import (
     tracks_summary_table,
     tracks_to_diffusionkit_df,
 )
-from napari_gemscape2.fbm import FbmAnalysis, fbm_record, restore_fbm
+from napari_gemscape2.fbm import FbmAnalysis, alpha_population, fbm_record, restore_fbm
+from napari_gemscape2.fbm import loglik_long_table as fbm_loglik_table
 from napari_gemscape2.results import (
     TRACKS_SUMMARY_FILENAME,
     load_diffusion_results,
     load_diffusion_summary,
+    load_loglik_alpha_D,
     load_tracks_summary,
     package_provenance,
     write_diffusion_results,
@@ -326,13 +330,17 @@ def _length_worker(analysis: PosteriorAnalysis, id_sets: list, weight: str) -> N
 
 
 @thread_worker(start_thread=False)
-def _tables_worker(analysis: PosteriorAnalysis, id_sets: list) -> None:
+def _tables_worker(analysis: Optional[PosteriorAnalysis], id_sets: list, fbm: Optional[FbmAnalysis] = None) -> None:
     """The deconvolutions the saved tables read, over `id_sets`, off the GUI
     thread: each set's ensemble and its track-length groups (fitted once;
-    the "detections" weighting only re-shares them). All cached on `analysis`."""
+    the "detections" weighting only re-shares them), cached on `analysis`,
+    and each set's α population, cached on `fbm`."""
     for ids in id_sets:
-        ensemble(analysis, ids)
-        length_composition(analysis, ids, "tracks")
+        if analysis is not None:
+            ensemble(analysis, ids)
+            length_composition(analysis, ids, "tracks")
+        if fbm is not None:
+            alpha_population(fbm, ids)
 
 
 @thread_worker(start_thread=False)
@@ -2026,8 +2034,9 @@ class DiffusionAnalysisWidget(QWidget):
         self._save_button.setToolTip(
             f"Write the per-track summary ({TRACKS_SUMMARY_FILENAME}, with every\n"
             "run's columns, α · D's included), every track's log-likelihood\n"
-            "over D (loglik_D.parquet), the ensemble distributions of D\n"
-            "(distributions_D.csv and, by track length,\n"
+            "over D (loglik_D.parquet) and, after an α · D run, over\n"
+            "(α, D_ref) (loglik_alpha_D.parquet), the ensemble\n"
+            "distributions of D (distributions_D.csv and, by track length,\n"
             "distributions_D_by_length.csv, over the tracks the\n"
             "filters pass) and the settings and population summary\n"
             "(diffusion_summary.json) into this layer's bundle."
@@ -2567,7 +2576,8 @@ class DiffusionAnalysisWidget(QWidget):
                 table = load_tracks_summary(self._result_dir)
                 if table is None:
                     raise StaleAnalysisError("its per-track table is missing")
-                self._fbm_tab.restore(restore_fbm(self._diffkit_tracks, summary["alpha_D"], table))
+                self._fbm_tab.restore(restore_fbm(self._diffkit_tracks, summary["alpha_D"], table,
+                                                  load_loglik_alpha_D(self._result_dir)))
                 restored = summary
             except errors as exc:
                 self._fbm_tab.report_error(f"saved α · D posteriors not loaded: {exc} — Run to re-fit")
@@ -3046,8 +3056,9 @@ class DiffusionAnalysisWidget(QWidget):
 
     def _save_results(self) -> None:
         """Save what the widget shows now. The deconvolutions the tables need
-        (the ensemble and each track-length group's) are computed on a worker
-        first (`_tables_worker`); the rest is written when it returns."""
+        (the ensemble, each track-length group's and the α populations) are
+        computed on a worker first (`_tables_worker`); the rest is written
+        when it returns."""
         if self._result_dir is None or self._save_worker is not None:
             return
         table = self.tracks_summary()
@@ -3059,11 +3070,10 @@ class DiffusionAnalysisWidget(QWidget):
         ids = self.combined_filtered_track_ids()
         by_class = self.group_track_ids(ids)
         extra: dict = {}
-        if self._fbm is not None:
-            extra["alpha_D"] = fbm_record(self._fbm, ids, by_class)
         extra["tracks_summary_filters"] = self._summary_filter_record()
         extra["packages"] = _analysis_packages()
         analysis = self._posterior
+        fbm = self._fbm
         msd = self._msd_window if self._msd_df is not None else None
         result_dir = self._result_dir
 
@@ -3075,15 +3085,20 @@ class DiffusionAnalysisWidget(QWidget):
             if analysis is not None:
                 tables = analysis_tables(analysis, ids, by_class)
                 summary = analysis_summary(analysis, ids, by_class, msd=msd)
+            if fbm is not None:
+                summary["alpha_D"] = fbm_record(fbm, ids, by_class)
+                tables["loglik_alpha_D"] = fbm_loglik_table(fbm)
             summary.update(extra)
             write_diffusion_results(result_dir, tracks_summary=table, summary=summary, **tables)
             self._posterior_tab.report_saved(f"saved {table.height} tracks' analysis to {result_dir.name}/")
+            if fbm is not None:
+                self._fbm_tab.refresh()  # the α populations it shows may have just been computed
 
-        if analysis is None:
+        if analysis is None and (fbm is None or fbm.likelihoods is None):
             write()
             return
         self._posterior_tab.report_caution("saving: deconvolving the populations…")
-        worker = _tables_worker(analysis, [ids, *(by_class or {}).values()])
+        worker = _tables_worker(analysis, [ids, *(by_class or {}).values()], fbm)
         worker.returned.connect(write)
         worker.errored.connect(self._save_failed)
         self._save_worker = worker

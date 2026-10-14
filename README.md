@@ -557,6 +557,12 @@ and `alpha_info_bits` near 0 says so.
   above are grey "<" marks at their upper bound.
 - **Track** draws the selected track's joint posterior with both margins, α's
   beside the flat prior it started from.
+- **Population** draws the distribution of α and D_ref across the tracks the
+  filters pass, one row per region class (needs at least 20 fitted tracks;
+  ~10 s per thousand tracks). Its numbers (P(α < 1), the mean and SD of α,
+  each with an interval) join the tab's summary, and *Save analysis* writes
+  them to `diffusion_summary.json` with the joint likelihoods in
+  `loglik_alpha_D.parquet`.
 
 > **D_ref is not a Brownian D.** It is the fBm amplitude expressed as
 > D_ref = MSD₁D(τ_ref) / (2 τ_ref), the true motion's apparent D at one lag
@@ -569,12 +575,17 @@ and `alpha_info_bits` near 0 says so.
 > with this tab's α. For how fast tracks move, and for populations of D, use
 > the D tab.
 
-There is no population of α in the widget. A track's α curve is a posterior,
-not a likelihood: it carries the amplitude's prior, so tracks don't combine by
-adding their curves (in simulation, a deconvolution of them was badly biased).
-The α–D plot is per-track posteriors side by side, not a population. The
-population of α comes from the 2D deconvolution of the tracks' joint (α, D)
-likelihoods, an analysis of pooled bundles outside the widget.
+The α–D plot is per-track posteriors side by side, not a population. A track's
+α curve is a posterior, not a likelihood: it carries the amplitude's prior, so
+tracks don't combine by adding their curves (in simulation, a deconvolution of
+them was badly biased). The population comes instead from diffusionkit's 2D
+deconvolution of the tracks' joint (α, D_ref) likelihoods, which carry no prior,
+the way the D tab's deconvolved distribution comes from the D likelihoods. On
+simulated tracks of 5–80 frames it recovered a two-mode population (P(α < 0.75)
+0.62 [0.58, 0.67] against 0.59) and a single α (mean 0.59 against 0.60).
+Below the D_ref floor the tracks barely tell D_ref values apart, and α there
+is mostly the smoothness prior continuing α from above, so the plot and the
+summary also give α above the floor and the share of the population below it.
 
 The classical MSD analysis has its own **MSD** tab. It needs only tracks, and it
 is a labelled comparison, run with the exposure treated as 0 (diffusionkit's
@@ -616,6 +627,10 @@ tracks_summary.csv        one row per track (below)
 loglik_D.parquet          every fitted track's log-likelihood over D: track_id, D_um2_s,
                           loglik (normalized, so also its flat-prior posterior); what
                           every population read is built from
+loglik_alpha_D.parquet    after an α · D run, every fitted track's likelihood over
+                          (α, log10 D_ref) cells: track_id, n_frames, D_ref_floor_um2_s,
+                          alpha, log10_D_ref, loglik (0 at each track's maximum); what
+                          the α population is built from
 distributions_D.csv       the population on the D grid, long by group ("all", then each
                           region class): shared_loglik (the tracks' log-likelihoods
                           summed, 0 at the peak: one D for every track -- the summary's
@@ -640,8 +655,12 @@ diffusion_summary.json    settings (dt, exposure, grid -- GridPostOptions' field
                           the fitted tracks' fingerprint (tracks_sha256), and packages
                           (diffusionkit's and napari-gemscape2's version and git SHA);
                           after an α · D run, an "alpha_D" entry: its settings (tau_ref_s,
-                          the alpha and SNR priors), counts and fingerprint (its
-                          per-track numbers are columns of tracks_summary.csv)
+                          the alpha and SNR priors), counts, fingerprint and
+                          "population" (P(α < 1), the mean and SD of α, the α-D_ref
+                          correlation and the share below the D_ref floor, each
+                          [median, low, high]; the same above the floor; overall and
+                          per region class); its per-track numbers are columns of
+                          tracks_summary.csv
 ```
 
 Points and tracks stay parquet (the atomic data); the tables people open in a

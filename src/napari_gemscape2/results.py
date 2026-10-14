@@ -26,6 +26,7 @@ and, once the diffusion widget has saved an analysis of it
 (`write_diffusion_results`):
     <result_dir>/tracks_summary.csv       one row per track
     <result_dir>/loglik_D.parquet         every track's log-likelihood over D
+    <result_dir>/loglik_alpha_D.parquet   every track's likelihood over (alpha, log10 D_ref), if α · D was run
     <result_dir>/distributions_D.csv      the ensemble on the D grid
     <result_dir>/distributions_D_by_length.csv  the same split by track length
     <result_dir>/diffusion_summary.json   settings + population numbers
@@ -86,6 +87,8 @@ DIFFUSION_SUMMARY_FILENAME = "diffusion_summary.json"
 # (`diffusion.tracks_summary_table`).
 TRACKS_SUMMARY_FILENAME = "tracks_summary.csv"
 LOGLIK_D_FILENAME = "loglik_D.parquet"
+# The α · D run's joint likelihoods (`fbm.loglik_long_table`), what its population is deconvolved from.
+LOGLIK_ALPHA_D_FILENAME = "loglik_alpha_D.parquet"
 DISTRIBUTIONS_D_FILENAME = "distributions_D.csv"
 DISTRIBUTIONS_D_BY_LENGTH_FILENAME = "distributions_D_by_length.csv"
 # Written by earlier versions of the diffusion widget; removed on the next
@@ -313,6 +316,7 @@ def write_diffusion_results(
     tracks_summary: pl.DataFrame,
     summary: dict,
     loglik_D: Optional[pl.DataFrame] = None,
+    loglik_alpha_D: Optional[pl.DataFrame] = None,
     distributions_D: Optional[pl.DataFrame] = None,
     distributions_D_by_length: Optional[pl.DataFrame] = None,
 ) -> None:
@@ -325,10 +329,11 @@ def write_diffusion_results(
     result_dir.mkdir(parents=True, exist_ok=True)
     tracks_summary.write_csv(result_dir / TRACKS_SUMMARY_FILENAME)
     (result_dir / DIFFUSION_SUMMARY_FILENAME).write_text(json.dumps(summary, indent=2))
-    if loglik_D is None:
-        (result_dir / LOGLIK_D_FILENAME).unlink(missing_ok=True)
-    else:
-        loglik_D.write_parquet(result_dir / LOGLIK_D_FILENAME)
+    for table, filename in ((loglik_D, LOGLIK_D_FILENAME), (loglik_alpha_D, LOGLIK_ALPHA_D_FILENAME)):
+        if table is None:
+            (result_dir / filename).unlink(missing_ok=True)
+        else:
+            table.write_parquet(result_dir / filename)
     for table, filename in (
         (distributions_D, DISTRIBUTIONS_D_FILENAME),
         (distributions_D_by_length, DISTRIBUTIONS_D_BY_LENGTH_FILENAME),
@@ -405,6 +410,12 @@ def load_diffusion_results(result_dir: str | Path) -> Optional[dict]:
         "tracks_summary": pl.read_csv(summary_path, infer_schema_length=None),
         "loglik_D": pl.read_parquet(loglik_path),
     }
+
+
+def load_loglik_alpha_D(result_dir: str | Path) -> Optional[pl.DataFrame]:
+    """The saved α · D joint likelihoods, or None if none were saved."""
+    path = Path(result_dir) / LOGLIK_ALPHA_D_FILENAME
+    return pl.read_parquet(path) if path.exists() else None
 
 
 def load_tracks_summary(result_dir: str | Path) -> Optional[pl.DataFrame]:

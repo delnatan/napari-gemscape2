@@ -15,10 +15,14 @@ wherever D_ref is shown.
   (`joint_plot.plot_alpha_D`).
 - **Track** -- the selected track's joint posterior with both margins, alpha's
   drawn beside the flat prior it started from (`joint_plot.plot_fbm_track`).
+- **Population** -- the distribution of (alpha, D_ref) across the tracks the
+  filters pass, per region class: diffusionkit's 2D deconvolution of their
+  joint likelihoods (`fbm.alpha_population`, `joint_plot.plot_alpha_population`),
+  on a worker (~10 s per thousand tracks). Its numbers join the summary once
+  computed, and Save computes them for the bundle.
 
-There is no ensemble here: a track's alpha curve is a posterior, so tracks
-don't combine by adding them, and the population of alpha needs the 2D
-(alpha, D) deconvolution, which runs outside the UI on pooled bundles.
+A track's alpha curve is a posterior, so tracks don't combine by adding those
+curves; the population comes from the joint likelihoods instead (see `fbm`).
 """
 
 from __future__ import annotations
@@ -35,15 +39,20 @@ from qtpy.QtWidgets import QLabel, QPushButton, QVBoxLayout, QWidget
 from napari_gemscape2 import units
 from napari_gemscape2.fbm import (
     MIN_BITS,
+    MIN_POPULATION_TRACKS,
     TAU_REF_S,
     FbmAnalysis,
+    alpha_population,
     analyze_fbm,
     fbm_options,
+    population_is_cached,
+    population_panels,
+    population_summary,
     scatter_panels,
     summarize_fbm,
     track_panel,
 )
-from napari_gemscape2.joint_plot import plot_alpha_D, plot_fbm_track
+from napari_gemscape2.joint_plot import plot_alpha_D, plot_alpha_population, plot_fbm_track
 from napari_gemscape2.widgets.msd_widgets import fit_window_to_figure
 
 if TYPE_CHECKING:
@@ -57,6 +66,12 @@ if TYPE_CHECKING:
 def _fbm_worker(tracks: pl.DataFrame, acquisition: "Acquisition", options: "FbmPostOptions", progress) -> FbmAnalysis:
     """`fbm.analyze_fbm` off the GUI thread: ~25 ms per 40-frame track, ~1 s at 300 frames."""
     return analyze_fbm(tracks, acquisition, options, progress=progress)
+
+
+@thread_worker(start_thread=False)
+def _population_worker(analysis: FbmAnalysis, groups: dict) -> list[dict]:
+    """`fbm.population_panels` off the GUI thread: one 2D deconvolution per group not yet cached."""
+    return population_panels(analysis, groups)
 
 
 _FBM_HELP = (
@@ -79,11 +94,16 @@ _FBM_HELP = (
     "<br><br><b>Ellipses, not error bars.</b> Within a track, α and D_ref trade off (their "
     "correlation, <i>alpha_D_ref_corr</i>, reaches about &minus;0.75 near the floor), so each track's "
     "error bar is its 1-SD ellipse; its projections are &plusmn;1 SD on each axis."
-    "<br><br><b>No population here.</b> A track's α curve is a posterior, not a likelihood, so "
-    "tracks don't combine by adding their curves (in simulation that was biased), and the plot is "
-    "not a population: a short track's α sits where the prior puts it. The population of α comes "
-    "from the 2D deconvolution of the tracks' joint (α, D) likelihoods, run outside this widget "
-    "on pooled bundles."
+    "<br><br><b>The α–D plot is not a population.</b> A short track's α sits where the prior puts "
+    "it, and a track's α curve is a posterior, so tracks don't combine by adding their curves (in "
+    "simulation that was biased)."
+    "<br><br><b>Population.</b> The distribution of α (and D_ref) across the tracks the filters "
+    "pass: a smooth 2D density fitted to every track's joint (α, D_ref) likelihood, which carries "
+    "no prior, as the D tab's deconvolution is fitted to the tracks' D likelihoods. Uninformative "
+    "tracks change nothing; the band is the population's uncertainty, not the spread of tracks. "
+    f"It needs at least {MIN_POPULATION_TRACKS} fitted tracks. <i>Below the D_ref floor</i> the tracks "
+    "barely tell D_ref values apart, and α there is mostly the smoothness prior continuing α from "
+    "above, so the plot also shows α above the floor and how much of the population lies below it."
 )
 
 
@@ -136,7 +156,16 @@ class FbmTab(QWidget):
             "margin beside its flat prior. Stays open and follows the selection."
         )
         self._track_button.clicked.connect(self._show_track)
-        plot_row = flow_row(QLabel("plot:"), self._scatter_button, self._track_button)
+        self._population_button = QPushButton("Population")
+        self._population_button.setToolTip(
+            "The distribution of α and D_ref across the tracks the filters pass,\n"
+            "one panel per region class: a 2D deconvolution of the tracks' joint\n"
+            "likelihoods (~10 s per thousand tracks, on a worker). Its numbers\n"
+            "join the summary below."
+        )
+        self._population_button.clicked.connect(self._show_population)
+        self._population_window: Optional[PlotWindow] = None
+        plot_row = flow_row(QLabel("plot:"), self._scatter_button, self._track_button, self._population_button)
 
         help_text = note_label(_FBM_HELP)
         help_text.setTextFormat(Qt.TextFormat.RichText)
@@ -189,6 +218,8 @@ class FbmTab(QWidget):
         self._summary.setText(self._format_summary())
         if self._scatter_window is not None and self._scatter_window.isVisible():
             self._show_scatter()
+        if self._population_window is not None and self._population_window.isVisible():
+            self._show_population()
 
     def on_track_selected(self) -> None:
         if self._track_window is not None and self._track_window.isVisible():
@@ -198,11 +229,12 @@ class FbmTab(QWidget):
         """A saved run's columns, reopened with the settings they ran with."""
         self._set_tau(analysis.tau_ref_s)
         n_ok = self._adopt(analysis)
+        no_population = "" if analysis.likelihoods is not None else " (saved without likelihoods: no population)"
         self._status.setText(
             f"saved α · D posteriors loaded: {n_ok} of {analysis.fits.height} tracks fitted, "
-            f"τ_ref {analysis.tau_ref_s:g} s — Run to re-fit"
+            f"τ_ref {analysis.tau_ref_s:g} s{no_population} — Run to re-fit"
         )
-        style_status_label(self._status, "ok")
+        style_status_label(self._status, "ok" if not no_population else "caution")
 
     def report_error(self, text: str) -> None:
         self._status.setText(text)
@@ -268,6 +300,7 @@ class FbmTab(QWidget):
         has_run = self._analysis is not None and self._analysis.ok.height > 0
         self._scatter_button.setEnabled(has_run)
         self._track_button.setEnabled(has_run)
+        self._population_button.setEnabled(has_run and self._analysis.likelihoods is not None)
 
     def _format_summary(self) -> str:
         """Counts over the tracks the filters pass -- by status, how many say
@@ -282,6 +315,7 @@ class FbmTab(QWidget):
             lines.append(f"{sm['n_D_ref_upper_bound']} only bound D_ref from above (D_ref_grid_edge = low)")
         if sm.get("D_ref_floor_median_um2_s") is not None:
             lines.append(f"D_ref floor {units.fmt(sm['D_ref_floor_median_um2_s'], 'D_ref_um2_s')} (median)")
+        lines.extend(self._population_lines())
         acq = self._analysis.acquisition
         lines.append(
             f"τ_ref {self._analysis.tau_ref_s:g} s · dt {units.fmt_unit(acq.dt_s, 's/frame')} · "
@@ -289,7 +323,49 @@ class FbmTab(QWidget):
         )
         return "\n".join(lines)
 
+    def _population_lines(self) -> list[str]:
+        """The population's numbers over the tracks the filters pass, once computed (Population or Save)."""
+        ids = self.host.combined_filtered_track_ids()
+        if self._analysis.likelihoods is None or not population_is_cached(self._analysis, ids):
+            return []
+        pop = alpha_population(self._analysis, ids)
+        if pop is None:
+            return [f"population: needs ≥ {MIN_POPULATION_TRACKS} fitted tracks"]
+        sm = population_summary(pop, self._analysis.options.level)
+
+        def iv(v):
+            return f"{v[0]:.2f} [{v[1]:.2f}, {v[2]:.2f}]"
+
+        return [
+            (f"population ({sm['n_tracks']} tracks): P(α<1) {iv(sm['p_alpha_below_1'])} · "
+             f"mean α {iv(sm['alpha_mean'])} · SD {iv(sm['alpha_sd'])}"),
+            (f"  above the D_ref floor: P(α<1) {iv(sm['above_floor']['p_alpha_below_1'])} · "
+             f"{sm['share_below_floor'][0]:.0%} of the population below it"),
+        ]
+
     # -- plots --
+
+    def _show_population(self) -> None:
+        if self._analysis is None or self._analysis.likelihoods is None:
+            return
+        ids = self.host.combined_filtered_track_ids()
+        groups = self.host.group_track_ids(ids) or {"all": ids}
+        worker = _population_worker(self._analysis, groups)
+        self.host.start_worker(worker, self._on_population, self._on_error, [self._population_button],
+                               "α population")
+
+    def _on_population(self, panels: list[dict]) -> None:
+        self._summary.setText(self._format_summary())
+        if not panels:
+            self._status.setText(f"no group has ≥ {MIN_POPULATION_TRACKS} fitted tracks passing the filters")
+            style_status_label(self._status, "caution")
+            return
+        figure = plot_alpha_population(panels)
+        if self._population_window is None:
+            self._population_window = PlotWindow("α · D: population", parent=self)
+        if not self._population_window.isVisible():
+            fit_window_to_figure(self._population_window, figure)
+        self._population_window.show_figure(figure)
 
     def _show_scatter(self) -> None:
         if self._analysis is None:
