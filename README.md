@@ -509,15 +509,15 @@ as wide as that resolution, and the band widens below the localization floor);
 two modes there mean the log-normal's numbers describe the wrong shape. The
 *shared* D is one D for every track: when the tracks differ it lands near their
 mean D with an interval far too narrow, which σ tells you. The **By length**
-plot splits the tracks' own posteriors (unpooled) by track length
-(`gridpost.by_track_length`), stacked
-so the groups add up to the whole, beside each length's own distribution. Fast
+plot deconvolves the population within each track-length group (3-4, 5-9,
+10-19, 20+ frames; `gridpost.by_track_length`), stacked by the groups' shares
+so they add up to a population, beside each length's own population. A group
+with few tracks is mostly the deconvolution's smoothness prior. Fast
 particles leave the focal depth within a few frames, so short tracks come
-mostly from fast particles and long ones from slow particles. Its window counts
-*each track once* (the default and the usual per-trajectory reading: the stack
-is the sum of the tracks' own posteriors) or *each detection* (a track
-once per frame, so long tracks weigh more: the make-up of the spots seen in
-focus at a moment). Neither is the share of particles, since a fast particle can
+mostly from fast particles and long ones from slow particles. Its window shares
+the groups by *tracks* (the default and the usual per-trajectory reading) or by
+*detections* (a track once per frame, so long tracks weigh more: the make-up of
+the spots seen in focus at a moment); within a group each track counts once. Neither is the share of particles, since a fast particle can
 leave the focus and return as another track.
 Every D axis — the ensemble,
 the posteriors, the track plot, and the joint plot when an axis is D at one
@@ -627,9 +627,10 @@ distributions_D_by_length.csv
                           the same split by track length, long by group, weight
                           (tracks or detections) and length (length_min, length_max
                           in frames; length_max empty for the open last group):
-                          n_tracks, n_detections and unpooled (the tracks' own
-                          posteriors), each the length's share of
-                          all the tracks or detections, so a weight's rows sum to 1
+                          n_tracks, n_detections and deconvolved (the length
+                          group's population times its share of all the tracks or
+                          detections, so a weight's rows sum to 1), with its
+                          band (_low, _high)
 diffusion_summary.json    settings (dt, exposure, grid -- GridPostOptions' fields --,
                           level), population numbers per group (lognormal_D_median_*,
                           lognormal_sigma_ln_D*, lognormal_D_mean_*, shared_D_*,

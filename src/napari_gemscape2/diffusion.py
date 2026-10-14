@@ -43,9 +43,10 @@ averaging their posteriors or histogramming their medians:
     with a pointwise band from posterior draws. A second view, against
     which the log-normal's shape is checked: two modes here mean the
     log-normal's numbers describe the wrong shape;
-  - **by track length**: `gridpost.by_track_length`, the tracks' own
-    posteriors (unpooled) split into track-length groups, per track or per
-    detection. Fast particles leave the focal depth within a
+  - **by track length**: `gridpost.by_track_length`, the population
+    deconvolved within each of a few track-length groups and stacked by the
+    groups' shares, per track or per detection. Fast particles leave the
+    focal depth within a
     few frames, so short tracks come mostly from fast particles and long
     tracks from slow ones;
   - **localization floor** (`D_floor_um2_s`, diffusionkit's
@@ -472,16 +473,20 @@ def length_composition(
     analysis: PosteriorAnalysis, track_ids: Optional[set] = None, weight: str = "tracks"
 ) -> Optional[LengthComposition]:
     """`gridpost.by_track_length` over `track_ids` (all for None): the
-    tracks' own posteriors (unpooled) split into track-length groups, each
-    track counted once (`weight="tracks"`) or once per frame
-    ("detections"). None when no track was fitted. Cached on `analysis`."""
+    population deconvolved within each track-length group, the groups
+    shared by tracks (`weight="tracks"`) or by frames ("detections"). The
+    groups' populations are fitted once, for "tracks", and only re-shared
+    for "detections". None when no track was fitted. Cached on `analysis`."""
 
     def compute():
+        if weight != "tracks":
+            base = length_composition(analysis, track_ids, "tracks")
+            return None if base is None else base.with_weight(weight)
         rows = analysis.rows_for(track_ids)
         if len(rows) == 0:
             return None
         likelihoods = GridLikelihoods(analysis.fitted_ids[rows], analysis.fitted_frames[rows], analysis.loglik_D[rows])
-        return by_track_length(likelihoods, analysis.u_D, weight=weight)
+        return by_track_length(likelihoods, analysis.u_D)
 
     return _cached(analysis, ("length", _ids_key(track_ids), weight), compute)
 
@@ -782,10 +787,11 @@ def length_distributions_table(
     track-length group: `group`, `weight` ("tracks" or "detections"),
     `length_min`/`length_max` (the group's track lengths in frames, both
     ends included; `length_max` empty for the open-ended last group),
-    `n_tracks`, `n_detections`, `D_um2_s` and `unpooled` (the tracks' own
-    flat-prior posteriors), that length group's share of all the group's
-    tracks (or detections): summed over lengths and the grid, a weight's
-    rows add up to 1."""
+    `n_tracks`, `n_detections`, `D_um2_s` and `deconvolved` (that length
+    group's deconvolved population times its share of all the group's
+    tracks, or detections: summed over lengths and the grid, a weight's
+    rows add up to 1), with `deconvolved_low`/`_high`, its pointwise band
+    at the credible level, scaled alike."""
     parts = []
     for name, ids in (groups or {"all": None}).items():
         for weight in LENGTH_WEIGHTS:
@@ -793,6 +799,7 @@ def length_distributions_table(
             if comp is None:
                 continue
             n_grid = len(comp.u)
+            band_lo, band_hi = comp.band(analysis.level)
             upper = [int(e) - 1 for e in comp.edges[1:]] + [None]
             for j in range(len(comp.edges)):
                 parts.append(
@@ -805,7 +812,9 @@ def length_distributions_table(
                             "n_tracks": [int(comp.n_tracks[j])] * n_grid,
                             "n_detections": [int(comp.n_detections[j])] * n_grid,
                             "D_um2_s": np.exp(comp.u),
-                            "unpooled": comp.unpooled[j],
+                            "deconvolved": comp.deconvolved[j],
+                            "deconvolved_low": band_lo[j],
+                            "deconvolved_high": band_hi[j],
                         }
                     )
                 )

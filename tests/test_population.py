@@ -47,7 +47,10 @@ def test_the_tables_name_their_models(analysis):
     assert dist["lognormal"].sum() == pytest.approx(1.0)
     assert dist["shared_loglik"].max() == 0.0
     by_length = dfn.length_distributions_table(analysis)
-    assert "unpooled" in by_length.columns and not any("pooled_" in c for c in by_length.columns)
+    assert {"deconvolved", "deconvolved_low", "deconvolved_high"} <= set(by_length.columns)
+    assert not any("pooled" in c for c in by_length.columns)
+    for _, rows in by_length.group_by("weight"):
+        assert rows["deconvolved"].sum() == pytest.approx(1.0)
     loglik = dfn.loglik_long_table(analysis)
     assert loglik.columns == ["track_id", "D_um2_s", "loglik"]
     per_track = loglik.group_by("track_id").agg(pl.col("loglik").exp().sum())

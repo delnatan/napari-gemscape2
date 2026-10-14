@@ -320,9 +320,19 @@ def _ensemble_worker(analysis: PosteriorAnalysis, id_sets: list) -> None:
 @thread_worker(start_thread=False)
 def _length_worker(analysis: PosteriorAnalysis, id_sets: list, weight: str) -> None:
     """Every `diffusion.length_composition` over `id_sets` at `weight`, off
-    the GUI thread: each is one pass over every track's posterior."""
+    the GUI thread: each is one deconvolution per track-length group."""
     for ids in id_sets:
         length_composition(analysis, ids, weight)
+
+
+@thread_worker(start_thread=False)
+def _tables_worker(analysis: PosteriorAnalysis, id_sets: list) -> None:
+    """The deconvolutions the saved tables read, over `id_sets`, off the GUI
+    thread: each set's ensemble and its track-length groups (fitted once;
+    the "detections" weighting only re-shares them). All cached on `analysis`."""
+    for ids in id_sets:
+        ensemble(analysis, ids)
+        length_composition(analysis, ids, "tracks")
 
 
 @thread_worker(start_thread=False)
@@ -916,13 +926,13 @@ _POSTERIOR_HELP = (
     "resolution, and below the localization floor the band widens because the tracks "
     "cannot tell those D apart. It takes a second or two per group, so the summary and "
     "figures update shortly after a filter change."
-    "<br><br><b>By length</b>: the tracks' own posteriors (unpooled), stacked by track "
-    "length. Fast particles leave the focal depth within a few frames, "
+    "<br><br><b>By length</b>: the population deconvolved within each track-length group "
+    "(3&ndash;4, 5&ndash;9, 10&ndash;19, 20+ frames), stacked by the groups' shares. A group "
+    "with few tracks is mostly the deconvolution's smoothness prior. Fast particles leave the focal depth within a few frames, "
     "so short tracks come mostly from fast particles and long ones from slow particles. "
-    "Its window counts <i>each track once</i> (the default, and the usual per-trajectory "
-    "reading: the stack is the sum of the tracks' own posteriors) or <i>each "
-    "detection</i> (a track once per frame, so long tracks weigh more: the make-up of the "
-    "spots seen in focus at a moment). Neither is the share of particles: a fast particle "
+    "Its window shares the groups by <i>tracks</i> (the default, the usual per-trajectory "
+    "reading) or by <i>detections</i> (a track once per frame, so long tracks weigh more: "
+    "the make-up of the spots seen in focus at a moment); within a group each track counts once. Neither is the share of particles: a fast particle "
     "leaves the focus and may come back as another track, a slow one stays as one long "
     "track. Tracks shorter than <i>min points</i> are in neither."
     "<br><br><b>Localization floor</b> (<i>D_floor_um2_s</i>): the D at which a track's "
@@ -1913,6 +1923,8 @@ class DiffusionAnalysisWidget(QWidget):
         # the window they ran on.
         self._posterior: Optional[PosteriorAnalysis] = None
         self._posterior_df: Optional[pl.DataFrame] = None
+        # The save's deconvolutions, while they run (`_save_results`).
+        self._save_worker = None
         # The last alpha-D (fBm) run, and its per-track columns.
         self._fbm: Optional[FbmAnalysis] = None
         self._msd_df: Optional[pl.DataFrame] = None
@@ -2620,7 +2632,7 @@ class DiffusionAnalysisWidget(QWidget):
 
     def _update_save_enabled(self) -> None:
         has_results = self._posterior is not None or self._fbm is not None or bool(self._nuts_rows)
-        self._save_button.setEnabled(has_results and self._result_dir is not None)
+        self._save_button.setEnabled(has_results and self._result_dir is not None and self._save_worker is None)
         self._export_csv_button.setEnabled(self._base_track_df is not None)
 
     # -- track table + selection --
@@ -3033,28 +3045,52 @@ class DiffusionAnalysisWidget(QWidget):
         self._posterior_tab.report_saved(f"exported {table.height} tracks to {path}")
 
     def _save_results(self) -> None:
-        if self._result_dir is None:
+        """Save what the widget shows now. The deconvolutions the tables need
+        (the ensemble and each track-length group's) are computed on a worker
+        first (`_tables_worker`); the rest is written when it returns."""
+        if self._result_dir is None or self._save_worker is not None:
             return
         table = self.tracks_summary()
         if table is None:
             return
-        analysis = self._posterior
-        summary: dict = {}
-        tables: dict = {}
-        if analysis is not None:
-            # The ensemble is over the tracks the filters pass -- the same
-            # set `passes_filters` marks in the summary table -- split by
-            # region class when there are several.
-            ids = self.combined_filtered_track_ids()
-            by_class = self.group_track_ids(ids)
-            tables = analysis_tables(analysis, ids, by_class)
-            summary = analysis_summary(
-                analysis, ids, by_class, msd=self._msd_window if self._msd_df is not None else None
-            )
+        # The ensemble is over the tracks the filters pass -- the same set
+        # `passes_filters` marks in the summary table -- split by region
+        # class when there are several.
+        ids = self.combined_filtered_track_ids()
+        by_class = self.group_track_ids(ids)
+        extra: dict = {}
         if self._fbm is not None:
-            ids = self.combined_filtered_track_ids()
-            summary["alpha_D"] = fbm_record(self._fbm, ids, self.group_track_ids(ids))
-        summary["tracks_summary_filters"] = self._summary_filter_record()
-        summary["packages"] = _analysis_packages()
-        write_diffusion_results(self._result_dir, tracks_summary=table, summary=summary, **tables)
-        self._posterior_tab.report_saved(f"saved {table.height} tracks' analysis to {self._result_dir.name}/")
+            extra["alpha_D"] = fbm_record(self._fbm, ids, by_class)
+        extra["tracks_summary_filters"] = self._summary_filter_record()
+        extra["packages"] = _analysis_packages()
+        analysis = self._posterior
+        msd = self._msd_window if self._msd_df is not None else None
+        result_dir = self._result_dir
+
+        def write(_result=None) -> None:
+            self._save_worker = None
+            self._update_save_enabled()
+            tables: dict = {}
+            summary: dict = {}
+            if analysis is not None:
+                tables = analysis_tables(analysis, ids, by_class)
+                summary = analysis_summary(analysis, ids, by_class, msd=msd)
+            summary.update(extra)
+            write_diffusion_results(result_dir, tracks_summary=table, summary=summary, **tables)
+            self._posterior_tab.report_saved(f"saved {table.height} tracks' analysis to {result_dir.name}/")
+
+        if analysis is None:
+            write()
+            return
+        self._posterior_tab.report_caution("saving: deconvolving the populations…")
+        worker = _tables_worker(analysis, [ids, *(by_class or {}).values()])
+        worker.returned.connect(write)
+        worker.errored.connect(self._save_failed)
+        self._save_worker = worker
+        self._save_button.setEnabled(False)
+        worker.start()
+
+    def _save_failed(self, exc: Exception) -> None:
+        self._save_worker = None
+        self._update_save_enabled()
+        self._posterior_tab.report_error(f"could not save: {exc}")

@@ -437,13 +437,13 @@ def plot_d_by_length(panels: list[dict], title: str | None = None) -> Figure:
     per panel (`diffusion.length_panels`: `name`, `composition` -- a
     diffusionkit `LengthComposition` -- and `floor`).
 
-    Left, the tracks' own flat-prior posteriors (unpooled), stacked by
-    track-length group: each group's band is its share of all the tracks
-    (or detections, as the composition was weighted), so the stack is the
-    whole distribution. Right, each group's own distribution, scaled to its
-    peak, with its tracks and
+    Left, each track-length group's deconvolved population, stacked: each
+    group's band is its share of all the tracks (or detections, as the
+    composition was weighted), so the stack is a population. Right, each
+    group's own population, scaled to its peak, with its tracks and
     detections at the right: short tracks come mostly from fast particles,
-    which leave the focal depth within a few frames."""
+    which leave the focal depth within a few frames. A group with few tracks
+    is mostly the deconvolution's smoothness prior."""
     n = len(panels)
     fig = Figure(figsize=(8.5, 1.0 + 3.0 * n), layout="constrained")
     axes = fig.subplots(n, 2, squeeze=False, sharex=True, gridspec_kw={"width_ratios": [1, 1.15]})
@@ -452,7 +452,7 @@ def plot_d_by_length(panels: list[dict], title: str | None = None) -> Figure:
         comp = panel["composition"]
         x = comp.u / np.log(10)
         dx = float(np.mean(np.diff(x)))
-        contrib = comp.unpooled
+        contrib = comp.deconvolved
         lo, hi = _mass_range(contrib.sum(axis=0), x, tail=0.005)
         if panel.get("floor") is not None:
             lo, hi = min(lo, np.log10(panel["floor"][1])), max(hi, np.log10(panel["floor"][1]))
@@ -469,7 +469,7 @@ def plot_d_by_length(panels: list[dict], title: str | None = None) -> Figure:
             bottom = upper
         if panel.get("floor") is not None:
             _draw_floor(ax, tuple(np.log10(panel["floor"])))
-        ax.set_title(f"{panel['name']} · unpooled, by track length", fontsize=9, loc="left", color=_INK)
+        ax.set_title(f"{panel['name']} · deconvolved, by track length", fontsize=9, loc="left", color=_INK)
         ax.set_ylabel(f"{comp.weight} per $\\log_{{10}} D$", fontsize=8, color=_MUTED_INK)
         ax.set_ylim(0, bottom.max() * 1.05)
         ax.legend(title="frames", fontsize=7, title_fontsize=7, frameon=False, loc="upper left", reverse=True)
@@ -487,16 +487,16 @@ def plot_d_by_length(panels: list[dict], title: str | None = None) -> Figure:
             ax.text(1.01, j, f"{comp.n_tracks[j]} / {comp.n_detections[j]}", transform=ax.get_yaxis_transform(),
                     va="center", fontsize=7, color=_MUTED_INK)
         ax.set_ylabel("track length (frames)", fontsize=8, color=_MUTED_INK)
-        ax.set_title("each length's own distribution (peak = 1) · tracks / detections", fontsize=9, loc="left",
+        ax.set_title("each length's own population (peak = 1) · tracks / detections", fontsize=9, loc="left",
                      color=_INK)
     axes[-1][0].set_xlim(x_lo - _LOG_D_PAD, x_hi + _LOG_D_PAD)
     for ax in axes[-1]:
         ax.set_xlabel(units.mpl_log_label("D_um2_s"), fontsize=9)
     if title is None:
         title = (
-            "counted per track: each track once -- the stack is the sum of the tracks' own posteriors"
+            "shared per track: each length group's population, stacked by its share of the tracks"
             if panels[0]["composition"].weight == "tracks"
-            else "counted per detection: each track once per frame, so long (often slow) tracks weigh more -- "
+            else "shared per detection: each group weighed by its frames, so long (often slow) tracks weigh more -- "
             "the make-up of the spots in focus"
         )
     fig.suptitle(title, fontsize=8, x=0.01, ha="left", color=_MUTED_INK)
