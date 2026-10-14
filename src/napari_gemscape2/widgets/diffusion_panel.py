@@ -53,7 +53,9 @@ pointed at a selection you could not see.
   track's value) colored by any per-track value -- track length from the
   start, then any fit's result: the spatial map, and the reason this
   analysis stays inside napari next to the image. The layer is added when
-  the tab is first opened. See `_MapTab`.
+  the tab is first opened. The same coloring is also drawn as a figure,
+  each track a line over the regions it was linked in, in a window that
+  saves it (`track_map.plot_track_map`). See `_MapTab`.
 - **NUTS** -- `diffusionkit.bayes.fit_track` on the selected track, with
   its corner plot; needs the optional `[bayes]` extra. See `_NutsTab`.
 
@@ -197,11 +199,13 @@ from napari_gemscape2.diffusion import (
 )
 from napari_gemscape2.fbm import FbmAnalysis, alpha_population, fbm_record, restore_fbm
 from napari_gemscape2.fbm import loglik_long_table as fbm_loglik_table
+from napari_gemscape2.track_map import plot_track_map
 from napari_gemscape2.results import (
     TRACKS_SUMMARY_FILENAME,
     load_diffusion_results,
     load_diffusion_summary,
     load_loglik_alpha_D,
+    load_regions,
     load_tracks_summary,
     package_provenance,
     write_diffusion_results,
@@ -217,7 +221,7 @@ from napari_gemscape2.joint_plot import (
     plot_track_posterior,
 )
 from napari_gemscape2.pipeline import filter_mask
-from napari_gemscape2.viewer import set_tracks_layer_data
+from napari_gemscape2.viewer import region_classes, set_tracks_layer_data
 from napari_gemscape2.widgets.feature_filters import FeatureFilterPanel
 from napari_gemscape2.widgets.msd_tab import MSDTab
 from napari_gemscape2.widgets.fbm_tab import FbmTab
@@ -1664,7 +1668,13 @@ class _MapTab(QWidget):
     (`DiffusionAnalysisWidget.register_spatial_source`) -- the reason this analysis stays inside
     napari next to the image. Nothing to run here; the color range is set
     by dragging the histogram, and a written scale says what the colors
-    mean, since a napari Points layer colored by a feature has no legend."""
+    mean, since a napari Points layer colored by a feature has no legend.
+
+    "Show figure" draws the same coloring in matplotlib
+    (`track_map.plot_track_map`): each track a line rather than dots,
+    with a colorbar, optionally over the regions, in a window that saves
+    it. While that window is open it follows the color-by, range, log and
+    filters, after a short pause so a histogram drag redraws once."""
 
     def __init__(self, host: "DiffusionAnalysisWidget") -> None:
         super().__init__()
@@ -1686,6 +1696,23 @@ class _MapTab(QWidget):
         self._map_histogram = HistogramRangeWidget()
         self._map_histogram.setEnabled(False)
         self._map_histogram.rangeChanged.connect(self._on_map_range_changed)
+        self._figure_button = QPushButton("Show figure")
+        self._figure_button.setEnabled(False)
+        self._figure_button.setToolTip(
+            "Each track as a line in this color range, with a colorbar,\n"
+            "in a window whose toolbar saves it (PNG, PDF, SVG)."
+        )
+        self._figure_button.clicked.connect(self._show_figure)
+        self._regions_check = QCheckBox("regions")
+        self._regions_check.setChecked(True)
+        self._regions_check.setEnabled(False)
+        self._regions_check.setToolTip("Draw the regions the tracks were linked in, from the layer's bundle.")
+        self._regions_check.toggled.connect(self._schedule_figure)
+        self._figure_window: Optional[PlotWindow] = None
+        self._figure_timer = QTimer(self)
+        self._figure_timer.setSingleShot(True)
+        self._figure_timer.setInterval(250)
+        self._figure_timer.timeout.connect(self._refresh_figure)
 
         layout = QVBoxLayout()
         layout.setContentsMargins(6, 6, 6, 6)
@@ -1694,6 +1721,7 @@ class _MapTab(QWidget):
         layout.addLayout(color_form)
         layout.addWidget(self._map_scale_label)
         layout.addWidget(self._map_histogram)
+        layout.addWidget(flow_row(self._figure_button, self._regions_check))
         layout.addStretch()
         self.setLayout(layout)
 
@@ -1712,16 +1740,22 @@ class _MapTab(QWidget):
         self._map_log_scale_check.setEnabled(False)
         self._map_scale_label.setText("")
         self._hint.setVisible(True)
+        self._figure_button.setEnabled(False)
+        self._regions_check.setEnabled(False)
+        if self._figure_window is not None:
+            self._figure_window.hide()
 
     def _on_color_by_changed(self, column: str) -> None:
         if not column:
             return
         self.host.set_map_color_by(column)
         self._refresh_map_histogram(reset_range=True)
+        self._schedule_figure()
 
     def _on_map_range_changed(self, vmin: float, vmax: float) -> None:
         self.host.set_map_contrast_limits(vmin, vmax)
         self._update_map_scale_label(vmin, vmax)
+        self._schedule_figure()
 
     def _on_map_log_scale_toggled(self, enabled: bool) -> None:
         """Re-bin the histogram on a log10 axis. `set_log_scale` is silent
@@ -1731,6 +1765,7 @@ class _MapTab(QWidget):
         vmin, vmax = self._map_histogram.range()
         self.host.set_map_contrast_limits(vmin, vmax)
         self._update_map_scale_label(vmin, vmax)
+        self._schedule_figure()
 
     def _update_map_scale_label(self, vmin: Optional[float] = None, vmax: Optional[float] = None) -> None:
         column = self._color_by_picker.currentText()
@@ -1767,6 +1802,8 @@ class _MapTab(QWidget):
         self._color_by_picker.setEnabled(enabled)
         self._map_histogram.setEnabled(enabled)
         self._map_log_scale_check.setEnabled(enabled)
+        self._figure_button.setEnabled(enabled)
+        self._regions_check.setEnabled(enabled and self.host.map_regions() is not None)
         if enabled:
             self.host.set_map_color_by(self._color_by_picker.currentText())
 
@@ -1774,6 +1811,7 @@ class _MapTab(QWidget):
         """After a filter change: the color range stays as set, only the
         histogram's data follows the new filtered set."""
         self._refresh_map_histogram(reset_range=False)
+        self._schedule_figure()
 
     def _refresh_map_histogram(self, reset_range: bool) -> None:
         values = self.host.map_values_for_histogram()
@@ -1789,6 +1827,28 @@ class _MapTab(QWidget):
             self.host.set_map_contrast_limits(float(lo), float(hi))
         self._map_histogram.blockSignals(False)
         self._update_map_scale_label()
+
+    def _schedule_figure(self, *_args) -> None:
+        """Redraw the figure once things settle, if its window is open."""
+        if self._figure_window is not None and self._figure_window.isVisible():
+            self._figure_timer.start()
+
+    def _refresh_figure(self) -> None:
+        if self._figure_window is not None and self._figure_window.isVisible():
+            self._show_figure()
+
+    def _show_figure(self) -> None:
+        vmin, vmax = self._map_histogram.range()
+        figure = self.host.track_map_figure(
+            vmin, vmax, log=self._map_log_scale_check.isChecked(),
+            regions=self._regions_check.isEnabled() and self._regions_check.isChecked(),
+        )
+        if figure is None:
+            return
+        if self._figure_window is None:
+            self._figure_window = PlotWindow("Map: tracks", parent=self)
+            fit_window_to_figure(self._figure_window, figure)
+        self._figure_window.show_figure(figure)
 
 
 def _bayes_available() -> bool:
@@ -1956,6 +2016,8 @@ class DiffusionAnalysisWidget(QWidget):
         self._tracks_layer: Optional[Tracks] = None
         self._highlight_layer: Optional[Shapes] = None
         self._spatial_map_layer: Optional[Points] = None
+        # (result_dir, regions found there) -- see `map_regions`.
+        self._map_regions_cache: Optional[tuple] = None
         self._mouse_callback = None
         # True while this widget is itself rewriting the tracks layer
         # ("sync viewer"), so that write isn't mistaken for someone else
@@ -2913,6 +2975,47 @@ class DiffusionAnalysisWidget(QWidget):
         if merged is None or self._map_color_by is None or self._map_color_by not in merged.columns:
             return None
         return merged[self._map_color_by].drop_nulls().to_numpy()
+
+    def map_regions(self) -> Optional[tuple[np.ndarray, dict[int, str]]]:
+        """`(labels, {label: class})` the loaded tracks were made with, read
+        from the layer's bundle once per bundle, or None without one."""
+        if self._result_dir is None:
+            return None
+        cached = self._map_regions_cache
+        if cached is None or cached[0] != self._result_dir:
+            labels, regions = load_regions(self._result_dir)
+            found = None if labels is None or not regions.table else (labels, region_classes(regions))
+            self._map_regions_cache = cached = (self._result_dir, found)
+        return cached[1]
+
+    def track_map_figure(self, vmin: float, vmax: float, log: bool, regions: bool):
+        """The Map tab's coloring as a matplotlib figure
+        (`track_map.plot_track_map`), over the filtered tracks; None when
+        there is nothing to draw."""
+        merged = self._filtered_map_df()
+        color_by = self._map_color_by
+        if merged is None or color_by is None or self._tracks_df_px is None or not vmin < vmax:
+            return None
+        found = self.map_regions() if regions else None
+        labels, classes = found if found is not None else (None, None)
+        return plot_track_map(
+            self._tracks_df_px,
+            merged.select("track_id", color_by),
+            color_by,
+            vmin,
+            vmax,
+            log=log,
+            pixel_size_um=self.pixel_size_um if self.units_known else None,
+            labels=labels,
+            region_classes=classes,
+            title=self._map_title(),
+        )
+
+    def _map_title(self) -> Optional[str]:
+        """The bundle's name (the movie), else the layer's."""
+        if self._result_dir is not None:
+            return self._result_dir.name
+        return self._tracks_layer.name if self._tracks_layer is not None else None
 
     def show_spatial_map(self) -> None:
         """Draw the spatial map now (the Map tab came into view)."""
