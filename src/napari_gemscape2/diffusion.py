@@ -612,19 +612,14 @@ def _scalar(value) -> Optional[float]:
 def ensemble_panels(
     analysis: PosteriorAnalysis,
     groups: Optional[dict[str, Optional[set]]] = None,
-    *,
-    track_posteriors: bool = False,
 ) -> list[dict]:
-    """What `joint_plot.plot_d_ensemble` and `plot_d_posteriors` draw, one
+    """What `joint_plot.plot_d_ensemble` draws, one
     dict per group (default one group, "all"); groups with no fitted track
     are left out. Each holds the three population reads (`Ensemble`):
     `lognormal` (weights on the grid) with its pointwise `lognormal_band`
     and its numbers (`lognormal_summary`'s keys, under `summary`),
     `deconvolved` with its `deconvolved_band`, and `shared_interval`
-    (low, median, high), all at credible `level`. `track_posteriors` adds
-    every track's flat-prior posterior as rows sorted by where its
-    likelihood peaks -- not by its median, which a wide posterior's prior
-    sets -- for the heat map. `floor` is the tracks' localization floor as
+    (low, median, high), all at credible `level`. `floor` is the tracks' localization floor as
     (10%, median, 90%), None when no track has one."""
     fits = analysis.fits.filter(pl.col("posterior_status") == "ok")
     panels = []
@@ -646,10 +641,6 @@ def ensemble_panels(
             "shared_interval": (shared["low"], shared["median"], shared["high"]),
             "floor": floor_band(rows["D_floor_um2_s"]),
         }
-        if track_posteriors:
-            lls = analysis.loglik_D[analysis.rows_for(ids)]
-            order = np.argsort(lls.argmax(axis=1), kind="stable")
-            panel["track_posteriors"] = np.exp(lls[order])
         panels.append(panel)
     return panels
 
@@ -683,7 +674,7 @@ def floor_band(floors) -> Optional[tuple[float, float, float]]:
 
 
 # The alpha-D run's D_ref columns, whose scale is its own floor, `D_ref_floor_um2_s`.
-D_REF_FLOOR_COLUMNS = ("D_ref_mean_um2_s", "D_ref_low_um2_s", "D_ref_high_um2_s")
+D_REF_FLOOR_COLUMNS = ("D_ref_hat_um2_s", "D_ref_low_um2_s", "D_ref_high_um2_s")
 
 
 def floor_references(table: pl.DataFrame, columns) -> dict[str, tuple[float, float, float]]:

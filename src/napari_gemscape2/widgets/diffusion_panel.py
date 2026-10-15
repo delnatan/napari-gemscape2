@@ -63,8 +63,9 @@ Saving writes the per-track summary (`tracks_summary.csv`), every
 track's log-likelihood over D (`loglik_D.parquet`), the ensemble distributions
 (`distributions_D.csv`, `distributions_D_by_length.csv`) and the settings and
 population numbers (`diffusion_summary.json`, with an "alpha_D" entry for
-an α · D run, whose per-track columns are in the summary table and whose
-joint likelihoods are in `loglik_alpha_D.parquet`) into the
+an α · D run, whose per-track columns are in the summary table, whose
+joint likelihoods are in `loglik_alpha_D.parquet` and whose profiles of
+alpha are in `profile_alpha.parquet`) into the
 layer's bundle -- see `results.py`. Picking a layer whose bundle has a saved
 analysis restores it (`diffusion.restore_analysis`, `fbm.restore_fbm`,
 each on its own) when the tracks it was fitted on are still the layer's,
@@ -199,12 +200,14 @@ from napari_gemscape2.diffusion import (
 )
 from napari_gemscape2.fbm import FbmAnalysis, alpha_population, fbm_record, restore_fbm
 from napari_gemscape2.fbm import loglik_long_table as fbm_loglik_table
+from napari_gemscape2.fbm import profile_long_table
 from napari_gemscape2.track_map import plot_track_map
 from napari_gemscape2.results import (
     TRACKS_SUMMARY_FILENAME,
     load_diffusion_results,
     load_diffusion_summary,
     load_loglik_alpha_D,
+    load_profile_alpha,
     load_regions,
     load_tracks_summary,
     package_provenance,
@@ -216,7 +219,6 @@ from napari_gemscape2.joint_plot import (
     numeric_columns,
     plot_d_by_length,
     plot_d_ensemble,
-    plot_d_posteriors,
     plot_property_joint,
     plot_track_posterior,
 )
@@ -416,7 +418,7 @@ class _ProgressRelay(QObject):
 _TRACK_COLOR_EXPRESSIONS = {
     "log10_D_mean": pl.col("D_mean_um2_s").log10(),
     "D_info_bits": pl.col("D_info_bits"),
-    "alpha_mean": pl.col("alpha_mean"),
+    "alpha_hat": pl.col("alpha_hat"),
 }
 _TRACK_COLOR_COLUMNS = tuple(_TRACK_COLOR_EXPRESSIONS)
 
@@ -1025,7 +1027,7 @@ class _AcquisitionRow(QWidget):
         self._exposure = double_spinbox(
             self._EXPOSURE_UNSET, self._EXPOSURE_UNSET, 3600.0, 0.001, decimals=4, suffix=" s",
             tooltip="Camera exposure per frame -- how long the sensor integrates, not\n"
-            "the frame interval. Both posteriors (D and α · D) model the blur of a\n"
+            "the frame interval. Both runs (D and α · D) model the blur of a\n"
             "continuous exposure; entering 0 when the camera exposed for 20 ms\n"
             "biases D low.\n\n"
             "Pre-filled from the layer when the file (or the image panel's\n"
@@ -1128,7 +1130,7 @@ class _PosteriorTab(QWidget):
     across tracks -- the standard quantification. Its exposure and min
     points are the shared `_AcquisitionRow`'s.
 
-    The summary and the Ensemble and Posteriors figures are read over the
+    The summary and the Ensemble figure are read over the
     tracks the tracks pane currently passes (and grouped by region class
     when there are several), so a filter change updates them without a
     re-run: the per-track posteriors don't depend on which other tracks
@@ -1142,7 +1144,6 @@ class _PosteriorTab(QWidget):
         self._summary_values: Optional[dict] = None
         self._summary_by_group: Optional[dict] = None
         self._ensemble_window: Optional[PlotWindow] = None
-        self._posteriors_window: Optional[PlotWindow] = None
         self._length_window: Optional[PlotWindow] = None
         # The by-length split's worker (one at a time), and whether the
         # filters or the weight changed while it ran.
@@ -1201,13 +1202,6 @@ class _PosteriorTab(QWidget):
             "The selected track's posterior. Stays open and follows the selection."
         )
         self._track_button.clicked.connect(self._show_track)
-        self._posteriors_button = QPushButton("Posteriors")
-        self._posteriors_button.setToolTip(
-            "Every track's posterior as one row of a heat map, sorted by where\n"
-            "its likelihood peaks, beside the population reads of the Ensemble\n"
-            "plot -- over the tracks the filters pass."
-        )
-        self._posteriors_button.clicked.connect(self._show_posteriors)
         self._length_button = QPushButton("By length")
         self._length_button.setToolTip(
             "The tracks' own posteriors stacked by track length, and each\n"
@@ -1232,7 +1226,6 @@ class _PosteriorTab(QWidget):
         plot_row = flow_row(
             QLabel("plot:"),
             self._ensemble_button,
-            self._posteriors_button,
             self._length_button,
             self._track_button,
         )
@@ -1340,7 +1333,6 @@ class _PosteriorTab(QWidget):
     def _refresh_plot_buttons(self) -> None:
         has_run = self._analysis is not None and len(self._analysis.fitted_ids) > 0
         self._ensemble_button.setEnabled(has_run)
-        self._posteriors_button.setEnabled(has_run)
         self._length_button.setEnabled(has_run)
         self._track_button.setEnabled(has_run)
 
@@ -1459,30 +1451,20 @@ class _PosteriorTab(QWidget):
         )
         if self._ensemble_window is not None and self._ensemble_window.isVisible():
             self._show_ensemble()
-        if self._posteriors_window is not None and self._posteriors_window.isVisible():
-            self._show_posteriors()
         self._refresh_length_window()
 
-    def _panels(self, *, track_posteriors: bool = False) -> list[dict]:
+    def _panels(self) -> list[dict]:
         """`ensemble_panels` over the tracks the filters pass, one per
         region class when there are several -- or [] (and says so)."""
         if self._analysis is None:
             return []
         ids = self.host.combined_filtered_track_ids()
         groups = self.host.group_track_ids(ids) or {"all": ids}
-        panels = ensemble_panels(self._analysis, groups, track_posteriors=track_posteriors)
+        panels = ensemble_panels(self._analysis, groups)
         if not panels:
             self._status.setText("no fitted tracks pass the current filters")
             style_status_label(self._status, "caution")
         return panels
-
-    def _show_posteriors(self) -> None:
-        panels = self._panels(track_posteriors=True)
-        if not panels:
-            return
-        if self._posteriors_window is None:
-            self._posteriors_window = PlotWindow("Posterior: every track", parent=self)
-        self._posteriors_window.show_figure(plot_d_posteriors(self._analysis.D_grid_um2_s, panels))
 
     def _show_ensemble(self) -> None:
         panels = self._panels()
@@ -2097,7 +2079,8 @@ class DiffusionAnalysisWidget(QWidget):
             f"Write the per-track summary ({TRACKS_SUMMARY_FILENAME}, with every\n"
             "run's columns, α · D's included), every track's log-likelihood\n"
             "over D (loglik_D.parquet) and, after an α · D run, over\n"
-            "(α, D_ref) (loglik_alpha_D.parquet), the ensemble\n"
+            "(α, D_ref) (loglik_alpha_D.parquet) and its profiles of α\n"
+            "(profile_alpha.parquet), the ensemble\n"
             "distributions of D (distributions_D.csv and, by track length,\n"
             "distributions_D_by_length.csv, over the tracks the\n"
             "filters pass) and the settings and population summary\n"
@@ -2639,10 +2622,11 @@ class DiffusionAnalysisWidget(QWidget):
                 if table is None:
                     raise StaleAnalysisError("its per-track table is missing")
                 self._fbm_tab.restore(restore_fbm(self._diffkit_tracks, summary["alpha_D"], table,
-                                                  load_loglik_alpha_D(self._result_dir)))
+                                                  load_loglik_alpha_D(self._result_dir),
+                                                  load_profile_alpha(self._result_dir)))
                 restored = summary
             except errors as exc:
-                self._fbm_tab.report_error(f"saved α · D posteriors not loaded: {exc} — Run to re-fit")
+                self._fbm_tab.report_error(f"saved α · D fits not loaded: {exc} — Run to re-fit")
         if restored is None:
             return
         # The tracks pane's cuts it was summarized under -- after the
@@ -2792,7 +2776,7 @@ class DiffusionAnalysisWidget(QWidget):
         numeric = [c for c, dtype in zip(columns.columns, columns.dtypes) if dtype.is_numeric()]
         self.register_spatial_source("fbm", columns.select(numeric))
         self._rebuild_track_table()
-        self._map_tab.on_spatial_source_registered("alpha_mean")
+        self._map_tab.on_spatial_source_registered("alpha_hat")
         self._update_save_enabled()
 
     def register_spatial_source(self, name: str, df: pl.DataFrame) -> None:
@@ -3191,6 +3175,7 @@ class DiffusionAnalysisWidget(QWidget):
             if fbm is not None:
                 summary["alpha_D"] = fbm_record(fbm, ids, by_class)
                 tables["loglik_alpha_D"] = fbm_loglik_table(fbm)
+                tables["profile_alpha"] = profile_long_table(fbm)
             summary.update(extra)
             write_diffusion_results(result_dir, tracks_summary=table, summary=summary, **tables)
             self._posterior_tab.report_saved(f"saved {table.height} tracks' analysis to {result_dir.name}/")

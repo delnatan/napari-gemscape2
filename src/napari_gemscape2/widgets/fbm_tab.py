@@ -1,28 +1,28 @@
-"""The diffusion widget's α · D tab: diffusionkit's fBm grid posteriors
+"""The diffusion widget's α · D tab: diffusionkit's fBm profile-likelihood fits
 (`napari_gemscape2.fbm`), per track, beside the Brownian D tab.
 
 The D tab is the standard quantification of how fast tracks move. This one
 answers a different question -- what each track's anomalous exponent alpha
-is -- with a second posterior, whose amplitude it reports as D_ref at a
-reference lag. D_ref is not a Brownian D (see `fbm`), and the tab says so
-wherever D_ref is shown.
+is -- with a second fit, whose amplitude it reports as D_ref at a reference
+lag. D_ref is not a Brownian D (see `fbm`), and the tab says so wherever
+D_ref is shown.
 
-- **Run** -- every track's joint posterior over (alpha, D_ref): the alpha_* and
-  D_ref_* columns in the tracks pane, so the Map tab can color by alpha and
-  the filters can cut on `alpha_info_bits`.
-- **α–D** -- every fitted track's alpha against D_ref with its 1-SD posterior
-  ellipse, one panel per region class, over the tracks the filters pass
+- **Run** -- every track's alpha_hat with its likelihood-ratio interval, the
+  test of alpha = 1 and D_ref: the alpha_* and D_ref_* columns in the tracks
+  pane, so the Map tab can color by alpha and the filters can cut on them.
+- **α–D** -- every fitted track's alpha_hat against D_ref with its intervals,
+  one panel per region class, over the tracks the filters pass
   (`joint_plot.plot_alpha_D`).
-- **Track** -- the selected track's joint posterior with both margins, alpha's
-  drawn beside the flat prior it started from (`joint_plot.plot_fbm_track`).
+- **Track** -- the selected track's likelihood over (alpha, D_ref) with its
+  profiles (`joint_plot.plot_fbm_track`).
 - **Population** -- the distribution of (alpha, D_ref) across the tracks the
   filters pass, per region class: diffusionkit's 2D deconvolution of their
   joint likelihoods (`fbm.alpha_population`, `joint_plot.plot_alpha_population`),
-  on a worker (~10 s per thousand tracks). Its numbers join the summary once
-  computed, and Save computes them for the bundle.
+  on a worker (~10 s per thousand tracks), with the shared alpha beside it. Its
+  numbers join the summary once computed, and Save computes them for the bundle.
 
-A track's alpha curve is a posterior, so tracks don't combine by adding those
-curves; the population comes from the joint likelihoods instead (see `fbm`).
+The shared alpha (one alpha for every track, summed profiles) is in the summary
+from the run on.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ from qtpy.QtWidgets import QLabel, QPushButton, QVBoxLayout, QWidget
 
 from napari_gemscape2 import units
 from napari_gemscape2.fbm import (
-    MIN_BITS,
+    BROWNIAN_P,
     MIN_POPULATION_TRACKS,
     TAU_REF_S,
     FbmAnalysis,
@@ -49,6 +49,7 @@ from napari_gemscape2.fbm import (
     population_panels,
     population_summary,
     scatter_panels,
+    shared_alpha_summary,
     summarize_fbm,
     track_panel,
 )
@@ -64,7 +65,7 @@ if TYPE_CHECKING:
 
 @thread_worker(start_thread=False)
 def _fbm_worker(tracks: pl.DataFrame, acquisition: "Acquisition", options: "FbmPostOptions", progress) -> FbmAnalysis:
-    """`fbm.analyze_fbm` off the GUI thread: ~25 ms per 40-frame track, ~1 s at 300 frames."""
+    """`fbm.analyze_fbm` off the GUI thread: ~40 ms per 40-frame track, ~2 s at 300 frames, per core."""
     return analyze_fbm(tracks, acquisition, options, progress=progress)
 
 
@@ -75,32 +76,35 @@ def _population_worker(analysis: FbmAnalysis, groups: dict) -> list[dict]:
 
 
 _FBM_HELP = (
-    "<b>What this is.</b> A second per-track posterior, beside the D tab's: the joint posterior of "
-    "the anomalous exponent <b>α</b> and an amplitude under fractional Brownian motion, with the "
-    "same exposure blur and localization SDs. At α = 1 its likelihood is the D tab's. Use the "
-    "<b>D</b> tab for how fast tracks move; use this one when α is the question."
-    "<br><br><b>Priors.</b> Every number here is a posterior, and the priors matter. α is flat on "
-    "0.02&ndash;1.98; the amplitude is flat in ln SNR. A track that carries no information on α "
-    "returns its prior: mean 1, interval 0.1&ndash;1.9, and <i>alpha_info_bits</i> near 0. The "
-    f"α&ndash;D plot draws tracks with less than {MIN_BITS:g} bit grey, and the Track plot draws "
-    "the prior beside the posterior, so how much of a track's α is data shows directly."
+    "<b>What this is.</b> A second per-track fit, beside the D tab's: the anomalous exponent "
+    "<b>α</b> and an amplitude under fractional Brownian motion, with the same exposure blur and "
+    "localization SDs. At α = 1 its likelihood is the D tab's. Use the <b>D</b> tab for how fast "
+    "tracks move; use this one when α is the question."
+    "<br><br><b>No prior.</b> For each α the amplitude is set to its best value (the profile "
+    "likelihood), so <i>alpha_hat</i> is the maximum-likelihood α and <i>alpha_low</i>&ndash;"
+    "<i>alpha_high</i> its 95% likelihood-ratio interval: every α whose profile is within 1.92 "
+    "log-likelihood units of the best. <i>alpha_edge</i> says when the interval reaches an end of "
+    "the α grid (0.02&ndash;1.98); \"both\" means the track says nothing about α. "
+    "<i>alpha_p_brownian</i> is the likelihood-ratio test of α = 1. A track with no motion above its "
+    "localization noise has no <i>alpha_hat</i>."
+    "<br><br><b>α at the low end.</b> Noise beyond the reported SDs, and confinement whose cage "
+    "relaxes within about a frame, both look like extra static noise, which is α &rarr; 0: such "
+    "tracks put <i>alpha_hat</i> at 0.02."
     "<br><br><b>D_ref is not a Brownian D.</b> It is the fBm amplitude expressed as "
     "D_ref = MSD<sub>1D</sub>(τ<sub>ref</sub>) / (2 τ<sub>ref</sub>), the true motion's apparent D at "
     "one lag, τ<sub>ref</sub>. It equals a Brownian D only at α = 1; otherwise it changes with "
-    "τ<sub>ref</sub> (at α = 0.3, going from 0.1 s to 1 s divides it by 5), so compare D_ref only at "
-    "the same τ<sub>ref</sub>. Its interval inherits the α prior: below its floor "
-    "(<i>D_ref_floor_um2_s</i>) read it as an upper bound. Never compare it with <i>D_mean</i> or an "
-    "MSD D, and never pair <i>D_mean</i> with this tab's α."
-    "<br><br><b>Ellipses, not error bars.</b> Within a track, α and D_ref trade off (their "
-    "correlation, <i>alpha_D_ref_corr</i>, reaches about &minus;0.75 near the floor), so each track's "
-    "error bar is its 1-SD ellipse; its projections are &plusmn;1 SD on each axis."
-    "<br><br><b>The α–D plot is not a population.</b> A short track's α sits where the prior puts "
-    "it, and a track's α curve is a posterior, so tracks don't combine by adding their curves (in "
-    "simulation that was biased)."
+    "τ<sub>ref</sub>, so compare D_ref only at the same τ<sub>ref</sub>. Its interval has α profiled "
+    "out; <i>D_ref_low_um2_s</i> = 0 means the track only bounds D_ref from above. Never compare it "
+    "with <i>D_mean</i> or an MSD D, and never pair <i>D_mean</i> with this tab's α."
+    "<br><br><b>The α–D plot is not a population.</b> It shows each track's own fit side by side."
+    "<br><br><b>Shared α.</b> One α for every track the filters pass: each track's profile is a "
+    "likelihood, so the profiles add, and the summed curve's maximum and 95% interval are the shared "
+    "α, as the D tab's shared D. When tracks differ in α it lands near an information-weighted "
+    "average, and its interval does not describe the spread."
     "<br><br><b>Population.</b> The distribution of α (and D_ref) across the tracks the filters "
-    "pass: a smooth 2D density fitted to every track's joint (α, D_ref) likelihood, which carries "
-    "no prior, as the D tab's deconvolution is fitted to the tracks' D likelihoods. Uninformative "
-    "tracks change nothing; the band is the population's uncertainty, not the spread of tracks. "
+    "pass: a smooth 2D density fitted to every track's joint (α, D_ref) likelihood, as the D tab's "
+    "deconvolution is fitted to the tracks' D likelihoods. Uninformative tracks change nothing; the "
+    "band is the population's uncertainty, not the spread of tracks. "
     f"It needs at least {MIN_POPULATION_TRACKS} fitted tracks. <i>Below the D_ref floor</i> the tracks "
     "barely tell D_ref values apart, and α there is mostly the smoothness prior continuing α from "
     "above, so the plot also shows α above the floor and how much of the population lies below it."
@@ -108,7 +112,7 @@ _FBM_HELP = (
 
 
 class FbmTab(QWidget):
-    """Per-track fBm posteriors with their own Run, and the α–D and Track plots.
+    """Per-track fBm fits with their own Run, and the α–D, Track and Population plots.
     Its exposure and min points are the shared `_AcquisitionRow`'s."""
 
     def __init__(self, host: "DiffusionAnalysisWidget") -> None:
@@ -119,8 +123,8 @@ class FbmTab(QWidget):
         self._track_window: Optional[PlotWindow] = None
 
         intro = note_label(
-            "Per-track α and D_ref under fractional Brownian motion: a second posterior, beside the "
-            "D tab's Brownian D. D_ref is not a Brownian D."
+            "Per-track α and D_ref under fractional Brownian motion, by profile likelihood: a second "
+            "fit, beside the D tab's Brownian D. D_ref is not a Brownian D."
         )
         self._tau_ref = double_spinbox(
             TAU_REF_S, 0.001, 1000.0, 0.01, decimals=3, suffix=" s",
@@ -130,13 +134,13 @@ class FbmTab(QWidget):
         )
         self._tau_ref.valueChanged.connect(lambda _v: self._on_tau_changed())
         self._tau_status = status_label("")
-        prior = note_label("priors: α flat on 0.02–1.98 · amplitude flat in ln SNR")
+        prior = note_label("profile likelihood: no prior · 95% likelihood-ratio intervals")
 
-        self._run_button = QPushButton("Run α · D posteriors")
+        self._run_button = QPushButton("Run α · D fits")
         self._run_button.setToolTip(
-            "Every track's joint (α, D_ref) posterior (or only the filtered ones,\n"
-            "with the footer's switch): adds the alpha_* and D_ref_* columns.\n"
-            "About 25 ms per 40-frame track; long tracks cost more (~1 s at 300)."
+            "Every track's α and D_ref by profile likelihood (or only the filtered\n"
+            "ones, with the footer's switch): adds the alpha_* and D_ref_* columns.\n"
+            "About 40 ms per 40-frame track per core; long tracks cost more (~2 s at 300)."
         )
         self._run_button.clicked.connect(self._run)
         self._status = status_label("")
@@ -145,23 +149,23 @@ class FbmTab(QWidget):
 
         self._scatter_button = QPushButton("α–D")
         self._scatter_button.setToolTip(
-            "Every fitted track's α against its D_ref with its 1-SD posterior\n"
-            "ellipse, over the tracks the filters pass, one panel per region\n"
-            "class. Per-track posteriors side by side -- not a population."
+            "Every fitted track's α̂ against its D_ref with its likelihood-ratio\n"
+            "intervals, over the tracks the filters pass, one panel per region\n"
+            "class. Per-track fits side by side -- not a population."
         )
         self._scatter_button.clicked.connect(self._show_scatter)
         self._track_button = QPushButton("Track")
         self._track_button.setToolTip(
-            "The selected track's joint posterior over (D_ref, α), with α's\n"
-            "margin beside its flat prior. Stays open and follows the selection."
+            "The selected track's likelihood over (D_ref, α), with its profiles\n"
+            "and 95% region. Stays open and follows the selection."
         )
         self._track_button.clicked.connect(self._show_track)
         self._population_button = QPushButton("Population")
         self._population_button.setToolTip(
             "The distribution of α and D_ref across the tracks the filters pass,\n"
             "one panel per region class: a 2D deconvolution of the tracks' joint\n"
-            "likelihoods (~10 s per thousand tracks, on a worker). Its numbers\n"
-            "join the summary below."
+            "likelihoods (~10 s per thousand tracks, on a worker), with the\n"
+            "shared α beside it. Its numbers join the summary below."
         )
         self._population_button.clicked.connect(self._show_population)
         self._population_window: Optional[PlotWindow] = None
@@ -200,7 +204,7 @@ class FbmTab(QWidget):
         return self._analysis
 
     def reset(self) -> None:
-        """New tracks: the posteriors shown belong to the old ones."""
+        """New tracks: the fits shown belong to the old ones."""
         self._analysis = None
         self._status.setText("")
         style_status_label(self._status)
@@ -231,7 +235,7 @@ class FbmTab(QWidget):
         n_ok = self._adopt(analysis)
         no_population = "" if analysis.likelihoods is not None else " (saved without likelihoods: no population)"
         self._status.setText(
-            f"saved α · D posteriors loaded: {n_ok} of {analysis.fits.height} tracks fitted, "
+            f"saved α · D fits loaded: {n_ok} of {analysis.fits.height} tracks fitted, "
             f"τ_ref {analysis.tau_ref_s:g} s{no_population} — Run to re-fit"
         )
         style_status_label(self._status, "ok" if not no_population else "caution")
@@ -276,7 +280,7 @@ class FbmTab(QWidget):
         self._status.setText("running…")
         style_status_label(self._status)
         worker = _fbm_worker(tracks, Acquisition(self.host.dt_s, exposure), options, self.host.progress_callback)
-        self.host.start_worker(worker, self._on_finished, self._on_error, [self._run_button], "α · D posteriors")
+        self.host.start_worker(worker, self._on_finished, self._on_error, [self._run_button], "α · D fits")
 
     def _on_finished(self, analysis: FbmAnalysis) -> None:
         n_ok = self._adopt(analysis)
@@ -303,18 +307,25 @@ class FbmTab(QWidget):
         self._population_button.setEnabled(has_run and self._analysis.likelihoods is not None)
 
     def _format_summary(self) -> str:
-        """Counts over the tracks the filters pass -- by status, how many say
-        something about α, how many only bound D_ref -- and what the run was."""
-        sm = summarize_fbm(self._analysis, self.host.combined_filtered_track_ids())
-        others = [f"{n} {key[2:]}" for key, n in sm.items()
-                  if key.startswith("n_") and key not in ("n_tracks", "n_ok", "n_alpha_informative",
-                                                          "n_D_ref_upper_bound") and n]
+        """Counts over the tracks the filters pass -- by status, how many pin α,
+        how many reject α = 1, how many only bound D_ref -- the shared α, and
+        what the run was."""
+        ids = self.host.combined_filtered_track_ids()
+        sm = summarize_fbm(self._analysis, ids)
+        counted = ("n_tracks", "n_ok", "n_alpha_identified", "n_alpha_bounded", "n_non_brownian", "n_D_ref_upper_bound")
+        others = [f"{n} {key[2:]}" for key, n in sm.items() if key.startswith("n_") and key not in counted and n]
         lines = [f"{sm['n_tracks']} tracks: {sm['n_ok']} fitted" + "".join(f" · {o}" for o in others),
-                 f"{sm['n_alpha_informative']} with ≥ {MIN_BITS:g} bit on α (the rest are mostly the prior)"]
+                 f"{sm['n_alpha_identified']} with α̂, {sm['n_alpha_bounded']} of them with the α interval inside "
+                 f"0.02–1.98 · {sm['n_non_brownian']} reject α = 1 (p < {BROWNIAN_P:g})"]
         if sm["n_D_ref_upper_bound"]:
-            lines.append(f"{sm['n_D_ref_upper_bound']} only bound D_ref from above (D_ref_grid_edge = low)")
+            lines.append(f"{sm['n_D_ref_upper_bound']} only bound D_ref from above")
         if sm.get("D_ref_floor_median_um2_s") is not None:
             lines.append(f"D_ref floor {units.fmt(sm['D_ref_floor_median_um2_s'], 'D_ref_um2_s')} (median)")
+        shared = shared_alpha_summary(self._analysis, ids)
+        if shared is not None:
+            edge = " (reaches the grid end)" if shared["at_grid_edge"] else ""
+            lines.append(f"shared α {shared['alpha']:.2f} [{shared['low']:.2f}, {shared['high']:.2f}]{edge} over "
+                         f"{shared['n_tracks']} tracks · p(α = 1) {shared['p_brownian']:.2g}")
         lines.extend(self._population_lines())
         acq = self._analysis.acquisition
         lines.append(
@@ -331,7 +342,7 @@ class FbmTab(QWidget):
         pop = alpha_population(self._analysis, ids)
         if pop is None:
             return [f"population: needs ≥ {MIN_POPULATION_TRACKS} fitted tracks"]
-        sm = population_summary(pop, self._analysis.options.level)
+        sm = population_summary(pop)
 
         def iv(v):
             return f"{v[0]:.2f} [{v[1]:.2f}, {v[2]:.2f}]"

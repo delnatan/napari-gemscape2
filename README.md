@@ -389,7 +389,7 @@ msd_alpha_max_lag = 10
 # or shares of each track's longest lag, replacing both lag counts:
 # msd_lag_fraction = 0.3        # D: the usual 25-40% rule
 # msd_alpha_lag_fraction = 0.5  # alpha
-# Also run the α · D (fBm) posteriors, D_ref at this lag in seconds. A
+# Also run the α · D (fBm) fits, D_ref at this lag in seconds. A
 # template saved after an α · D run sets it. D_ref is not a Brownian D.
 alpha_D_tau_ref_s = 0.1
 exposure_s = 0.01       # optional: overrides each bundle's recorded exposure
@@ -496,7 +496,7 @@ stay off until it has a value) and **min points**, the shortest track fitted.
 The **D** tab is the standard quantification: for each track, the Brownian
 posterior over D (flat prior in ln D, the exposure's blur modelled) summarized
 as its mean E[D] and 5%/95% quantiles. The motion's shape (α) is a separate
-posterior, on the **α · D** tab (below). The run
+fit, on the **α · D** tab (below). The run
 is diffusionkit's own `gridpost.analyze_tracks` with the `GridPostOptions` the
 D tab shows: *D min*/*D max* (µm²/s) and *D points* set the D grid,
 whose range is the flat prior's support (by default 10⁻⁵ to 10 µm²/s, so
@@ -541,61 +541,73 @@ still resolved. It marks accuracy instead: below it most of each step's
 variance is localization noise being subtracted, so D leans on the SDs being
 calibrated. It moves with the square of any error in them, a bias that more
 frames do not average away.
-The **Posteriors** plot shows every track's posterior as one row of a heat map,
-sorted by where its likelihood peaks, beside the population reads of the
-Ensemble plot. The plots and summary follow the
+The plots and summary follow the
 filters without a re-run; each group's deconvolution takes a second or two, on
 a worker thread, so they update shortly after a change. The **Track** plot shows
 the selected track's posterior; the **Map** tab colors each track's localizations
 by any per-track value (track length from the start, then any result); the **NUTS** tab fits the selected track's full posterior with the
 same exposure (needs `--extra bayes`).
 
-The **α · D** tab runs a second per-track posterior, diffusionkit's
-`fbmpost`: the joint posterior of the anomalous exponent α and an amplitude
-under fractional Brownian motion, with the same exposure blur and
-localization SDs (at α = 1 its likelihood is the D tab's). Every number on it
-is a posterior under stated priors: α flat on 0.02–1.98, the amplitude flat in
-ln SNR. A track that carries no information on α returns that prior (mean 1),
-and `alpha_info_bits` near 0 says so.
+The **α · D** tab runs a second per-track fit, diffusionkit's `fbmpost`: the
+anomalous exponent α and an amplitude under fractional Brownian motion, with
+the same exposure blur and localization SDs (at α = 1 its likelihood is the D
+tab's). It has no prior. For each α on a grid over 0.02–1.98 the amplitude is
+set to its best value, which gives the track's **profile likelihood** of α;
+α̂ is its peak and the interval is every α within 1.92 log-likelihood units
+of it (a 95% likelihood-ratio interval). The same profile tests α = 1:
+`alpha_p_brownian` is that test's p-value, so a small one says the track is
+not Brownian. A track that cannot tell α values apart (motion buried in the
+localization noise) has no α̂, and its interval spans the whole grid.
 
-- **Run α · D posteriors** adds the `alpha_*` and `D_ref_*` columns (about
-  10 s for 2,000 tracks of ~20 frames), so the Map tab can color tracks by α and
-  the filters can cut on `alpha_info_bits`.
-- **α–D** draws every fitted track's α against its D_ref with its 1-SD
-  posterior ellipse, one panel per region class. Within a track α and D_ref
-  trade off, so an ellipse, not a cross, is the error bar. Tracks with less
-  than 0.5 bit on α are grey (mostly prior); tracks that only bound D_ref from
-  above are grey "<" marks at their upper bound.
-- **Track** draws the selected track's joint posterior with both margins, α's
-  beside the flat prior it started from.
+- **Run α · D fits** adds the `alpha_*` and `D_ref_*` columns (about 6 ms per
+  track of 10 frames, 40 ms at 40 frames), so the Map tab can color tracks by
+  α̂ and the filters can cut on `alpha_p_brownian` or the interval's width.
+  The summary counts the tracks whose α is identified, bounded on both sides,
+  and not Brownian, and gives the **shared α**: one α for every track the
+  filters pass, from their profiles summed, with its interval and its test of
+  α = 1, per region class.
+- **α–D** draws every fitted track's α̂ against its D_ref with likelihood-ratio
+  intervals on both, one panel per region class. Tracks whose α interval spans
+  the grid are grey; tracks that only bound D_ref from above are grey "<"
+  marks at their upper bound.
+- **Track** draws the selected track's relative likelihood over (α, D_ref),
+  the 95% region outlined, with the profile of α and of D_ref beside it, each
+  crossing the threshold where the interval ends.
 - **Population** draws the distribution of α and D_ref across the tracks the
-  filters pass, one row per region class (needs at least 20 fitted tracks;
-  ~10 s per thousand tracks). Its numbers (P(α < 1), the mean and SD of α,
-  each with an interval) join the tab's summary, and *Save analysis* writes
-  them to `diffusion_summary.json` with the joint likelihoods in
-  `loglik_alpha_D.parquet`.
+  filters pass, one row per region class, with the shared α marked (needs at
+  least 20 fitted tracks; ~10 s per thousand tracks). Its numbers (P(α < 1),
+  the mean and SD of α, each with an interval) join the tab's summary, and
+  *Save analysis* writes them to `diffusion_summary.json` with the joint
+  likelihoods in `loglik_alpha_D.parquet` and the profiles in
+  `profile_alpha.parquet`.
 
 > **D_ref is not a Brownian D.** It is the fBm amplitude expressed as
 > D_ref = MSD₁D(τ_ref) / (2 τ_ref), the true motion's apparent D at one lag
 > τ_ref (default 0.1 s, set on the tab). It has the units of D only so the
 > scatter has a readable axis. It equals a Brownian D only at α = 1; otherwise
 > it changes with τ_ref (at α = 0.3, going from 0.1 s to 1 s divides it by 5),
-> so compare D_ref only at the same τ_ref. Its interval inherits the α prior:
-> below its floor (`D_ref_floor_um2_s`) read it as an upper bound. Never
-> compare it with `D_mean_um2_s` or an MSD D, and never pair `D_mean_um2_s`
-> with this tab's α. For how fast tracks move, and for populations of D, use
-> the D tab.
+> so compare D_ref only at the same τ_ref. Below its floor
+> (`D_ref_floor_um2_s`) read it as an upper bound; `D_ref_low_um2_s` is 0 when
+> the data do not rule out no motion. Never compare it with `D_mean_um2_s` or
+> an MSD D, and never pair `D_mean_um2_s` with this tab's α. For how fast
+> tracks move, and for populations of D, use the D tab.
 
-The α–D plot is per-track posteriors side by side, not a population. A track's
-α curve is a posterior, not a likelihood: it carries the amplitude's prior, so
-tracks don't combine by adding their curves (in simulation, a deconvolution of
-them was badly biased). The population comes instead from diffusionkit's 2D
-deconvolution of the tracks' joint (α, D_ref) likelihoods, which carry no prior,
-the way the D tab's deconvolved distribution comes from the D likelihoods. On
-simulated tracks of 5–80 frames it recovered a two-mode population (P(α < 0.75)
-0.62 [0.58, 0.67] against 0.59) and a single α (mean 0.59 against 0.60).
-Below the D_ref floor the tracks barely tell D_ref values apart, and α there
-is mostly the smoothness prior continuing α from above, so the plot and the
+**α near 0 is a reading, not a failure.** Motion confined to a region the
+particle crosses within a frame looks, frame to frame, like a fixed position
+plus noise, and fBm reads that as α at the grid's low end. In simulation,
+confined tracks whose relaxation time was 0.1–1 frame gave a median α̂ of
+0.02 at 30 and at 100 frames. A prior that ruled out α near 0 would hide
+those tracks instead of flagging them, which is why the tab has none.
+
+A track's α interval says what that track alone rules out. Two reads combine
+tracks. The **shared α** asks which single α fits them all: it adds their
+profiles, which is valid because each profile is a likelihood. The
+**population** asks how α and D_ref are spread across tracks: diffusionkit's
+2D deconvolution of the tracks' joint (α, D_ref) likelihoods, the way the D
+tab's deconvolved distribution comes from the D likelihoods. When the shared
+α's interval is narrow but the population is wide, the tracks differ. Below
+the D_ref floor the tracks barely tell D_ref values apart, and α there is
+mostly the population's smoothness carrying α from above, so the plot and the
 summary also give α above the floor and the share of the population below it.
 
 The classical MSD analysis has its own **MSD** tab. It needs only tracks, and it
@@ -628,7 +640,7 @@ are still the bundle's, vertex for vertex (`tracks_sha256` in the summary);
 after a re-track or a new pixel size the saved numbers show as text and Run
 re-fits. The D and α · D runs are restored independently, each by its own
 fingerprint. Analyses saved before the fingerprint existed, with the α
-posterior of earlier versions, or as `posterior_D.parquet` (before the
+posterior of earlier versions (before the profile fits), or as `posterior_D.parquet` (before the
 likelihoods were saved as `loglik_D.parquet`), need one re-run.
 
 *Save analysis* writes into the bundle:
@@ -642,6 +654,9 @@ loglik_alpha_D.parquet    after an α · D run, every fitted track's likelihood 
                           (α, log10 D_ref) cells: track_id, n_frames, D_ref_floor_um2_s,
                           alpha, log10_D_ref, loglik (0 at each track's maximum); what
                           the α population is built from
+profile_alpha.parquet     after an α · D run, every fitted track's profile
+                          log-likelihood of α: track_id, n_frames, alpha, loglik
+                          (0 at each track's maximum); what the shared α sums
 distributions_D.csv       the population on the D grid, long by group ("all", then each
                           region class): shared_loglik (the tracks' log-likelihoods
                           summed, 0 at the peak: one D for every track -- the summary's
@@ -666,7 +681,8 @@ diffusion_summary.json    settings (dt, exposure, grid -- GridPostOptions' field
                           the fitted tracks' fingerprint (tracks_sha256), and packages
                           (diffusionkit's and napari-gemscape2's version and git SHA);
                           after an α · D run, an "alpha_D" entry: its settings (tau_ref_s,
-                          the alpha and SNR priors), counts, fingerprint and
+                          the alpha grid, lr_level), counts, fingerprint,
+                          "shared_alpha" (alpha, low, high, p_brownian) and
                           "population" (P(α < 1), the mean and SD of α, the α-D_ref
                           correlation and the share below the D_ref floor, each
                           [median, low, high]; the same above the floor; overall and
@@ -703,13 +719,12 @@ this track": it was excluded, too short, or that analysis was off.
 | `D_floor_um2_s` | µm²/s | Localization floor: the D at which motion per frame equals localization noise, ⟨σ²⟩ / (dt − exposure/3) from the track's SDs. Not a resolution limit or a threshold: below it, D depends on the SDs being calibrated |
 | **α and D_ref (fBm), after an α · D run** | | |
 | `fbm_status` | | `ok`, `excluded` (shorter than `min_frames`), or `invalid_input` |
-| `alpha_mean`, `alpha_low`, `alpha_high`, `alpha_sd` | | α's posterior mean, 90% credible interval and SD (flat prior on 0.02–1.98) |
-| `alpha_info_bits` | bits | How much the track narrowed α from its flat prior; near 0, α is the prior's |
-| `alpha_p_below_1` | | Posterior probability that α < 1 |
-| `D_ref_mean_um2_s`, `D_ref_low_um2_s`, `D_ref_high_um2_s` | µm²/s | D_ref = MSD₁D(τ_ref) / (2 τ_ref) at the run's τ_ref (in `diffusion_summary.json`): mean and 90% interval. **Not a Brownian D** (see above) |
-| `log10_D_ref_mean`, `log10_D_ref_sd`, `alpha_D_ref_corr` | | The error ellipse: log10 D_ref's mean and SD and its correlation with α |
+| `alpha_hat`, `alpha_low`, `alpha_high` | | α's maximum-likelihood value (amplitude profiled out; empty when the track does not identify α) and its 95% likelihood-ratio interval on 0.02–1.98 |
+| `alpha_edge` | | Which end of the α grid the interval reaches: `low`, `high`, `both` (α not bounded), empty when it reaches neither |
+| `alpha_dll_brownian`, `alpha_p_brownian` | nats, – | The likelihood-ratio test of α = 1: the profile's drop from α̂ to 1 and its p-value (χ²₁ of twice the drop). A small p-value says the track is not Brownian |
+| `D_ref_hat_um2_s`, `D_ref_low_um2_s`, `D_ref_high_um2_s` | µm²/s | D_ref = MSD₁D(τ_ref) / (2 τ_ref) at the run's τ_ref (in `diffusion_summary.json`): at the joint maximum, with the 95% likelihood-ratio interval over all α. A low of 0 means only an upper bound. **Not a Brownian D** (see above) |
+| `log10_D_ref_hat` | | log10 of `D_ref_hat_um2_s` |
 | `D_ref_floor_um2_s` | µm²/s | The D_ref at which the motion's MSD at τ_ref equals the localization noise's, ⟨σ²⟩ / τ_ref |
-| `D_ref_grid_edge` | | `low` when the amplitude posterior reaches the prior's low end: the track only bounds D_ref from above |
 | **Optional fits** | | |
 | `D_msd_um2_s`, `K_msd_um2_s_alpha`, `alpha_msd` | µm²/s, µm²/s^α, – | Classical MSD fits (D over D's window, α by log-log over its own), when they ran; no uncertainties |
 | `*_nuts*` | | Full-posterior NUTS fit, for tracks fitted in the NUTS tab |

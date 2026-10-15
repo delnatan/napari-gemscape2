@@ -1,5 +1,6 @@
-"""The α · D run (`napari_gemscape2.fbm`): diffusionkit's fBm posteriors reshaped for the tracks
-pane, saved in the per-track summary and restored from it, and the batch settings that rerun it."""
+"""The α · D run (`napari_gemscape2.fbm`): diffusionkit's fBm profile fits reshaped for the tracks
+pane, the shared alpha and population across them, saved in the bundle and restored from it, and the
+batch settings that rerun it."""
 
 import matplotlib
 
@@ -43,17 +44,29 @@ def test_one_row_per_track_with_the_panes_columns(analysis):
     assert fits.filter(pl.col("track_id") == 99)["fbm_status"].item() == "excluded"
     ok = analysis.ok
     assert ok.height == 40
-    assert ((ok["alpha_low"] <= ok["alpha_mean"]) & (ok["alpha_mean"] <= ok["alpha_high"])).all()
+    fitted = ok.filter(pl.col("alpha_hat").is_not_null())
+    assert ((fitted["alpha_low"] <= fitted["alpha_hat"]) & (fitted["alpha_hat"] <= fitted["alpha_high"])).all()
+    assert ((ok["D_ref_low_um2_s"] <= ok["D_ref_high_um2_s"])).all()
     # The two populations separate in alpha on average: subdiffusive vs Brownian.
-    low, high = ok.filter(pl.col("track_id") < 20), ok.filter(pl.col("track_id") >= 20)
-    assert low["alpha_mean"].median() < 0.75 < high["alpha_mean"].median()
+    low, high = fitted.filter(pl.col("track_id") < 20), fitted.filter(pl.col("track_id") >= 20)
+    assert low["alpha_hat"].median() < 0.75 < high["alpha_hat"].median()
+    assert (low["alpha_p_brownian"] < 0.05).mean() > (high["alpha_p_brownian"] < 0.05).mean()
 
 
 def test_summary_counts_without_population_numbers(analysis):
     s = fbm.summarize_fbm(analysis)
     assert s["n_tracks"] == 41 and s["n_ok"] == 40 and s["n_excluded"] == 1
-    assert 0 < s["n_alpha_informative"] <= 40
-    assert not any("median_alpha" in k or "alpha_mean" in k for k in s)
+    assert 0 < s["n_alpha_bounded"] <= s["n_alpha_identified"] <= 40
+    assert 0 < s["n_non_brownian"] <= 40
+    assert not any("median_alpha" in k or "alpha_hat" in k for k in s)
+
+
+def test_shared_alpha_pools_the_profiles(analysis):
+    low, high = fbm.shared_alpha_summary(analysis, LOW), fbm.shared_alpha_summary(analysis, HIGH)
+    assert low["n_tracks"] == high["n_tracks"] == 20
+    assert low["low"] <= 0.4 <= low["high"] and low["p_brownian"] < 1e-3
+    assert high["low"] <= 1.0 <= high["high"]
+    assert fbm.shared_alpha_summary(analysis, {99}) is None  # excluded: no profile
 
 
 def test_saved_columns_restore_the_run(tracks, analysis):
@@ -66,18 +79,20 @@ def test_saved_columns_restore_the_run(tracks, analysis):
     restored = fbm.restore_fbm(tracks, record, table)
     assert restored.tau_ref_s == analysis.tau_ref_s
     assert restored.likelihoods is None  # saved without loglik_alpha_D: no population
+    assert restored.profiles is None  # saved without profile_alpha: no shared alpha
     a, b = analysis.fits.sort("track_id"), restored.fits.sort("track_id")
-    np.testing.assert_allclose(a["alpha_mean"].fill_null(np.nan), b["alpha_mean"].fill_null(np.nan))
-    np.testing.assert_allclose(a["alpha_D_ref_corr"].fill_null(np.nan), b["alpha_D_ref_corr"].fill_null(np.nan))
+    np.testing.assert_allclose(a["alpha_hat"].fill_null(np.nan), b["alpha_hat"].fill_null(np.nan))
+    np.testing.assert_allclose(a["alpha_p_brownian"].fill_null(np.nan), b["alpha_p_brownian"].fill_null(np.nan))
+    assert a["alpha_edge"].to_list() == b["alpha_edge"].to_list()
     moved = tracks.with_columns(pl.when(pl.col("track_id") == 3).then(pl.col("x_um") + 1e-3).otherwise(pl.col("x_um")))
     with pytest.raises(StaleAnalysisError):
         fbm.restore_fbm(moved, record, table)
 
 
 def test_d_ref_columns_are_read_against_their_own_floor(analysis):
-    refs = floor_references(analysis.ok, ("D_ref_mean_um2_s", "alpha_mean"))
-    assert set(refs) == {"D_ref_mean_um2_s"}
-    assert refs["D_ref_mean_um2_s"][1] == pytest.approx(0.013**2 / 0.1)
+    refs = floor_references(analysis.ok, ("D_ref_hat_um2_s", "alpha_hat"))
+    assert set(refs) == {"D_ref_hat_um2_s"}
+    assert refs["D_ref_hat_um2_s"][1] == pytest.approx(0.013**2 / 0.1)
 
 
 def test_a_template_with_an_alpha_D_run_reruns_it():
@@ -90,11 +105,14 @@ def test_plots_draw(tracks, analysis):
     panels = fbm.scatter_panels(analysis, {"a": set(range(20)), "b": set(range(20, 40))})
     assert [p["name"] for p in panels] == ["a", "b"]
     assert len(plot_alpha_D(panels).axes) == 2
-    panel = fbm.track_panel(analysis, tracks.filter(pl.col("track_id") == 5))
-    da = panel["alphas"][1] - panel["alphas"][0]
-    dx = panel["log10_D_ref"][1] - panel["log10_D_ref"][0]
-    assert panel["density"].sum() * da * dx == pytest.approx(1, abs=1e-3)
-    assert (panel["p_alpha"] * panel["alphas"]).sum() * da == pytest.approx(panel["fit"]["alpha_mean"], abs=1e-6)
+    panel = fbm.track_panel(analysis, tracks.filter(pl.col("track_id") == 25))
+    assert panel["loglik"].max() == 0
+    # The grid's alpha profile crosses the threshold where the fit's interval ends.
+    inside = panel["alphas"][panel["profile_alpha"] >= panel["threshold"]]
+    fit = panel["fit"]
+    assert inside.min() == pytest.approx(fit["alpha_low"], abs=0.03)
+    assert inside.max() == pytest.approx(fit["alpha_high"], abs=0.03)
+    assert panel["alphas"][panel["profile_alpha"].argmax()] == pytest.approx(fit["alpha_hat"], abs=0.02)
     plot_fbm_track(panel)
     assert fbm.track_panel(analysis, tracks.filter(pl.col("track_id") == 99)) is None
 
@@ -126,7 +144,9 @@ def test_population_separates_the_two_groups(analysis):
 def test_record_carries_the_population_overall_and_by_class(analysis):
     record = fbm.fbm_record(analysis, None, {"a": LOW, "b": HIGH})
     assert record["population"]["n_tracks"] == 40
+    assert record["shared_alpha"]["n_tracks"] == 40
     assert record["by_region_class"]["a"]["population"]["alpha_mean"][0] < 0.75
+    assert record["by_region_class"]["a"]["shared_alpha"]["alpha"] < 0.75
     assert record["by_region_class"]["a"]["n_ok"] == 20
 
 
@@ -137,7 +157,9 @@ def test_saved_likelihoods_restore_the_population(tracks, analysis):
     table = pl.read_csv(table.write_csv().encode(), infer_schema_length=None)
     loglik = fbm.loglik_long_table(analysis)
     loglik = pl.read_parquet(_parquet_roundtrip(loglik))
-    restored = fbm.restore_fbm(tracks, fbm.fbm_record(analysis, None, None), table, loglik)
+    profiles = pl.read_parquet(_parquet_roundtrip(fbm.profile_long_table(analysis)))
+    restored = fbm.restore_fbm(tracks, fbm.fbm_record(analysis, None, None), table, loglik, profiles)
+    assert fbm.shared_alpha_summary(restored, LOW) == fbm.shared_alpha_summary(analysis, LOW)
     a, b = analysis.likelihoods, restored.likelihoods
     np.testing.assert_array_equal(a.track_ids, b.track_ids)
     np.testing.assert_allclose(a.log10_D_ref, b.log10_D_ref)
@@ -147,6 +169,18 @@ def test_saved_likelihoods_restore_the_population(tracks, analysis):
     with pytest.raises(StaleAnalysisError):
         fbm.restore_fbm(tracks, fbm.fbm_record(analysis, None, None), table,
                         loglik.filter(pl.col("track_id") != 3))
+    with pytest.raises(StaleAnalysisError):
+        fbm.restore_fbm(tracks, fbm.fbm_record(analysis, None, None), table, loglik,
+                        profiles.filter(pl.col("track_id") != 3))
+
+
+def test_a_bundle_from_the_grid_posterior_version_is_stale(tracks, analysis):
+    base = tracks.group_by("track_id").agg(pl.len().alias("track_length"),
+                                           pl.col("x_um").mean().alias("x_px"), pl.col("y_um").mean().alias("y_px"))
+    table = tracks_summary_table(base, analysis.columns(), result_id="m", pixel_size_um=1.0, passing_ids=None)
+    old = {k: v for k, v in fbm.fbm_record(analysis, None, None).items() if k != "alpha_grid"}
+    with pytest.raises(StaleAnalysisError):
+        fbm.restore_fbm(tracks, old, table)
 
 
 def _parquet_roundtrip(df):
@@ -161,4 +195,5 @@ def _parquet_roundtrip(df):
 def test_population_plot_draws(analysis):
     panels = fbm.population_panels(analysis, {"a": LOW, "b": HIGH, "few": set(range(5))})
     assert [p["name"] for p in panels] == ["a", "b"]
+    assert all(p["shared"] is not None for p in panels)
     assert len(plot_alpha_population(panels).axes) == 4

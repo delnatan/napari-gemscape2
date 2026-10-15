@@ -147,18 +147,16 @@ _EXACT: dict[str, Optional[str]] = {
     "D_grid_edge": None,
     # What a track's D posterior gained over the flat prior.
     "D_info_bits": BITS,
-    # The alpha-D (fBm) posteriors (`napari_gemscape2.fbm`): their status
-    # and edge, alpha's information, SD and P(alpha < 1), and the ellipse's
-    # log10 D_ref moments (a log of um^2/s, itself unitless) and correlation.
-    # D_ref's own columns take `_um2_s` from the suffix rule.
+    # The alpha-D (fBm) profile fits (`napari_gemscape2.fbm`): their status,
+    # which grid end alpha's interval reaches, the test of alpha = 1, and
+    # log10 D_ref (a log of um^2/s, itself unitless). alpha_hat/_low/_high
+    # resolve through the statistic suffixes; D_ref's own columns take
+    # `_um2_s` from the suffix rule.
     "fbm_status": None,
-    "D_ref_grid_edge": None,
-    "alpha_info_bits": BITS,
-    "alpha_sd": None,
-    "alpha_p_below_1": None,
-    "log10_D_ref_mean": None,
-    "log10_D_ref_sd": None,
-    "alpha_D_ref_corr": None,
+    "alpha_edge": None,
+    "alpha_dll_brownian": None,
+    "alpha_p_brownian": None,
+    "log10_D_ref_hat": None,
     "loglik": None,
     "posterior": None,
     "weight": None,
@@ -205,6 +203,7 @@ _STATISTIC_SUFFIXES = (
     "_nuts",
     "_msd",
     "_est",
+    "_hat",
 )
 
 # Greek/italic forms for the quantity part of a matplotlib label, so an

@@ -10,7 +10,7 @@ import pytest
 from diffusionkit import Acquisition
 
 from napari_gemscape2 import diffusion as dfn
-from napari_gemscape2.joint_plot import plot_d_by_length, plot_d_ensemble, plot_d_posteriors
+from napari_gemscape2.joint_plot import plot_d_by_length, plot_d_ensemble
 
 DT = 0.03
 MEDIAN_D, SIGMA = 0.05, 0.6
@@ -57,18 +57,16 @@ def test_the_tables_name_their_models(analysis):
     assert np.allclose(per_track["loglik"].to_numpy(), 1.0)  # normalized: also the flat-prior posterior
 
 
-def test_the_heat_map_is_sorted_by_likelihood_peak(analysis):
-    (panel,) = dfn.ensemble_panels(analysis, track_posteriors=True)
-    peaks = panel["track_posteriors"].argmax(axis=1)
-    assert np.all(np.diff(peaks) >= 0)
+def test_the_spectrum_panel_holds_only_population_reads(analysis):
+    (panel,) = dfn.ensemble_panels(analysis)
     assert set(panel) >= {"lognormal", "lognormal_band", "summary", "deconvolved", "shared_interval"}
+    assert "track_posteriors" not in panel
 
 
 def test_the_figures_draw(analysis):
     grid = analysis.D_grid_um2_s
     groups = {"early": set(range(150)), "late": set(range(150, 300))}
     for fig in (plot_d_ensemble(grid, dfn.ensemble_panels(analysis, groups)),
-                plot_d_posteriors(grid, dfn.ensemble_panels(analysis, groups, track_posteriors=True)),
                 plot_d_by_length(dfn.length_panels(analysis, groups))):
         fig.canvas.draw()
         assert len(fig.axes) >= 2
