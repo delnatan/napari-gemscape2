@@ -31,13 +31,11 @@ A row with a saved bundle is also a live session as soon as it's shown
 re-filtered and re-saved, without re-running detect.
 
 This widget always runs `run_detect_step` with a `progress_callback`
-(for the live frame-count/cancel UI), which is what actually puts it on
-`run_detect_step`'s chunked path -- not the mask itself, which
-`find_spots_stack_df` accepts directly (see `pipeline.run_detect_step`'s
-docstring). The Detect tab's "cores" spinbox (`get_n_threads`) is the
-chunk's own `localize_stack` call's `n_threads`, so this path is still
-multi-core; only progress/cancel granularity, not parallelism, is traded
-away here.
+(for the live frame-count/cancel UI): the whole range is still one
+`localize_stack` call, watched through a `spotsolve.Progress` (see
+`pipeline.run_detect_step`'s docstring), so what the widget finds is what
+the headless runner finds. The Detect tab's "cores" spinbox
+(`get_n_threads`) is that call's `n_threads`.
 
 Drag-and-drop accepts a dropped folder anywhere on this dock widget (not
 just precisely on the list rows) -- both `_ExperimentListView` and the

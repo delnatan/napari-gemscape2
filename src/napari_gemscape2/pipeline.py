@@ -144,11 +144,9 @@ ProgressCallback = Callable[[int, int, str], None]
 class PipelineCancelled(Exception):
     """Raised at a `cancel_event` checkpoint (see `run_detect_step`/
     `run_track_step`'s `cancel_event` argument).
-    Cooperative cancellation only -- takes effect at the next chunk
-    (detect, when a `progress_callback` puts it on the chunked
-    `localize_stack` path) or stage boundary, not instantly, since
-    `localize_stack` and `link` are each one opaque
-    Rust call with no interruption point of their own. Propagates like any
+    Cooperative cancellation only -- detect's `localize_stack`, watched
+    through a `progress_callback`, stops within a frame; `link` is one
+    opaque Rust call, so linking stops only at a stage boundary. Propagates like any
     other exception through `napari.qt.threading`'s `errored` signal; the
     widget is responsible for telling this apart from a real error."""
 
@@ -374,6 +372,33 @@ def _resolve_frame_range(frame_range: Optional[tuple[int, int]], t: int) -> tupl
     return (start, end if end > 0 else t)
 
 
+def _watched(call, progress_callback: ProgressCallback, cancel_event: Optional[threading.Event]):
+    """`call(progress)` -- one `spotsolve.localize_stack` -- on a helper
+    thread, its `spotsolve.Progress` relayed to `progress_callback` as
+    frames are fitted and `cancel_event` relayed to it."""
+    progress = spotsolve.Progress()
+    out: dict = {}
+
+    def target() -> None:
+        try:
+            out["value"] = call(progress)
+        except BaseException as exc:  # handed back to the caller's thread
+            out["error"] = exc
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    while worker.is_alive():
+        worker.join(0.1)
+        if cancel_event is not None and cancel_event.is_set():
+            progress.cancel()
+        progress_callback(progress.done, progress.total, "finding spots")
+    if isinstance(out.get("error"), spotsolve.Cancelled):
+        raise PipelineCancelled("cancelled")
+    if "error" in out:
+        raise out["error"]
+    return out["value"]
+
+
 def estimate_gain(
     session: PipelineSession,
     sigma: float,
@@ -420,7 +445,7 @@ def run_detect_step(
 
     `camera_kwargs` (`None`: `DEFAULT_CAMERA_KWARGS`) holds `offset` and
     `gain`. Without a gain, it is estimated once over the frames and mask
-    of this run (`estimate_gain`), before any chunking below, and
+    of this run (`estimate_gain`), and
     `session.gain_source` records which it was.
 
     Sets `session.points_df` (one row per detection,
@@ -452,19 +477,14 @@ def run_detect_step(
     "how much of this movie was junk" stays an auditable fact about the
     run rather than a silent deletion.
 
-    Both paths run every frame through `spotsolve.localize_stack`, which
+    The whole range goes through one `spotsolve.localize_stack` call, which
     runs frames in parallel -- `n_threads` (default: every core,
-    `os.cpu_count()`) is how many native threads it hands frames to. They
-    differ only in chunk size: with no `progress_callback`, the whole range
-    goes through in one call; with one, the range is split into chunks of
-    `n_threads` frames each -- small enough that progress and cancellation
-    still land often, large enough that every thread stays busy within a
-    chunk.
-
-    `cancel_event`, if given, is checked before this stage starts and --
-    on the `progress_callback` path only -- again before each chunk, so a
-    cancellation lands within one chunk rather than only between stages
-    (see `PipelineCancelled`'s docstring).
+    `os.cpu_count()`) is how many native threads it hands frames to. One
+    call, because the read variance, the bar `u` and `P(real | z)` are the
+    movie's: a range split into calls would be several movies, each with its
+    own. With a `progress_callback`, the call runs on a helper thread and a
+    `spotsolve.Progress` is read off it as frames are fitted; `cancel_event`
+    is relayed to it, so a cancellation stops the call within a frame.
     """
     _check_cancelled(cancel_event)
     if sigma is None:
@@ -488,7 +508,7 @@ def run_detect_step(
     n = end - start
     threads = int(n_threads or os.cpu_count() or 1)
 
-    # One gain for the whole run, so every chunk below shares it.
+    # One gain for the whole run.
     gain_source = "given"
     if camera.get("gain") is None:
         if progress_callback is not None:
@@ -500,24 +520,13 @@ def run_detect_step(
         gain_source = "estimated"
         _check_cancelled(cancel_event)
 
-    if progress_callback is not None:
-        results = []
-        i = start
-        while i < end:
-            _check_cancelled(cancel_event)
-            j = min(i + threads, end)
-            results.extend(
-                localize_stack_fn(
-                    session.image[i:j], sigma=sigma, roi=mask, images=False,
-                    n_threads=threads, **camera, **detect
-                )
-            )
-            progress_callback(len(results), n, "finding spots")
-            i = j
+    run = dict(sigma=sigma, roi=mask, images=False, n_threads=threads, **camera, **detect)
+    if progress_callback is None:
+        results = localize_stack_fn(session.image[start:end], **run)
     else:
-        results = localize_stack_fn(
-            session.image[start:end], sigma=sigma, roi=mask, images=False,
-            n_threads=threads, **camera, **detect
+        results = _watched(
+            lambda progress: localize_stack_fn(session.image[start:end], progress=progress, **run),
+            progress_callback, cancel_event,
         )
 
     # `frame_tables` is per-frame; stitch them with a running `loc_id0` so
