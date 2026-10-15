@@ -2014,7 +2014,10 @@ def _debounce_timer(parent: QObject, slot: Callable[[], None], msec: int = 40) -
     return timer
 
 
-@thread_worker(start_thread=False)
+# Every worker here has its `errored` connected by the widget (cancellation
+# included), so `ignore_errors` keeps napari from also re-raising the error
+# as an unhandled exception.
+@thread_worker(start_thread=False, ignore_errors=True)
 def _load_item_worker(image_path: Path, result_dir: Path):
     """A row's saved bundle if it has one, else its raw image and any mask
     saved for it (`(labels, regions)`, both None without) -- read off the
@@ -2024,7 +2027,7 @@ def _load_item_worker(image_path: Path, result_dir: Path):
     return load_image_display(image_path), load_mask(result_dir)
 
 
-@thread_worker(start_thread=False)
+@thread_worker(start_thread=False, ignore_errors=True)
 def _run_detect_worker(
     session: PipelineSession,
     sigma: float,
@@ -2054,7 +2057,7 @@ def _run_detect_worker(
     )
 
 
-@thread_worker(start_thread=False)
+@thread_worker(start_thread=False, ignore_errors=True)
 def _estimate_gain_worker(
     session: PipelineSession,
     sigma: float,
@@ -2068,7 +2071,7 @@ def _estimate_gain_worker(
     return estimate_gain(session, sigma, offset, frame_range, mask, n_threads=n_threads, **kw)
 
 
-@thread_worker(start_thread=False)
+@thread_worker(start_thread=False, ignore_errors=True)
 def _run_track_worker(
     session: PipelineSession,
     max_step: float,
