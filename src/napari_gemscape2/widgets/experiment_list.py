@@ -154,6 +154,7 @@ from napari_gemscape2.pipeline import (
     PipelineSession,
     apply_filters,
     apply_track_filters,
+    estimate_gain,
     filter_mask,
     load_session,
     run_detect_step,
@@ -552,6 +553,7 @@ class ExperimentListWidget(QWidget):
         self.params_panel = PipelineParamsWidget()
         self.params_panel.detectRequested.connect(self._run_detect_step)
         self.params_panel.detectCancelRequested.connect(self._cancel_active_run)
+        self.params_panel.estimateGainRequested.connect(self._estimate_gain)
         self.params_panel.trackRequested.connect(self._run_track_step)
         self.params_panel.saveRequested.connect(self._save_result)
         self.params_panel.saveDetectionsRequested.connect(self._save_detection_result)
@@ -1322,6 +1324,51 @@ class ExperimentListWidget(QWidget):
             on_error=lambda exc, item=item: self._on_detect_error(item, exc),
         )
 
+    def _estimate_gain(self) -> None:
+        """Measure the camera's gain from the current movie -- its frame
+        range and regions, as a detect run would use them -- and put it in
+        the Detect tab's gain box, so it is seen and stays fixed."""
+        item = self.list_view.currentItem()
+        if item is None or self._worker is not None:
+            return
+        try:
+            session = self._ensure_session(item)
+            mask = None
+            if self.params_panel.regions_panel.get_use_mask():
+                mask = self._build_regions(session.image.shape[1:])[0]
+        except Exception as exc:
+            self.params_panel.set_detect_status(f"error: {exc}", level="error")
+            return
+        detect = self.params_panel.get_detect_kwargs()
+        self.progress_label.setText(f"Measuring the gain: {item.entry.image_path.name}")
+        self.params_panel.set_estimating_gain(True)
+        worker = _estimate_gain_worker(
+            session,
+            self.params_panel.get_sigma(),
+            self.params_panel.get_camera_kwargs()["offset"],
+            self.params_panel.get_frame_range(),
+            mask,
+            detect.get("width"),
+            self.params_panel.get_n_threads(),
+        )
+        self._start_step_worker(
+            worker,
+            self._on_gain_estimated,
+            indeterminate=True,
+            on_error=self._on_gain_error,
+        )
+
+    def _on_gain_estimated(self, gain: float) -> None:
+        self.params_panel.set_estimating_gain(False)
+        self.params_panel.set_gain(gain)
+        self.params_panel.set_detect_status(f"gain {gain:.3f} ADU²/ADU, estimated from this movie", level="ok")
+        self._finish_step_worker()
+
+    def _on_gain_error(self, exc: Exception) -> None:
+        self.params_panel.set_estimating_gain(False)
+        self.params_panel.set_detect_status(f"error: {exc}", level="error")
+        self._finish_step_worker()
+
     def _on_detect_finished(self, item: ExperimentItem, session: PipelineSession) -> None:
         self.params_panel.set_detect_running(False)
         if self._session_item is not item:
@@ -1344,6 +1391,8 @@ class ExperimentListWidget(QWidget):
             n_flagged = int(frames["n_flagged"].sum())
             if n_flagged:
                 extra = f"  ({n_flagged} flagged)"
+        if session.gain_source == "estimated":
+            extra += f"\ngain {session.camera_kwargs_used['gain']:.3f} (estimated; Estimate keeps one fixed)"
         self.params_panel.set_detect_status(
             f"{n_points} points across frames {start}-{end - 1}{extra}"
             + self._region_count_text(session),
@@ -2005,6 +2054,20 @@ def _run_detect_worker(
         n_threads=n_threads,
         detector=detector,
     )
+
+
+@thread_worker(start_thread=False)
+def _estimate_gain_worker(
+    session: PipelineSession,
+    sigma: float,
+    offset: float,
+    frame_range: Optional[tuple[int, int]],
+    mask: Optional[np.ndarray],
+    width: Optional[tuple[float, float]],
+    n_threads: Optional[int],
+) -> float:
+    kw = {} if width is None else dict(width=width)
+    return estimate_gain(session, sigma, offset, frame_range, mask, n_threads=n_threads, **kw)
 
 
 @thread_worker(start_thread=False)

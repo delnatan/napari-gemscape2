@@ -79,13 +79,15 @@ from napari_gemscape2.regions import Regions
 from napari_gemscape2.io_formats import StackMetadata, load_stack
 from napari_gemscape2.tracking_diagnostics import check_resolvability
 
-# The camera's own calibration, forwarded to every `spotsolve.localize`/
-# `localize_stack` call. `offset` (ADU) is subtracted
-# before fitting; everything else about the camera -- gain, read noise --
-# is measured from each frame's own noise (`spotsolve` no longer takes
-# either as an input), so `offset` is the only knob left here.
+# The camera, forwarded to every `spotsolve.localize_stack` call. `offset`
+# (ADU) is subtracted before fitting. `gain` is the pixel variance per ADU
+# of light -- the conversion gain times any excess-noise factor (2 for an
+# EMCCD) -- which scales every likelihood ratio and standard error, so
+# spotsolve takes it as an input; None estimates it from the movie at run
+# time (`estimate_gain`). The read noise is measured from the background.
 DEFAULT_CAMERA_KWARGS = dict(
     offset=0.0,
+    gain=None,
 )
 
 # Forwarded to `spotsolve.localize`/`localize_stack` as **kwargs, mirroring
@@ -272,13 +274,15 @@ class PipelineSession:
 
     points_df: Optional[pl.DataFrame] = None
     # One row per frame (`loctable.FRAME_SCHEMA`): detection and flagged
-    # counts, median flux and precision, background and the measured
-    # dispersion. Kept on the session rather than folded into `points_df`
+    # counts, median flux and precision, background, the gain and the
+    # measured read variance. Kept on the session rather than folded into `points_df`
     # because it's a fact about the frame, not about any one detection --
     # and it's what makes "why did this frame find nothing" answerable
     # after the fact.
     frames_df: Optional[pl.DataFrame] = None
     camera_kwargs_used: Optional[dict] = None
+    # "given" or "estimated": where `camera_kwargs_used`'s gain came from.
+    gain_source: Optional[str] = None
     detect_kwargs_used: Optional[dict] = None
     detector_used: Optional[str] = None
     frame_range_used: Optional[tuple[int, int]] = None
@@ -370,6 +374,29 @@ def _resolve_frame_range(frame_range: Optional[tuple[int, int]], t: int) -> tupl
     return (start, end if end > 0 else t)
 
 
+def estimate_gain(
+    session: PipelineSession,
+    sigma: float,
+    offset: float,
+    frame_range: Optional[tuple[int, int]] = None,
+    mask: Optional[np.ndarray] = None,
+    width: tuple[float, float] = spotsolve.WIDTH,
+    n_threads: Optional[int] = None,
+) -> float:
+    """The camera's gain, pixel variance per ADU of light, measured from
+    `session.image[start:end]` (`spotsolve.estimate_gain`): the frames, and
+    the `mask`, a detect run over `frame_range` would use. It reads the
+    residuals of bright emitters, so a movie without them gives the
+    background's variance per unit level, an upper bound."""
+    start, end = _resolve_frame_range(frame_range, session.image.shape[0])
+    if end <= start:
+        raise ValueError(f"empty frame_range: start={start} >= end={end}")
+    return spotsolve.estimate_gain(
+        session.image[start:end], sigma, offset=offset, roi=mask, width=width,
+        n_threads=int(n_threads or os.cpu_count() or 1),
+    )
+
+
 def run_detect_step(
     session: PipelineSession,
     sigma: Optional[float] = None,
@@ -390,6 +417,11 @@ def run_detect_step(
     several emitters per window (`fit_mixtures=True`), "single" one.
     `detect_kwargs` (`None`: `DEFAULT_DETECT_KWARGS`) is forwarded to
     `spotsolve.localize_stack`.
+
+    `camera_kwargs` (`None`: `DEFAULT_CAMERA_KWARGS`) holds `offset` and
+    `gain`. Without a gain, it is estimated once over the frames and mask
+    of this run (`estimate_gain`), before any chunking below, and
+    `session.gain_source` records which it was.
 
     Sets `session.points_df` (one row per detection,
     `loctable.LOCALIZATION_SCHEMA`) and `session.frames_df` (one row per
@@ -442,7 +474,7 @@ def run_detect_step(
             )
         sigma = session.sigma
 
-    camera = dict(camera_kwargs) if camera_kwargs is not None else dict(DEFAULT_CAMERA_KWARGS)
+    camera = {**DEFAULT_CAMERA_KWARGS, **(camera_kwargs or {})}
     detector = detector_name(detector)
     detect = dict(detect_kwargs if detect_kwargs is not None else DEFAULT_DETECT_KWARGS)
 
@@ -455,6 +487,18 @@ def run_detect_step(
 
     n = end - start
     threads = int(n_threads or os.cpu_count() or 1)
+
+    # One gain for the whole run, so every chunk below shares it.
+    gain_source = "given"
+    if camera.get("gain") is None:
+        if progress_callback is not None:
+            progress_callback(0, n, "measuring the camera's gain")
+        camera["gain"] = estimate_gain(
+            session, sigma, camera["offset"], (start, end), mask,
+            width=detect.get("width", spotsolve.WIDTH), n_threads=threads,
+        )
+        gain_source = "estimated"
+        _check_cancelled(cancel_event)
 
     if progress_callback is not None:
         results = []
@@ -498,6 +542,7 @@ def run_detect_step(
     session.points_df = loctable.concat(locs_parts)
     session.frames_df = loctable.concat(frame_parts)
     session.camera_kwargs_used = camera
+    session.gain_source = gain_source
     session.detect_kwargs_used = detect
     session.detector_used = detector
     session.frame_range_used = (start, end)
@@ -943,6 +988,7 @@ def session_manifest_extra(session: PipelineSession) -> dict:
         "n_points": session.points_df.height if session.points_df is not None else 0,
         "n_tracks": session.tracks_df["track_id"].n_unique() if session.tracks_df is not None and session.tracks_df.height else 0,
         "camera_kwargs": session.camera_kwargs_used,
+        "gain_source": session.gain_source,
         "detector": session.detector_used,
         "detect_kwargs": _jsonable_detect_kwargs(session.detect_kwargs_used),
         "frame_range": list(session.frame_range_used) if session.frame_range_used is not None else None,
@@ -1019,6 +1065,7 @@ def session_from_bundle(
         sigma=params.get("sigma_px"),
         points_df=points_df,
         camera_kwargs_used=params.get("camera_kwargs"),
+        gain_source=params.get("gain_source"),
         detect_kwargs_used=detect_kwargs,
         detector_used=detector_name(params.get("detector")),
         frame_range_used=tuple(frame_range) if frame_range is not None else None,

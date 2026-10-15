@@ -4,7 +4,7 @@ detect -> filter -> finalize flow of its own, the shape Imaris and
 TrackMate use for spot detection:
 
     Detect:  Detect -> Filter -> Save
-             (offset + PSF width + detection knobs, [Run detect], then
+             (camera + PSF width + detection knobs, [Run detect], then
              histogram filters on what it found)
     Track:   Link -> Filter -> Save
              (linking knobs, [Run tracking], histogram filters on the
@@ -36,9 +36,13 @@ width -- two focal planes, junk fitted as signal -- is seen rather than
 averaged into one number. Fits cannot go narrower than `sigma`, so an
 overestimated sigma shows as a pile-up at the histogram's low edge.
 
-`offset` is the one camera fact spotsolve takes (noise is measured from
-each frame), and `PipelineParamsWidget.get_camera_kwargs` is the single
-source of truth `ExperimentListWidget` forwards to every stage.
+The camera is two numbers: `offset` and `gain`, the pixel variance per ADU
+of light, which scales every likelihood ratio and standard error. The gain
+box reads "auto" until it holds a number, and a run then estimates it from
+the movie; its "Estimate" button (`estimateGainRequested`) measures it from
+the current movie now, so the number is on screen and stays fixed across
+runs. `PipelineParamsWidget.get_camera_kwargs` is the single source of
+truth `ExperimentListWidget` forwards to every stage.
 
 Above both tabs sits `_ImageInfoPanel`: a one-line readout of the
 *image's own* metadata -- frame count, pixel size, frame interval -- over
@@ -63,7 +67,7 @@ rather than to the whole form.
 
 `spotsolve`'s detector has one threshold, the least probability that a
 reported spot is real (`p_real`), and its linker one distance
-(`max_step`), so what's left to expose is the camera, the PSF width, those
+(`max_step`), so what's left to expose is the camera (offset and gain), the PSF width, those
 two numbers, and the "detector" choice: mixtures (several emitters per
 window, the default) or single fits (one per window, faster for
 well-separated spots), with mixtures' "motion blur" switch for exposures
@@ -235,8 +239,8 @@ class _DetectTab(QWidget):
     knobs plus scope and the Run button, then a filter stack over what it
     found (where `fit_sigma` is read to settle the PSF width), then Save.
 
-    Core: `sigma`, `offset` (the one camera fact `spotsolve` takes -- gain
-    and read noise are measured from each frame), the `detector` dropdown
+    Core: `sigma`, the camera's `offset` and `gain` (with its "Estimate"
+    button; read noise is measured from the background), the `detector` dropdown
     (mixtures or single fits) with mixtures' `motion_blur` checkbox,
     `p_real` -- the one threshold, the least probability that a reported
     spot is real, restated as a noise fraction underneath -- a frame range
@@ -247,16 +251,40 @@ class _DetectTab(QWidget):
     cancelRequested = Signal()
     filtersChanged = Signal()
     saveRequested = Signal()
+    estimateGainRequested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
         self._running = False
         self.offset = _dspin(
             DEFAULT_CAMERA_KWARGS["offset"], 0.0, 1e6, 1.0, decimals=2,
-            tooltip="Camera offset / baseline, ADU -- subtracted before fitting.\n"
-            "The only camera fact spotsolve needs: noise is measured from\n"
-            "each frame, not from a gain/read-noise calibration.",
+            tooltip="Camera offset / baseline, ADU -- subtracted before fitting.",
         )
+        # 0 is "auto": no gain given, so each run estimates one from its
+        # movie. `Estimate` fills in a number instead.
+        self.gain = _dspin(
+            0.0, 0.0, 1e5, 0.1, decimals=3,
+            tooltip="Camera gain: pixel variance per ADU of light above the offset --\n"
+            "the conversion gain (ADU per photoelectron) times any excess-noise\n"
+            "factor (2 for an EMCCD). It scales every detection test and\n"
+            "localization error, so it should be right to about 10%.\n\n"
+            "Take it from the camera's calibration, or press Estimate to measure\n"
+            "it from this movie's bright spots. 'auto' estimates it at each run.",
+        )
+        self.gain.setSpecialValueText("auto")
+        self.estimate_gain_button = QPushButton("Estimate")
+        self.estimate_gain_button.setToolTip(
+            "Measure the gain from the current movie (its frame range and\n"
+            "regions), from the residuals of its bright spots. Without bright\n"
+            "spots this is the background's variance per unit level, an\n"
+            "upper bound."
+        )
+        self.estimate_gain_button.clicked.connect(self.estimateGainRequested.emit)
+        gain_row = QHBoxLayout()
+        gain_row.setContentsMargins(0, 0, 0, 0)
+        gain_row.addWidget(self.gain)
+        gain_row.addWidget(self.estimate_gain_button)
+        gain_row.addStretch()
         d = DEFAULT_DETECT_KWARGS
         width_lo, width_hi = d["width"]
 
@@ -322,6 +350,7 @@ class _DetectTab(QWidget):
         core_form.addRow("detector", self.detector)
         core_form.addRow("", self.motion_blur)
         core_form.addRow("offset (ADU)", self.offset)
+        core_form.addRow("gain (ADU²/ADU)", gain_row)
         core_form.addRow("P(real) at least", self.p_real)
         core_form.addRow(self._p_note)
 
@@ -537,7 +566,15 @@ class _DetectTab(QWidget):
         return self.n_threads.value()
 
     def get_camera_kwargs(self) -> dict:
-        return dict(offset=self.offset.value())
+        gain = self.gain.value()
+        return dict(offset=self.offset.value(), gain=gain if gain > 0 else None)
+
+    def set_gain(self, gain: float) -> None:
+        self.gain.setValue(gain)
+
+    def set_estimating_gain(self, running: bool) -> None:
+        self.estimate_gain_button.setEnabled(not running)
+        self.estimate_gain_button.setText("Estimating…" if running else "Estimate")
 
     def get_detect_kwargs(self) -> dict:
         return dict(
@@ -1150,6 +1187,7 @@ class PipelineParamsWidget(QWidget):
 
     detectRequested = Signal()
     detectCancelRequested = Signal()
+    estimateGainRequested = Signal()
     trackRequested = Signal()
     saveRequested = Signal()
     saveDetectionsRequested = Signal()
@@ -1168,6 +1206,7 @@ class PipelineParamsWidget(QWidget):
 
         self._detect.runRequested.connect(self.detectRequested)
         self._detect.cancelRequested.connect(self.detectCancelRequested)
+        self._detect.estimateGainRequested.connect(self.estimateGainRequested)
         self._detect.filtersChanged.connect(self.pointFiltersChanged)
         self._detect.saveRequested.connect(self.saveDetectionsRequested)
         self._tracking.runRequested.connect(self.trackRequested)
@@ -1258,8 +1297,15 @@ class PipelineParamsWidget(QWidget):
         return self._detect.get_sigma()
 
     def get_camera_kwargs(self) -> dict:
-        """The one source of truth for `offset`."""
+        """The one source of truth for `offset` and `gain` (None: estimate
+        it at run time)."""
         return self._detect.get_camera_kwargs()
+
+    def set_gain(self, gain: float) -> None:
+        self._detect.set_gain(gain)
+
+    def set_estimating_gain(self, running: bool) -> None:
+        self._detect.set_estimating_gain(running)
 
     def get_detect_kwargs(self) -> dict:
         return self._detect.get_detect_kwargs()

@@ -43,8 +43,7 @@ from typing import Optional
 
 # Unicode forms, for Qt labels. "ADU" is spotsolve's own unit for `flux`
 # and `bg` -- camera counts above the offset, not photons: nothing here
-# converts by a gain, since spotsolve measures noise from each frame
-# rather than taking a gain calibration.
+# converts by the gain, which only sets the noise.
 UM = "µm"
 UM2 = "µm²"
 UM2_S = "µm²/s"
@@ -133,7 +132,7 @@ _EXACT: dict[str, Optional[str]] = {
     "n_locs": None,
     "n_flagged": None,
     "crowding_ratio": None,
-    # The camera's measured gain, variance per unit signal, which
+    # The camera's gain as given, variance per unit signal, which
     # spotsolve's own schema labels ADU (ADU² per ADU), and its read
     # variance. Taken from there rather than re-derived, on the principle
     # that this table states what upstream says and nothing it had to

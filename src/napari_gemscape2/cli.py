@@ -82,6 +82,8 @@ def detect_track(
         [params]
         sigma = 1.3      # PSF width, px (required unless the template has it)
         max_step = 20.0  # largest linked step, px (likewise required)
+        # optional: the camera; without `gain` it is estimated per movie
+        camera_kwargs = { offset = 100.0, gain = 2.7 }
         exclude_flags = ["STALLED"]   # optional: spotsolve FitFlag names
 
         [[inputs]]

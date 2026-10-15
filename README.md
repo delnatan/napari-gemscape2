@@ -63,8 +63,9 @@ you'll publish, use the clone.
 Both halves of the problem are handled by `spotsolve` rather than tuned around:
 
 - **Detection** fits each candidate spot on its own window, every emitter at
-  its own width, with each pixel's noise from the camera's noise curve
-  (gain and read noise, both measured from the movie). With the default
+  its own width, with each pixel's noise from the camera's noise curve (the
+  camera's gain, given or estimated from the movie, and its read noise,
+  measured from the background). With the default
   "mixtures" detector a window takes as many emitters as the likelihood ratio
   supports, so overlapping spots are resolved instead of being merged into one
   bright centroid; "single" fits one per window, faster for well-separated
@@ -179,6 +180,14 @@ in-focus end of the main peak, not its middle. Fits can't go below `sigma`
 bimodal or ragged `fit_sigma` (two focal planes, junk being fitted as signal) is
 something you see rather than something a median averages away. A sigma set too
 high shows as a pile-up at the histogram's low edge.
+
+The camera's **gain** sits beside the offset on the Detect page: the pixel
+variance per ADU of light, which scales every detection test and localization
+error, so it should be right to about 10%. Type it from the camera's
+calibration, or press *Estimate* to measure it from the current movie's bright
+spots (its frame range and regions). The box reads "auto" until it holds a
+number; a run then estimates the gain itself, and `manifest.json` records the
+value used and whether it was given or estimated.
 
 One unit caveat, since two are in play: `sigma` is in **pixels**, while `width`
 (the reported widths, expert settings) is a **multiple of sigma** (`sigma_ratio
@@ -348,9 +357,11 @@ sigma = 1.3
 # scale, so a large value costs slow particles little.
 max_step = 20.0
 min_track_length = 2
-# `offset` is the only camera fact spotsolve needs -- noise is measured
-# from each frame directly.
-camera_kwargs = { offset = 100.0 }
+# The camera: `offset` (ADU) and `gain`, the pixel variance per ADU of
+# light (conversion gain times any excess-noise factor; 2 for an EMCCD).
+# Leave `gain` out to estimate it from each movie; the read noise is
+# measured from the background.
+camera_kwargs = { offset = 100.0, gain = 2.7 }
 # "mixtures" (default: several emitters per fit window) or "single".
 detector = "mixtures"
 # The detector's one threshold: the least probability that a reported spot
