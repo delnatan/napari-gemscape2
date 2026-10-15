@@ -125,7 +125,7 @@ _EXACT: dict[str, Optional[str]] = {
     # spotsolve's detection score, sqrt(2 * likelihood ratio) of the
     # emitter against background alone (at least the threshold `u` that
     # `p_real` sets), and the probability the emitter is real.
-    "z": None,
+    "detect_z": None,
     "p_real": None,
     # spotsolve's per-fit diagnostics: a `FitFlag` bitmask.
     "flags": None,

@@ -480,7 +480,7 @@ def run_detect_step(
     The whole range goes through one `spotsolve.localize_stack` call, which
     runs frames in parallel -- `n_threads` (default: every core,
     `os.cpu_count()`) is how many native threads it hands frames to. One
-    call, because the read variance, the bar `u` and `P(real | z)` are the
+    call, because the read variance, the bar `u` and `P(real | detect_z)` are the
     movie's: a range split into calls would be several movies, each with its
     own. With a `progress_callback`, the call runs on a helper thread and a
     `spotsolve.Progress` is read off it as frames are fitted; `cancel_event`
