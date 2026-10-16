@@ -466,7 +466,7 @@ wheels = [
 [[package]]
 name = "diffusionkit"
 version = "0.1.0"
-source = { git = "https://github.com/delnatan/diffusionkit.git?branch=main#594b0e5cff5a18afd09503dd25d3952e590fc845" }
+source = { git = "https://github.com/delnatan/diffusionkit.git?branch=main#3f79fc9c1c6a23afac513b2c4f237b93b8dca46f" }
 dependencies = [
     { name = "numpy" },
     { name = "polars" },
