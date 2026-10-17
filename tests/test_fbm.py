@@ -137,6 +137,9 @@ def test_population_separates_the_two_groups(analysis):
     s = fbm.population_summary(high)
     assert s["n_tracks"] == 20
     for key in ("alpha_mean", "alpha_sd", "p_alpha_below_1", "alpha_D_ref_corr", "share_below_floor"):
+        if s[key] is None:  # the correlation, for a population on one alpha cell
+            assert key == "alpha_D_ref_corr"
+            continue
         median, low_, high_ = s[key]
         assert low_ <= median <= high_
 

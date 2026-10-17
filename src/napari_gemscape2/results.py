@@ -26,7 +26,7 @@ and, once the diffusion widget has saved an analysis of it
 (`write_diffusion_results`):
     <result_dir>/tracks_summary.csv       one row per track
     <result_dir>/loglik_D.parquet         every track's log-likelihood over D
-    <result_dir>/loglik_alpha_D.parquet   every track's likelihood over (alpha, log10 D_ref), if α · D was run
+    <result_dir>/loglik_alpha_D.parquet   every track's likelihood over (alpha, log10 D at the frame interval), if α · D was run
     <result_dir>/profile_alpha.parquet    every track's profile log-likelihood of alpha, if α · D was run
     <result_dir>/distributions_D.csv      the ensemble on the D grid
     <result_dir>/distributions_D_by_length.csv  the same split by track length

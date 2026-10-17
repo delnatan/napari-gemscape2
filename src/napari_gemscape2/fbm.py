@@ -157,13 +157,13 @@ def analyze_fbm(
 
 
 def _cropped(lik: JointLikelihoods) -> Optional[JointLikelihoods]:
-    """`lik` over its informative D_ref cells: a subset's range lies inside it, and the rest is
+    """`lik` over its informative D cells: a subset's range lies inside it, and the rest is
     either flat (below detection) or negligible for every track."""
     if not len(lik.track_ids):
         return None
     keep = informative_range(lik)
     return JointLikelihoods(lik.track_ids, lik.n_frames, lik.D_ref_floor_um2_s, lik.alphas,
-                            lik.log10_D_ref[keep], lik.loglik[:, :, keep])
+                            lik.log10_D_ref[keep], lik.loglik[:, :, keep], lik.tau_s, lik.tau_ref_s)
 
 
 def _rows(analysis: FbmAnalysis, ids: Optional[set]) -> pl.DataFrame:
@@ -240,7 +240,12 @@ def population_is_cached(analysis: FbmAnalysis, ids: Optional[set] = None) -> bo
     return analysis.likelihoods is None or (None if ids is None else frozenset(ids)) in analysis._populations
 
 
-def _interval(draws: np.ndarray, level: float) -> list[float]:
+def _interval(draws: np.ndarray, level: float) -> Optional[list[float]]:
+    """[median, low, high] over the draws where the read is defined (the alpha-D_ref correlation is not
+    in a draw whose alpha is one cell), or None in none."""
+    draws = draws[np.isfinite(draws)]
+    if not len(draws):
+        return None
     tail = (1 - level) / 2
     return [float(v) for v in np.quantile(draws, [0.5, tail, 1 - tail])]
 
@@ -311,6 +316,8 @@ def fbm_record(analysis: FbmAnalysis, ids: Optional[set], by_class: Optional[dic
         "tau_ref_s": o.tau_ref_s,
         "alpha_grid": [o.alpha_min, o.alpha_max, o.n_alpha],
         "tracks_sha256": analysis.tracks_sha256,
+        # The lag D is set at on the joint likelihood's cells (`loglik_long_table`'s `log10_D`).
+        "population_tau_s": None if analysis.likelihoods is None else analysis.likelihoods.tau_s,
         **summarize_fbm(analysis, ids),
     }
     reads(record, ids)
@@ -348,7 +355,8 @@ def _profiles_from(table: pl.DataFrame) -> AlphaProfiles:
 
 def loglik_long_table(analysis: FbmAnalysis) -> Optional[pl.DataFrame]:
     """Every fitted track's joint likelihood, one row per (track, cell):
-    `track_id`, `alpha`, `log10_D_ref`, `loglik` (each track's maximum 0) --
+    `track_id`, `alpha`, `log10_D` (D at the cells' lag, `fbm_record`'s
+    "population_tau_s"), `loglik` (each track's maximum 0) --
     what `alpha_population` deconvolves, so a bundle reopens without
     refitting. Also the track's frames and D_ref floor, repeated per row.
     None without likelihoods."""
@@ -362,27 +370,30 @@ def loglik_long_table(analysis: FbmAnalysis) -> Optional[pl.DataFrame]:
             "n_frames": np.repeat(lik.n_frames, n_a * n_d),
             "D_ref_floor_um2_s": np.repeat(lik.D_ref_floor_um2_s, n_a * n_d),
             "alpha": np.tile(np.repeat(lik.alphas, n_d), n),
-            "log10_D_ref": np.tile(lik.log10_D_ref, n * n_a),
+            "log10_D": np.tile(lik.log10_D_ref, n * n_a),
             "loglik": lik.loglik.reshape(-1).astype(np.float32),
         },
         schema={"track_id": pl.Int64, "n_frames": pl.Int64, "D_ref_floor_um2_s": pl.Float64, "alpha": pl.Float64,
-                "log10_D_ref": pl.Float64, "loglik": pl.Float32},
+                "log10_D": pl.Float64, "loglik": pl.Float32},
     )
 
 
-def _likelihoods_from(table: pl.DataFrame) -> JointLikelihoods:
-    """`loglik_long_table`'s table back to `JointLikelihoods`."""
-    table = table.sort("track_id", "alpha", "log10_D_ref")
+def _likelihoods_from(table: pl.DataFrame, tau_s: float, tau_ref_s: float) -> JointLikelihoods:
+    """`loglik_long_table`'s table back to `JointLikelihoods`, its cells' D at the lag `tau_s`."""
+    if "log10_D" not in table.columns:
+        raise StaleAnalysisError("its joint likelihoods were saved by an earlier α · D version: Run to re-fit")
+    table = table.sort("track_id", "alpha", "log10_D")
     alphas = np.unique(table["alpha"].to_numpy())
-    D = np.unique(table["log10_D_ref"].to_numpy())
+    D = np.unique(table["log10_D"].to_numpy())
     per_track = table.group_by("track_id", maintain_order=True).agg(
         pl.col("n_frames").first(), pl.col("D_ref_floor_um2_s").first(), pl.len().alias("n_cells"))
     if (per_track["n_cells"] != len(alphas) * len(D)).any():
-        raise ValueError("loglik_alpha_D: every track needs one row per (alpha, log10_D_ref) cell")
+        raise ValueError("loglik_alpha_D: every track needs one row per (alpha, log10_D) cell")
     return JointLikelihoods(
         per_track["track_id"].to_numpy(), per_track["n_frames"].to_numpy(),
         per_track["D_ref_floor_um2_s"].to_numpy(), alphas, D,
         table["loglik"].cast(pl.Float64).to_numpy().reshape(per_track.height, len(alphas), len(D)),
+        tau_s, tau_ref_s,
     )
 
 
@@ -415,7 +426,9 @@ def restore_fbm(tracks: pl.DataFrame, record: dict, tracks_summary: pl.DataFrame
     ok_ids = set(fits.filter(pl.col("fbm_status") == "ok")["track_id"].to_list())
     likelihoods = None
     if loglik is not None and loglik.height:
-        likelihoods = _likelihoods_from(loglik)
+        if record.get("population_tau_s") is None:
+            raise StaleAnalysisError("it was saved by an earlier α · D version (no population lag): Run to re-fit")
+        likelihoods = _likelihoods_from(loglik, record["population_tau_s"], record["tau_ref_s"])
         if set(likelihoods.track_ids.tolist()) != ok_ids:
             raise StaleAnalysisError("its joint likelihoods are not those of its fitted tracks")
     prof = None
