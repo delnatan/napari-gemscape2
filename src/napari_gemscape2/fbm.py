@@ -44,7 +44,7 @@ from typing import Callable, Optional
 import numpy as np
 import polars as pl
 from diffusionkit import Acquisition
-from diffusionkit.fbmpost import AlphaDPopulation, AlphaProfiles, FbmPostOptions, JointLikelihoods
+from diffusionkit.fbmpost import AlphaDPopulation, AlphaProfiles, FbmPostOptions, JointGrid, JointLikelihoods
 from diffusionkit.fbmpost import analyze_tracks as dk_analyze_fbm
 from diffusionkit.fbmpost import deconvolve_tracks as dk_deconvolve_alpha_D
 from diffusionkit.fbmpost import likelihood as fbm_likelihood
@@ -95,10 +95,59 @@ _RENAME = {
 }
 
 
-def fbm_options(min_frames: int = MIN_FRAMES, tau_ref_s: float = TAU_REF_S) -> FbmPostOptions:
-    """The `FbmPostOptions` a run here uses: diffusionkit's alpha grid and its
-    likelihood-ratio level (95%). Raises ValueError for an invalid value."""
-    return FbmPostOptions(min_frames=min_frames, tau_ref_s=tau_ref_s)
+# The grids a run evaluates the likelihood on, the settings the tab and a batch expose:
+# - n_alpha: the per-track alpha grid's points over 0.02-1.98 (`FbmPostOptions.n_alpha`). Each costs
+#   one eigendecomposition per track; alpha_hat is refined between them.
+# - alpha_group, d_log10_D, cell_points: the population's cells (`JointGrid`): alpha_group alpha
+#   rows by d_log10_D decades of D, each cell the likelihood averaged over cell_points D points. A
+#   run's time with the population kept is mostly these cells: in proportion to cell_points / d_log10_D.
+# cell_points is 4 here, not diffusionkit's 8: on 0.05-decade cells 4 points stay within 0.08 nats of 8
+# on GEM-like tracks, at two thirds of the run time.
+FBM_GRID_DEFAULTS = {
+    "n_alpha": FbmPostOptions().n_alpha,
+    "alpha_group": JointGrid().alpha_group,
+    "d_log10_D": JointGrid().d_log10_D_ref,
+    "cell_points": 4,
+}
+
+
+def fbm_options(min_frames: int = MIN_FRAMES, tau_ref_s: float = TAU_REF_S, grid: Optional[dict] = None) -> FbmPostOptions:
+    """The `FbmPostOptions` a run here uses: diffusionkit's alpha range and its
+    likelihood-ratio level (95%), `grid`'s n_alpha (`FBM_GRID_DEFAULTS` for any key
+    left out), which must make at least 3 population cells of `alpha_group`. Raises
+    ValueError for an invalid value."""
+    g = fbm_grid_settings(grid)
+    n_alpha = int(g["n_alpha"])
+    if n_alpha < 3:
+        raise ValueError(f"n_alpha must be at least 3, got {n_alpha}")
+    if n_alpha // max(int(g["alpha_group"]), 1) < 3:
+        raise ValueError(f"{n_alpha} α points make fewer than 3 population cells of {g['alpha_group']}")
+    return FbmPostOptions(min_frames=min_frames, tau_ref_s=tau_ref_s, n_alpha=n_alpha)
+
+
+def fbm_grid_settings(grid: Optional[dict] = None) -> dict:
+    """`grid` over `FBM_GRID_DEFAULTS`. Raises ValueError for an unknown key."""
+    grid = dict(grid or {})
+    unknown = set(grid) - set(FBM_GRID_DEFAULTS)
+    if unknown:
+        raise ValueError(f"unknown alpha-D grid setting(s): {', '.join(sorted(unknown))}")
+    return {**FBM_GRID_DEFAULTS, **grid}
+
+
+def joint_grid(grid: Optional[dict] = None) -> JointGrid:
+    """The population's cells (`JointGrid`) from `grid` (`FBM_GRID_DEFAULTS` for any key
+    left out). Raises ValueError for an invalid value."""
+    g = fbm_grid_settings(grid)
+    return JointGrid(alpha_group=int(g["alpha_group"]), d_log10_D_ref=float(g["d_log10_D"]),
+                     cell_points=int(g["cell_points"]))
+
+
+def grid_record(options: FbmPostOptions, joint: Optional[JointGrid]) -> dict:
+    """The grid settings a run used (`FBM_GRID_DEFAULTS`' keys); a run restored from a
+    bundle saved before they were recorded has diffusionkit's population cells then."""
+    joint = joint or JointGrid()
+    return {"n_alpha": options.n_alpha, "alpha_group": joint.alpha_group, "d_log10_D": joint.d_log10_D_ref,
+            "cell_points": joint.cell_points}
 
 
 @dataclass(frozen=True)
@@ -113,6 +162,8 @@ class FbmAnalysis:
     acquisition: Acquisition
     options: FbmPostOptions
     tracks_sha256: Optional[str] = None
+    # The population's cells (`joint_grid`); None for a run restored from a bundle that did not record them.
+    joint: Optional[JointGrid] = None
     likelihoods: Optional[JointLikelihoods] = field(default=None, compare=False, repr=False)
     profiles: Optional[AlphaProfiles] = field(default=None, compare=False, repr=False)
     # `alpha_population`'s results by track ids: ~10 s each for a thousand tracks.
@@ -126,6 +177,11 @@ class FbmAnalysis:
     def ok(self) -> pl.DataFrame:
         return self.fits.filter(pl.col("fbm_status") == "ok")
 
+    @property
+    def grid(self) -> dict:
+        """The grid settings it ran with (`grid_record`)."""
+        return grid_record(self.options, self.joint)
+
     def columns(self) -> pl.DataFrame:
         """The per-track columns (`FBM_SCHEMA`) for the tracks pane."""
         return self.fits.select(FBM_SCHEMA.keys())
@@ -136,24 +192,27 @@ def analyze_fbm(
     acquisition: Acquisition,
     options: FbmPostOptions,
     *,
+    joint: Optional[JointGrid] = None,
     progress: Optional[Callable[[int, int], None]] = None,
     threads: Optional[int] = None,
 ) -> FbmAnalysis:
     """`diffusionkit.fbmpost.analyze_tracks` on `tracks` (`tracks_to_diffusionkit_df`'s
     table), on a pool of `threads` (default: one per CPU), reshaped to `FBM_SCHEMA`,
-    with each fitted track's profile of alpha and its joint likelihood, the latter
-    kept over the D_ref cells some track tells apart (`fbmpost.population.informative_range`)."""
+    with each fitted track's profile of alpha and its joint likelihood on `joint`'s
+    cells (default `joint_grid()`), the latter kept over the D cells some track tells
+    apart (`fbmpost.population.informative_range`)."""
+    joint = joint_grid() if joint is None else joint
     threads = threads or os.cpu_count() or 1
+    kw = dict(progress=progress, keep_likelihoods=True, keep_profiles=True, joint=joint)
     if threads > 1:
         with ThreadPoolExecutor(threads) as pool:
-            result = dk_analyze_fbm(tracks, acquisition, options, progress=progress, keep_likelihoods=True,
-                                    keep_profiles=True, map_fn=pool.map)
+            result = dk_analyze_fbm(tracks, acquisition, options, map_fn=pool.map, **kw)
     else:
-        result = dk_analyze_fbm(tracks, acquisition, options, progress=progress, keep_likelihoods=True,
-                                keep_profiles=True)
+        result = dk_analyze_fbm(tracks, acquisition, options, **kw)
     fits = result.fits.rename(_RENAME).select("n_frames", *FBM_SCHEMA.keys()).cast(FBM_SCHEMA)
     profiles = result.profiles if len(result.profiles.track_ids) else None
-    return FbmAnalysis(fits, acquisition, options, tracks_fingerprint(tracks), _cropped(result.likelihoods), profiles)
+    return FbmAnalysis(fits, acquisition, options, tracks_fingerprint(tracks), joint, _cropped(result.likelihoods),
+                       profiles)
 
 
 def _cropped(lik: JointLikelihoods) -> Optional[JointLikelihoods]:
@@ -315,6 +374,8 @@ def fbm_record(analysis: FbmAnalysis, ids: Optional[set], by_class: Optional[dic
         "population_level": LEVEL,
         "tau_ref_s": o.tau_ref_s,
         "alpha_grid": [o.alpha_min, o.alpha_max, o.n_alpha],
+        # The grid settings (`FBM_GRID_DEFAULTS`' keys), what a batch template reruns with.
+        "grid": analysis.grid,
         "tracks_sha256": analysis.tracks_sha256,
         # The lag D is set at on the joint likelihood's cells (`loglik_long_table`'s `log10_D`).
         "population_tau_s": None if analysis.likelihoods is None else analysis.likelihoods.tau_s,
@@ -436,7 +497,9 @@ def restore_fbm(tracks: pl.DataFrame, record: dict, tracks_summary: pl.DataFrame
         prof = _profiles_from(profiles)
         if set(prof.track_ids.tolist()) != ok_ids:
             raise StaleAnalysisError("its alpha profiles are not those of its fitted tracks")
-    return FbmAnalysis(fits, acquisition, options, record["tracks_sha256"], likelihoods, prof)
+    saved = record.get("grid")
+    joint = joint_grid(saved) if saved else None
+    return FbmAnalysis(fits, acquisition, options, record["tracks_sha256"], joint, likelihoods, prof)
 
 
 def scatter_panels(analysis: FbmAnalysis, groups: dict[str, Optional[set]]) -> list[dict]:

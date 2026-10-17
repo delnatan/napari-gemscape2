@@ -190,9 +190,13 @@ def diffusion(
         # or shares of each track's longest lag (replace both lag counts):
         # msd_lag_fraction = 0.3
         # msd_alpha_lag_fraction = 0.5
-        # Also run the alpha-D (fBm) posteriors, D_ref at this lag (s); a
+        # Also run the alpha-D (fBm) fits, D_ref at this lag (s); a
         # template saved with them sets it. D_ref is not a Brownian D.
         alpha_D_tau_ref_s = 0.1
+        # their grids; any key left out keeps the default (shown): alpha
+        # points per track, then the population's cells -- alpha rows per
+        # cell, D cell width in decades, likelihood points per D cell.
+        alpha_D_grid = { n_alpha = 99, alpha_group = 3, d_log10_D = 0.05, cell_points = 4 }
         exposure_s = 0.01       # optional: overrides each bundle's recorded one
         min_track_length = 1    # which tracks pass (passes_filters, ensemble)
         filters = { D_info_bits = [1.0, inf], flux_mean = [800.0, inf] }
@@ -224,8 +228,9 @@ def diffusion(
         # Lags asked for here replace shares the template was saved with.
         settings_cfg.pop("msd_lag_fraction", None)
         settings_cfg.pop("msd_alpha_lag_fraction", None)
-    if isinstance(diff_cfg.get("grid"), dict):
-        settings_cfg["grid"] = {**inherited.get("grid", {}), **diff_cfg["grid"]}
+    for key in ("grid", "alpha_D_grid"):  # key by key over the template's
+        if isinstance(diff_cfg.get(key), dict):
+            settings_cfg[key] = {**inherited.get(key, {}), **diff_cfg[key]}
     try:
         DiffusionSettings(**{k: v for k, v in settings_cfg.items() if k != "filters"}).options()
     except (TypeError, ValueError) as exc:

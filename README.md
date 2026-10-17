@@ -392,6 +392,10 @@ msd_alpha_max_lag = 10
 # Also run the α · D (fBm) fits, D_ref at this lag in seconds. A
 # template saved after an α · D run sets it. D_ref is not a Brownian D.
 alpha_D_tau_ref_s = 0.1
+# and their grids (any key left out keeps the default, shown): α points per
+# track, then the population's cells: α rows per cell, D cell width in
+# decades, likelihood points per D cell.
+alpha_D_grid = { n_alpha = 99, alpha_group = 3, d_log10_D = 0.05, cell_points = 4 }
 exposure_s = 0.01       # optional: overrides each bundle's recorded exposure
 # Which tracks pass (`passes_filters`) and so make up the ensemble -- the
 # diffusion widget's tracks-pane cuts, on any per-track column.
@@ -566,6 +570,14 @@ localization noise) has no α̂, and its interval spans the whole grid.
   and not Brownian, and gives the **shared α**: one α for every track the
   filters pass, from their profiles summed, with its interval and its test of
   α = 1, per region class.
+- **Grid** (collapsed above Run) sets what the likelihood is evaluated on: the
+  α points per track (default 99, steps of 0.02), and the population's cells,
+  α points per cell (3), D cell width (0.05 decades of D at the frame
+  interval) and likelihood points per D cell (4). A run with the population
+  costs mostly the cells, in proportion to points per cell over cell width, so
+  coarser cells or fewer points run faster at the cost of blurring narrow
+  populations. The grid is saved with the run (`"grid"` in the summary) and a
+  batch template reruns it (`alpha_D_grid`).
 - **α–D** draws every fitted track's α̂ against its D_ref with likelihood-ratio
   intervals on both, one panel per region class. Tracks whose α interval spans
   the grid are grey; tracks that only bound D_ref from above are grey "<"
@@ -681,7 +693,7 @@ diffusion_summary.json    settings (dt, exposure, grid -- GridPostOptions' field
                           the fitted tracks' fingerprint (tracks_sha256), and packages
                           (diffusionkit's and napari-gemscape2's version and git SHA);
                           after an α · D run, an "alpha_D" entry: its settings (tau_ref_s,
-                          the alpha grid, lr_level), counts, fingerprint,
+                          the alpha grid, "grid", lr_level), counts, fingerprint,
                           "shared_alpha" (alpha, low, high, p_brownian) and
                           "population" (P(α < 1), the mean and SD of α, the α-D_ref
                           correlation and the share below the D_ref floor, each

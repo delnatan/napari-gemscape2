@@ -4,7 +4,7 @@ without napari.
 
 `analyze_bundle` rebuilds the table the widget reads off the "tracks"
 layer (`bundle_track_table`), runs the same D posteriors and per-track MSD
-fits (always both: the MSD fits take seconds), the α · D posteriors when
+fits (always both: the MSD fits take seconds), the α · D fits when
 `alpha_D_tau_ref_s` is set (a template saved with them sets it), and writes the same files
 through the same `diffusion` functions, so a bundle analyzed by
 `gemscape2 diffusion` reopens in the widget exactly like one analyzed
@@ -42,7 +42,7 @@ from napari_gemscape2.diffusion import (
     tracks_summary_table,
     tracks_to_diffusionkit_df,
 )
-from napari_gemscape2.fbm import analyze_fbm, fbm_options, fbm_record, profile_long_table
+from napari_gemscape2.fbm import analyze_fbm, fbm_options, fbm_record, joint_grid, profile_long_table
 from napari_gemscape2.fbm import loglik_long_table as fbm_loglik_table
 from napari_gemscape2.pipeline import FilterSpec, track_features_df
 from napari_gemscape2.regions import Regions
@@ -67,9 +67,12 @@ class DiffusionSettings:
     # over `msd_lag_fraction` (the 25-40% rule), alpha over the other.
     msd_lag_fraction: Optional[float] = None
     msd_alpha_lag_fraction: float = MSD_ALPHA_LAG_FRACTION
-    # When set, also run the α · D (fBm) posteriors, D_ref at this lag in
+    # When set, also run the α · D (fBm) fits, D_ref at this lag in
     # seconds (`fbm`). None: don't.
     alpha_D_tau_ref_s: Optional[float] = None
+    # Their grids (`fbm.FBM_GRID_DEFAULTS`' keys: n_alpha, alpha_group,
+    # d_log10_D, cell_points); any key left out keeps the default.
+    alpha_D_grid: dict = field(default_factory=dict)
     # Overrides the bundle's recorded exposure. None: use the manifest's.
     exposure_s: Optional[float] = None
     # Which tracks `passes_filters` marks and the ensemble is over. Every
@@ -79,6 +82,7 @@ class DiffusionSettings:
 
     def __post_init__(self):
         self.msd_window  # validates
+        fbm_options(self.min_frames, grid=self.alpha_D_grid), joint_grid(self.alpha_D_grid)  # validate
 
     @property
     def msd_window(self) -> MSDWindow:
@@ -105,6 +109,7 @@ def settings_from_summary(summary: dict) -> dict:
         "grid": {k: v for k, v in summary["grid"].items() if k in GRID_FIELDS} if summary.get("grid") else None,
         **{k: v for k, v in (summary.get("msd") or {}).items() if k.startswith("msd_")},
         "alpha_D_tau_ref_s": (summary.get("alpha_D") or {}).get("tau_ref_s"),
+        "alpha_D_grid": (summary.get("alpha_D") or {}).get("grid"),
         "min_track_length": record.get("min_track_length"),
         "filters": (
             {col: tuple(bounds) for col, bounds in record["ranges"].items()}
@@ -211,8 +216,9 @@ def analyze_bundle(
     results = posterior_results_table(analysis, msd)
     fbm = None
     if settings.alpha_D_tau_ref_s is not None:
-        fbm = analyze_fbm(diffkit_tracks, acquisition, fbm_options(settings.min_frames, settings.alpha_D_tau_ref_s),
-                          progress=progress)
+        grid = settings.alpha_D_grid
+        fbm = analyze_fbm(diffkit_tracks, acquisition, fbm_options(settings.min_frames, settings.alpha_D_tau_ref_s, grid),
+                          joint=joint_grid(grid), progress=progress)
         results = results.join(fbm.columns(), on="track_id", how="left")
 
     joined = base.join(results, on="track_id", how="left")

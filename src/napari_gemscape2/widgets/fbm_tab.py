@@ -34,17 +34,19 @@ from napari.qt.threading import thread_worker
 from qtkit import CollapsibleSection, double_spinbox, flow_row, note_label, status_label, style_status_label
 from qtkit.plot import PlotWindow
 from qtpy.QtCore import Qt
-from qtpy.QtWidgets import QLabel, QPushButton, QVBoxLayout, QWidget
+from qtpy.QtWidgets import QFormLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 from napari_gemscape2 import units
 from napari_gemscape2.fbm import (
     BROWNIAN_P,
+    FBM_GRID_DEFAULTS,
     MIN_POPULATION_TRACKS,
     TAU_REF_S,
     FbmAnalysis,
     alpha_population,
     analyze_fbm,
     fbm_options,
+    joint_grid,
     population_is_cached,
     population_panels,
     population_summary,
@@ -55,18 +57,20 @@ from napari_gemscape2.fbm import (
 )
 from napari_gemscape2.joint_plot import plot_alpha_D, plot_alpha_population, plot_fbm_track
 from napari_gemscape2.widgets.msd_widgets import fit_window_to_figure
+from napari_gemscape2.widgets.params_panel import _compact_form, _dspin, _ispin
 
 if TYPE_CHECKING:
     from diffusionkit import Acquisition
-    from diffusionkit.fbmpost import FbmPostOptions
+    from diffusionkit.fbmpost import FbmPostOptions, JointGrid
 
     from napari_gemscape2.widgets.diffusion_panel import DiffusionAnalysisWidget
 
 
 @thread_worker(start_thread=False)
-def _fbm_worker(tracks: pl.DataFrame, acquisition: "Acquisition", options: "FbmPostOptions", progress) -> FbmAnalysis:
+def _fbm_worker(tracks: pl.DataFrame, acquisition: "Acquisition", options: "FbmPostOptions", joint: "JointGrid",
+                progress) -> FbmAnalysis:
     """`fbm.analyze_fbm` off the GUI thread: ~40 ms per 40-frame track, ~2 s at 300 frames, per core."""
-    return analyze_fbm(tracks, acquisition, options, progress=progress)
+    return analyze_fbm(tracks, acquisition, options, joint=joint, progress=progress)
 
 
 @thread_worker(start_thread=False)
@@ -119,6 +123,7 @@ class FbmTab(QWidget):
         super().__init__()
         self.host = host
         self._analysis: Optional[FbmAnalysis] = None
+        self._grid_valid = True
         self._scatter_window: Optional[PlotWindow] = None
         self._track_window: Optional[PlotWindow] = None
 
@@ -135,6 +140,51 @@ class FbmTab(QWidget):
         self._tau_ref.valueChanged.connect(lambda _v: self._on_tau_changed())
         self._tau_status = status_label("")
         prior = note_label("profile likelihood: no prior · 95% likelihood-ratio intervals")
+
+        # The grids the likelihood is evaluated on (`fbm.FBM_GRID_DEFAULTS`), read when Run is pressed.
+        d = FBM_GRID_DEFAULTS
+        self._grid_n_alpha = _ispin(
+            d["n_alpha"], 3, 999,
+            tooltip="Points of each track's α grid over 0.02–1.98 (default 99: steps of 0.02).\n"
+            "α̂ is refined between them; the profile and its interval are read on them.\n"
+            "Each point costs one eigendecomposition per track. Odd counts keep α = 1 on the grid.",
+        )
+        self._grid_alpha_group = _ispin(
+            d["alpha_group"], 1, 20,
+            tooltip="α grid points per population cell along α (default 3: cells 0.06 wide).\n"
+            "The population's α resolution; odd counts keep α = 1 a cell centre.",
+        )
+        self._grid_d_log10_D = _dspin(
+            d["d_log10_D"], 0.005, 0.5, 0.01, 3, suffix=" dec",
+            tooltip="Width of a population cell along D, in decades of D at the frame interval\n"
+            "(default 0.05). Narrower than the sharpest tracks' likelihood across D (~0.07\n"
+            "decades for long tracks); wider cells blur a narrow population across alphas.\n"
+            "The run's time with the population is in proportion to 1 / this width.",
+        )
+        self._grid_cell_points = _ispin(
+            d["cell_points"], 1, 32,
+            tooltip="Likelihood points averaged across each population cell along D (default 4).\n"
+            "The run's time with the population is in proportion to this. On 0.05-decade\n"
+            "cells 4 points stay within 0.08 nats of 8; use more for wider cells.",
+        )
+        grid_form = _compact_form(QFormLayout())
+        grid_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        grid_form.addRow("α points (per track)", self._grid_n_alpha)
+        grid_form.addRow("α points per cell", self._grid_alpha_group)
+        grid_form.addRow("D cell width", self._grid_d_log10_D)
+        grid_form.addRow("points per D cell", self._grid_cell_points)
+        grid_reset = QPushButton("default grid")
+        grid_reset.setToolTip("napari-gemscape2's defaults (diffusionkit's, with 4 points per D cell).")
+        grid_reset.clicked.connect(lambda: self._set_grid(FBM_GRID_DEFAULTS))
+        grid_body = QWidget()
+        grid_layout = QVBoxLayout(grid_body)
+        grid_layout.setContentsMargins(0, 0, 0, 0)
+        grid_layout.addLayout(grid_form)
+        grid_layout.addWidget(grid_reset, alignment=Qt.AlignmentFlag.AlignLeft)
+        self._grid_section = CollapsibleSection("Grid", grid_body, expanded=False)
+        self._grid_status = status_label("")
+        for box in self._grid_boxes():
+            box.valueChanged.connect(lambda _v: self._on_grid_changed())
 
         self._run_button = QPushButton("Run α · D fits")
         self._run_button.setToolTip(
@@ -181,6 +231,8 @@ class FbmTab(QWidget):
         layout.addWidget(intro)
         layout.addWidget(flow_row(QLabel("τ_ref"), self._tau_ref, prior))
         layout.addWidget(self._tau_status)
+        layout.addWidget(self._grid_section)
+        layout.addWidget(self._grid_status)
         layout.addWidget(self._run_button)
         layout.addWidget(self._status)
         layout.addWidget(self._summary)
@@ -189,7 +241,7 @@ class FbmTab(QWidget):
         layout.addStretch()
         self.setLayout(layout)
         self._refresh_plot_buttons()
-        self.refresh_inputs()
+        self._on_grid_changed()
 
     def showEvent(self, event) -> None:  # noqa: N802
         # As the D tab: the image panel's exposure box writes into the
@@ -211,9 +263,11 @@ class FbmTab(QWidget):
         self._summary.setText("")
         self._refresh_plot_buttons()
         self._on_tau_changed()
+        self._on_grid_changed()
 
     def refresh_inputs(self) -> None:
-        self._run_button.setEnabled(self.host.has_tracks and self.host.run_exposure_s() is not None)
+        self._run_button.setEnabled(self.host.has_tracks and self.host.run_exposure_s() is not None
+                                    and self._grid_valid)
 
     def refresh(self) -> None:
         """The filters changed: restate the summary, redraw the open α–D plot."""
@@ -232,6 +286,7 @@ class FbmTab(QWidget):
     def restore(self, analysis: FbmAnalysis) -> None:
         """A saved run's columns, reopened with the settings they ran with."""
         self._set_tau(analysis.tau_ref_s)
+        self._set_grid(analysis.grid)
         n_ok = self._adopt(analysis)
         no_population = "" if analysis.likelihoods is not None else " (saved without likelihoods: no population)"
         self._status.setText(
@@ -262,6 +317,49 @@ class FbmTab(QWidget):
             self._tau_status.setText("")
             style_status_label(self._tau_status)
 
+    # -- the grid --
+
+    def _grid_boxes(self) -> tuple:
+        return (self._grid_n_alpha, self._grid_alpha_group, self._grid_d_log10_D, self._grid_cell_points)
+
+    def grid(self) -> dict:
+        """The next run's grid settings (`fbm.FBM_GRID_DEFAULTS`' keys), from the controls."""
+        return {"n_alpha": self._grid_n_alpha.value(), "alpha_group": self._grid_alpha_group.value(),
+                "d_log10_D": round(self._grid_d_log10_D.value(), 6), "cell_points": self._grid_cell_points.value()}
+
+    def _set_grid(self, grid: dict) -> None:
+        for box, key in zip(self._grid_boxes(), ("n_alpha", "alpha_group", "d_log10_D", "cell_points")):
+            blocked = box.blockSignals(True)
+            box.setValue(grid[key])
+            box.blockSignals(blocked)
+        self._on_grid_changed()
+
+    def _on_grid_changed(self) -> None:
+        """State the cells the grid makes, whether it is valid, and whether the
+        columns shown ran on another one."""
+        grid = self.grid()
+        try:
+            options, joint = fbm_options(grid=grid), joint_grid(grid)
+        except ValueError as exc:
+            self._grid_valid = False
+            self._grid_status.setText(f"grid: {exc}")
+            style_status_label(self._grid_status, "error")
+            self.refresh_inputs()
+            return
+        self._grid_valid = True
+        step = (options.alpha_max - options.alpha_min) / (options.n_alpha - 1)
+        text = (f"α step {step:.3g} · population cells {joint.alpha_group * step:.3g} in α × "
+                f"{joint.d_log10_D_ref:g} decades of D, {joint.cell_points} points each")
+        ran = self._analysis.grid if self._analysis is not None else None
+        if ran is not None and ran != grid:
+            text += (f"\ncolumns shown ran on {ran['n_alpha']} α points, cells {ran['alpha_group']} α points × "
+                     f"{ran['d_log10_D']:g} decades, {ran['cell_points']} points — Run to use this grid")
+            style_status_label(self._grid_status, "caution")
+        else:
+            style_status_label(self._grid_status)
+        self._grid_status.setText(text)
+        self.refresh_inputs()
+
     # -- the run --
 
     def _run(self) -> None:
@@ -273,13 +371,16 @@ class FbmTab(QWidget):
         if tracks is None or exposure is None:
             return
         try:
-            options = fbm_options(self.host.min_frames, self._tau_ref.value())
+            grid = self.grid()
+            options = fbm_options(self.host.min_frames, self._tau_ref.value(), grid)
+            joint = joint_grid(grid)
         except ValueError as exc:
             self.report_error(f"settings: {exc}")
             return
         self._status.setText("running…")
         style_status_label(self._status)
-        worker = _fbm_worker(tracks, Acquisition(self.host.dt_s, exposure), options, self.host.progress_callback)
+        worker = _fbm_worker(tracks, Acquisition(self.host.dt_s, exposure), options, joint,
+                             self.host.progress_callback)
         self.host.start_worker(worker, self._on_finished, self._on_error, [self._run_button], "α · D fits")
 
     def _on_finished(self, analysis: FbmAnalysis) -> None:
@@ -293,6 +394,7 @@ class FbmTab(QWidget):
         self._analysis = analysis
         self._refresh_plot_buttons()
         self._on_tau_changed()
+        self._on_grid_changed()
         self.host.set_fbm_results(analysis)
         self._summary.setText(self._format_summary())
         return analysis.ok.height
