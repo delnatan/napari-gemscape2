@@ -104,6 +104,14 @@ DEFAULT_CAMERA_KWARGS = dict(
 # `motion_blur` (mixtures only) tests each close pair against one
 # elongated spot, as an emitter moving within the exposure is; off, close
 # pairs are resolved.
+# `spotsolve.FitFlag` bits linking leaves out by default: fits the detector
+# could not take as one in-focus, diffraction-limited emitter -- wider than
+# the width bound (AT_BOUND: haze, defocused beads) or one elongated spot
+# (ELONGATED). Their positions wander beyond their standard errors, and
+# spotsolve's linker, pricing track ends by each detection's strength, would
+# let them take a bright particle's step.
+DEFAULT_EXCLUDE_FLAGS = int(spotsolve.FitFlag.AT_BOUND) | int(spotsolve.FitFlag.ELONGATED)
+
 DEFAULT_DETECT_KWARGS = dict(
     p_real=spotsolve.P_REAL,
     width=spotsolve.WIDTH,
@@ -217,9 +225,9 @@ class DetectTrackParams:
     max_step: float
     min_track_length: int = 2
     # `spotsolve.FitFlag` bits whose fits linking does not see (a bitmask;
-    # 0 keeps every fit). Off by default, following spotsolve: a flag is a
-    # diagnostic, not a verdict that the detection is wrong.
-    exclude_flags: int = 0
+    # 0 keeps every fit). By default the fits that are not one in-focus
+    # emitter (`DEFAULT_EXCLUDE_FLAGS`).
+    exclude_flags: int = DEFAULT_EXCLUDE_FLAGS
     # One of `DETECTORS`: "mixtures" (default) or "single".
     detector: str = "mixtures"
     camera_kwargs: dict = field(default_factory=lambda: dict(DEFAULT_CAMERA_KWARGS))
@@ -681,7 +689,7 @@ def run_track_step(
     session: PipelineSession,
     max_step: float,
     min_track_length: int = 2,
-    exclude_flags: int = 0,
+    exclude_flags: int = DEFAULT_EXCLUDE_FLAGS,
     point_filters: Optional[FilterSpec] = None,
     track_filters: Optional[FilterSpec] = None,
     progress_callback: Optional[ProgressCallback] = None,
