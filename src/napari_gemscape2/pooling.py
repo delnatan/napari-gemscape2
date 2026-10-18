@@ -15,7 +15,9 @@ refitted -- and hands them to diffusionkit's batch layer:
   with D and alpha each fitted over an explicit number of lags.
 
 Only tracks that passed the filters when each bundle was saved enter either. The likelihoods must share one D
-grid. Comparing samples is left to analysis outside the GUI: the per-sample and per-movie draws of the
+grid. An input can also be one spatial class of a movie (`spatial_class`): the tracks its neighbours put in that
+class (`spatial_class_neighbours` in the saved table), so a class matched by the user across movies is pooled as a
+sample. Classes are numbered per movie, so which numbers match is the user's call. Comparing samples is left to analysis outside the GUI: the per-sample and per-movie draws of the
 log-normal's (mu, sigma) are written for it, and the movie (or cell) -- not the track -- is the unit such a
 comparison must treat as the replicate. The ensemble MSD runs with the exposure treated as 0, as the widget's MSD comparison does: the MSD
 estimators have no blur model, so it is labelled as that wherever it shows.
@@ -102,9 +104,14 @@ class PoolSettings:
         return {f.name for f in fields(cls)}
 
 
-def load_pooled_bundle(result_dir: str | Path, sample: Optional[str] = None) -> PooledBundle:
+def load_pooled_bundle(
+    result_dir: str | Path, sample: Optional[str] = None, spatial_class: Optional[int] = None
+) -> PooledBundle:
     """Restore the saved analysis of one bundle. Raises ValueError if it has none, or it is stale (its tracks
-    differ from the bundle's now); `sample` defaults to the bundle's name."""
+    differ from the bundle's now); `sample` defaults to the bundle's name (with " class c" for a spatial class).
+
+    `spatial_class` keeps only the passing tracks of that saved spatial class, by their neighbours' class; the
+    bundle's name then carries the class, so two classes of one movie are two inputs."""
     result_dir = Path(result_dir)
     saved = load_diffusion_results(result_dir)
     if saved is None:
@@ -119,7 +126,18 @@ def load_pooled_bundle(result_dir: str | Path, sample: Optional[str] = None) -> 
         "passes_filters" in saved["tracks_summary"].columns
     ) else None
     ids = None if passes is None else set(passes.to_list())
-    return PooledBundle(result_dir.name, sample or result_dir.name, restored.analysis, ids, tracks)
+    name = result_dir.name
+    if spatial_class is not None:
+        table = saved["tracks_summary"]
+        if "spatial_class_neighbours" not in table.columns or not saved["summary"].get("spatial"):
+            raise ValueError("no spatial classes saved here -- run them (Map tab, or `spatial = true`) first")
+        n_classes = saved["summary"]["spatial"]["n_classes"]
+        if not 1 <= int(spatial_class) <= n_classes:
+            raise ValueError(f"spatial_class {spatial_class} is not one of this movie's classes 1..{n_classes}")
+        members = set(table.filter(pl.col("spatial_class_neighbours") == int(spatial_class))["track_id"].to_list())
+        ids = members if ids is None else ids & members
+        name = f"{name} class {int(spatial_class)}"
+    return PooledBundle(name, sample or name, restored.analysis, ids, tracks)
 
 
 def n_pooled(bundle: PooledBundle) -> int:

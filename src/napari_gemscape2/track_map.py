@@ -17,7 +17,7 @@ outside viridis's range so a region never reads as a value.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import polars as pl
@@ -66,6 +66,7 @@ def plot_track_map(
     region_classes: Optional[dict[int, str]] = None,
     shape: Optional[tuple[int, int]] = None,
     title: Optional[str] = None,
+    class_colors: Optional[Callable[[int], str]] = None,
 ) -> Figure:
     """`tracks_px` holds every vertex (`track_id`, `frame`, `y`, `x` in
     pixels); `values` one row per track to draw (`track_id`, `column`).
@@ -75,7 +76,11 @@ def plot_track_map(
 
     `labels` (a regions image) and `region_classes` (`{label: class}`)
     draw the regions; `shape` (H, W) frames the field of view, and falls
-    back to `labels`' shape, then to the tracks' extent."""
+    back to `labels`' shape, then to the tracks' extent.
+
+    `class_colors` (class number -> colour) draws a column of class numbers
+    (`spatial_class`) in those colours with a legend, instead of on the
+    colormap; `vmin`, `vmax` and `log` are then unused."""
     values = values.select("track_id", column).drop_nulls()
     track_ids = values["track_id"].to_numpy()
     segments = track_segments(tracks_px, track_ids)
@@ -106,10 +111,16 @@ def plot_track_map(
                 title_fontsize=9, alignment="left",
             )
 
-    lines = LineCollection(
-        segments, array=track_values, cmap=MAP_COLORMAP, norm=norm,
-        linewidths=_TRACK_LINEWIDTH, capstyle="round", joinstyle="round",
-    )
+    if class_colors is not None:
+        lines = LineCollection(
+            segments, colors=[class_colors(int(v)) for v in track_values],
+            linewidths=_TRACK_LINEWIDTH, capstyle="round", joinstyle="round",
+        )
+    else:
+        lines = LineCollection(
+            segments, array=track_values, cmap=MAP_COLORMAP, norm=norm,
+            linewidths=_TRACK_LINEWIDTH, capstyle="round", joinstyle="round",
+        )
     ax.add_collection(lines)
 
     if shape is not None:
@@ -126,6 +137,17 @@ def plot_track_map(
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
     ax.tick_params(labelsize=8)
+
+    count = f"{len(segments)} track{'s' if len(segments) != 1 else ''}"
+    if class_colors is not None:
+        present = sorted({int(v) for v in track_values})
+        ax.legend(
+            handles=[Patch(color=class_colors(c), label=f"class {c}") for c in present], loc="lower left",
+            bbox_to_anchor=(1.0, 0.0), frameon=False, fontsize=9, title=units.header(column), title_fontsize=9,
+            alignment="left",
+        )
+        ax.set_title(f"{title} · {count}" if title else count, fontsize=10, loc="left")
+        return figure
 
     below = track_values.size and track_values.min() < vmin
     above = track_values.size and track_values.max() > vmax

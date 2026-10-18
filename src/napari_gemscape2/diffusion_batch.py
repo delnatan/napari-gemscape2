@@ -5,7 +5,8 @@ without napari.
 `analyze_bundle` rebuilds the table the widget reads off the "tracks"
 layer (`bundle_track_table`), runs the same D posteriors and per-track MSD
 fits (always both: the MSD fits take seconds), the α · D fits when
-`alpha_D_tau_ref_s` is set (a template saved with them sets it), and writes the same files
+`alpha_D_tau_ref_s` is set (a template saved with them sets it), the spatial classes when `spatial`
+is set (likewise), and writes the same files
 through the same `diffusion` functions, so a bundle analyzed by
 `gemscape2 diffusion` reopens in the widget exactly like one analyzed
 there.
@@ -47,6 +48,7 @@ from napari_gemscape2.fbm import loglik_long_table as fbm_loglik_table
 from napari_gemscape2.pipeline import FilterSpec, track_features_df
 from napari_gemscape2.regions import Regions
 from napari_gemscape2.results import load_result, package_provenance, write_diffusion_results
+from napari_gemscape2.spatial import N_SHUFFLES, analyze_spatial, class_groups, spatial_columns, spatial_options, spatial_record
 from napari_gemscape2.viewer import layer_units_metadata, region_classes
 
 
@@ -73,6 +75,12 @@ class DiffusionSettings:
     # Their grids (`fbm.FBM_GRID_DEFAULTS`' keys: n_alpha, alpha_group,
     # d_log10_D, cell_points); any key left out keeps the default.
     alpha_D_grid: dict = field(default_factory=dict)
+    # When set, also find spatial classes of D among the tracks the filters
+    # pass (`spatial`): `spatial_n_classes` of them, or the suggested number
+    # when None, tested against `spatial_shuffles` shuffles of the positions.
+    spatial: bool = False
+    spatial_n_classes: Optional[int] = None
+    spatial_shuffles: int = N_SHUFFLES
     # Overrides the bundle's recorded exposure. None: use the manifest's.
     exposure_s: Optional[float] = None
     # Which tracks `passes_filters` marks and the ensemble is over. Every
@@ -83,6 +91,7 @@ class DiffusionSettings:
     def __post_init__(self):
         self.msd_window  # validates
         fbm_options(self.min_frames, grid=self.alpha_D_grid), joint_grid(self.alpha_D_grid)  # validate
+        self.spatial_options()
 
     @property
     def msd_window(self) -> MSDWindow:
@@ -91,6 +100,10 @@ class DiffusionSettings:
     @classmethod
     def names(cls) -> set[str]:
         return {f.name for f in fields(cls)}
+
+    def spatial_options(self):
+        """The spatial run's `SpatialOptions`; raises ValueError for bad ones."""
+        return spatial_options(self.spatial_n_classes, self.spatial_shuffles)
 
     def options(self):
         """The run's `GridPostOptions`; raises ValueError for a bad grid."""
@@ -102,6 +115,7 @@ def settings_from_summary(summary: dict) -> dict:
     `diffusion_summary.json` -- the settings one movie was analyzed with
     in the widget. Not its exposure, which belongs to that movie."""
     record = summary.get("tracks_summary_filters") or {}
+    spatial = (summary.get("spatial") or {}).get("options") or {}
     out = {
         "min_frames": summary.get("min_frames"),
         # Only the D grid: a summary saved with the alpha posterior also
@@ -110,6 +124,9 @@ def settings_from_summary(summary: dict) -> dict:
         **{k: v for k, v in (summary.get("msd") or {}).items() if k.startswith("msd_")},
         "alpha_D_tau_ref_s": (summary.get("alpha_D") or {}).get("tau_ref_s"),
         "alpha_D_grid": (summary.get("alpha_D") or {}).get("grid"),
+        # Not the number of classes: that is each movie's own, the suggested one unless set in [diffusion].
+        "spatial": True if summary.get("spatial") else None,
+        "spatial_shuffles": spatial.get("n_shuffles"),
         "min_track_length": record.get("min_track_length"),
         "filters": (
             {col: tuple(bounds) for col, bounds in record["ranges"].items()}
@@ -224,19 +241,27 @@ def analyze_bundle(
     joined = base.join(results, on="track_id", how="left")
     ids = passing_track_ids(joined, settings.min_track_length, settings.filters)
     by_class = region_class_groups(base, ids)
+    spatial = None
+    if settings.spatial:
+        spatial = analyze_spatial(analysis, base, pixel_size_um, ids, settings.spatial_options())
+        results = results.join(spatial_columns(spatial), on="track_id", how="left")
     table = tracks_summary_table(
         base, results, result_id=result_dir.name, pixel_size_um=pixel_size_um, passing_ids=ids
     )
     summary = analysis_summary(analysis, ids, by_class, msd=settings.msd_window)
     if fbm is not None:
         summary["alpha_D"] = fbm_record(fbm, ids, by_class)
+    if spatial is not None:
+        summary["spatial"] = spatial_record(spatial)
     summary["tracks_summary_filters"] = filter_record(settings.min_track_length, settings.filters)
     import diffusionkit
     import napari_gemscape2
 
     summary["packages"] = package_provenance(diffusionkit, napari_gemscape2)
     write_diffusion_results(
-        result_dir, tracks_summary=table, summary=summary, **analysis_tables(analysis, ids, by_class),
+        result_dir, tracks_summary=table, summary=summary,
+        **analysis_tables(analysis, ids, by_class, None if spatial is None else class_groups(spatial)),
+        spatial_classes=None if spatial is None else spatial.probabilities(),
         loglik_alpha_D=None if fbm is None else fbm_loglik_table(fbm),
         profile_alpha=None if fbm is None else profile_long_table(fbm),
     )

@@ -396,6 +396,12 @@ alpha_D_tau_ref_s = 0.1
 # track, then the population's cells: α rows per cell, D cell width in
 # decades, likelihood points per D cell.
 alpha_D_grid = { n_alpha = 99, alpha_group = 3, d_log10_D = 0.05, cell_points = 4 }
+# Also find spatial classes of D among the tracks that pass (a template saved
+# with them sets it). The number of classes is each movie's suggested one
+# unless set here; the pattern test shuffles the positions spatial_shuffles times.
+spatial = true
+# spatial_n_classes = 2
+spatial_shuffles = 99
 exposure_s = 0.01       # optional: overrides each bundle's recorded exposure
 # Which tracks pass (`passes_filters`) and so make up the ensemble -- the
 # diffusion widget's tracks-pane cuts, on any per-track column.
@@ -441,6 +447,14 @@ sample = "wt"
 [[inputs]]
 path = "data/mut_1.tif"
 sample = "mut"
+
+# One spatial class of a movie, by the class its tracks' neighbours give them
+# (see "Spatial classes"). Classes are numbered per movie, so match them
+# yourself; list a movie once per class to pool its classes into different samples.
+[[inputs]]
+path = "data/wt_1.tif"
+sample = "wt inner"
+spatial_class = 1
 
 [pool]
 output = "pooled"            # default: <results_root>/pooled
@@ -622,6 +636,44 @@ the D_ref floor the tracks barely tell D_ref values apart, and α there is
 mostly the population's smoothness carrying α from above, so the plot and the
 summary also give α above the floor and the share of the population below it.
 
+### Spatial classes
+
+The Map tab's **Spatial classes** section asks whether tracks of similar D sit
+together in the cell, and if so, where. It reads the D run's likelihoods of the
+tracks the filters pass and their centroids (diffusionkit's `spatial`): a few
+classes of D, and a prior that neighbouring tracks (each track's 8 nearest)
+tend to share a class. Nothing is refitted per track. Classes are numbered 1, 2,
+… in increasing order of D and have no names: what a class is, and which class
+of another movie it matches, is yours to judge from its populations.
+
+- **Run** fits 1 to 4 classes. *classes* picks how many to use: by default the
+  suggested number, the last whose gain clears 0.02 nats per track, counting up.
+  **Number of classes** plots the score against the number of classes, with
+  that threshold, so the elbow can be read and picked instead.
+- The run tests for a spatial pattern: the tracks' positions are shuffled 99
+  times and refitted, and the neighbours' gain on the real arrangement is
+  compared with theirs (p down to 0.01). Without a pattern the classes are an
+  ordinary mixture of D, and **Class map** draws only the tracks, no map.
+- **Class map** draws, with a pattern, each class's places: the colour of the
+  most probable class at each point, paler where less sure, blank more than two
+  track spacings from any track, with each track's centroid in its class's
+  colour. The Map tab can also color tracks by `spatial_class`, in the same
+  colours.
+- **Class populations** draws each class's D population, deconvolved from its
+  tracks' likelihoods with its band, all classes on one axis, and its α
+  population when there is an α · D run. A track belongs to the class its
+  neighbours give it (`spatial_class_neighbours`), its own data left out, so a
+  class's α is not selected by the same track's errors in D.
+
+The run adds `spatial_class`, `spatial_p` (its probability),
+`spatial_class_neighbours`, `spatial_p_neighbours` and `D_spatial_*` (the
+track's D with its class as the prior: it borrows from the class, so read
+`D_mean_um2_s` for the track's own) to the tracks pane. *Save analysis* writes
+the run to `diffusion_summary.json` (`"spatial"`) and `spatial_classes.parquet`,
+each class's D population to `distributions_D.csv` (`spatial class c`), and the
+bundle reopens with it. `gemscape2 diffusion` runs it with `spatial = true`, and
+`gemscape2 pool` pools a class across movies with `spatial_class` on an input.
+
 The classical MSD analysis has its own **MSD** tab. It needs only tracks, and it
 is a labelled comparison, run with the exposure treated as 0 (diffusionkit's
 MSD estimators have no blur model). D and α are fitted over separate windows
@@ -669,8 +721,11 @@ loglik_alpha_D.parquet    after an α · D run, every fitted track's likelihood 
 profile_alpha.parquet     after an α · D run, every fitted track's profile
                           log-likelihood of α: track_id, n_frames, alpha, loglik
                           (0 at each track's maximum); what the shared α sums
+spatial_classes.parquet   after a spatial-classes run, each of its tracks' class
+                          probabilities and centroid: track_id, x_um, y_um, q_1..q_C;
+                          with "spatial" in the summary, what the run is restored from
 distributions_D.csv       the population on the D grid, long by group ("all", then each
-                          region class): shared_loglik (the tracks' log-likelihoods
+                          region class, then each spatial class): shared_loglik (the tracks' log-likelihoods
                           summed, 0 at the peak: one D for every track -- the summary's
                           shared_D_* interval is read below the grid step), lognormal
                           (the log-normal population at its posterior mode) and

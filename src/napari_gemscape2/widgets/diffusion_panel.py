@@ -55,7 +55,11 @@ pointed at a selection you could not see.
   analysis stays inside napari next to the image. The layer is added when
   the tab is first opened. The same coloring is also drawn as a figure,
   each track a line over the regions it was linked in, in a window that
-  saves it (`track_map.plot_track_map`). See `_MapTab`.
+  saves it (`track_map.plot_track_map`). Its "Spatial classes" section
+  finds classes of D among the tracks from the D run's likelihoods and
+  their neighbours (`spatial`), with the figures to choose their number,
+  map them and read each class's populations. See `_MapTab` and
+  `widgets.spatial_section`.
 - **NUTS** -- `diffusionkit.bayes.fit_track` on the selected track, with
   its corner plot; needs the optional `[bayes]` extra. See `_NutsTab`.
 
@@ -147,6 +151,7 @@ from qtkit import (
 )
 from qtkit.napari import live_layer, tabify_with_open_widget
 from qtkit.plot import AxisPicker, PlotWindow
+from matplotlib.colors import to_rgba
 from qtpy.QtGui import QValidator
 from qtpy.QtWidgets import (
     QCheckBox,
@@ -201,6 +206,9 @@ from napari_gemscape2.diffusion import (
 from napari_gemscape2.fbm import FbmAnalysis, alpha_population, fbm_record, restore_fbm
 from napari_gemscape2.fbm import loglik_long_table as fbm_loglik_table
 from napari_gemscape2.fbm import profile_long_table
+from napari_gemscape2.spatial import (
+    CLASS_COLORS, class_color, class_groups, restore_spatial, spatial_columns, spatial_record,
+)
 from napari_gemscape2.track_map import plot_track_map
 from napari_gemscape2.results import (
     TRACKS_SUMMARY_FILENAME,
@@ -209,6 +217,7 @@ from napari_gemscape2.results import (
     load_loglik_alpha_D,
     load_profile_alpha,
     load_regions,
+    load_spatial_classes,
     load_tracks_summary,
     package_provenance,
     write_diffusion_results,
@@ -227,6 +236,7 @@ from napari_gemscape2.viewer import region_classes, set_tracks_layer_data
 from napari_gemscape2.widgets.feature_filters import FeatureFilterPanel
 from napari_gemscape2.widgets.msd_tab import MSDTab
 from napari_gemscape2.widgets.fbm_tab import FbmTab
+from napari_gemscape2.widgets.spatial_section import SpatialSection
 from napari_gemscape2.widgets.msd_widgets import fit_window_to_figure
 from napari_gemscape2.widgets.params_panel import _compact_form, _ispin
 
@@ -264,6 +274,8 @@ _TRACK_BOX_TEXT = dict(
 # track only a few pixels across the box's aspect ratio understates the
 # anisotropy; it's a read, not a measure.
 _TRACK_BOX_PAD_PX = 2.0
+# Per-track columns that are a spatial class number (`spatial.SPATIAL_COLUMNS`), drawn in the class colours.
+_CLASS_COLUMNS = ("spatial_class", "spatial_class_neighbours")
 _TRACK_BOX_MIN_HALF_PX = 4.0
 
 
@@ -336,17 +348,22 @@ def _length_worker(analysis: PosteriorAnalysis, id_sets: list, weight: str) -> N
 
 
 @thread_worker(start_thread=False)
-def _tables_worker(analysis: Optional[PosteriorAnalysis], id_sets: list, fbm: Optional[FbmAnalysis] = None) -> None:
+def _tables_worker(analysis: Optional[PosteriorAnalysis], id_sets: list, fbm: Optional[FbmAnalysis] = None,
+                   ensemble_sets: tuple = ()) -> None:
     """The deconvolutions the saved tables read, over `id_sets`, off the GUI
     thread: each set's ensemble and its track-length groups (fitted once;
     the "detections" weighting only re-shares them), cached on `analysis`,
-    and each set's α population, cached on `fbm`."""
+    and each set's α population, cached on `fbm`; over `ensemble_sets`
+    (the spatial classes) the ensemble alone."""
     for ids in id_sets:
         if analysis is not None:
             ensemble(analysis, ids)
             length_composition(analysis, ids, "tracks")
         if fbm is not None:
             alpha_population(fbm, ids)
+    for ids in ensemble_sets:
+        if analysis is not None:
+            ensemble(analysis, ids)
 
 
 @thread_worker(start_thread=False)
@@ -1704,6 +1721,8 @@ class _MapTab(QWidget):
         layout.addWidget(self._map_scale_label)
         layout.addWidget(self._map_histogram)
         layout.addWidget(flow_row(self._figure_button, self._regions_check))
+        self.spatial = SpatialSection(host)
+        layout.addWidget(CollapsibleSection("Spatial classes", self.spatial, expanded=False))
         layout.addStretch()
         self.setLayout(layout)
 
@@ -1726,6 +1745,7 @@ class _MapTab(QWidget):
         self._regions_check.setEnabled(False)
         if self._figure_window is not None:
             self._figure_window.hide()
+        self.spatial.reset()
 
     def _on_color_by_changed(self, column: str) -> None:
         if not column:
@@ -1977,6 +1997,9 @@ class DiffusionAnalysisWidget(QWidget):
         self._save_worker = None
         # The last alpha-D (fBm) run, and its per-track columns.
         self._fbm: Optional[FbmAnalysis] = None
+        # The spatial classes read off `self._posterior` (`spatial`); a new D
+        # run drops them.
+        self._spatial = None
         self._msd_df: Optional[pl.DataFrame] = None
         self._msd_window: Optional[MSDWindow] = None
         self._map_color_by: Optional[str] = None
@@ -2143,6 +2166,16 @@ class DiffusionAnalysisWidget(QWidget):
         return self._posterior
 
     @property
+    def fbm(self) -> Optional[FbmAnalysis]:
+        """The α · D run on screen, or None."""
+        return self._fbm
+
+    @property
+    def base_track_df(self) -> Optional[pl.DataFrame]:
+        """One row per loaded track (`diffusion.base_track_table`): centroids in px."""
+        return self._base_track_df
+
+    @property
     def selected_track_id(self) -> Optional[int]:
         return self._current_track_id
 
@@ -2244,15 +2277,18 @@ class DiffusionAnalysisWidget(QWidget):
         on_error,
         busy_widgets: list,
         label: str,
+        unit: str = "tracks",
     ) -> None:
         """Run `worker` in the one host-wide slot. Until the worker's first
         report through `progress_callback` arrives (and throughout, for one
-        that never reports) the bar is a busy indicator."""
+        that never reports) the bar is a busy indicator; `unit` is what it
+        counts."""
         if self._worker is not None:
             return
         for widget in busy_widgets:
             widget.setEnabled(False)
         self._progress_label = label
+        self._progress_unit = unit
         self._progress_bar.setRange(0, 0)
         self._progress_bar.setFormat(f"{label}…")
         self._progress_bar.show()
@@ -2283,7 +2319,7 @@ class DiffusionAnalysisWidget(QWidget):
             return
         self._progress_bar.setRange(0, total)
         self._progress_bar.setValue(done)
-        self._progress_bar.setFormat(f"{self._progress_label}: {done}/{total} tracks")
+        self._progress_bar.setFormat(f"{self._progress_label}: {done}/{total} {getattr(self, '_progress_unit', 'tracks')}")
 
     # -- tracks-layer selection --
 
@@ -2376,6 +2412,7 @@ class DiffusionAnalysisWidget(QWidget):
         self._posterior = None
         self._posterior_df = None
         self._fbm = None
+        self._spatial = None
         self._msd_df = None
         self._msd_window = None
         self._map_color_by = None
@@ -2614,6 +2651,17 @@ class DiffusionAnalysisWidget(QWidget):
                 if saved.msd is not None:
                     self._msd_tab.restore(saved.msd, MSDWindow.from_settings(saved.summary["msd"]))
                 restored = summary
+                if summary.get("spatial"):
+                    try:
+                        probabilities = load_spatial_classes(self._result_dir)
+                        if probabilities is None:
+                            raise StaleAnalysisError("its spatial_classes.parquet is missing")
+                        s = restore_spatial(saved.analysis, summary["spatial"], probabilities)
+                        self.set_spatial_results(s)
+                        self._map_tab.spatial.adopt(s, f"saved: {s.n_classes} classes")
+                    except errors as exc:
+                        self._map_tab.spatial.reset()
+                        self._map_tab.spatial.report_error(f"saved spatial classes not loaded: {exc} — Run to redo them")
         except errors as exc:
             self._show_saved_summary_only(exc)
         if summary.get("alpha_D"):
@@ -2687,7 +2735,8 @@ class DiffusionAnalysisWidget(QWidget):
         return sorted(set(base["region_class"].drop_nulls().to_list()))
 
     def _update_save_enabled(self) -> None:
-        has_results = self._posterior is not None or self._fbm is not None or bool(self._nuts_rows)
+        has_results = (self._posterior is not None or self._fbm is not None or self._spatial is not None
+                       or bool(self._nuts_rows))
         self._save_button.setEnabled(has_results and self._result_dir is not None and self._save_worker is None)
         self._export_csv_button.setEnabled(self._base_track_df is not None)
 
@@ -2735,6 +2784,9 @@ class DiffusionAnalysisWidget(QWidget):
         if self._msd_df is not None:
             msd = self._msd_df
             df = msd if df is None else df.join(msd, on="track_id", how="full", coalesce=True)
+        if self._spatial is not None:
+            sp = spatial_columns(self._spatial)
+            df = sp if df is None else df.join(sp, on="track_id", how="full", coalesce=True)
         if self._nuts_rows:
             nuts = pl.DataFrame(self._nuts_rows).group_by("track_id", maintain_order=True).last()
             df = nuts if df is None else df.join(nuts, on="track_id", how="full", coalesce=True)
@@ -2746,6 +2798,10 @@ class DiffusionAnalysisWidget(QWidget):
         put `_TRACK_COLOR_COLUMNS` on the Tracks layer itself."""
         self._posterior = analysis
         self._posterior_df = display_df
+        if self._spatial is not None:  # read off the D run this one replaces
+            self._spatial = None
+            self._spatial_sources.pop("spatial", None)
+            self._map_tab.spatial.reset()
         numeric = [c for c, dtype in zip(display_df.columns, display_df.dtypes) if dtype.is_numeric()]
         self.register_spatial_source("posterior", display_df.select(numeric))
         self._rebuild_track_table()
@@ -2779,6 +2835,15 @@ class DiffusionAnalysisWidget(QWidget):
         self._map_tab.on_spatial_source_registered("alpha_hat")
         self._update_save_enabled()
 
+    def set_spatial_results(self, s) -> None:
+        """A spatial-classes run finished (or was restored): keep it for Save,
+        join its columns into the tracks pane, and offer them as map colors."""
+        self._spatial = s
+        self.register_spatial_source("spatial", spatial_columns(s))
+        self._rebuild_track_table()
+        self._map_tab.on_spatial_source_registered("spatial_class")
+        self._update_save_enabled()
+
     def register_spatial_source(self, name: str, df: pl.DataFrame) -> None:
         """`df` must have `track_id` plus one or more value columns --
         registers it as a spatial-map color choice (`spatial_color_by_columns`),
@@ -2802,6 +2867,8 @@ class DiffusionAnalysisWidget(QWidget):
         self._update_spatial_map_layer()
 
     def set_map_contrast_limits(self, vmin: float, vmax: float) -> None:
+        if self._map_color_by in _CLASS_COLUMNS:  # drawn in the class colours, not on a range
+            return
         if self._live(self._spatial_map_layer) is not None and vmin < vmax:
             self._spatial_map_layer.face_contrast_limits = (vmin, vmax)
             self._spatial_map_layer.border_contrast_limits = (vmin, vmax)
@@ -2982,6 +3049,12 @@ class DiffusionAnalysisWidget(QWidget):
             return None
         found = self.map_regions() if regions else None
         labels, classes = found if found is not None else (None, None)
+        if color_by in _CLASS_COLUMNS:
+            return plot_track_map(
+                self._tracks_df_px, merged.select("track_id", color_by), color_by, vmin, vmax,
+                pixel_size_um=self.pixel_size_um if self.units_known else None, labels=labels,
+                region_classes=classes, title=self._map_title(), class_colors=class_color,
+            )
         return plot_track_map(
             self._tracks_df_px,
             merged.select("track_id", color_by),
@@ -2994,6 +3067,10 @@ class DiffusionAnalysisWidget(QWidget):
             region_classes=classes,
             title=self._map_title(),
         )
+
+    def map_title(self) -> Optional[str]:
+        """The movie's name, for figure titles."""
+        return self._map_title()
 
     def _map_title(self) -> Optional[str]:
         """The bundle's name (the movie), else the layer's."""
@@ -3029,6 +3106,24 @@ class DiffusionAnalysisWidget(QWidget):
         positions = vertices.select("y", "x").to_numpy()
         values = vertices[color_by].to_numpy()
         track_ids = vertices["track_id"].to_numpy()
+        if color_by in _CLASS_COLUMNS:
+            # A class is a number with no order to read off a colormap: each
+            # in its colour, the same as in the spatial classes' figures.
+            palette = np.array([to_rgba(c) for c in CLASS_COLORS])
+            colors = palette[(values.astype(int) - 1) % len(CLASS_COLORS)]
+            if self._live(self._spatial_map_layer) is None:
+                self._spatial_map_layer = self.viewer.add_points(
+                    positions, name="diffusion map", features={color_by: values, "track_id": track_ids},
+                    face_color=colors, symbol="disc", size=2.5, border_width=0.0, border_color=colors,
+                    canvas_size_limits=(4, 10000),
+                )
+                self._spatial_map_layer.mouse_drag_callbacks.append(self._make_spatial_map_click_callback())
+            else:
+                self._spatial_map_layer.data = positions
+                self._spatial_map_layer.features = {color_by: values, "track_id": track_ids}
+                self._spatial_map_layer.face_color = colors
+                self._spatial_map_layer.border_color = colors
+            return
         if self._live(self._spatial_map_layer) is None:
             self._spatial_map_layer = self.viewer.add_points(
                 positions,
@@ -3161,6 +3256,8 @@ class DiffusionAnalysisWidget(QWidget):
         extra["packages"] = _analysis_packages()
         analysis = self._posterior
         fbm = self._fbm
+        spatial = self._spatial
+        by_spatial = None if spatial is None else class_groups(spatial)
         msd = self._msd_window if self._msd_df is not None else None
         result_dir = self._result_dir
 
@@ -3170,8 +3267,11 @@ class DiffusionAnalysisWidget(QWidget):
             tables: dict = {}
             summary: dict = {}
             if analysis is not None:
-                tables = analysis_tables(analysis, ids, by_class)
+                tables = analysis_tables(analysis, ids, by_class, by_spatial)
                 summary = analysis_summary(analysis, ids, by_class, msd=msd)
+            if spatial is not None:
+                summary["spatial"] = spatial_record(spatial)
+                tables["spatial_classes"] = spatial.probabilities()
             if fbm is not None:
                 summary["alpha_D"] = fbm_record(fbm, ids, by_class)
                 tables["loglik_alpha_D"] = fbm_loglik_table(fbm)
@@ -3186,7 +3286,7 @@ class DiffusionAnalysisWidget(QWidget):
             write()
             return
         self._posterior_tab.report_caution("saving: deconvolving the populations…")
-        worker = _tables_worker(analysis, [ids, *(by_class or {}).values()], fbm)
+        worker = _tables_worker(analysis, [ids, *(by_class or {}).values()], fbm, tuple((by_spatial or {}).values()))
         worker.returned.connect(write)
         worker.errored.connect(self._save_failed)
         self._save_worker = worker

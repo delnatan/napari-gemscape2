@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.13"
 resolution-markers = [
     "python_full_version >= '3.14' and platform_machine == 'arm64' and sys_platform == 'darwin'",
@@ -466,7 +466,7 @@ wheels = [
 [[package]]
 name = "diffusionkit"
 version = "0.1.0"
-source = { git = "https://github.com/delnatan/diffusionkit.git?branch=main#3f79fc9c1c6a23afac513b2c4f237b93b8dca46f" }
+source = { git = "https://github.com/delnatan/diffusionkit.git?branch=claude%2Fspatial#f6a9301cd71aea6c7deae3c166d6ab3d99bff914" }
 dependencies = [
     { name = "numpy" },
     { name = "polars" },
@@ -1219,8 +1219,8 @@ bayes = [
 
 [package.metadata]
 requires-dist = [
-    { name = "diffusionkit", git = "https://github.com/delnatan/diffusionkit.git?branch=main" },
-    { name = "diffusionkit", extras = ["bayes", "plots"], marker = "extra == 'bayes'", git = "https://github.com/delnatan/diffusionkit.git?branch=main" },
+    { name = "diffusionkit", git = "https://github.com/delnatan/diffusionkit.git?branch=claude%2Fspatial" },
+    { name = "diffusionkit", extras = ["bayes", "plots"], marker = "extra == 'bayes'", git = "https://github.com/delnatan/diffusionkit.git?branch=claude%2Fspatial" },
     { name = "h5py" },
     { name = "matplotlib" },
     { name = "napari", extras = ["pyqt6"] },

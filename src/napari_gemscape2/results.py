@@ -28,6 +28,7 @@ and, once the diffusion widget has saved an analysis of it
     <result_dir>/loglik_D.parquet         every track's log-likelihood over D
     <result_dir>/loglik_alpha_D.parquet   every track's likelihood over (alpha, log10 D at the frame interval), if α · D was run
     <result_dir>/profile_alpha.parquet    every track's profile log-likelihood of alpha, if α · D was run
+    <result_dir>/spatial_classes.parquet  each track's spatial class probabilities and centroid, if spatial classes were run
     <result_dir>/distributions_D.csv      the ensemble on the D grid
     <result_dir>/distributions_D_by_length.csv  the same split by track length
     <result_dir>/diffusion_summary.json   settings + population numbers
@@ -92,6 +93,9 @@ LOGLIK_D_FILENAME = "loglik_D.parquet"
 LOGLIK_ALPHA_D_FILENAME = "loglik_alpha_D.parquet"
 # The α · D run's per-track profiles of alpha (`fbm.profile_long_table`), what its shared alpha sums.
 PROFILE_ALPHA_FILENAME = "profile_alpha.parquet"
+# The spatial classes' per-track class probabilities and centroids (`SpatialAnalysis.probabilities`), what
+# the run is restored from with its record in the summary.
+SPATIAL_CLASSES_FILENAME = "spatial_classes.parquet"
 DISTRIBUTIONS_D_FILENAME = "distributions_D.csv"
 DISTRIBUTIONS_D_BY_LENGTH_FILENAME = "distributions_D_by_length.csv"
 # Written by earlier versions of the diffusion widget; removed on the next
@@ -321,6 +325,7 @@ def write_diffusion_results(
     loglik_D: Optional[pl.DataFrame] = None,
     loglik_alpha_D: Optional[pl.DataFrame] = None,
     profile_alpha: Optional[pl.DataFrame] = None,
+    spatial_classes: Optional[pl.DataFrame] = None,
     distributions_D: Optional[pl.DataFrame] = None,
     distributions_D_by_length: Optional[pl.DataFrame] = None,
 ) -> None:
@@ -334,7 +339,7 @@ def write_diffusion_results(
     tracks_summary.write_csv(result_dir / TRACKS_SUMMARY_FILENAME)
     (result_dir / DIFFUSION_SUMMARY_FILENAME).write_text(json.dumps(summary, indent=2))
     for table, filename in ((loglik_D, LOGLIK_D_FILENAME), (loglik_alpha_D, LOGLIK_ALPHA_D_FILENAME),
-                            (profile_alpha, PROFILE_ALPHA_FILENAME)):
+                            (profile_alpha, PROFILE_ALPHA_FILENAME), (spatial_classes, SPATIAL_CLASSES_FILENAME)):
         if table is None:
             (result_dir / filename).unlink(missing_ok=True)
         else:
@@ -426,6 +431,12 @@ def load_loglik_alpha_D(result_dir: str | Path) -> Optional[pl.DataFrame]:
 def load_profile_alpha(result_dir: str | Path) -> Optional[pl.DataFrame]:
     """The saved α · D per-track profiles of alpha, or None if none were saved."""
     path = Path(result_dir) / PROFILE_ALPHA_FILENAME
+    return pl.read_parquet(path) if path.exists() else None
+
+
+def load_spatial_classes(result_dir: str | Path) -> Optional[pl.DataFrame]:
+    """The saved spatial classes' per-track table, or None if none was saved."""
+    path = Path(result_dir) / SPATIAL_CLASSES_FILENAME
     return pl.read_parquet(path) if path.exists() else None
 
 
