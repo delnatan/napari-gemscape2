@@ -507,19 +507,20 @@ detection knobs, then filters on what it found, where `fit_sigma` settles the
 width) and **Track**
 (link, optionally with flux as a second link cue, then filters on the
 tracks), pressing *Save results* when the result is worth keeping. The "Diffusion analysis" widget then reads the tracks layer for
-diffusionkit's grid posteriors. Above its tabs sit the two run inputs every
-posterior shares: the camera **exposure** (pre-filled from the layer; the runs
+diffusionkit's grid likelihoods. Above its tabs sit the two run inputs every
+run shares: the camera **exposure** (pre-filled from the layer; the runs
 stay off until it has a value) and **min points**, the shortest track fitted.
 
-The **D** tab is the standard quantification: for each track, the Brownian
-posterior over D (flat prior in ln D, the exposure's blur modelled) summarized
-as its mean E[D] and 5%/95% quantiles. The motion's shape (α) is a separate
+The **D** tab is the standard quantification (*Run likelihoods*): for each
+track, the Brownian likelihood over D (the exposure's blur modelled), which
+normalized is its posterior under a flat prior in ln D, summarized as its mean
+E[D] and 5%/95% quantiles. The motion's shape (α) is a separate
 fit, on the **α · D** tab (below). The run
 is diffusionkit's own `gridpost.analyze_tracks` with the `GridPostOptions` the
 D tab shows: *D min*/*D max* (µm²/s) and *D points* set the D grid,
 whose range is the flat prior's support (by default 10⁻⁵ to 10 µm²/s, so
 tracks that can't be told from still fall into a low tail, read as upper
-bounds). A track whose posterior is cut by an edge
+bounds). A track whose likelihood is cut by an edge
 is marked in `D_grid_edge` with the end that cuts it (its numbers move with the edge — near-immobile
 tracks reach *D min* this way), and the summary counts them. The grid is
 saved with the analysis, so `GridPostOptions(**summary["grid"])` in a
@@ -528,7 +529,7 @@ a thread pool: about 20 s for ~10,000 tracks. The **Ensemble**
 plot reads them across the tracks the filters pass, per region class, by
 adding the tracks' log-likelihoods under a model of the population -- never by
 histogramming their medians (a short track's median sits where the prior puts
-it) or averaging their posteriors. The *log-normal* population is the
+it) or averaging their normalized likelihoods. The *log-normal* population is the
 headline: ln D normal across tracks, its median D and spread σ (in ln D) each
 with an interval, every track's own measurement noise in the model rather than
 in σ. The *deconvolved* distribution, with its 90% band, is the same tracks
@@ -549,7 +550,7 @@ the groups by *tracks* (the default and the usual per-trajectory reading) or by
 the spots seen in focus at a moment); within a group each track counts once. Neither is the share of particles, since a fast particle can
 leave the focus and return as another track.
 Every D axis — the ensemble,
-the posteriors, the track plot, and the joint plot when an axis is D at one
+the per-track likelihoods, the track plot, and the joint plot when an axis is D at one
 frame interval — shows the **localization floor** `D_floor_um2_s`, the D at
 which a track's motion per frame equals its localization noise, ⟨σ²⟩ /
 (dt − exposure/3) from its own SDs, as a thin dotted line at the tracks'
@@ -683,7 +684,7 @@ since a log-log slope needs about a decade of τ to mean much.
 - **Run MSD fits** fits each track's time-averaged MSD: D over its first lags
   (default 3) and α over its first 10, or over shares of each track's own lags
   (D the usual 25–40%), adding `D_msd`/`K_msd`/`α_msd` columns. A batch
-  always runs them alongside the posteriors.
+  always runs them alongside the D likelihoods.
 - **Track** draws the selected track's MSD on linear (D) and log-log (α) axes,
   each fit over its window, with a linear fit with a free intercept whose
   localization SD is a check on the SDs. No error bars: one track's lags share

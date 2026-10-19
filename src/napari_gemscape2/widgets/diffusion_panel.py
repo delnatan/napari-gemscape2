@@ -929,26 +929,27 @@ class _TracksPane(QWidget):
 
 _POSTERIOR_HELP = (
     "<b>Brownian D, the standard quantification.</b> The motion's shape (&alpha;) is on "
-    "the <b>α · D</b> tab, a separate posterior."
-    "<br><br><b>Per track</b>, <i>D_mean</i> is the posterior mean E[D] (flat prior in ln D), and "
-    "<b>low/high</b> are the 5% and 95% quantiles: a 90% credible interval. The "
+    "the <b>α · D</b> tab, a separate likelihood."
+    "<br><br><b>Per track</b>: the track's likelihood over D. Normalized over the grid it is "
+    "also the track's posterior under a flat prior in ln D, so <i>D_mean</i> is E[D] under "
+    "that prior and <b>low/high</b> are its 5% and 95% quantiles: a 90% credible interval. The "
     "likelihood is exact: each frame's localization error and the motion blur of "
     "the exposure are both modelled. A short track has a wide interval, and that "
     "width is the honest answer, not a failure."
-    "<br><br><b>Grid</b>: each posterior is evaluated on a grid in ln D, and the flat "
+    "<br><br><b>Grid</b>: each likelihood is evaluated on a grid in ln D, and the flat "
     "prior is zero outside its range &mdash; so <i>D min</i>/<i>D max</i> are part of "
-    "the analysis, not a numerical detail. A track whose posterior is cut by an edge is "
+    "the analysis, not a numerical detail. A track whose likelihood is cut by an edge is "
     "marked in <i>D_grid_edge</i> with the edge that cuts it: <i>low</i> means read its "
     "numbers as upper bounds, <i>high</i> as lower bounds. Near-immobile tracks reach "
     "<i>D min</i> this way, since localization error only lets the data bound D from "
-    "above. Each track's one point estimate is its posterior mean <i>D_mean</i>, the "
+    "above. Each track's one point estimate is its flat-prior mean <i>D_mean</i>, the "
     "summary a grid edge barely moves; under the flat prior it reads high for short "
     "tracks, so don't average it &mdash; the Ensemble is the average. These are diffusionkit's <tt>GridPostOptions</tt> "
     "fields, saved with the analysis, so a script can repeat the run exactly."
     "<br><br><b>Ensemble</b>: the population is the tracks' log-likelihoods added up "
     "under a model of how D is spread across them &mdash; never a histogram of their "
     "medians (a short track's median sits where the prior puts it) or an average of "
-    "their posteriors. <i>Log-normal</i>: ln D is normal across tracks; its median D "
+    "their normalized likelihoods. <i>Log-normal</i>: ln D is normal across tracks; its median D "
     "and spread σ (in ln D) come with intervals, and each track's own measurement "
     "noise is taken out by the model, not counted as spread. σ near 0 means one "
     "shared D describes the tracks. <i>Shared D</i>: one D for every track. When the "
@@ -1066,7 +1067,7 @@ class _AcquisitionRow(QWidget):
         self._min_frames.setToolTip(
             "Tracks with fewer localizations than this are excluded from a fit\n"
             f"(and counted as such). {MIN_FRAMES} is diffusionkit's own minimum; a short\n"
-            "track just gets a wide posterior, so there is no need to raise it for accuracy."
+            "track just gets a wide likelihood, so there is no need to raise it for accuracy."
         )
         self._min_frames.valueChanged.connect(lambda _v: self.changed.emit())
 
@@ -1175,14 +1176,14 @@ class _PosteriorTab(QWidget):
         self._summary_worker = None
         self._summary_stale = False
 
-        # The posterior grid -- diffusionkit's `GridPostOptions` fields,
+        # The likelihood grid -- diffusionkit's `GridPostOptions` fields,
         # read when Run is pressed. D's range is the flat prior's support,
         # so it stays in view.
         grid_default = GridPostOptions()
         d_range_tip = (
-            "The range of D (µm²/s) the posterior is evaluated over -- the flat\n"
+            "The range of D (µm²/s) the likelihood is evaluated over -- the flat\n"
             "prior's support, so it is part of the analysis: a track whose\n"
-            "posterior reaches an edge is cut there (and flagged in D_grid_edge).\n"
+            "likelihood reaches an edge is cut there (and flagged in D_grid_edge).\n"
             f"diffusionkit's default: {grid_default.D_min_um2_s:g} to {grid_default.D_max_um2_s:g}."
         )
         self._grid_D_min = _LogSpinBox(grid_default.D_min_um2_s, 1e-9, 1e4, tooltip=d_range_tip)
@@ -1204,7 +1205,7 @@ class _PosteriorTab(QWidget):
         for box in self._grid_boxes():
             box.valueChanged.connect(lambda _v: self._on_grid_changed())
 
-        self._run_button = QPushButton("Run posteriors")
+        self._run_button = QPushButton("Run likelihoods")
         self._run_button.clicked.connect(self._run)
         self._status = status_label("")
         self._summary = status_label("")
@@ -1219,12 +1220,12 @@ class _PosteriorTab(QWidget):
         self._ensemble_button.clicked.connect(self._show_ensemble)
         self._track_button = QPushButton("Track")
         self._track_button.setToolTip(
-            "The selected track's posterior. Stays open and follows the selection."
+            "The selected track's likelihood over D. Stays open and follows the selection."
         )
         self._track_button.clicked.connect(self._show_track)
         self._length_button = QPushButton("By length")
         self._length_button.setToolTip(
-            "The tracks' own posteriors stacked by track length, and each\n"
+            "The tracks' own likelihoods stacked by track length, and each\n"
             "length's own distribution -- which tracks each part of the\n"
             "distribution comes from -- over the tracks the filters pass, one\n"
             "row per region class."
@@ -1236,7 +1237,7 @@ class _PosteriorTab(QWidget):
             self._length_weight.addItem(label, weight)
         self._length_weight.setToolTip(
             "Each track once: every particle track is one sample, and the stack\n"
-            "is the sum of the tracks' own posteriors -- the usual\n"
+            "is the sum of the tracks' own likelihoods -- the usual\n"
             "per-trajectory reading. Each detection: a track counts once per\n"
             "frame, so long tracks weigh more -- the make-up of the spots seen in\n"
             "focus at a moment, where fast particles (short tracks, out of focus\n"
@@ -1252,7 +1253,7 @@ class _PosteriorTab(QWidget):
 
         help_text = note_label(_POSTERIOR_HELP)
         help_text.setTextFormat(Qt.TextFormat.RichText)
-        self._help = CollapsibleSection("Reading the posteriors", help_text, expanded=False)
+        self._help = CollapsibleSection("Reading the likelihoods", help_text, expanded=False)
 
         layout = QVBoxLayout()
         layout.setContentsMargins(6, 6, 6, 6)
@@ -1390,7 +1391,7 @@ class _PosteriorTab(QWidget):
             options,
             self.host.progress_callback,
         )
-        self.host.start_worker(worker, self._on_finished, self._on_error, [self._run_button], "posteriors")
+        self.host.start_worker(worker, self._on_finished, self._on_error, [self._run_button], "likelihoods")
 
     def _on_finished(self, analysis: PosteriorAnalysis) -> None:
         n_ok = self._adopt(analysis)
@@ -1492,7 +1493,7 @@ class _PosteriorTab(QWidget):
             return
         figure = plot_d_ensemble(self._analysis.D_grid_um2_s, panels)
         if self._ensemble_window is None:
-            self._ensemble_window = PlotWindow("Posterior: ensemble", parent=self)
+            self._ensemble_window = PlotWindow("D: ensemble", parent=self)
         fit_window_to_figure(self._ensemble_window, figure)
         self._ensemble_window.show_figure(figure)
 
@@ -1539,7 +1540,7 @@ class _PosteriorTab(QWidget):
             return
         figure = plot_d_by_length(panels)
         if self._length_window is None:
-            self._length_window = PlotWindow("Posterior: by track length", parent=self)
+            self._length_window = PlotWindow("D: by track length", parent=self)
             self._length_window.layout().insertWidget(0, flow_row(QLabel("count"), self._length_weight))
         fit_window_to_figure(self._length_window, figure)
         self._length_window.show_figure(figure)
@@ -1563,7 +1564,7 @@ class _PosteriorTab(QWidget):
             style_status_label(self._status, "caution")
             return
         if self._track_window is None:
-            self._track_window = PlotWindow("Posterior: selected track", parent=self)
+            self._track_window = PlotWindow("D: selected track", parent=self)
         self._track_window.show_figure(plot_track_posterior(**data))
 
     def on_track_selected(self) -> None:
@@ -2073,7 +2074,7 @@ class DiffusionAnalysisWidget(QWidget):
         tabs.addTab(scrolled(self._map_tab), "Map")
         tabs.addTab(scrolled(self._nuts_tab), "NUTS")
         tabs.setTabToolTip(
-            0, "Per-track Brownian D posteriors and the population of D (diffusionkit.gridpost) -- the standard"
+            0, "Per-track Brownian D likelihoods and the population of D (diffusionkit.gridpost) -- the standard"
         )
         tabs.setTabToolTip(
             1, "Per-track α and D_ref under fBm (diffusionkit.fbmpost); D_ref is not a Brownian D"
