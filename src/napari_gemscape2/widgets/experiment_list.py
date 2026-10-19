@@ -1406,6 +1406,17 @@ class ExperimentListWidget(QWidget):
         self.params_panel.set_point_filter_source(session.points_df)
         self.params_panel.show_tab("Detect", "Filter")
         self._update_points_layer(new_data=True)
+        # The run dropped the tracks linked from the detections it replaced
+        # (`run_detect_step`), so their layer goes too: left up, it was what
+        # the diffusion panel kept reading -- and fitting -- until the next
+        # Track run, tracks of spots that are no longer there.
+        self._track_cache = None
+        self.params_panel.set_track_filter_source(None)
+        layer = self._live(self._tracks_layer)
+        if layer is not None:
+            self.viewer.layers.remove(layer)
+        self._tracks_layer = None
+        self.params_panel.set_track_status("")
         self.params_panel.set_save_enabled(False)
         self.params_panel.set_detect_save_enabled(n_points > 0)
         self.params_panel.set_detect_save_status("not saved yet" if n_points > 0 else "", level="caution")
