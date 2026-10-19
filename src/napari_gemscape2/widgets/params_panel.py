@@ -18,7 +18,10 @@ off-screen as often as not. See `qtkit.StepPager` for why the height actually
 shrinks (a stacked widget otherwise reserves its tallest page). Stage
 completions leaf for you: `ExperimentListWidget` calls
 `show_tab("Detect", "Filter")` when a detect run lands, and
-`show_tab("Track", "Filter")` after linking.
+`show_tab("Track", "Filter")` after linking. A new movie opens on the
+Detect tab's first page, and each Save page ends with "Next movie"
+(`nextMovieRequested`), so a folder can be worked through one movie at a
+time without leafing back by hand.
 
 The filters are `widgets/feature_filters.FeatureFilterPanel` in both
 places, and neither deletes anything: a filter decides what the next stage
@@ -220,18 +223,34 @@ def _run_row(button_text: str) -> tuple[QPushButton, QLabel, QHBoxLayout]:
     return button, status, row
 
 
-def _save_page(button_text: str, tooltip: str) -> tuple[QPushButton, QLabel, QWidget]:
+def _save_page(button_text: str, tooltip: str) -> tuple[QPushButton, QLabel, QPushButton, QWidget]:
     """A stage's "Save" page: its save button (off until there is
-    something to save) and status label, as one page body."""
+    something to save) and status label, then "Next movie", as one page
+    body held to the top. The pager hands its page the spare height, and
+    without the closing stretch the save row sat halfway down an empty
+    page."""
     button, status, row = _run_row(button_text)
     button.setEnabled(False)
     button.setToolTip(tooltip)
+    next_button = QPushButton("Next movie ›")
+    next_button.setEnabled(False)
+    next_button.setToolTip(
+        "Open the next movie in the list, on the Detect tab's first page,\n"
+        "with these settings kept. Asks first if this one has unsaved results."
+    )
+    next_row = QHBoxLayout()
+    next_row.setContentsMargins(0, 0, 0, 0)
+    next_row.addWidget(next_button)
+    next_row.addStretch()
     body = QWidget()
     layout = QVBoxLayout(body)
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(2)
     layout.addLayout(row)
-    return button, status, body
+    layout.addWidget(hline())
+    layout.addLayout(next_row)
+    layout.addStretch()
+    return button, status, next_button, body
 
 
 class _DetectTab(QWidget):
@@ -252,6 +271,7 @@ class _DetectTab(QWidget):
     cancelRequested = Signal()
     filtersChanged = Signal()
     saveRequested = Signal()
+    nextMovieRequested = Signal()
     estimateGainRequested = Signal()
 
     def __init__(self) -> None:
@@ -433,7 +453,7 @@ class _DetectTab(QWidget):
         self.filters.filtersChanged.connect(self.filtersChanged)
 
         # --- save (detections alone, independent of tracking) -----------
-        self.save_button, self.save_status, save_body = _save_page(
+        self.save_button, self.save_status, self.next_button, save_body = _save_page(
             "Save detections",
             "Write points.parquet (every detection, unfiltered) and\n"
             "manifest.json alone -- usable as soon as detect has run, before\n"
@@ -442,6 +462,7 @@ class _DetectTab(QWidget):
             "Nothing is written until you press this.",
         )
         self.save_button.clicked.connect(self.saveRequested.emit)
+        self.next_button.clicked.connect(self.nextMovieRequested.emit)
 
         detect_body = QWidget()
         detect_layout = QVBoxLayout(detect_body)
@@ -1026,6 +1047,7 @@ class _TrackingTab(QWidget):
 
     runRequested = Signal()
     saveRequested = Signal()
+    nextMovieRequested = Signal()
     filtersChanged = Signal()
 
     def __init__(self) -> None:
@@ -1103,7 +1125,7 @@ class _TrackingTab(QWidget):
         )
         self.filters.filtersChanged.connect(self.filtersChanged)
 
-        self.save_button, self.save_status, save_body = _save_page(
+        self.save_button, self.save_status, self.next_button, save_body = _save_page(
             "Save results",
             "Write the bundle: points.parquet (every detection, unfiltered),\n"
             "tracks.parquet (the tracks that pass the filters above),\n"
@@ -1113,6 +1135,7 @@ class _TrackingTab(QWidget):
             "press it again to rewrite the same bundle.",
         )
         self.save_button.clicked.connect(self.saveRequested.emit)
+        self.next_button.clicked.connect(self.nextMovieRequested.emit)
 
         self.pager = StepPager()
         self.pager.add_page("Link", link_body)
@@ -1194,6 +1217,8 @@ class PipelineParamsWidget(QWidget):
     trackRequested = Signal()
     saveRequested = Signal()
     saveDetectionsRequested = Signal()
+    # "Next movie" on either Save page: move the list on one row.
+    nextMovieRequested = Signal()
     pointFiltersChanged = Signal()
     trackFiltersChanged = Signal()
     # The pixel size / frame interval override was turned on, off or
@@ -1215,6 +1240,8 @@ class PipelineParamsWidget(QWidget):
         self._tracking.runRequested.connect(self.trackRequested)
         self._tracking.saveRequested.connect(self.saveRequested)
         self._tracking.filtersChanged.connect(self.trackFiltersChanged)
+        self._detect.nextMovieRequested.connect(self.nextMovieRequested)
+        self._tracking.nextMovieRequested.connect(self.nextMovieRequested)
 
         self._tabs = QTabWidget()
         self._tabs.addTab(self._detect, "Detect")
@@ -1293,6 +1320,11 @@ class PipelineParamsWidget(QWidget):
                 if step is not None:
                     self._tabs.widget(index).show_step(step)
                 return
+
+    def set_next_movie_enabled(self, enabled: bool) -> None:
+        """Whether there is a row after the current one for "Next movie"."""
+        self._detect.next_button.setEnabled(enabled)
+        self._tracking.next_button.setEnabled(enabled)
 
     # -- detect stage -----------------------------------------------------
 
