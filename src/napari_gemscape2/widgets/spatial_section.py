@@ -80,7 +80,7 @@ class SpatialSection(QWidget):
         self._run_button.clicked.connect(self._run)
         form = QFormLayout()
         form.setContentsMargins(0, 0, 0, 0)
-        form.addRow("classes", flow_row(self._classes, self._run_button))
+        form.addRow("classes", self._classes)
         form.addRow("shuffles", self._shuffles)
         self._status = status_label("")
         self._summary = note_label("")
@@ -104,6 +104,10 @@ class SpatialSection(QWidget):
         layout.addWidget(note_label("Classes numbered by increasing D, from each track's D likelihood and its "
                                     "neighbours'."))
         layout.addLayout(form)
+        # Its own row, not beside "classes" in the form: a flow row in a
+        # form field wraps the button onto a second line the field never
+        # grows to show, which in napari's wider combo boxes hid Run.
+        layout.addWidget(flow_row(self._run_button))
         layout.addWidget(self._status)
         layout.addWidget(self._summary)
         layout.addWidget(self._figure_row)
