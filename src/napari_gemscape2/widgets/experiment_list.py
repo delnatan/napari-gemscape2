@@ -555,6 +555,7 @@ class ExperimentListWidget(QWidget):
         self.params_panel.trackRequested.connect(self._run_track_step)
         self.params_panel.saveRequested.connect(self._save_result)
         self.params_panel.saveDetectionsRequested.connect(self._save_detection_result)
+        self.params_panel.nextMovieRequested.connect(self._open_next_item)
         regions_panel = self.params_panel.regions_panel
         regions_panel.newLayerRequested.connect(self._on_new_regions_layer_requested)
         regions_panel.layerChosen.connect(self._on_region_layer_chosen)
@@ -843,12 +844,24 @@ class ExperimentListWidget(QWidget):
         # screen is worse than none.
         self.params_panel.set_image_metadata(None)
         self.params_panel.set_stack_shape(None)
+        self.params_panel.set_next_movie_enabled(self.list_view.row(current) < self.list_view.count() - 1)
+        # A new movie starts at the beginning. `_adopt_bundle_session`
+        # leafs on from here when the row already has a saved bundle.
+        self.params_panel.show_tab("Detect", "Detect")
         self.list_view.viewport().update()
 
         # Blank the viewer now rather than when the load lands: until then
         # the previous row's layers would sit there looking like this one's.
         self.viewer.layers.clear()
         self._request_item_load(current)
+
+    def _open_next_item(self) -> None:
+        """"Next movie": select the row after the current one. The
+        selection change does the rest, including the unsaved-results
+        prompt, so a refusal there leaves this row where it was."""
+        row = self.list_view.currentRow() + 1
+        if 0 < row < self.list_view.count():
+            self.list_view.setCurrentRow(row)
 
     def _drop_session(self) -> None:
         """Forget the in-memory session and everything derived from it."""
@@ -1058,6 +1071,9 @@ class ExperimentListWidget(QWidget):
             )
         self.params_panel.set_detect_save_enabled(False)
         self._update_points_layer()
+        # Open where this movie's work left off: its tracks' filters, or
+        # its detections' when it was never linked.
+        self.params_panel.show_tab(*(("Track", "Filter") if session.tracks_df is not None else ("Detect", "Filter")))
         if session.tracks_df is not None:
             self.params_panel.set_save_enabled(True)
             n_tracks = session.tracks_df["track_id"].n_unique()
