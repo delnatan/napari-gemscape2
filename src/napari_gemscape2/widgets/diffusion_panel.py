@@ -207,11 +207,12 @@ from napari_gemscape2.fbm import FbmAnalysis, alpha_population, fbm_record, rest
 from napari_gemscape2.fbm import loglik_long_table as fbm_loglik_table
 from napari_gemscape2.fbm import profile_long_table
 from napari_gemscape2.spatial import (
-    CLASS_COLORS, class_color, class_groups, restore_spatial, spatial_columns, spatial_record,
+    CLASS_COLORS, class_color, class_groups, class_map, restore_spatial, spatial_columns, spatial_record,
 )
 from napari_gemscape2.track_map import plot_track_map
 from napari_gemscape2.results import (
     TRACKS_SUMMARY_FILENAME,
+    frame_shape_px,
     load_diffusion_results,
     load_diffusion_summary,
     load_loglik_alpha_D,
@@ -3293,6 +3294,8 @@ class DiffusionAnalysisWidget(QWidget):
             if spatial is not None:
                 summary["spatial"] = spatial_record(spatial)
                 tables["spatial_classes"] = spatial.probabilities()
+                if spatial.patterned:
+                    tables["spatial_class_map"] = class_map(spatial, self.pixel_size_um, frame_shape_px(result_dir))
             if fbm is not None:
                 summary["alpha_D"] = fbm_record(fbm, ids, by_class)
                 tables["loglik_alpha_D"] = fbm_loglik_table(fbm)

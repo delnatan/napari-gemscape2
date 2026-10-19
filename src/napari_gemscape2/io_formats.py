@@ -227,6 +227,8 @@ class StackMetadata:
             "dt_spread_s": self.dt_spread_s,
             "exposure_s_source": self.exposure_source,
             "n_frames_in_file": self.n_frames,
+            # (H, W): the pixel grid a saved spatial class map is on.
+            "frame_shape_px": [int(self.shape[-2]), int(self.shape[-1])],
             "n_channels_in_file": self.n_channels,
             "n_z_in_file": self.n_z,
             "metadata_notes": list(self.notes),

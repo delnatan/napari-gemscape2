@@ -47,8 +47,10 @@ from napari_gemscape2.fbm import analyze_fbm, fbm_options, fbm_record, joint_gri
 from napari_gemscape2.fbm import loglik_long_table as fbm_loglik_table
 from napari_gemscape2.pipeline import FilterSpec, track_features_df
 from napari_gemscape2.regions import Regions
-from napari_gemscape2.results import load_result, package_provenance, write_diffusion_results
-from napari_gemscape2.spatial import N_SHUFFLES, analyze_spatial, class_groups, spatial_columns, spatial_options, spatial_record
+from napari_gemscape2.results import frame_shape_px, load_result, package_provenance, write_diffusion_results
+from napari_gemscape2.spatial import (
+    N_SHUFFLES, analyze_spatial, class_groups, class_map, spatial_columns, spatial_options, spatial_record,
+)
 from napari_gemscape2.viewer import layer_units_metadata, region_classes
 
 
@@ -262,6 +264,8 @@ def analyze_bundle(
         result_dir, tracks_summary=table, summary=summary,
         **analysis_tables(analysis, ids, by_class, None if spatial is None else class_groups(spatial)),
         spatial_classes=None if spatial is None else spatial.probabilities(),
+        spatial_class_map=(class_map(spatial, pixel_size_um, frame_shape_px(result_dir, manifest))
+                           if spatial is not None and spatial.patterned else None),
         loglik_alpha_D=None if fbm is None else fbm_loglik_table(fbm),
         profile_alpha=None if fbm is None else profile_long_table(fbm),
     )

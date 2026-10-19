@@ -671,6 +671,8 @@ The run adds `spatial_class`, `spatial_p` (its probability),
 track's D with its class as the prior: it borrows from the class, so read
 `D_mean_um2_s` for the track's own) to the tracks pane. *Save analysis* writes
 the run to `diffusion_summary.json` (`"spatial"`) and `spatial_classes.parquet`,
+and, when there is a pattern, the class map pixel by pixel on the movie's frame
+(`spatial_class_map.tif`, `spatial_class_probability.tif`) for figures of your own,
 each class's D population to `distributions_D.csv` (`spatial class c`), and the
 bundle reopens with it. `gemscape2 diffusion` runs it with `spatial = true`, and
 `gemscape2 pool` pools a class across movies with `spatial_class` on an input.
@@ -725,6 +727,12 @@ profile_alpha.parquet     after an α · D run, every fitted track's profile
 spatial_classes.parquet   after a spatial-classes run, each of its tracks' class
                           probabilities and centroid: track_id, x_um, y_um, q_1..q_C;
                           with "spatial" in the summary, what the run is restored from
+spatial_class_map.tif     with a spatial pattern, the class map on the frame's pixels
+                          (the grid of labels.tif): uint8 (H, W), each pixel's most
+                          probable class 1..C, 0 where no track is within 2 typical
+                          spacings -- what the "Class map" figure shades
+spatial_class_probability.tif  float32 (C, H, W): each class's probability at each
+                          pixel, NaN where the map is blank
 distributions_D.csv       the population on the D grid, long by group ("all", then each
                           region class, then each spatial class): shared_loglik (the tracks' log-likelihoods
                           summed, 0 at the peak: one D for every track -- the summary's

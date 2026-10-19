@@ -73,6 +73,26 @@ def test_a_batch_finds_two_spatially_organized_classes(project):
         "spatial_class_neighbours"].mean() > 1.8
 
 
+def test_the_class_map_is_saved_pixel_by_pixel(project):
+    import tifffile
+
+    result_dir = project / "results" / "cell_1"
+    label = tifffile.imread(result_dir / "spatial_class_map.tif")
+    probability = tifffile.imread(result_dir / "spatial_class_probability.tif")
+    # No frame shape recorded in these bundles: the grid reaches the farthest track (60 µm at PX).
+    assert label.dtype == np.uint8 and probability.dtype == np.float32
+    assert probability.shape == (2, *label.shape)
+    assert set(np.unique(label)) <= {0, 1, 2}
+    near = label > 0
+    assert np.allclose(np.nansum(probability, axis=0)[near], 1, atol=1e-5)
+    assert np.isnan(probability[:, ~near]).all()
+    assert np.array_equal(label[near], probability[:, near].argmax(axis=0) + 1)
+    # The slow disk at the field's centre is class 1, the fast outside class 2.
+    centre = (int(30 / PX), int(30 / PX))
+    assert label[centre] == 1
+    assert label[int(3 / PX), int(3 / PX)] in (0, 2)
+
+
 def test_each_class_is_a_group_of_the_distributions(project):
     dist = pl.read_csv(project / "results" / "cell_1" / "distributions_D.csv")
     assert {"all", "spatial class 1", "spatial class 2"} <= set(dist["group"].unique().to_list())
