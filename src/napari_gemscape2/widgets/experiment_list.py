@@ -412,7 +412,9 @@ class _ExperimentListView(QListWidget):
     def dropEvent(self, event) -> None:
         folder = _dropped_folder(event)
         if folder is not None:
-            self.load_folder(folder, self.results_root)
+            # Its own results/, as a folder opened from the dialog gets: carrying
+            # the last folder's root over saved another experiment's bundles there.
+            self.load_folder(folder)
 
     def load_folder(self, folder_path: Path, results_root: Optional[Path] = None) -> None:
         if self.is_busy():
