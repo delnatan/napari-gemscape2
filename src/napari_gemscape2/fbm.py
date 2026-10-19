@@ -279,7 +279,8 @@ def alpha_population(analysis: FbmAnalysis, ids: Optional[set] = None) -> Option
     """The population of (alpha, log10 D_ref) over the tracks `ids` (None: all
     fitted), `fbmpost.deconvolve_tracks` of their joint likelihoods -- or None
     without likelihoods or with fewer than `MIN_POPULATION_TRACKS` fitted
-    tracks. ~10 s for a thousand tracks; cached on `analysis`."""
+    tracks. ~10 s for a thousand tracks (less for a subset of tracks already fitted together); cached on
+    `analysis`."""
     lik = analysis.likelihoods
     if lik is None:
         return None
@@ -287,7 +288,12 @@ def alpha_population(analysis: FbmAnalysis, ids: Optional[set] = None) -> Option
     if key in analysis._populations:
         return analysis._populations[key]
     rows = np.arange(len(lik.track_ids)) if ids is None else np.flatnonzero(np.isin(lik.track_ids, list(ids)))
-    pop = dk_deconvolve_alpha_D(lik.rows(rows)) if len(rows) >= MIN_POPULATION_TRACKS else None
+    # A population already fitted over more of these tracks (all of them, or a spatial run's before its
+    # classes) starts this one's search for its smoothness where it found its own.
+    parent = None if key is None else next(
+        (p for k, p in analysis._populations.items() if p is not None and (k is None or k > key)), None)
+    lam_start = None if parent is None else parent.lam
+    pop = dk_deconvolve_alpha_D(lik.rows(rows), lam_start=lam_start) if len(rows) >= MIN_POPULATION_TRACKS else None
     if len(analysis._populations) >= _POPULATION_CACHE_SIZE:
         analysis._populations.clear()
     analysis._populations[key] = pop
