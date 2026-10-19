@@ -74,9 +74,9 @@ def _fbm_worker(tracks: pl.DataFrame, acquisition: "Acquisition", options: "FbmP
 
 
 @thread_worker(start_thread=False)
-def _population_worker(analysis: FbmAnalysis, groups: dict) -> list[dict]:
+def _population_worker(analysis: FbmAnalysis, groups: dict, report) -> list[dict]:
     """`fbm.population_panels` off the GUI thread: one 2D deconvolution per group not yet cached."""
-    return population_panels(analysis, groups)
+    return population_panels(analysis, groups, report)
 
 
 _FBM_HELP = (
@@ -463,7 +463,7 @@ class FbmTab(QWidget):
             return
         ids = self.host.combined_filtered_track_ids()
         groups = self.host.group_track_ids(ids) or {"all": ids}
-        worker = _population_worker(self._analysis, groups)
+        worker = _population_worker(self._analysis, groups, self.host.stage_callback)
         self.host.start_worker(worker, self._on_population, self._on_error, [self._population_button],
                                "α population")
 

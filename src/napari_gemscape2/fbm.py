@@ -275,12 +275,13 @@ MIN_POPULATION_TRACKS = 20
 _POPULATION_CACHE_SIZE = 16
 
 
-def alpha_population(analysis: FbmAnalysis, ids: Optional[set] = None) -> Optional[AlphaDPopulation]:
+def alpha_population(analysis: FbmAnalysis, ids: Optional[set] = None,
+                     progress: Optional[Callable[[str, int, int], None]] = None) -> Optional[AlphaDPopulation]:
     """The population of (alpha, log10 D_ref) over the tracks `ids` (None: all
     fitted), `fbmpost.deconvolve_tracks` of their joint likelihoods -- or None
     without likelihoods or with fewer than `MIN_POPULATION_TRACKS` fitted
     tracks. ~10 s for a thousand tracks (less for a subset of tracks already fitted together); cached on
-    `analysis`."""
+    `analysis`. `progress` is diffusionkit's `(stage, done, total)` (`population_stage` makes one)."""
     lik = analysis.likelihoods
     if lik is None:
         return None
@@ -293,11 +294,26 @@ def alpha_population(analysis: FbmAnalysis, ids: Optional[set] = None) -> Option
     parent = None if key is None else next(
         (p for k, p in analysis._populations.items() if p is not None and (k is None or k > key)), None)
     lam_start = None if parent is None else parent.lam
-    pop = dk_deconvolve_alpha_D(lik.rows(rows), lam_start=lam_start) if len(rows) >= MIN_POPULATION_TRACKS else None
+    pop = (dk_deconvolve_alpha_D(lik.rows(rows), lam_start=lam_start, progress=progress)
+           if len(rows) >= MIN_POPULATION_TRACKS else None)
     if len(analysis._populations) >= _POPULATION_CACHE_SIZE:
         analysis._populations.clear()
     analysis._populations[key] = pop
     return pop
+
+
+def population_stage(prefix: str, report: Callable[[str, int, int], None]) -> Callable[[str, int, int], None]:
+    """diffusionkit's deconvolution progress, `(stage, done, total)`, as `report(text, done, total)` for a
+    progress bar: the Laplace fits counted as they go, since how many the smoothness needs is not known
+    ahead (total 0: a busy bar), then the draws as a fraction. `prefix` names the population."""
+
+    def stage(name: str, done: int, total: int) -> None:
+        if name == "sampling":
+            report(f"{prefix}sampling", done, total)
+        else:
+            report(f"{prefix}{'support' if name == 'coarse' else 'smoothness'}, fit {done}", 0, 0)
+
+    return stage
 
 
 def population_is_cached(analysis: FbmAnalysis, ids: Optional[set] = None) -> bool:
@@ -337,14 +353,16 @@ def population_summary(pop: AlphaDPopulation, level: float = LEVEL) -> dict:
     }
 
 
-def population_panels(analysis: FbmAnalysis, groups: dict[str, Optional[set]]) -> list[dict]:
+def population_panels(analysis: FbmAnalysis, groups: dict[str, Optional[set]],
+                      report: Optional[Callable[[str, int, int], None]] = None) -> list[dict]:
     """What `joint_plot.plot_alpha_population` draws, one dict per group with
     a population: `name`, the `AlphaDPopulation` (`population`), its summary
     and band at `diffusion.LEVEL`, the shared alpha (`shared_alpha_summary`, or
-    None) and tau_ref."""
+    None) and tau_ref. `report(text, done, total)` follows the deconvolutions."""
     panels = []
-    for name, ids in groups.items():
-        pop = alpha_population(analysis, ids)
+    for i, (name, ids) in enumerate(groups.items()):
+        prefix = f"{name} ({i + 1}/{len(groups)}) · " if len(groups) > 1 else ""
+        pop = alpha_population(analysis, ids, progress=None if report is None else population_stage(prefix, report))
         if pop is not None:
             panels.append({"name": name, "population": pop, "summary": population_summary(pop, LEVEL),
                            "level": LEVEL, "shared": shared_alpha_summary(analysis, ids),

@@ -128,6 +128,7 @@ here shows a bare number:
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -203,7 +204,7 @@ from napari_gemscape2.diffusion import (
     tracks_summary_table,
     tracks_to_diffusionkit_df,
 )
-from napari_gemscape2.fbm import FbmAnalysis, alpha_population, fbm_record, restore_fbm
+from napari_gemscape2.fbm import FbmAnalysis, alpha_population, fbm_record, population_stage, restore_fbm
 from napari_gemscape2.fbm import loglik_long_table as fbm_loglik_table
 from napari_gemscape2.fbm import profile_long_table
 from napari_gemscape2.spatial import (
@@ -349,21 +350,25 @@ def _length_worker(analysis: PosteriorAnalysis, id_sets: list, weight: str) -> N
 
 
 @thread_worker(start_thread=False)
-def _tables_worker(analysis: Optional[PosteriorAnalysis], id_sets: list, fbm: Optional[FbmAnalysis] = None,
-                   ensemble_sets: tuple = ()) -> None:
-    """The deconvolutions the saved tables read, over `id_sets`, off the GUI
-    thread: each set's ensemble and its track-length groups (fitted once;
-    the "detections" weighting only re-shares them), cached on `analysis`,
-    and each set's α population, cached on `fbm`; over `ensemble_sets`
-    (the spatial classes) the ensemble alone."""
-    for ids in id_sets:
+def _tables_worker(analysis: Optional[PosteriorAnalysis], groups: dict, fbm: Optional[FbmAnalysis] = None,
+                   ensemble_groups: Optional[dict] = None, report=None) -> None:
+    """The deconvolutions the saved tables read, over `groups` (name: track
+    ids), off the GUI thread: each group's ensemble and its track-length
+    groups (fitted once; the "detections" weighting only re-shares them),
+    cached on `analysis`, and each group's α population, cached on `fbm`;
+    over `ensemble_groups` (the spatial classes) the ensemble alone.
+    `report(text, done, total)` says which is running (`stage_callback`)."""
+    report = report or (lambda *_a: None)
+    for name, ids in groups.items():
         if analysis is not None:
+            report(f"{name} · D population", 0, 0)
             ensemble(analysis, ids)
             length_composition(analysis, ids, "tracks")
         if fbm is not None:
-            alpha_population(fbm, ids)
-    for ids in ensemble_sets:
+            alpha_population(fbm, ids, progress=population_stage(f"{name} · α · D ", report))
+    for name, ids in (ensemble_groups or {}).items():
         if analysis is not None:
+            report(f"{name} · D population", 0, 0)
             ensemble(analysis, ids)
 
 
@@ -422,6 +427,9 @@ class _ProgressRelay(QObject):
     and the progress bar is only ever touched where Qt allows it."""
 
     progress = Signal(int, int)
+    # (what is running, done, total): total 0 when the amount of work is not known ahead -- the
+    # deconvolutions' search over their smoothness (`fbm.population_stage`).
+    stage = Signal(str, int, int)
 
 
 # Per-track posterior results this widget broadcasts onto the viewer's
@@ -2020,8 +2028,17 @@ class DiffusionAnalysisWidget(QWidget):
         # changed record from a re-read of the same one (`_adopt_track_table`).
         self._layer_exposure_s = _UNSEEN
         self._progress_label = ""
+        self._progress_text = ""
+        self._progress_active = False
+        self._progress_started = 0.0
         self._progress_relay = _ProgressRelay(self)
         self._progress_relay.progress.connect(self._on_worker_progress)
+        self._progress_relay.stage.connect(self._on_worker_stage)
+        # Ticks the elapsed seconds on the bar, so work whose length is not
+        # known ahead still visibly moves.
+        self._progress_clock = QTimer(self)
+        self._progress_clock.setInterval(1000)
+        self._progress_clock.timeout.connect(self._refresh_progress_text)
 
         self._tracks_layer: Optional[Tracks] = None
         self._highlight_layer: Optional[Shapes] = None
@@ -2275,6 +2292,39 @@ class DiffusionAnalysisWidget(QWidget):
         worker thread (see `_ProgressRelay`)."""
         return self._progress_relay.progress.emit
 
+    @property
+    def stage_callback(self):
+        """`report(text, done, total)` from a worker thread: what is running
+        now, on the bar, with its count when `total` is known (else a busy
+        bar). See `fbm.population_stage`."""
+        return self._progress_relay.stage.emit
+
+    def begin_progress(self, label: str, unit: str = "tracks") -> bool:
+        """Show the bar for one piece of work, with its elapsed time; False
+        when it is already showing another's."""
+        if self._progress_active:
+            return False
+        self._progress_active = True
+        self._progress_label = label
+        self._progress_unit = unit
+        self._progress_text = ""
+        self._progress_started = time.monotonic()
+        self._progress_bar.setRange(0, 0)
+        self._refresh_progress_text()
+        self._progress_bar.show()
+        self._progress_clock.start()
+        return True
+
+    def end_progress(self) -> None:
+        self._progress_active = False
+        self._progress_clock.stop()
+        self._progress_bar.hide()
+
+    def _refresh_progress_text(self) -> None:
+        elapsed = int(time.monotonic() - self._progress_started)
+        head = f"{self._progress_label}: {self._progress_text}" if self._progress_text else f"{self._progress_label}…"
+        self._progress_bar.setFormat(f"{head} · {elapsed} s")
+
     def start_worker(
         self,
         worker,
@@ -2287,20 +2337,19 @@ class DiffusionAnalysisWidget(QWidget):
         """Run `worker` in the one host-wide slot. Until the worker's first
         report through `progress_callback` arrives (and throughout, for one
         that never reports) the bar is a busy indicator; `unit` is what it
-        counts."""
+        counts. Returns False, starting nothing, while another worker has
+        the slot."""
         if self._worker is not None:
-            return
+            return False
         for widget in busy_widgets:
             widget.setEnabled(False)
-        self._progress_label = label
-        self._progress_unit = unit
-        self._progress_bar.setRange(0, 0)
-        self._progress_bar.setFormat(f"{label}…")
-        self._progress_bar.show()
+        if self._progress_active:  # a save's deconvolutions: the run in the slot takes the bar
+            self.end_progress()
+        self.begin_progress(label, unit)
 
         def _done(_widgets=busy_widgets) -> None:
             self._worker = None
-            self._progress_bar.hide()
+            self.end_progress()
             for w in _widgets:
                 w.setEnabled(True)
 
@@ -2316,15 +2365,28 @@ class DiffusionAnalysisWidget(QWidget):
         worker.errored.connect(_errored)
         self._worker = worker
         worker.start()
+        return True
 
     def _on_worker_progress(self, done: int, total: int) -> None:
-        if self._worker is None or total <= 0 or done <= 0:
+        if not self._progress_active or total <= 0 or done <= 0:
             # Stay a busy indicator until there is progress to show; a
             # determinate bar parked at 0% reads as hung.
             return
         self._progress_bar.setRange(0, total)
         self._progress_bar.setValue(done)
-        self._progress_bar.setFormat(f"{self._progress_label}: {done}/{total} {getattr(self, '_progress_unit', 'tracks')}")
+        self._progress_text = f"{done}/{total} {self._progress_unit}"
+        self._refresh_progress_text()
+
+    def _on_worker_stage(self, text: str, done: int, total: int) -> None:
+        if not self._progress_active:
+            return
+        if total > 0:
+            self._progress_bar.setRange(0, total)
+            self._progress_bar.setValue(done)
+        else:
+            self._progress_bar.setRange(0, 0)
+        self._progress_text = text
+        self._refresh_progress_text()
 
     # -- tracks-layer selection --
 
@@ -3310,7 +3372,13 @@ class DiffusionAnalysisWidget(QWidget):
             write()
             return
         self._posterior_tab.report_caution("saving: deconvolving the populations…")
-        worker = _tables_worker(analysis, [ids, *(by_class or {}).values()], fbm, tuple((by_spatial or {}).values()))
+        groups = {"all": ids, **(by_class or {})}
+        on_bar = self._worker is None and self.begin_progress("saving")
+        worker = _tables_worker(analysis, groups, fbm, by_spatial or {}, self.stage_callback if on_bar else None)
+        if on_bar:
+            # Unless a run took the bar meanwhile (`start_worker`).
+            worker.returned.connect(lambda _r: self._worker is None and self.end_progress())
+            worker.errored.connect(lambda _e: self._worker is None and self.end_progress())
         worker.returned.connect(write)
         worker.errored.connect(self._save_failed)
         self._save_worker = worker
