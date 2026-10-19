@@ -387,7 +387,7 @@ class _ExperimentListView(QListWidget):
             return
         if key == Qt.Key.Key_F5:
             if self.folder_path is not None:
-                self.load_folder(self.folder_path, self.results_root)
+                self.load_folder(self.folder_path)
             return
         super().keyPressEvent(event)
 
@@ -412,11 +412,13 @@ class _ExperimentListView(QListWidget):
     def dropEvent(self, event) -> None:
         folder = _dropped_folder(event)
         if folder is not None:
-            # Its own results/, as a folder opened from the dialog gets: carrying
-            # the last folder's root over saved another experiment's bundles there.
             self.load_folder(folder)
 
-    def load_folder(self, folder_path: Path, results_root: Optional[Path] = None) -> None:
+    def load_folder(self, folder_path: Path) -> None:
+        """List the movies in `folder_path`, with their bundles in its own
+        `results/`. Always that folder's: a results root carried over from the
+        previously loaded folder once saved one experiment's bundles among
+        another's."""
         if self.is_busy():
             self.on_busy_blocked()
             return
@@ -424,7 +426,7 @@ class _ExperimentListView(QListWidget):
             return
         self.clear()
         self.folder_path = Path(folder_path)
-        self.results_root = results_root or (self.folder_path / "results")
+        self.results_root = self.folder_path / "results"
 
         for file_path in natsorted(self.folder_path.iterdir()):
             if file_path.name.startswith("."):
