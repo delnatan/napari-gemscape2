@@ -133,3 +133,10 @@ def test_a_class_a_movie_does_not_have_stops_the_pooling(project):
     cfg.write_text('results_root = "results"\n[[inputs]]\npath = "cell_1.tif"\nspatial_class = 5\n')
     result = CliRunner().invoke(app, ["pool", str(cfg)])
     assert result.exit_code == 1 and "not one of this movie's classes" in result.output
+
+
+def test_too_few_shuffles_to_reach_the_pattern_threshold_are_refused():
+    with pytest.raises(ValueError, match="at least 19"):
+        DiffusionSettings(spatial=True, spatial_shuffles=9)
+    DiffusionSettings(spatial=True, spatial_shuffles=0)
+    DiffusionSettings(spatial=True, spatial_shuffles=19)

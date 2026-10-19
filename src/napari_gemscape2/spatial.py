@@ -57,8 +57,14 @@ def class_color(c: int) -> str:
 
 def spatial_options(n_classes: Optional[int] = None, n_shuffles: int = N_SHUFFLES,
                     max_classes: int = MAX_CLASSES) -> SpatialOptions:
-    """The run's options: `n_classes` None takes the suggested C. Raises ValueError for bad ones."""
-    return SpatialOptions(max_classes=max(max_classes, n_classes or 1), n_classes=n_classes, n_shuffles=n_shuffles)
+    """The run's options: `n_classes` None takes the suggested C. Raises ValueError for bad ones, among them a
+    number of shuffles too small for p to reach `p_pattern` (0 skips the test)."""
+    options = SpatialOptions(max_classes=max(max_classes, n_classes or 1), n_classes=n_classes, n_shuffles=n_shuffles)
+    if n_shuffles and 1 / (1 + n_shuffles) > options.p_pattern:
+        need = int(np.ceil(1 / options.p_pattern)) - 1
+        raise ValueError(f"{n_shuffles} shuffles cannot show a pattern at p <= {options.p_pattern:g}: "
+                         f"use at least {need}, or 0 to skip the test")
+    return options
 
 
 def positions_um(base: pl.DataFrame, pixel_size_um: float) -> pl.DataFrame:

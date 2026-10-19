@@ -72,7 +72,8 @@ class SpatialSection(QWidget):
         self._shuffles.setValue(N_SHUFFLES)
         self._shuffles.setToolTip(
             "Shuffles of the track positions for the pattern test.\n"
-            "99 resolve p down to 0.01; 0 skips the test (and the class map)."
+            "99 resolve p down to 0.01, 19 is the fewest that can reach 0.05;\n"
+            "0 skips the test (and the class map)."
         )
         self._run_button = QPushButton("Run")
         self._run_button.setToolTip("Classes of D among the tracks the filters pass, from the D run's likelihoods.")
