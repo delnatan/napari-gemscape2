@@ -27,6 +27,9 @@ _MUTED_INK = "#52514e"
 _ALL_COLOR = "#9a9993"
 # Cells across the field's longer side.
 _FIELD_CELLS = 320
+# How far a sure cell of the field goes from white toward its class colour: pale, so the tracks' dots in the
+# full colour read on top of it.
+_FIELD_STRENGTH = 0.45
 
 
 def _style(ax) -> None:
@@ -80,7 +83,7 @@ def plot_class_selection(s: SpatialAnalysis, title: Optional[str] = None) -> Fig
 
 def class_field(s: SpatialAnalysis, extent_um: tuple[float, float, float, float], cells: int = _FIELD_CELLS
                 ) -> tuple[np.ndarray, tuple[float, float, float, float]]:
-    """The class map as an RGBA image over `extent_um` (x0, x1, y0, y1), rows along y: each cell the colour of
+    """The class map as an RGBA image over `extent_um` (x0, x1, y0, y1), rows along y: each cell a pale tint of
     its most probable class, faded to white as that class's probability falls to 1/C, and transparent where its
     k-th nearest track is beyond `FIELD_REACH` typical spacings. Returns the image and its imshow extent."""
     x0, x1, y0, y1 = extent_um
@@ -93,7 +96,7 @@ def class_field(s: SpatialAnalysis, extent_um: tuple[float, float, float, float]
     best = p.argmax(axis=1)
     sure = np.clip((p.max(axis=1) - 1 / c) / (1 - 1 / c), 0, 1) if c > 1 else np.ones(len(p))
     palette = np.array([to_rgb(class_color(k + 1)) for k in range(c)])
-    rgb = 1 - sure[:, None] * (1 - palette[best])
+    rgb = 1 - _FIELD_STRENGTH * sure[:, None] * (1 - palette[best])
     alpha = (dist <= FIELD_REACH * s.typical_spacing_um()).astype(float)
     image = np.concatenate([rgb, alpha[:, None]], axis=1).reshape(len(ys), len(xs), 4)
     return image, (xs[0] - step / 2, xs[-1] + step / 2, ys[-1] + step / 2, ys[0] - step / 2)
@@ -120,8 +123,7 @@ def plot_class_map(
     fig = Figure(figsize=(7.0, min(max(7.0 * 0.85 * aspect, 3.0), 10.0)), layout="constrained")
     ax = fig.add_subplot()
 
-    drawn_field = s.patterned
-    if drawn_field:
+    if s.patterned:
         image, im_extent = class_field(s, extent)
         ax.imshow(image, extent=im_extent, origin="upper", interpolation="nearest", zorder=0)
     if labels is not None and region_classes and pixel_size_um:
@@ -133,14 +135,16 @@ def plot_class_map(
 
     cls = s.columns()["spatial_class"].to_numpy()
     colors = [class_color(int(k)) for k in cls]
-    ax.scatter(xy[:, 0], xy[:, 1], s=7, c=colors, edgecolors=_INK, linewidths=0.25, zorder=2)
+    # Smaller dots for more tracks, so the shade between them stays readable.
+    size = float(np.clip(5000 / len(xy), 1.0, 8.0))
+    ax.scatter(xy[:, 0], xy[:, 1], s=size, c=colors, edgecolors=_INK, linewidths=0.1 if size < 3 else 0.25, zorder=2)
 
     report = s.report()
     handles = [Patch(facecolor=class_color(int(r["spatial_class"])), edgecolor=_INK, linewidth=0.3,
                      label=f"class {r['spatial_class']} · {r['n_tracks']} tracks")
                for r in report.iter_rows(named=True)]
     ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(1.0, 1.0), frameon=False, fontsize=8,
-              title="classes (lowest D first)", title_fontsize=8, alignment="left")
+              title="classes (lowest D first),\ntracks by their neighbours' class", title_fontsize=8, alignment="left")
     ax.set_xlim(extent[0], extent[1])
     ax.set_ylim(extent[3], extent[2])
     ax.set_aspect("equal")
@@ -153,13 +157,12 @@ def plot_class_map(
     if s.null is None:
         verdict = "one class: no map" if s.n_classes == 1 else "no pattern test run: no map"
     elif s.patterned:
-        verdict = (f"spatial pattern: neighbour gain {s.null.gain:.1f} nats, p = {s.null.p:.2g} · colour: the most "
-                   f"probable class, paler where less sure, blank beyond {FIELD_REACH:g} track spacings")
+        verdict = (f"spatial pattern: neighbour gain {s.null.gain:.1f} nats, p = {s.null.p:.2g}\n"
+                   f"shade: the most probable class there, paler where less sure,\n"
+                   f"blank beyond {FIELD_REACH:g} track spacings · dots: each track's own class")
     else:
-        verdict = (f"no spatial pattern (p = {s.null.p:.2g}): the classes are a mixture with no places, so no map; "
-                   "dots are each track's own class")
-    if not drawn_field and s.null is not None and s.patterned is False:
-        pass
+        verdict = (f"no spatial pattern (p = {s.null.p:.2g}): the classes are a mixture with no places,\n"
+                   "so no map; dots: each track's own class")
     head = f"{title} · " if title else ""
     ax.set_title(f"{head}{len(xy)} tracks, {s.n_classes} classes\n{verdict}", fontsize=8, loc="left", color=_INK)
     return fig
