@@ -134,7 +134,7 @@ from typing import Optional
 import numpy as np
 import polars as pl
 from diffusionkit import Acquisition
-from napari.layers import Points, Shapes, Tracks
+from napari.layers import Labels, Points, Shapes, Tracks
 from napari.qt.threading import thread_worker
 from qtpy.QtCore import QObject, Qt, QTimer, Signal
 from qtkit import (
@@ -2804,7 +2804,7 @@ class DiffusionAnalysisWidget(QWidget):
         if self._spatial is not None:  # read off the D run this one replaces
             self._spatial = None
             self._spatial_sources.pop("spatial", None)
-            self._map_tab.spatial.reset()
+        self._map_tab.spatial.reset()  # and Run is ready now
         numeric = [c for c, dtype in zip(display_df.columns, display_df.dtypes) if dtype.is_numeric()]
         self.register_spatial_source("posterior", display_df.select(numeric))
         self._rebuild_track_table()
@@ -3032,7 +3032,9 @@ class DiffusionAnalysisWidget(QWidget):
 
     def map_regions(self) -> Optional[tuple[np.ndarray, dict[int, str]]]:
         """`(labels, {label: class})` the loaded tracks were made with, read
-        from the layer's bundle once per bundle, or None without one."""
+        from the layer's bundle once per bundle, or None without one. The
+        names are the regions layer's when it still holds those labels: a
+        region renamed since the save is drawn under its new name."""
         if self._result_dir is None:
             return None
         cached = self._map_regions_cache
@@ -3040,7 +3042,22 @@ class DiffusionAnalysisWidget(QWidget):
             labels, regions = load_regions(self._result_dir)
             found = None if labels is None or not regions.table else (labels, region_classes(regions))
             self._map_regions_cache = cached = (self._result_dir, found)
-        return cached[1]
+        if cached[1] is None:
+            return None
+        labels, classes = cached[1]
+        live = self._live_region_classes(labels)
+        return labels, {label: live.get(label, name) for label, name in classes.items()}
+
+    def _live_region_classes(self, labels: np.ndarray) -> dict[int, str]:
+        """`{label: class}` of a regions layer in the viewer painted exactly
+        as `labels` (the bundle's), or {} when there is none."""
+        for layer in self.viewer.layers:
+            if not isinstance(layer, Labels) or layer.metadata.get("regions") is None:
+                continue
+            data = np.asarray(layer.data)
+            if data.shape == labels.shape and np.array_equal(data, labels):
+                return region_classes(layer.metadata["regions"])
+        return {}
 
     def track_map_figure(self, vmin: float, vmax: float, log: bool, regions: bool):
         """The Map tab's coloring as a matplotlib figure
