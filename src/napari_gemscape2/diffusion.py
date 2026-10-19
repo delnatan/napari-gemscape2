@@ -1227,14 +1227,17 @@ def analysis_tables(
     analysis: PosteriorAnalysis,
     ids: Optional[set],
     by_class: Optional[dict],
+    by_spatial_class: Optional[dict] = None,
 ) -> dict:
     """The likelihood and distribution tables, as `write_diffusion_results`
     keyword arguments. The ensemble is over the tracks passing the filters
-    (`ids`), split by region class when there are several."""
+    (`ids`), split by region class when there are several, and in
+    `distributions_D` also by spatial class (`spatial.class_groups`) when
+    those were run."""
     groups = {"all": ids, **(by_class or {})}
     return dict(
         loglik_D=loglik_long_table(analysis),
-        distributions_D=distributions_table(analysis, groups),
+        distributions_D=distributions_table(analysis, {**groups, **(by_spatial_class or {})}),
         distributions_D_by_length=length_distributions_table(analysis, groups),
     )
 

@@ -171,7 +171,8 @@ def diffusion(
     Reads `<results_root>/<result_id>/` for each [[inputs]] entry and
     writes the widget's files there (tracks_summary.csv, loglik_D.parquet,
     distributions_D.csv, distributions_D_by_length.csv,
-    diffusion_summary.json), so the result reopens
+    diffusion_summary.json, and spatial_classes.parquet with spatial
+    classes), so the result reopens
     in the widget as if saved from it.
 
     Settings come from the template bundle's diffusion_summary.json when
@@ -190,9 +191,21 @@ def diffusion(
         # or shares of each track's longest lag (replace both lag counts):
         # msd_lag_fraction = 0.3
         # msd_alpha_lag_fraction = 0.5
-        # Also run the alpha-D (fBm) posteriors, D_ref at this lag (s); a
+        # Also run the alpha-D (fBm) fits, D_ref at this lag (s); a
         # template saved with them sets it. D_ref is not a Brownian D.
         alpha_D_tau_ref_s = 0.1
+        # their grids; any key left out keeps the default (shown): alpha
+        # points per track, then the population's cells -- alpha rows per
+        # cell, D cell width in decades, likelihood points per D cell.
+        alpha_D_grid = { n_alpha = 99, alpha_group = 3, d_log10_D = 0.05, cell_points = 4 }
+        # Also find spatial classes of D among the tracks that pass (a
+        # template saved with them sets it): classes numbered by increasing
+        # D, a test for a spatial pattern against shuffled positions, and
+        # the spatial_* columns in tracks_summary.csv. The number of classes
+        # is each movie's suggested one unless set here.
+        spatial = true
+        spatial_n_classes = 2
+        spatial_shuffles = 99
         exposure_s = 0.01       # optional: overrides each bundle's recorded one
         min_track_length = 1    # which tracks pass (passes_filters, ensemble)
         filters = { D_info_bits = [1.0, inf], flux_mean = [800.0, inf] }
@@ -224,8 +237,9 @@ def diffusion(
         # Lags asked for here replace shares the template was saved with.
         settings_cfg.pop("msd_lag_fraction", None)
         settings_cfg.pop("msd_alpha_lag_fraction", None)
-    if isinstance(diff_cfg.get("grid"), dict):
-        settings_cfg["grid"] = {**inherited.get("grid", {}), **diff_cfg["grid"]}
+    for key in ("grid", "alpha_D_grid"):  # key by key over the template's
+        if isinstance(diff_cfg.get(key), dict):
+            settings_cfg[key] = {**inherited.get(key, {}), **diff_cfg[key]}
     try:
         DiffusionSettings(**{k: v for k, v in settings_cfg.items() if k != "filters"}).options()
     except (TypeError, ValueError) as exc:
@@ -282,6 +296,9 @@ def pool(
         [[inputs]]
         path = "data/wt_1.tif"
         sample = "wt"           # replicates share it; default: the bundle's own name
+        spatial_class = 1       # optional: only this saved spatial class's tracks (by their neighbours'
+                                # class). Classes are numbered per movie: match them across movies yourself,
+                                # and list a movie once per class to pool its classes into different samples.
 
         [pool]
         output = "pooled"       # a folder under the config's folder (default: results_root/pooled)
@@ -315,7 +332,7 @@ def pool(
     for entry in cfg["inputs"]:
         result_dir = _result_dir(entry, results_root)
         try:
-            bundles.append(load_pooled_bundle(result_dir, entry.get("sample")))
+            bundles.append(load_pooled_bundle(result_dir, entry.get("sample"), entry.get("spatial_class")))
         except (ValueError, OSError) as exc:
             problems.append(f"[{result_dir.name}] {exc}")
     if problems:

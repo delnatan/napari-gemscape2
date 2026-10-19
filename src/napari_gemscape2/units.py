@@ -153,6 +153,13 @@ _EXACT: dict[str, Optional[str]] = {
     # resolve through the statistic suffixes; D_ref's own columns take
     # `_um2_s` from the suffix rule.
     "fbm_status": None,
+    # The spatial classes (`napari_gemscape2.spatial`): a class number and its
+    # probability, by the track's own data and neighbours or by the neighbours
+    # alone; D_spatial's columns take `_um2_s` from the suffix rule.
+    "spatial_class": None,
+    "spatial_p": None,
+    "spatial_class_neighbours": None,
+    "spatial_p_neighbours": None,
     "alpha_edge": None,
     "alpha_dll_brownian": None,
     "alpha_p_brownian": None,

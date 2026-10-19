@@ -132,6 +132,7 @@ from napari_gemscape2.io_formats import StackMetadata
 from napari_gemscape2.pipeline import (
     DEFAULT_CAMERA_KWARGS,
     DEFAULT_DETECT_KWARGS,
+    DEFAULT_EXCLUDE_FLAGS,
     TRACK_METRIC_COLUMNS,
     FilterSpec,
 )
@@ -1000,9 +1001,10 @@ class _TrackingTab(QWidget):
     the linked steps' own rms.
 
     What the linker is fed: one checkbox per `spotsolve.FitFlag`, each
-    excluding the fits carrying it (all off by default -- spotsolve's
-    flags are diagnostics, not verdicts; `pipeline.run_track_step` always
-    drops fits with no usable position error regardless).
+    excluding the fits carrying it (by default AT_BOUND and ELONGATED,
+    `pipeline.DEFAULT_EXCLUDE_FLAGS`: fits that are not one in-focus
+    emitter; `pipeline.run_track_step` always drops fits with no usable
+    position error regardless).
 
     `min_track_length` filters the final `tracks_df` (see
     `pipeline.run_track_step`) -- default 2 drops bare singletons (a
@@ -1063,6 +1065,7 @@ class _TrackingTab(QWidget):
         for i, (flag, tip) in enumerate(_FLAG_TOOLTIPS.items()):
             box = QCheckBox(flag.name.lower().replace("_", " "))
             box.setToolTip(tip)
+            box.setChecked(bool(int(flag) & DEFAULT_EXCLUDE_FLAGS))
             self._flag_boxes[flag] = box
             flag_grid.addWidget(box, i // 2, i % 2)
         flags_body = QWidget()

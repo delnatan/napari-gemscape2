@@ -96,9 +96,32 @@ def test_d_ref_columns_are_read_against_their_own_floor(analysis):
 
 
 def test_a_template_with_an_alpha_D_run_reruns_it():
-    settings = settings_from_summary({"min_frames": 3, "alpha_D": {"tau_ref_s": 0.25}})
-    assert DiffusionSettings(**settings).alpha_D_tau_ref_s == 0.25
+    grid = {"n_alpha": 49, "alpha_group": 3, "d_log10_D": 0.1, "cell_points": 2}
+    settings = settings_from_summary({"min_frames": 3, "alpha_D": {"tau_ref_s": 0.25, "grid": grid}})
+    s = DiffusionSettings(**settings)
+    assert s.alpha_D_tau_ref_s == 0.25 and s.alpha_D_grid == grid
     assert "alpha_D_tau_ref_s" not in settings_from_summary({"min_frames": 3})
+    with pytest.raises(ValueError):
+        DiffusionSettings(alpha_D_grid={"n_D": 3})  # not an alpha-D grid key
+    with pytest.raises(ValueError):
+        DiffusionSettings(alpha_D_grid={"n_alpha": 7, "alpha_group": 3})  # 2 population cells
+
+
+def test_the_grid_settings_run_save_and_restore(tracks):
+    grid = {"n_alpha": 49, "alpha_group": 3, "d_log10_D": 0.1, "cell_points": 2}
+    few = tracks.filter(pl.col("track_id").is_in([0, 1, 2, 20, 21]))
+    run = fbm.analyze_fbm(few, ACQ, fbm.fbm_options(grid=grid), joint=fbm.joint_grid(grid), threads=1)
+    assert run.grid == grid
+    assert len(run.profiles.alphas) == 49
+    D = run.likelihoods.log10_D_ref
+    assert D[1] - D[0] == pytest.approx(0.1)
+    record = fbm.fbm_record(run, None, None)
+    assert record["grid"] == grid
+    base = few.group_by("track_id").agg(pl.len().alias("track_length"),
+                                        pl.col("x_um").mean().alias("x_px"), pl.col("y_um").mean().alias("y_px"))
+    table = tracks_summary_table(base, run.columns(), result_id="m", pixel_size_um=1.0, passing_ids=None)
+    assert fbm.restore_fbm(few, record, table).grid == grid
+    assert fbm.analyze_fbm(few, ACQ, fbm.fbm_options(), threads=1).grid == fbm.FBM_GRID_DEFAULTS
 
 
 def test_plots_draw(tracks, analysis):
@@ -137,6 +160,9 @@ def test_population_separates_the_two_groups(analysis):
     s = fbm.population_summary(high)
     assert s["n_tracks"] == 20
     for key in ("alpha_mean", "alpha_sd", "p_alpha_below_1", "alpha_D_ref_corr", "share_below_floor"):
+        if s[key] is None:  # the correlation, for a population on one alpha cell
+            assert key == "alpha_D_ref_corr"
+            continue
         median, low_, high_ = s[key]
         assert low_ <= median <= high_
 
