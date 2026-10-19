@@ -76,7 +76,7 @@ spotsolve = [
 ]
 # Pure Python; follows main, and uv.lock pins the commit. Note that PyPI's
 # `diffusionkit` is an unrelated package, so this source must stay.
-diffusionkit = { git = "https://github.com/delnatan/diffusionkit.git", branch = "claude/spatial" }  # back to main once spatial merges there
+diffusionkit = { git = "https://github.com/delnatan/diffusionkit.git", branch = "main" }
 # Follows main likewise; `uv lock --upgrade-package qtkit` brings a newer
 # commit in.
 qtkit = { git = "https://github.com/delnatan/qtkit.git", branch = "main" }
