@@ -558,6 +558,16 @@ def run_detect_step(
     # A fresh detection table supersedes whatever bundle this session was
     # rebuilt from, so none of that bundle's recorded numbers still apply.
     session.source_params = None
+    # Nor do the last link run's tracks: they were linked from detections
+    # this run just replaced, so they are cleared rather than left to be
+    # drawn, filtered, analyzed or saved beside a table they didn't come from.
+    session.tracks_df = None
+    session.track_summary = None
+    session.max_step_used = None
+    session.exclude_flags_used = None
+    session.min_track_length_used = None
+    session.point_filters_used = None
+    session.track_filters_used = None
     return session
 
 

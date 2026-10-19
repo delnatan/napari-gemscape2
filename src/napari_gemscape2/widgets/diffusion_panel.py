@@ -430,11 +430,14 @@ _UNSEEN = object()
 def _shared_tracks_unchanged(old: Optional[pl.DataFrame], new: pl.DataFrame) -> bool:
     """Whether every track_id present in both vertex tables has identical
     vertices in each -- i.e. `new` differs from `old` only by whole tracks
-    added or removed (a filter), not by tracks being re-linked. False when
-    they share no track at all, since then nothing carries over anyway."""
+    added or removed (a filter), not by tracks being re-linked or
+    re-localized. The localization errors count as much as the positions:
+    every fit reads them, so a re-detect that moved no spot but changed
+    their se_y/se_x has still made the fits stale. False when they share
+    no track at all, since then nothing carries over anyway."""
     if old is None:
         return False
-    columns = ["track_id", "frame", "y", "x"]
+    columns = ["track_id", "frame", "y", "x", "se_y", "se_x"]
     shared = old.select("track_id").unique().join(new.select("track_id").unique(), on="track_id")
     if shared.height == 0:
         return False
