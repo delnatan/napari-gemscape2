@@ -34,7 +34,15 @@ OFFSET_LABELS = {"provided": "from the SDs", "fit": "fitted (intercept)"}
 def fit_window_to_figure(window: QWidget, figure) -> None:
     """Size a plot window for `figure`'s own layout (its inches at its dpi,
     plus room for the toolbar), within the screen: the ensemble figure gains
-    a column per optional analysis, which a fixed-size window squeezes."""
+    a column per optional analysis, which a fixed-size window squeezes.
+
+    Only when the figure's shape differs from the one the window was last
+    sized for: a redraw of the same figure (new fit windows, a new offset)
+    keeps whatever size the user has dragged the window to."""
+    inches = tuple(float(x) for x in figure.get_size_inches())
+    if getattr(window, "_figure_inches", None) == inches:
+        return
+    window._figure_inches = inches
     width, height = (figure.get_size_inches() * figure.dpi).astype(int)
     height += 60  # the navigation toolbar
     screen = window.screen() or QApplication.primaryScreen()
