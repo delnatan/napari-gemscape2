@@ -5,9 +5,9 @@ Batch orchestration and napari visualization for single-particle tracking, conne
 - [`spotsolve`](https://github.com/delnatan/spotsolve) — 2D localization after u-track's
   detector, with overlapping spots fitted jointly, plus frame-to-frame linking. Runs in Rust.
 - [`diffusionkit`](https://github.com/delnatan/diffusionkit) — per-track grid posteriors over D, the
-  population they make (a shared D, a log-normal, and a deconvolved distribution, also by track
-  length), per-track posteriors over α and D_ref under fractional Brownian motion, classic MSD
-  fits, and per-track NUTS.
+  population they make (a log-normal and a deconvolved distribution), per-track likelihoods of α
+  and D_ref under fractional Brownian motion and their population, spatial classes of D, and
+  classic MSD fits as the comparison.
 
 ## Install
 
@@ -22,7 +22,7 @@ powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | ie
 # 2. Get napari-gemscape2 and its environment
 git clone https://github.com/delnatan/napari-gemscape2.git
 cd napari-gemscape2
-uv sync                 # or `uv sync --extra bayes` for the NUTS tab (JAX, NumPyro)
+uv sync
 
 # 3. Run it, from this folder
 uv run napari           # widgets: Plugins → GEMscape2
@@ -53,8 +53,7 @@ uv tool install "napari-gemscape2 @ git+https://github.com/delnatan/napari-gemsc
 uv tool upgrade napari-gemscape2   # to update
 ```
 
-For the NUTS tab, write `"napari-gemscape2[bayes] @ git+…"` instead. This route
-ignores `uv.lock`: it resolves everything fresh and takes the latest diffusionkit
+This route ignores `uv.lock`: it resolves everything fresh and takes the latest diffusionkit
 and qtkit, so two machines installed on different days can differ. For analyses
 you'll publish, use the clone.
 
@@ -290,7 +289,7 @@ uv run --project dev pytest                          # this repo's tests
 uv run --project dev --package spotsolve pytest      # a library's own tests, same env
 ```
 
-The environment includes the `[bayes]` extra plus maturin, pytest and ruff.
+The environment includes maturin, pytest and ruff.
 It lives in `dev/.venv`, separate from the standard `.venv`. Python edits in
 any of the four packages take effect when you restart. After changing
 spotsolve's Rust code, rebuild it with
@@ -507,19 +506,20 @@ detection knobs, then filters on what it found, where `fit_sigma` settles the
 width) and **Track**
 (link, optionally with flux as a second link cue, then filters on the
 tracks), pressing *Save results* when the result is worth keeping. The "Diffusion analysis" widget then reads the tracks layer for
-diffusionkit's grid posteriors. Above its tabs sit the two run inputs every
-posterior shares: the camera **exposure** (pre-filled from the layer; the runs
+diffusionkit's grid likelihoods. Above its tabs sit the two run inputs every
+run shares: the camera **exposure** (pre-filled from the layer; the runs
 stay off until it has a value) and **min points**, the shortest track fitted.
 
-The **D** tab is the standard quantification: for each track, the Brownian
-posterior over D (flat prior in ln D, the exposure's blur modelled) summarized
-as its mean E[D] and 5%/95% quantiles. The motion's shape (α) is a separate
+The **D** tab is the standard quantification (*Run likelihoods*): for each
+track, the Brownian likelihood over D (the exposure's blur modelled), which
+normalized is its posterior under a flat prior in ln D, summarized as its mean
+E[D] and 5%/95% quantiles. The motion's shape (α) is a separate
 fit, on the **α · D** tab (below). The run
 is diffusionkit's own `gridpost.analyze_tracks` with the `GridPostOptions` the
 D tab shows: *D min*/*D max* (µm²/s) and *D points* set the D grid,
 whose range is the flat prior's support (by default 10⁻⁵ to 10 µm²/s, so
 tracks that can't be told from still fall into a low tail, read as upper
-bounds). A track whose posterior is cut by an edge
+bounds). A track whose likelihood is cut by an edge
 is marked in `D_grid_edge` with the end that cuts it (its numbers move with the edge — near-immobile
 tracks reach *D min* this way), and the summary counts them. The grid is
 saved with the analysis, so `GridPostOptions(**summary["grid"])` in a
@@ -528,7 +528,7 @@ a thread pool: about 20 s for ~10,000 tracks. The **Ensemble**
 plot reads them across the tracks the filters pass, per region class, by
 adding the tracks' log-likelihoods under a model of the population -- never by
 histogramming their medians (a short track's median sits where the prior puts
-it) or averaging their posteriors. The *log-normal* population is the
+it) or averaging their normalized likelihoods. The *log-normal* population is the
 headline: ln D normal across tracks, its median D and spread σ (in ln D) each
 with an interval, every track's own measurement noise in the model rather than
 in σ. The *deconvolved* distribution, with its 90% band, is the same tracks
@@ -549,7 +549,7 @@ the groups by *tracks* (the default and the usual per-trajectory reading) or by
 the spots seen in focus at a moment); within a group each track counts once. Neither is the share of particles, since a fast particle can
 leave the focus and return as another track.
 Every D axis — the ensemble,
-the posteriors, the track plot, and the joint plot when an axis is D at one
+the per-track likelihoods, the track plot, and the joint plot when an axis is D at one
 frame interval — shows the **localization floor** `D_floor_um2_s`, the D at
 which a track's motion per frame equals its localization noise, ⟨σ²⟩ /
 (dt − exposure/3) from its own SDs, as a thin dotted line at the tracks'
@@ -563,8 +563,7 @@ The plots and summary follow the
 filters without a re-run; each group's deconvolution takes a second or two, on
 a worker thread, so they update shortly after a change. The **Track** plot shows
 the selected track's posterior; the **Map** tab colors each track's localizations
-by any per-track value (track length from the start, then any result); the **NUTS** tab fits the selected track's full posterior with the
-same exposure (needs `--extra bayes`).
+by any per-track value (track length from the start, then any result).
 
 The **α · D** tab runs a second per-track fit, diffusionkit's `fbmpost`: the
 anomalous exponent α and an amplitude under fractional Brownian motion, with
@@ -638,7 +637,7 @@ summary also give α above the floor and the share of the population below it.
 
 ### Spatial classes
 
-The Map tab's **Spatial classes** section asks whether tracks of similar D sit
+The **Spatial** tab asks whether tracks of similar D sit
 together in the cell, and if so, where. It reads the D run's likelihoods of the
 tracks the filters pass and their centroids (diffusionkit's `spatial`): a few
 classes of D, and a prior that neighbouring tracks (each track's 8 nearest)
@@ -670,8 +669,10 @@ The run adds `spatial_class`, `spatial_p` (its probability),
 track's D with its class as the prior: it borrows from the class, so read
 `D_mean_um2_s` for the track's own) to the tracks pane. *Save analysis* writes
 the run to `diffusion_summary.json` (`"spatial"`) and `spatial_classes.parquet`,
-each class's D population to `distributions_D.csv` (`spatial class c`), and the
-bundle reopens with it. `gemscape2 diffusion` runs it with `spatial = true`, and
+and, when there is a pattern, the class map pixel by pixel on the movie's frame
+(`spatial_class_map.tif`, `spatial_class_probability.tif`) for figures of your own,
+each class's D and α populations to `populations.csv`, `distributions_D.csv` and
+`distributions_alpha.csv` (group `spatial class c`), and the bundle reopens with it. `gemscape2 diffusion` runs it with `spatial = true`, and
 `gemscape2 pool` pools a class across movies with `spatial_class` on an input.
 
 The classical MSD analysis has its own **MSD** tab. It needs only tracks, and it
@@ -683,7 +684,7 @@ since a log-log slope needs about a decade of τ to mean much.
 - **Run MSD fits** fits each track's time-averaged MSD: D over its first lags
   (default 3) and α over its first 10, or over shares of each track's own lags
   (D the usual 25–40%), adding `D_msd`/`K_msd`/`α_msd` columns. A batch
-  always runs them alongside the posteriors.
+  always runs them alongside the D likelihoods.
 - **Track** draws the selected track's MSD on linear (D) and log-log (α) axes,
   each fit over its window, with a linear fit with a free intercept whose
   localization SD is a check on the SDs. No error bars: one track's lags share
@@ -724,21 +725,29 @@ profile_alpha.parquet     after an α · D run, every fitted track's profile
 spatial_classes.parquet   after a spatial-classes run, each of its tracks' class
                           probabilities and centroid: track_id, x_um, y_um, q_1..q_C;
                           with "spatial" in the summary, what the run is restored from
-distributions_D.csv       the population on the D grid, long by group ("all", then each
-                          region class, then each spatial class): shared_loglik (the tracks' log-likelihoods
-                          summed, 0 at the peak: one D for every track -- the summary's
-                          shared_D_* interval is read below the grid step), lognormal
-                          (the log-normal population at its posterior mode) and
-                          deconvolved, each with its pointwise band at the credible
-                          level (_low, _high)
-distributions_D_by_length.csv
-                          the same split by track length, long by group, weight
-                          (tracks or detections) and length (length_min, length_max
-                          in frames; length_max empty for the open last group):
-                          n_tracks, n_detections and deconvolved (the length
-                          group's population times its share of all the tracks or
-                          detections, so a weight's rows sum to 1), with its
-                          band (_low, _high)
+spatial_class_map.tif     with a spatial pattern, the class map on the frame's pixels
+                          (the grid of labels.tif): uint8 (H, W), each pixel's most
+                          probable class 1..C, 0 where no track is within 2 typical
+                          spacings -- what the "Class map" figure shades
+spatial_class_probability.tif  float32 (C, H, W): each class's probability at each
+                          pixel, NaN where the map is blank
+populations.csv           one row per group of tracks ("all" -- the tracks the filters
+                          pass --, then each region class, then each spatial class):
+                          the D population (lognormal_D_median_um2_s, lognormal_sigma_ln_D,
+                          lognormal_D_mean_um2_s, each with _low/_high; the deconvolved
+                          distribution's mode and median; the median localization floor)
+                          and, after an α · D run, the α population (alpha_mean, alpha_sd,
+                          p_alpha_below_1, each with _low/_high; the share below the D_ref
+                          floor; shared_alpha with its interval and p_brownian). The
+                          table to compare movies from (see "Reading results in a script")
+distributions_D.csv       the D populations on the D grid, long by group (the groups of
+                          populations.csv): lognormal (the log-normal population at its
+                          posterior mode) and deconvolved, each with its pointwise band
+                          at the credible level (_low, _high); each sums to 1 over the grid
+distributions_alpha.csv   after an α · D run, the α populations on the α grid, long by
+                          group: deconvolved (α's margin over D_ref, summing to 1) with
+                          its band (_low, _high), and deconvolved_above_floor (the
+                          population above the D_ref floor alone)
 diffusion_summary.json    settings (dt, exposure, grid -- GridPostOptions' fields --,
                           level), population numbers per group (lognormal_D_median_*,
                           lognormal_sigma_ln_D*, lognormal_D_mean_*, shared_D_*,
@@ -794,7 +803,6 @@ this track": it was excluded, too short, or that analysis was off.
 | `D_ref_floor_um2_s` | µm²/s | The D_ref at which the motion's MSD at τ_ref equals the localization noise's, ⟨σ²⟩ / τ_ref |
 | **Optional fits** | | |
 | `D_msd_um2_s`, `K_msd_um2_s_alpha`, `alpha_msd` | µm²/s, µm²/s^α, – | Classical MSD fits (D over D's window, α by log-log over its own), when they ran; no uncertainties |
-| `*_nuts*` | | Full-posterior NUTS fit, for tracks fitted in the NUTS tab |
 | **Detection quality** (mean over the track's detections, spotsolve's columns) | | |
 | `sigma` | px | Detector's reference PSF width (the same for every track) |
 | `t_mean` | s | Mean detection time |
@@ -815,6 +823,42 @@ posterior `D` is filterable by the same drag as any other feature.
 The widgets tune one image at a time, on purpose. To process a whole folder
 without looking at each one, use **Batch from this movie…** in the experiment
 list, or `gemscape2 detect-track` and `gemscape2 diffusion` with one tuned movie
-as the `template`. To compare experiments, read the saved
-bundles' `tracks_summary.csv` into a script and pool them there (each row
-carries its `result_id`).
+as the `template`. To compare experiments, read the saved bundles in a script
+(below).
+
+### Reading results in a script
+
+`read_results` stacks the saved analyses of every bundle under a folder (searched
+recursively, so a tree of experiment folders each with its own `results/` reads in
+one call) into polars tables, each row carrying its bundle's `result_id`:
+
+```python
+from napari_gemscape2 import read_results
+import matplotlib.pyplot as plt
+
+res = read_results("~/data/2026-10-16/results")
+res.populations          # populations.csv: one row per (movie, group)
+res.tracks               # tracks_summary.csv: one row per track
+res.distributions_D      # the D populations' curves, by movie and group
+res.distributions_alpha  # the α populations' curves
+res.summaries            # {result_id: diffusion_summary.json}
+
+# One point per movie: its population's median D and mean α, with their intervals.
+pops = res.populations.filter(group="all").to_pandas()
+plt.errorbar(pops.lognormal_D_median_um2_s, pops.alpha_mean,
+             xerr=[pops.lognormal_D_median_um2_s - pops.lognormal_D_median_low_um2_s,
+                   pops.lognormal_D_median_high_um2_s - pops.lognormal_D_median_um2_s],
+             yerr=[pops.alpha_mean - pops.alpha_mean_low, pops.alpha_mean_high - pops.alpha_mean], fmt="o")
+plt.xscale("log")
+
+# Each movie's deconvolved D population.
+for rid, curve in res.distributions_D.filter(group="all").group_by("result_id"):
+    plt.semilogx(curve["D_um2_s"], curve["deconvolved"], label=rid[0])
+```
+
+Nothing is refitted: these are the numbers the widget or `gemscape2 diffusion`
+saved, over the tracks that passed the filters saved with them. Map the movies to
+conditions yourself (from `result_id` or a table of your own); when comparing
+conditions, the movie, not the track, is the replicate. To combine a sample's
+movies into one population first (each with only a few tracks), use `gemscape2
+pool`.

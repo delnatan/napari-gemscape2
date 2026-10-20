@@ -25,8 +25,6 @@ from napari_gemscape2.diffusion import (
     EXPOSURE_CLAMP_FRACTION,
     GRID_FIELDS,
     MIN_FRAMES,
-    analysis_summary,
-    analysis_tables,
     analyze_posteriors,
     base_track_table,
     filter_record,
@@ -43,12 +41,12 @@ from napari_gemscape2.diffusion import (
     tracks_summary_table,
     tracks_to_diffusionkit_df,
 )
-from napari_gemscape2.fbm import analyze_fbm, fbm_options, fbm_record, joint_grid, profile_long_table
-from napari_gemscape2.fbm import loglik_long_table as fbm_loglik_table
+from napari_gemscape2.fbm import analyze_fbm, fbm_options, joint_grid
+from napari_gemscape2.outputs import analysis_outputs
 from napari_gemscape2.pipeline import FilterSpec, track_features_df
 from napari_gemscape2.regions import Regions
-from napari_gemscape2.results import load_result, package_provenance, write_diffusion_results
-from napari_gemscape2.spatial import N_SHUFFLES, analyze_spatial, class_groups, spatial_columns, spatial_options, spatial_record
+from napari_gemscape2.results import frame_shape_px, load_result, package_provenance, write_diffusion_results
+from napari_gemscape2.spatial import N_SHUFFLES, analyze_spatial, spatial_columns, spatial_options
 from napari_gemscape2.viewer import layer_units_metadata, region_classes
 
 
@@ -248,23 +246,16 @@ def analyze_bundle(
     table = tracks_summary_table(
         base, results, result_id=result_dir.name, pixel_size_um=pixel_size_um, passing_ids=ids
     )
-    summary = analysis_summary(analysis, ids, by_class, msd=settings.msd_window)
-    if fbm is not None:
-        summary["alpha_D"] = fbm_record(fbm, ids, by_class)
-    if spatial is not None:
-        summary["spatial"] = spatial_record(spatial)
+    summary, tables = analysis_outputs(
+        analysis, fbm, spatial, ids, by_class, msd=settings.msd_window, result_id=result_dir.name,
+        pixel_size_um=pixel_size_um, frame_shape_px=frame_shape_px(result_dir, manifest),
+    )
     summary["tracks_summary_filters"] = filter_record(settings.min_track_length, settings.filters)
     import diffusionkit
     import napari_gemscape2
 
     summary["packages"] = package_provenance(diffusionkit, napari_gemscape2)
-    write_diffusion_results(
-        result_dir, tracks_summary=table, summary=summary,
-        **analysis_tables(analysis, ids, by_class, None if spatial is None else class_groups(spatial)),
-        spatial_classes=None if spatial is None else spatial.probabilities(),
-        loglik_alpha_D=None if fbm is None else fbm_loglik_table(fbm),
-        profile_alpha=None if fbm is None else profile_long_table(fbm),
-    )
+    write_diffusion_results(result_dir, tracks_summary=table, summary=summary, **tables)
     return BundleReport(
         n_tracks=base.height,
         n_fitted=len(analysis.fitted_ids),

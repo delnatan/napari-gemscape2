@@ -29,8 +29,12 @@ and, once the diffusion widget has saved an analysis of it
     <result_dir>/loglik_alpha_D.parquet   every track's likelihood over (alpha, log10 D at the frame interval), if α · D was run
     <result_dir>/profile_alpha.parquet    every track's profile log-likelihood of alpha, if α · D was run
     <result_dir>/spatial_classes.parquet  each track's spatial class probabilities and centroid, if spatial classes were run
-    <result_dir>/distributions_D.csv      the ensemble on the D grid
-    <result_dir>/distributions_D_by_length.csv  the same split by track length
+    <result_dir>/spatial_class_map.tif    the class map pixel by pixel, (H, W) uint8: 1..C, 0 where no track is near,
+                                          if the classes have a spatial pattern (`spatial.class_map`)
+    <result_dir>/spatial_class_probability.tif  each class's probability there, (C, H, W) float32, NaN where blank
+    <result_dir>/populations.csv          one row per group of tracks: the D and alpha populations' numbers
+    <result_dir>/distributions_D.csv      the D populations on the D grid, by group
+    <result_dir>/distributions_alpha.csv  the alpha populations on the alpha grid, by group, if α · D was run
     <result_dir>/diffusion_summary.json   settings + population numbers
 
 Across bundles, `gemscape2 pool` writes one more directory (`write_pooled_results`), by default
@@ -96,13 +100,21 @@ PROFILE_ALPHA_FILENAME = "profile_alpha.parquet"
 # The spatial classes' per-track class probabilities and centroids (`SpatialAnalysis.probabilities`), what
 # the run is restored from with its record in the summary.
 SPATIAL_CLASSES_FILENAME = "spatial_classes.parquet"
+# The class map on the movie's pixel grid (`spatial.class_map`), for figures made outside the widget; written
+# only when the classes have a spatial pattern, as the "Class map" figure only shades one then.
+SPATIAL_CLASS_MAP_FILENAME = "spatial_class_map.tif"
+SPATIAL_CLASS_PROBABILITY_FILENAME = "spatial_class_probability.tif"
+# One row per group of tracks ("all", each region class, each spatial class): the numbers of its D and alpha
+# populations (`outputs.populations_table`), the table to plot movies against each other from.
+POPULATIONS_FILENAME = "populations.csv"
 DISTRIBUTIONS_D_FILENAME = "distributions_D.csv"
-DISTRIBUTIONS_D_BY_LENGTH_FILENAME = "distributions_D_by_length.csv"
+# The alpha populations' margins on the alpha grid, by group (`outputs.alpha_distributions_table`).
+DISTRIBUTIONS_ALPHA_FILENAME = "distributions_alpha.csv"
 # Written by earlier versions of the diffusion widget; removed on the next
 # save so a bundle never mixes two analyses.
 _STALE_DIFFUSION_FILES = (
-    "diffusion_fits.parquet", "tracks_summary.parquet", "posterior_alpha.parquet", "distributions_alpha.csv",
-    "posterior_D.parquet",
+    "diffusion_fits.parquet", "tracks_summary.parquet", "posterior_alpha.parquet", "posterior_D.parquet",
+    "distributions_D_by_length.csv",
 )
 
 
@@ -326,8 +338,10 @@ def write_diffusion_results(
     loglik_alpha_D: Optional[pl.DataFrame] = None,
     profile_alpha: Optional[pl.DataFrame] = None,
     spatial_classes: Optional[pl.DataFrame] = None,
+    spatial_class_map: Optional[tuple[np.ndarray, np.ndarray]] = None,
+    populations: Optional[pl.DataFrame] = None,
     distributions_D: Optional[pl.DataFrame] = None,
-    distributions_D_by_length: Optional[pl.DataFrame] = None,
+    distributions_alpha: Optional[pl.DataFrame] = None,
 ) -> None:
     """The diffusion widget's analysis of this bundle's tracks (see this
     module's docstring for the files). An optional table left as None has
@@ -345,13 +359,20 @@ def write_diffusion_results(
         else:
             table.write_parquet(result_dir / filename)
     for table, filename in (
+        (populations, POPULATIONS_FILENAME),
         (distributions_D, DISTRIBUTIONS_D_FILENAME),
-        (distributions_D_by_length, DISTRIBUTIONS_D_BY_LENGTH_FILENAME),
+        (distributions_alpha, DISTRIBUTIONS_ALPHA_FILENAME),
     ):
         if table is None:
             (result_dir / filename).unlink(missing_ok=True)
         else:
             table.write_csv(result_dir / filename)
+    for image, filename in zip(spatial_class_map or (None, None),
+                               (SPATIAL_CLASS_MAP_FILENAME, SPATIAL_CLASS_PROBABILITY_FILENAME)):
+        if image is None:
+            (result_dir / filename).unlink(missing_ok=True)
+        else:
+            tifffile.imwrite(result_dir / filename, image, compression="zlib")
     for filename in _STALE_DIFFUSION_FILES:
         (result_dir / filename).unlink(missing_ok=True)
 
@@ -416,7 +437,7 @@ def load_diffusion_results(result_dir: str | Path) -> Optional[dict]:
     return {
         "summary": summary,
         # Every row read before typing a column: one that is empty for the
-        # first thousand tracks (MSD, NUTS) would otherwise be a string.
+        # first thousand tracks (MSD) would otherwise be a string.
         "tracks_summary": pl.read_csv(summary_path, infer_schema_length=None),
         "loglik_D": pl.read_parquet(loglik_path),
     }
@@ -432,6 +453,20 @@ def load_profile_alpha(result_dir: str | Path) -> Optional[pl.DataFrame]:
     """The saved α · D per-track profiles of alpha, or None if none were saved."""
     path = Path(result_dir) / PROFILE_ALPHA_FILENAME
     return pl.read_parquet(path) if path.exists() else None
+
+
+def frame_shape_px(result_dir: str | Path, manifest: Optional[dict] = None) -> Optional[tuple[int, int]]:
+    """The movie's frame (H, W) in pixels: what the manifest records (`frame_shape_px`), else the shape of
+    the bundle's `labels.tif`, else None (bundles saved before it was recorded, without regions)."""
+    manifest = load_manifest(result_dir) if manifest is None else manifest
+    shape = (manifest or {}).get("params", {}).get("frame_shape_px")
+    if shape:
+        return int(shape[0]), int(shape[1])
+    path = Path(result_dir) / LABELS_FILENAME
+    if path.exists():
+        with tifffile.TiffFile(path) as tif:
+            return tuple(int(v) for v in tif.pages[0].shape[-2:])
+    return None
 
 
 def load_spatial_classes(result_dir: str | Path) -> Optional[pl.DataFrame]:

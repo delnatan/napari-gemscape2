@@ -331,7 +331,7 @@ def run_batch_worker(plan: BatchPlan, cancel_event: threading.Event, emitter: Ba
         # before it writes anything.
         if cancel_event.is_set():
             raise PipelineCancelled("cancelled")
-        emitter.progress.emit(done, total, "diffusion posteriors")
+        emitter.progress.emit(done, total, "diffusion likelihoods")
 
     for index, job in enumerate(plan.jobs):
         if cancel_event.is_set():
@@ -352,7 +352,7 @@ def run_batch_worker(plan: BatchPlan, cancel_event: threading.Event, emitter: Ba
                 notes.append(f"{extra['n_points']} points, {extra['n_tracks']} tracks")
                 notes.extend(f"! {note}" for note in extra.get("metadata_notes") or ())
             if diffusion_settings is not None:
-                emitter.progress.emit(0, 0, "diffusion posteriors")
+                emitter.progress.emit(0, 0, "diffusion likelihoods")
                 report = analyze_bundle(job.result_dir, diffusion_settings, progress=diffusion_progress)
                 notes.append(
                     f"{report.n_fitted} of {report.n_tracks} tracks fitted, "

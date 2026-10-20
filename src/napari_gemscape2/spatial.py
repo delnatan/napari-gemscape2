@@ -104,6 +104,26 @@ def analyze_spatial(
         return dk_spatial.analyze_likelihoods(lik, analysis.u_D, pos, options, map_fn=pool.map, progress=progress)
 
 
+def class_map(
+    s: SpatialAnalysis, pixel_size_um: float, shape_px: Optional[tuple[int, int]] = None
+) -> tuple[np.ndarray, np.ndarray]:
+    """The class map on the movie's pixels, what the "Class map" figure shades: `(H, W)` uint8, each pixel's
+    most probable class (1..C, lowest D first) and 0 where its k-th nearest track is beyond `FIELD_REACH`
+    typical spacings (the figure's blank); and `(C, H, W)` float32, each class's probability there, NaN where
+    blank. Pixel (row, col) is at (y, x) = (row, col) × `pixel_size_um`, the grid of `labels.tif`. Without
+    `shape_px` the grid reaches the tracks' farthest centroid."""
+    if shape_px is None:
+        h, w = (int(np.ceil(v / pixel_size_um)) + 1 for v in s.xy_um.max(axis=0)[::-1])
+    else:
+        h, w = shape_px
+    rows, cols = np.mgrid[0:h, 0:w]
+    p, dist = s.field(np.column_stack([cols.ravel(), rows.ravel()]) * pixel_size_um)
+    near = dist <= FIELD_REACH * s.typical_spacing_um()
+    label = np.where(near, p.argmax(axis=1) + 1, 0).astype(np.uint8).reshape(h, w)
+    probability = np.where(near[:, None], p, np.nan).T.reshape(-1, h, w).astype(np.float32)
+    return label, probability
+
+
 def class_groups(s: SpatialAnalysis) -> dict[str, set]:
     """`{"spatial class c": its track ids}`, each track in the class its neighbours give it
     (`SpatialAnalysis.groups`): the groups a class's populations are read from."""

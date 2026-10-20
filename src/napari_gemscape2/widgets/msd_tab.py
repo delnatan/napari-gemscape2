@@ -61,7 +61,7 @@ def _ensemble_msd_worker(experiments: list, min_frames: int, max_lag: int):
 
 
 _MSD_HELP = (
-    "<b>Classic MSD analysis</b>, a comparison with the posteriors. The MSD estimators have no "
+    "<b>Classic MSD analysis</b>, a comparison with the D tab's likelihoods. The MSD estimators have no "
     "blur model, so they run with the exposure treated as 0, which biases D low when the "
     "exposure is a good share of the frame interval. The offset subtracted is the "
     "localization error the tracks' own SDs imply."
@@ -81,7 +81,7 @@ _MSD_HELP = (
     "the focus sooner); the &alpha; panel says how many reach its last lag, and the Map tab can "
     "color the tracks by <i>track_length</i>. An ensemble average describes the population only "
     "if its particles share one motion: a mix of slow and fast tracks averages to one curve, "
-    "which the posteriors' deconvolved distribution would show as two."
+    "which the D tab's deconvolved distribution would show as two."
 )
 
 
@@ -99,7 +99,7 @@ class MSDTab(QWidget):
         self._pending: Optional[MSDWindow] = None
 
         intro = note_label(
-            "Classic MSD analysis: needs only tracks. A comparison with the posteriors — "
+            "Classic MSD analysis: needs only tracks. A comparison with the D tab's likelihoods — "
             "the exposure is treated as 0 (no blur model)."
         )
 
@@ -144,7 +144,7 @@ class MSDTab(QWidget):
         self._run_button.setToolTip(
             "Fit every track's MSD (or only the filtered ones, with the footer's\n"
             "switch): adds the D_msd, K_msd and α_msd columns. Seconds per\n"
-            "thousand tracks. Save analysis writes them with the posteriors."
+            "thousand tracks. Save analysis writes them with the D likelihoods."
         )
         self._run_button.clicked.connect(self._run)
         self._status = status_label("")

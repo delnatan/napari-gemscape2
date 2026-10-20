@@ -73,6 +73,26 @@ def test_a_batch_finds_two_spatially_organized_classes(project):
         "spatial_class_neighbours"].mean() > 1.8
 
 
+def test_the_class_map_is_saved_pixel_by_pixel(project):
+    import tifffile
+
+    result_dir = project / "results" / "cell_1"
+    label = tifffile.imread(result_dir / "spatial_class_map.tif")
+    probability = tifffile.imread(result_dir / "spatial_class_probability.tif")
+    # No frame shape recorded in these bundles: the grid reaches the farthest track (60 µm at PX).
+    assert label.dtype == np.uint8 and probability.dtype == np.float32
+    assert probability.shape == (2, *label.shape)
+    assert set(np.unique(label)) <= {0, 1, 2}
+    near = label > 0
+    assert np.allclose(np.nansum(probability, axis=0)[near], 1, atol=1e-5)
+    assert np.isnan(probability[:, ~near]).all()
+    assert np.array_equal(label[near], probability[:, near].argmax(axis=0) + 1)
+    # The slow disk at the field's centre is class 1, the fast outside class 2.
+    centre = (int(30 / PX), int(30 / PX))
+    assert label[centre] == 1
+    assert label[int(3 / PX), int(3 / PX)] in (0, 2)
+
+
 def test_each_class_is_a_group_of_the_distributions(project):
     dist = pl.read_csv(project / "results" / "cell_1" / "distributions_D.csv")
     assert {"all", "spatial class 1", "spatial class 2"} <= set(dist["group"].unique().to_list())
@@ -140,3 +160,22 @@ def test_too_few_shuffles_to_reach_the_pattern_threshold_are_refused():
         DiffusionSettings(spatial=True, spatial_shuffles=9)
     DiffusionSettings(spatial=True, spatial_shuffles=0)
     DiffusionSettings(spatial=True, spatial_shuffles=19)
+
+
+def test_the_populations_table_has_a_row_per_group_and_reads_back(project):
+    from napari_gemscape2 import read_results
+
+    pops = pl.read_csv(project / "results" / "cell_1" / "populations.csv")
+    assert pops["group"].to_list() == ["all", "spatial class 1", "spatial class 2"]
+    slow, fast = pops.row(1, named=True), pops.row(2, named=True)
+    assert slow["lognormal_D_median_um2_s"] < 0.1 < fast["lognormal_D_median_um2_s"]
+    assert pops["alpha_mean"].is_null().all()  # no α · D run in this batch
+    assert not (project / "results" / "cell_1" / "distributions_alpha.csv").exists()
+
+    res = read_results(project)
+    assert [b.name for b in res.bundles] == ["cell_1", "cell_2"]
+    assert set(res.populations["result_id"]) == {"cell_1", "cell_2"}
+    assert res.tracks.height == 600 and set(res.tracks["result_id"]) == {"cell_1", "cell_2"}
+    assert {"result_id", "group", "D_um2_s", "deconvolved"} <= set(res.distributions_D.columns)
+    assert res.distributions_alpha.is_empty()
+    assert set(res.summaries) == {"cell_1", "cell_2"}

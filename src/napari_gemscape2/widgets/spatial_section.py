@@ -1,4 +1,4 @@
-"""The Map tab's "Spatial classes" section: classes of D among the tracks, from the D run's likelihoods
+"""The Spatial tab: classes of D among the tracks, from the D run's likelihoods
 (`napari_gemscape2.spatial`).
 
 Run takes the D run on screen and the tracks the filters pass now, fits C = 1..4 classes with the Potts prior on
@@ -28,7 +28,7 @@ from qtkit.plot import PlotWindow
 from qtpy.QtWidgets import QComboBox, QFormLayout, QPushButton, QSpinBox, QVBoxLayout, QWidget
 
 from napari_gemscape2.diffusion import LEVEL, ensemble
-from napari_gemscape2.fbm import alpha_population
+from napari_gemscape2.fbm import alpha_population, population_stage
 from napari_gemscape2.spatial import MAX_CLASSES, N_SHUFFLES, analyze_spatial, class_groups, describe, spatial_options
 from napari_gemscape2.spatial_plot import plot_class_map, plot_class_populations, plot_class_selection
 from napari_gemscape2.widgets.msd_widgets import fit_window_to_figure
@@ -45,12 +45,15 @@ def _spatial_worker(analysis, base, pixel_size_um, ids, options, progress) -> Sp
 
 
 @thread_worker(start_thread=False)
-def _populations_worker(analysis, fbm, id_sets: list) -> None:
-    """The deconvolutions the populations figure reads, off the GUI thread (cached on the analyses)."""
-    for ids in id_sets:
+def _populations_worker(analysis, fbm, groups: dict, report) -> None:
+    """The deconvolutions the populations figure reads, off the GUI thread (cached on the analyses), each
+    named on the progress bar as it runs."""
+    for i, (name, ids) in enumerate(groups.items()):
+        prefix = f"{name} ({i + 1}/{len(groups)}) · "
+        report(f"{prefix}D population", 0, 0)
         ensemble(analysis, ids)
         if fbm is not None:
-            alpha_population(fbm, ids)
+            alpha_population(fbm, ids, progress=population_stage(f"{prefix}α · D ", report))
 
 
 class SpatialSection(QWidget):
@@ -58,7 +61,6 @@ class SpatialSection(QWidget):
         super().__init__()
         self.host = host
         self._analysis: Optional[SpatialAnalysis] = None
-        self._populations_worker = None
         self._windows: dict[str, PlotWindow] = {}
 
         self._classes = QComboBox()
@@ -80,7 +82,7 @@ class SpatialSection(QWidget):
         self._run_button.clicked.connect(self._run)
         form = QFormLayout()
         form.setContentsMargins(0, 0, 0, 0)
-        form.addRow("classes", flow_row(self._classes, self._run_button))
+        form.addRow("classes", self._classes)
         form.addRow("shuffles", self._shuffles)
         self._status = status_label("")
         self._summary = note_label("")
@@ -93,32 +95,43 @@ class SpatialSection(QWidget):
         self._populations_button = QPushButton("Class populations")
         self._populations_button.clicked.connect(self._show_populations)
         self._figure_buttons = (self._selection_button, self._map_button, self._populations_button)
-        for button in self._figure_buttons:
-            button.setEnabled(False)
+        # Shown once there is a run to draw: three greyed buttons beside
+        # Run read as the whole section being off.
+        self._figure_row = flow_row(*self._figure_buttons)
+        self._figure_row.setVisible(False)
 
         layout = QVBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
         layout.addWidget(note_label("Classes numbered by increasing D, from each track's D likelihood and its "
-                                    "neighbours'. Needs a D run."))
+                                    "neighbours'."))
         layout.addLayout(form)
+        # Its own row, not beside "classes" in the form: a flow row in a
+        # form field wraps the button onto a second line the field never
+        # grows to show, which in napari's wider combo boxes hid Run.
+        layout.addWidget(flow_row(self._run_button))
         layout.addWidget(self._status)
         layout.addWidget(self._summary)
-        layout.addWidget(flow_row(*self._figure_buttons))
+        layout.addWidget(self._figure_row)
+        layout.addStretch()
         self.setLayout(layout)
+        self.reset()
 
     @property
     def analysis(self) -> Optional[SpatialAnalysis]:
         return self._analysis
 
     def reset(self) -> None:
-        """Forget the run (new tracks, or a new D run it was read from)."""
+        """Forget the run (new tracks, or a new D run it was read from).
+        Run is on once there is a D run to read the likelihoods from."""
         self._analysis = None
-        self._status.setText("")
+        ready = self.host.posterior is not None
+        self._run_button.setEnabled(ready)
+        self._status.setText("" if ready else "needs a D run: run it on the D tab first")
+        style_status_label(self._status, "neutral")
         self._summary.setText("")
         self._summary.setVisible(False)
-        for button in self._figure_buttons:
-            button.setEnabled(False)
+        self._figure_row.setVisible(False)
         for window in self._windows.values():
             window.hide()
 
@@ -133,6 +146,8 @@ class SpatialSection(QWidget):
         style_status_label(self._status, "ok")
         self._summary.setText(describe(s))
         self._summary.setVisible(True)
+        self._figure_row.setVisible(True)
+        self._run_button.setEnabled(True)
         for button in self._figure_buttons:
             button.setEnabled(True)
         self._populations_button.setEnabled(s.n_classes > 1)
@@ -202,28 +217,27 @@ class SpatialSection(QWidget):
 
     def _show_populations(self) -> None:
         s, analysis = self._analysis, self.host.posterior
-        if s is None or analysis is None or self._populations_worker is not None:
+        if s is None or analysis is None:
             return
         fbm = self.host.fbm
         fbm = fbm if fbm is not None and fbm.likelihoods is not None else None
-        self._populations_button.setEnabled(False)
+        sets = self._population_sets()
+        groups = dict(zip(["all tracks", *(f"class {c}" for c in range(1, s.n_classes + 1))], sets))
+        # In the host's worker slot, so its progress bar follows each deconvolution.
+        worker = _populations_worker(analysis, fbm, groups, self.host.stage_callback)
+        if not self.host.start_worker(worker, lambda _r: self._populations_ready(analysis, fbm),
+                                      self._populations_failed, [self._populations_button], "class populations"):
+            self._status.setText("another run is going: Class populations once it is done")
+            style_status_label(self._status, "caution")
+            return
         self._status.setText("deconvolving the classes' populations…")
         style_status_label(self._status)
-        worker = _populations_worker(analysis, fbm, self._population_sets())
-        worker.returned.connect(lambda _r: self._populations_ready(analysis, fbm))
-        worker.errored.connect(self._populations_failed)
-        self._populations_worker = worker
-        worker.start()
 
     def _populations_failed(self, exc: Exception) -> None:
-        self._populations_worker = None
-        self._populations_button.setEnabled(True)
         self._status.setText(f"populations failed: {exc}")
         style_status_label(self._status, "error")
 
     def _populations_ready(self, analysis, fbm) -> None:
-        self._populations_worker = None
-        self._populations_button.setEnabled(True)
         s = self._analysis
         if s is None or analysis is not self.host.posterior:
             return

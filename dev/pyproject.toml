@@ -23,7 +23,7 @@ name = "napari-gemscape2-dev"
 version = "0"
 requires-python = ">=3.13"
 dependencies = [
-    "napari-gemscape2[bayes]",
+    "napari-gemscape2",
     "spotsolve",
     "diffusionkit",
     "qtkit",
@@ -34,9 +34,7 @@ dev = ["maturin>=1.14,<2", "pytest", "pytest-qt", "ruff"]
 
 [tool.uv]
 package = false
-# The extras napari-gemscape2[bayes] asks of diffusionkit have to be restated
-# here: an override replaces the whole requirement, extras included.
-override-dependencies = ["spotsolve", "diffusionkit[bayes,plots]", "qtkit"]
+override-dependencies = ["spotsolve", "diffusionkit", "qtkit"]
 
 [tool.uv.workspace]
 members = ["../../spotsolve", "../../diffusionkit", "../../qtkit"]

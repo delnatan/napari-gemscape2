@@ -660,7 +660,7 @@ def plot_track_posterior(
                 fontsize=7, color=_MUTED_INK)
         lo, hi = min(lo, floor), max(hi, floor)
     ax.set_xlim(lo - _LOG_D_PAD, hi + _LOG_D_PAD)
-    ax.set_ylabel("posterior density", fontsize=8, color=_MUTED_INK)
+    ax.set_ylabel("likelihood (normalized)", fontsize=8, color=_MUTED_INK)
     low, mean, high = d_interval
     head = f"track {track_id}" + (f" · {n_frames} frames" if n_frames else "")
     reading = {"low": f"D < {high:.3g} µm²/s (cut at the grid's low edge: an upper bound)",
