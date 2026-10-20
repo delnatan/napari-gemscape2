@@ -1099,12 +1099,12 @@ dependencies = [
     { name = "qtpy" },
     { name = "scipy" },
     { name = "seaborn" },
-    { name = "spotsolve", version = "0.5.4", source = { url = "https://github.com/delnatan/spotsolve/releases/download/v0.5.4/spotsolve-0.5.4-cp39-abi3-macosx_10_12_x86_64.whl" }, marker = "platform_machine == 'x86_64' and sys_platform == 'darwin'" },
-    { name = "spotsolve", version = "0.5.4", source = { url = "https://github.com/delnatan/spotsolve/releases/download/v0.5.4/spotsolve-0.5.4-cp39-abi3-macosx_11_0_arm64.whl" }, marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
-    { name = "spotsolve", version = "0.5.4", source = { url = "https://github.com/delnatan/spotsolve/releases/download/v0.5.4/spotsolve-0.5.4-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl" }, marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "spotsolve", version = "0.5.4", source = { url = "https://github.com/delnatan/spotsolve/releases/download/v0.5.4/spotsolve-0.5.4-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "spotsolve", version = "0.5.4", source = { url = "https://github.com/delnatan/spotsolve/releases/download/v0.5.4/spotsolve-0.5.4-cp39-abi3-win_amd64.whl" }, marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
-    { name = "spotsolve", version = "0.5.4", source = { url = "https://github.com/delnatan/spotsolve/releases/download/v0.5.4/spotsolve-0.5.4.tar.gz" }, marker = "(platform_machine != 'arm64' and platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux') or (platform_machine != 'AMD64' and sys_platform == 'win32') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32')" },
+    { name = "spotsolve", version = "0.6.0", source = { url = "https://github.com/delnatan/spotsolve/releases/download/v0.6.0/spotsolve-0.6.0-cp39-abi3-macosx_10_12_x86_64.whl" }, marker = "platform_machine == 'x86_64' and sys_platform == 'darwin'" },
+    { name = "spotsolve", version = "0.6.0", source = { url = "https://github.com/delnatan/spotsolve/releases/download/v0.6.0/spotsolve-0.6.0-cp39-abi3-macosx_11_0_arm64.whl" }, marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
+    { name = "spotsolve", version = "0.6.0", source = { url = "https://github.com/delnatan/spotsolve/releases/download/v0.6.0/spotsolve-0.6.0-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl" }, marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
+    { name = "spotsolve", version = "0.6.0", source = { url = "https://github.com/delnatan/spotsolve/releases/download/v0.6.0/spotsolve-0.6.0-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "spotsolve", version = "0.6.0", source = { url = "https://github.com/delnatan/spotsolve/releases/download/v0.6.0/spotsolve-0.6.0-cp39-abi3-win_amd64.whl" }, marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+    { name = "spotsolve", version = "0.6.0", source = { url = "https://github.com/delnatan/spotsolve/releases/download/v0.6.0/spotsolve-0.6.0.tar.gz" }, marker = "(platform_machine != 'arm64' and platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux') or (platform_machine != 'AMD64' and sys_platform == 'win32') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32')" },
     { name = "tifffile" },
     { name = "typer" },
 ]
@@ -1124,12 +1124,12 @@ requires-dist = [
     { name = "qtpy" },
     { name = "scipy" },
     { name = "seaborn" },
-    { name = "spotsolve", marker = "(platform_machine != 'arm64' and platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux') or (platform_machine != 'AMD64' and sys_platform == 'win32') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32')", url = "https://github.com/delnatan/spotsolve/releases/download/v0.5.4/spotsolve-0.5.4.tar.gz" },
-    { name = "spotsolve", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", url = "https://github.com/delnatan/spotsolve/releases/download/v0.5.4/spotsolve-0.5.4-cp39-abi3-macosx_11_0_arm64.whl" },
-    { name = "spotsolve", marker = "platform_machine == 'x86_64' and sys_platform == 'darwin'", url = "https://github.com/delnatan/spotsolve/releases/download/v0.5.4/spotsolve-0.5.4-cp39-abi3-macosx_10_12_x86_64.whl" },
-    { name = "spotsolve", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'", url = "https://github.com/delnatan/spotsolve/releases/download/v0.5.4/spotsolve-0.5.4-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl" },
-    { name = "spotsolve", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", url = "https://github.com/delnatan/spotsolve/releases/download/v0.5.4/spotsolve-0.5.4-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" },
-    { name = "spotsolve", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'", url = "https://github.com/delnatan/spotsolve/releases/download/v0.5.4/spotsolve-0.5.4-cp39-abi3-win_amd64.whl" },
+    { name = "spotsolve", marker = "(platform_machine != 'arm64' and platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux') or (platform_machine != 'AMD64' and sys_platform == 'win32') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32')", url = "https://github.com/delnatan/spotsolve/releases/download/v0.6.0/spotsolve-0.6.0.tar.gz" },
+    { name = "spotsolve", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", url = "https://github.com/delnatan/spotsolve/releases/download/v0.6.0/spotsolve-0.6.0-cp39-abi3-macosx_11_0_arm64.whl" },
+    { name = "spotsolve", marker = "platform_machine == 'x86_64' and sys_platform == 'darwin'", url = "https://github.com/delnatan/spotsolve/releases/download/v0.6.0/spotsolve-0.6.0-cp39-abi3-macosx_10_12_x86_64.whl" },
+    { name = "spotsolve", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'", url = "https://github.com/delnatan/spotsolve/releases/download/v0.6.0/spotsolve-0.6.0-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl" },
+    { name = "spotsolve", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", url = "https://github.com/delnatan/spotsolve/releases/download/v0.6.0/spotsolve-0.6.0-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" },
+    { name = "spotsolve", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'", url = "https://github.com/delnatan/spotsolve/releases/download/v0.6.0/spotsolve-0.6.0-cp39-abi3-win_amd64.whl" },
     { name = "tifffile" },
     { name = "typer" },
 ]
@@ -2254,8 +2254,8 @@ wheels = [
 
 [[package]]
 name = "spotsolve"
-version = "0.5.4"
-source = { url = "https://github.com/delnatan/spotsolve/releases/download/v0.5.4/spotsolve-0.5.4-cp39-abi3-macosx_10_12_x86_64.whl" }
+version = "0.6.0"
+source = { url = "https://github.com/delnatan/spotsolve/releases/download/v0.6.0/spotsolve-0.6.0-cp39-abi3-macosx_10_12_x86_64.whl" }
 resolution-markers = [
     "python_full_version >= '3.14' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
     "python_full_version < '3.14' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
@@ -2266,7 +2266,7 @@ dependencies = [
     { name = "scipy" },
 ]
 wheels = [
-    { url = "https://github.com/delnatan/spotsolve/releases/download/v0.5.4/spotsolve-0.5.4-cp39-abi3-macosx_10_12_x86_64.whl", hash = "sha256:b08d947b92277a8ce6a161233e0420b3e5f866673065385f602b48a845c11fd5" },
+    { url = "https://github.com/delnatan/spotsolve/releases/download/v0.6.0/spotsolve-0.6.0-cp39-abi3-macosx_10_12_x86_64.whl", hash = "sha256:e1d59e5459a5b5cd5e79b7cde47215709996e83149a7ef4abe0733342e0b0a9b" },
 ]
 
 [package.metadata]
@@ -2283,8 +2283,8 @@ provides-extras = ["dev", "scripts", "test"]
 
 [[package]]
 name = "spotsolve"
-version = "0.5.4"
-source = { url = "https://github.com/delnatan/spotsolve/releases/download/v0.5.4/spotsolve-0.5.4-cp39-abi3-macosx_11_0_arm64.whl" }
+version = "0.6.0"
+source = { url = "https://github.com/delnatan/spotsolve/releases/download/v0.6.0/spotsolve-0.6.0-cp39-abi3-macosx_11_0_arm64.whl" }
 resolution-markers = [
     "python_full_version >= '3.14' and platform_machine == 'arm64' and sys_platform == 'darwin'",
     "python_full_version < '3.14' and platform_machine == 'arm64' and sys_platform == 'darwin'",
@@ -2295,7 +2295,7 @@ dependencies = [
     { name = "scipy" },
 ]
 wheels = [
-    { url = "https://github.com/delnatan/spotsolve/releases/download/v0.5.4/spotsolve-0.5.4-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:16d1ecb85faabca55c70a74950a20637e3478c12cc037e89966839cab9bacd52" },
+    { url = "https://github.com/delnatan/spotsolve/releases/download/v0.6.0/spotsolve-0.6.0-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:0a8d661aa60eadbee85420905a454cbf34218088e6c90c29a749e76ecaffc2e6" },
 ]
 
 [package.metadata]
@@ -2312,8 +2312,8 @@ provides-extras = ["dev", "scripts", "test"]
 
 [[package]]
 name = "spotsolve"
-version = "0.5.4"
-source = { url = "https://github.com/delnatan/spotsolve/releases/download/v0.5.4/spotsolve-0.5.4-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl" }
+version = "0.6.0"
+source = { url = "https://github.com/delnatan/spotsolve/releases/download/v0.6.0/spotsolve-0.6.0-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl" }
 resolution-markers = [
     "python_full_version >= '3.14' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version < '3.14' and platform_machine == 'aarch64' and sys_platform == 'linux'",
@@ -2324,7 +2324,7 @@ dependencies = [
     { name = "scipy" },
 ]
 wheels = [
-    { url = "https://github.com/delnatan/spotsolve/releases/download/v0.5.4/spotsolve-0.5.4-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:17ab00e764d37f75b0b9e187670771b16404dc77b7027693f6ad5483d13a77d1" },
+    { url = "https://github.com/delnatan/spotsolve/releases/download/v0.6.0/spotsolve-0.6.0-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:12a4910778cdf7064182ffba5d43f12113b4379a7f3b6cf5ab72a54afb52ad26" },
 ]
 
 [package.metadata]
@@ -2341,8 +2341,8 @@ provides-extras = ["dev", "scripts", "test"]
 
 [[package]]
 name = "spotsolve"
-version = "0.5.4"
-source = { url = "https://github.com/delnatan/spotsolve/releases/download/v0.5.4/spotsolve-0.5.4-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" }
+version = "0.6.0"
+source = { url = "https://github.com/delnatan/spotsolve/releases/download/v0.6.0/spotsolve-0.6.0-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" }
 resolution-markers = [
     "python_full_version >= '3.14' and platform_machine == 'x86_64' and sys_platform == 'linux'",
     "python_full_version < '3.14' and platform_machine == 'x86_64' and sys_platform == 'linux'",
@@ -2353,7 +2353,7 @@ dependencies = [
     { name = "scipy" },
 ]
 wheels = [
-    { url = "https://github.com/delnatan/spotsolve/releases/download/v0.5.4/spotsolve-0.5.4-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:09655f21028ba2c9199b8418bc24f12035aee9fd2eaa84ef504f20b69688bbba" },
+    { url = "https://github.com/delnatan/spotsolve/releases/download/v0.6.0/spotsolve-0.6.0-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:6ec3339d4e682ec0d17b65f1b7ef4414759df8427d32ac5889839cf67904b9f2" },
 ]
 
 [package.metadata]
@@ -2370,8 +2370,8 @@ provides-extras = ["dev", "scripts", "test"]
 
 [[package]]
 name = "spotsolve"
-version = "0.5.4"
-source = { url = "https://github.com/delnatan/spotsolve/releases/download/v0.5.4/spotsolve-0.5.4-cp39-abi3-win_amd64.whl" }
+version = "0.6.0"
+source = { url = "https://github.com/delnatan/spotsolve/releases/download/v0.6.0/spotsolve-0.6.0-cp39-abi3-win_amd64.whl" }
 resolution-markers = [
     "python_full_version >= '3.14' and platform_machine == 'AMD64' and sys_platform == 'win32'",
     "python_full_version < '3.14' and platform_machine == 'AMD64' and sys_platform == 'win32'",
@@ -2382,7 +2382,7 @@ dependencies = [
     { name = "scipy" },
 ]
 wheels = [
-    { url = "https://github.com/delnatan/spotsolve/releases/download/v0.5.4/spotsolve-0.5.4-cp39-abi3-win_amd64.whl", hash = "sha256:c1e662789268b5b621edc62a780fa0f4045d049283c79f7f071894272b3c06c6" },
+    { url = "https://github.com/delnatan/spotsolve/releases/download/v0.6.0/spotsolve-0.6.0-cp39-abi3-win_amd64.whl", hash = "sha256:bfc8cf7ade5fc183b31b234d72d3eae984d07156dabed9ab9b9b0032d859a975" },
 ]
 
 [package.metadata]
@@ -2399,8 +2399,8 @@ provides-extras = ["dev", "scripts", "test"]
 
 [[package]]
 name = "spotsolve"
-version = "0.5.4"
-source = { url = "https://github.com/delnatan/spotsolve/releases/download/v0.5.4/spotsolve-0.5.4.tar.gz" }
+version = "0.6.0"
+source = { url = "https://github.com/delnatan/spotsolve/releases/download/v0.6.0/spotsolve-0.6.0.tar.gz" }
 resolution-markers = [
     "python_full_version >= '3.14' and platform_machine != 'arm64' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version >= '3.14' and platform_machine != 'AMD64' and sys_platform == 'win32'",
@@ -2416,7 +2416,7 @@ dependencies = [
     { name = "polars" },
     { name = "scipy" },
 ]
-sdist = { hash = "sha256:aafad58276e9be8087f7bf0a3700ed8ae8eefc35b2b33b9420abe81f446dc8ea" }
+sdist = { hash = "sha256:dd31357883a36f9240bdb86563926d7c6ff75806eb0a86f45d584785f87d90dd" }
 
 [package.metadata]
 requires-dist = [
