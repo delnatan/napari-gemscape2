@@ -223,3 +223,22 @@ def test_population_plot_draws(analysis):
     assert [p["name"] for p in panels] == ["a", "b"]
     assert all(p["shared"] is not None for p in panels)
     assert len(plot_alpha_population(panels).axes) == 4
+
+
+def test_the_saved_tables_carry_the_alpha_populations(analysis):
+    from napari_gemscape2.outputs import POPULATION_SCHEMA, alpha_distributions_table, populations_table
+
+    groups = {"all": None, "low": LOW, "few": set(range(10))}
+    dist = alpha_distributions_table(analysis, groups)
+    assert set(dist["group"].unique()) == {"all", "low"}  # "few" has too few tracks for a population
+    for _, rows in dist.group_by("group"):
+        assert rows["deconvolved"].sum() == pytest.approx(1.0)
+        assert (rows["deconvolved_low"] <= rows["deconvolved_high"]).all()
+    pops = populations_table(None, analysis, groups, "movie")
+    assert pops.columns == list(POPULATION_SCHEMA)
+    assert pops["group"].to_list() == ["all", "low", "few"]
+    low = pops.row(1, named=True)
+    assert low["alpha_mean_low"] <= low["alpha_mean"] <= low["alpha_mean_high"] and low["alpha_mean"] < 0.75
+    few = pops.row(2, named=True)
+    assert few["alpha_mean"] is None and few["shared_alpha"] is not None  # a shared alpha needs no population
+    assert pops["lognormal_D_median_um2_s"].is_null().all()  # no D run here

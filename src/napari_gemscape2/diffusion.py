@@ -735,13 +735,11 @@ def loglik_long_table(analysis: PosteriorAnalysis) -> pl.DataFrame:
 def distributions_table(
     analysis: PosteriorAnalysis, groups: Optional[dict[str, Optional[set]]] = None
 ) -> Optional[pl.DataFrame]:
-    """The population reads on the D grid, long by group: `group`,
-    `n_tracks`, `D_um2_s`, and `Ensemble`'s three models --
-    `shared_loglik` (the tracks' log-likelihoods summed, 0 at the peak: one
-    D for every track), `lognormal` (the log-normal population at its
-    posterior mode) and `deconvolved` (weights; each sums to 1 over the
-    grid within a group), each population with `_low`/`_high`, its
-    pointwise band at the credible level.
+    """The populations on the D grid, long by group: `group`, `n_tracks`,
+    `D_um2_s`, `lognormal` (the log-normal population at its posterior
+    mode) and `deconvolved` (weights; each sums to 1 over the grid within a
+    group), each with `_low`/`_high`, its pointwise band at the credible
+    level.
 
     `groups` maps a group name to its track ids; the default is one group,
     "all", over every fitted track."""
@@ -758,7 +756,6 @@ def distributions_table(
                     "group": [name] * n_grid,
                     "n_tracks": [ens.n_tracks] * n_grid,
                     "D_um2_s": analysis.D_grid_um2_s,
-                    "shared_loglik": ens.shared_loglik_D,
                     "lognormal": ens.lognormal.weights,
                     "lognormal_low": lognormal_band[0],
                     "lognormal_high": lognormal_band[1],
@@ -768,47 +765,6 @@ def distributions_table(
                 }
             )
         )
-    return pl.concat(parts) if parts else None
-
-
-def length_distributions_table(
-    analysis: PosteriorAnalysis, groups: Optional[dict[str, Optional[set]]] = None
-) -> Optional[pl.DataFrame]:
-    """`length_composition` on the D grid, long by group, weight and
-    track-length group: `group`, `weight` ("tracks" or "detections"),
-    `length_min`/`length_max` (the group's track lengths in frames, both
-    ends included; `length_max` empty for the open-ended last group),
-    `n_tracks`, `n_detections`, `D_um2_s` and `deconvolved` (that length
-    group's deconvolved population times its share of all the group's
-    tracks, or detections: summed over lengths and the grid, a weight's
-    rows add up to 1), with `deconvolved_low`/`_high`, its pointwise band
-    at the credible level, scaled alike."""
-    parts = []
-    for name, ids in (groups or {"all": None}).items():
-        for weight in LENGTH_WEIGHTS:
-            comp = length_composition(analysis, ids, weight)
-            if comp is None:
-                continue
-            n_grid = len(comp.u)
-            band_lo, band_hi = comp.band(analysis.level)
-            upper = [int(e) - 1 for e in comp.edges[1:]] + [None]
-            for j in range(len(comp.edges)):
-                parts.append(
-                    pl.DataFrame(
-                        {
-                            "group": [name] * n_grid,
-                            "weight": [weight] * n_grid,
-                            "length_min": [int(comp.edges[j])] * n_grid,
-                            "length_max": pl.Series([upper[j]] * n_grid, dtype=pl.Int64),
-                            "n_tracks": [int(comp.n_tracks[j])] * n_grid,
-                            "n_detections": [int(comp.n_detections[j])] * n_grid,
-                            "D_um2_s": np.exp(comp.u),
-                            "deconvolved": comp.deconvolved[j],
-                            "deconvolved_low": band_lo[j],
-                            "deconvolved_high": band_hi[j],
-                        }
-                    )
-                )
     return pl.concat(parts) if parts else None
 
 
@@ -1128,7 +1084,7 @@ def tracks_summary_table(
     `base` is the diffusion widget's per-track table (length, centroid in
     px, shape, `region_class`, per-point detection QC aggregated per
     track); `results` the per-track analysis columns (posterior means and
-    bounds, and any MSD or NUTS columns), or None before a run. Kept from
+    bounds, and any MSD columns), or None before a run. Kept from
     `base`: every column except the per-point min/max. Added: `result_id`
     (which experiment -- so pooling is a plain concat), the centroid in
     µm, and `passes_filters` (the tracks pane's cuts; `passing_ids` None
@@ -1231,15 +1187,10 @@ def analysis_tables(
 ) -> dict:
     """The likelihood and distribution tables, as `write_diffusion_results`
     keyword arguments. The ensemble is over the tracks passing the filters
-    (`ids`), split by region class when there are several, and in
-    `distributions_D` also by spatial class (`spatial.class_groups`) when
-    those were run."""
-    groups = {"all": ids, **(by_class or {})}
-    return dict(
-        loglik_D=loglik_long_table(analysis),
-        distributions_D=distributions_table(analysis, {**groups, **(by_spatial_class or {})}),
-        distributions_D_by_length=length_distributions_table(analysis, groups),
-    )
+    (`ids`), split by region class when there are several, and also by
+    spatial class (`spatial.class_groups`) when those were run."""
+    groups = {"all": ids, **(by_class or {}), **(by_spatial_class or {})}
+    return dict(loglik_D=loglik_long_table(analysis), distributions_D=distributions_table(analysis, groups))
 
 
 def analysis_summary(
@@ -1263,7 +1214,6 @@ def analysis_summary(
         # Every grid the run used (`GridPostOptions`' fields), so a
         # diffusionkit script can repeat it: GridPostOptions(**grid, ...).
         "grid": grid_record(analysis.options),
-        "D_grid_um2_s": [float(analysis.D_grid_um2_s[0]), float(analysis.D_grid_um2_s[-1]), analysis.options.n_D],
         # The per-track MSD fits' windows and estimators, when they ran.
         "msd": msd.record() if msd is not None else None,
         "tracks_sha256": analysis.tracks_sha256,
@@ -1303,12 +1253,11 @@ class StaleAnalysisError(ValueError):
 @dataclass(frozen=True)
 class SavedAnalysis:
     """A saved analysis, restored: the likelihoods, the MSD comparison's
-    columns and the NUTS fits' rows when they were saved, and the
-    `diffusion_summary.json` settings they were run and summarized with."""
+    columns when they were saved, and the `diffusion_summary.json`
+    settings they were run and summarized with."""
 
     analysis: PosteriorAnalysis
     msd: Optional[pl.DataFrame]
-    nuts_rows: list[dict] = field(default_factory=list)
     summary: dict = field(default_factory=dict)
 
 
@@ -1396,12 +1345,4 @@ def restore_analysis(
             pl.any_horizontal(pl.col(c).is_not_null() for c in msd_cols)
         )
 
-    # NUTS fits of tracks the fingerprint covers -- of any other, nothing
-    # says the track_id still names the same track.
-    nuts_rows: list[dict] = []
-    if "nuts_model" in ran.columns:
-        nuts_cols = ["track_id", "nuts_model", *(c for c in ran.columns if "_nuts" in c)]
-        for row in ran.filter(pl.col("nuts_model").is_not_null()).select(nuts_cols).iter_rows(named=True):
-            nuts_rows.append({k: v for k, v in row.items() if v is not None})
-
-    return SavedAnalysis(analysis=analysis, msd=msd, nuts_rows=nuts_rows, summary=summary)
+    return SavedAnalysis(analysis=analysis, msd=msd, summary=summary)

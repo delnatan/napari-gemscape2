@@ -130,7 +130,7 @@ def load_pooled_bundle(
     if spatial_class is not None:
         table = saved["tracks_summary"]
         if "spatial_class_neighbours" not in table.columns or not saved["summary"].get("spatial"):
-            raise ValueError("no spatial classes saved here -- run them (Map tab, or `spatial = true`) first")
+            raise ValueError("no spatial classes saved here -- run them (Spatial tab, or `spatial = true`) first")
         n_classes = saved["summary"]["spatial"]["n_classes"]
         if not 1 <= int(spatial_class) <= n_classes:
             raise ValueError(f"spatial_class {spatial_class} is not one of this movie's classes 1..{n_classes}")

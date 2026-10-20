@@ -160,3 +160,22 @@ def test_too_few_shuffles_to_reach_the_pattern_threshold_are_refused():
         DiffusionSettings(spatial=True, spatial_shuffles=9)
     DiffusionSettings(spatial=True, spatial_shuffles=0)
     DiffusionSettings(spatial=True, spatial_shuffles=19)
+
+
+def test_the_populations_table_has_a_row_per_group_and_reads_back(project):
+    from napari_gemscape2 import read_results
+
+    pops = pl.read_csv(project / "results" / "cell_1" / "populations.csv")
+    assert pops["group"].to_list() == ["all", "spatial class 1", "spatial class 2"]
+    slow, fast = pops.row(1, named=True), pops.row(2, named=True)
+    assert slow["lognormal_D_median_um2_s"] < 0.1 < fast["lognormal_D_median_um2_s"]
+    assert pops["alpha_mean"].is_null().all()  # no α · D run in this batch
+    assert not (project / "results" / "cell_1" / "distributions_alpha.csv").exists()
+
+    res = read_results(project)
+    assert [b.name for b in res.bundles] == ["cell_1", "cell_2"]
+    assert set(res.populations["result_id"]) == {"cell_1", "cell_2"}
+    assert res.tracks.height == 600 and set(res.tracks["result_id"]) == {"cell_1", "cell_2"}
+    assert {"result_id", "group", "D_um2_s", "deconvolved"} <= set(res.distributions_D.columns)
+    assert res.distributions_alpha.is_empty()
+    assert set(res.summaries) == {"cell_1", "cell_2"}

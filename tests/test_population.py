@@ -42,15 +42,10 @@ def test_the_summary_reads_the_population_not_the_medians(analysis):
 
 def test_the_tables_name_their_models(analysis):
     dist = dfn.distributions_table(analysis)
-    assert dist.columns == ["group", "n_tracks", "D_um2_s", "shared_loglik", "lognormal", "lognormal_low",
+    assert dist.columns == ["group", "n_tracks", "D_um2_s", "lognormal", "lognormal_low",
                             "lognormal_high", "deconvolved", "deconvolved_low", "deconvolved_high"]
     assert dist["lognormal"].sum() == pytest.approx(1.0)
-    assert dist["shared_loglik"].max() == 0.0
-    by_length = dfn.length_distributions_table(analysis)
-    assert {"deconvolved", "deconvolved_low", "deconvolved_high"} <= set(by_length.columns)
-    assert not any("pooled" in c for c in by_length.columns)
-    for _, rows in by_length.group_by("weight"):
-        assert rows["deconvolved"].sum() == pytest.approx(1.0)
+    assert dist["deconvolved"].sum() == pytest.approx(1.0)
     loglik = dfn.loglik_long_table(analysis)
     assert loglik.columns == ["track_id", "D_um2_s", "loglik"]
     per_track = loglik.group_by("track_id").agg(pl.col("loglik").exp().sum())

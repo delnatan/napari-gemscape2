@@ -1,4 +1,4 @@
-"""The Map tab's "Spatial classes" section: classes of D among the tracks, from the D run's likelihoods
+"""The Spatial tab: classes of D among the tracks, from the D run's likelihoods
 (`napari_gemscape2.spatial`).
 
 Run takes the D run on screen and the tracks the filters pass now, fits C = 1..4 classes with the Potts prior on
@@ -101,7 +101,7 @@ class SpatialSection(QWidget):
         self._figure_row.setVisible(False)
 
         layout = QVBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
         layout.addWidget(note_label("Classes numbered by increasing D, from each track's D likelihood and its "
                                     "neighbours'."))
@@ -113,6 +113,7 @@ class SpatialSection(QWidget):
         layout.addWidget(self._status)
         layout.addWidget(self._summary)
         layout.addWidget(self._figure_row)
+        layout.addStretch()
         self.setLayout(layout)
         self.reset()
 

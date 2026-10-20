@@ -33,7 +33,7 @@ with a per-track aggregate suffix (`_min`/`_mean`/`_max`, added by
 `diffusion.qc_aggregate_table`) stripped, then a
 unit-bearing name suffix (`_um2_s`, `_um`, `_s`, `_rad`, ...), then a
 statistic suffix (`_median`/`_low`/`_high`/...) or a fit-variant suffix
-(`_msd`/`_nuts`/`_est`) stripped, and finally the unitless and
+(`_msd`/`_est`) stripped, and finally the unitless and
 pixel-space registries below.
 """
 
@@ -198,7 +198,7 @@ _AGGREGATE_SUFFIXES = ("_min", "_mean", "_max", "_sum")
 
 # A point estimate or interval edge of a fitted quantity, and the naming
 # this project uses to keep one quantity's several fits in separate
-# columns (`alpha_median` vs `alpha_msd` vs `alpha_nuts`). Both
+# columns (`alpha_hat` vs `alpha_msd`). Both
 # kinds carry the base quantity's unit.
 _STATISTIC_SUFFIXES = (
     "_median",
@@ -207,7 +207,6 @@ _STATISTIC_SUFFIXES = (
     "_hi",
     "_low",
     "_high",
-    "_nuts",
     "_msd",
     "_est",
     "_hat",

@@ -36,11 +36,6 @@ dependencies = [
     "qtkit",
 ]
 
-[project.optional-dependencies]
-# Per-track NUTS in the diffusion widget (`diffusionkit.bayes.fit_track`).
-# Optional: it pulls in JAX/NumPyro, and the widget runs without it.
-bayes = ["diffusionkit[bayes,plots]"]
-
 [project.scripts]
 gemscape2 = "napari_gemscape2.cli:main"
 
