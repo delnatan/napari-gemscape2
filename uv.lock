@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.13"
 resolution-markers = [
     "python_full_version >= '3.14' and platform_machine == 'arm64' and sys_platform == 'darwin'",
@@ -466,7 +466,7 @@ wheels = [
 [[package]]
 name = "diffusionkit"
 version = "0.1.0"
-source = { git = "https://github.com/delnatan/diffusionkit.git?branch=main#e49cb196aa03e88e3cc9399aaa2a71c62080708c" }
+source = { git = "https://github.com/delnatan/diffusionkit.git?branch=main#518e56a1962c1eae0280102aff5d8500f5b03162" }
 dependencies = [
     { name = "numpy" },
     { name = "polars" },
