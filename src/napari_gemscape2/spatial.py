@@ -20,6 +20,10 @@ input, after the user has matched the class numbers.
 Saved with the analysis: the run's record under "spatial" in `diffusion_summary.json` and each track's class
 probabilities and position in `spatial_classes.parquet`; `restore_spatial` rebuilds the run from those and the
 saved likelihoods.
+
+`analyze_map` asks the other question, with no classes: how ln D varies over the cell (`diffusionkit.spatial
+.smooth_map`, a BYM map on the same graph). It is shown, not saved, and needs a diffusionkit that has it
+(`HAS_MAP`).
 """
 
 from __future__ import annotations
@@ -33,6 +37,11 @@ import polars as pl
 from diffusionkit import spatial as dk_spatial
 from diffusionkit.gridpost import GridLikelihoods
 from diffusionkit.spatial import SpatialAnalysis, SpatialOptions
+
+try:
+    from diffusionkit.spatial import SmoothMap, SmoothMapOptions
+except ImportError:  # a diffusionkit from before spatial.smooth_map
+    SmoothMap = SmoothMapOptions = None
 
 from napari_gemscape2.diffusion import PosteriorAnalysis
 
@@ -48,6 +57,7 @@ CLASS_COLORS = ("#2a6fdb", "#e0a100", "#14a37f", "#b0399a", "#6b4f2a", "#00a3c4"
 # A class map leaves out points whose k-th nearest track is farther than this many typical spacings.
 FIELD_REACH = 2.0
 GROUP_PREFIX = "spatial class "
+HAS_MAP = SmoothMap is not None
 
 
 def class_color(c: int) -> str:
@@ -102,6 +112,45 @@ def analyze_spatial(
     threads = threads or os.cpu_count() or 1
     with ThreadPoolExecutor(threads) as pool:
         return dk_spatial.analyze_likelihoods(lik, analysis.u_D, pos, options, map_fn=pool.map, progress=progress)
+
+
+def analyze_map(
+    analysis: PosteriorAnalysis,
+    base: pl.DataFrame,
+    pixel_size_um: float,
+    ids: Optional[set],
+    n_shuffles: int = N_SHUFFLES,
+    *,
+    progress: Optional[Callable[[int, int], None]] = None,
+    threads: Optional[int] = None,
+) -> "SmoothMap":
+    """The smooth map of ln D over the D run's tracks `ids` (None: all fitted), at their centroids, with
+    `n_shuffles` position shuffles for its pattern test on a pool of `threads` (default one per CPU)."""
+    if not HAS_MAP:
+        raise RuntimeError("this diffusionkit has no spatial.smooth_map: update it")
+    options = SmoothMapOptions(n_shuffles=n_shuffles)
+    lik = likelihoods_of(analysis, ids)
+    if len(lik.track_ids) <= options.k:
+        raise ValueError(f"a map needs more than {options.k} fitted tracks, got {len(lik.track_ids)}")
+    pos = positions_um(base, pixel_size_um)
+    threads = threads or os.cpu_count() or 1
+    with ThreadPoolExecutor(threads) as pool:
+        return dk_spatial.smooth_map_likelihoods(lik, analysis.u_D, pos, options, map_fn=pool.map,
+                                                 progress=progress)
+
+
+def describe_map(m: "SmoothMap") -> str:
+    """One or two lines on a map run: the pattern test and how much of the variation is spatial."""
+    if m.null is None:
+        test = f"evidence gain over no space {m.gain:.1f} nats (no shuffles)"
+    else:
+        verdict = "a spatial pattern" if m.patterned else "no spatial pattern"
+        test = (f"{verdict}: evidence gain over no space {m.gain:.1f} nats, p = {m.null.p:.2g} "
+                f"against {len(m.null.shuffled_gain)} shuffles")
+    d = np.exp(m.ln_D)
+    lo, hi = np.percentile(d, [5, 95])
+    return (f"{len(m.track_ids)} tracks · {test}\n"
+            f"mapped D from {lo:.3g} to {hi:.3g} µm²/s (5th–95th percentile of tracks)")
 
 
 def class_map(

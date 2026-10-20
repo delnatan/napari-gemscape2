@@ -13,8 +13,8 @@ from napari_gemscape2.diffusion_batch import DiffusionSettings, analyze_bundle, 
 from napari_gemscape2.results import (
     build_manifest, load_diffusion_results, load_result, load_spatial_classes, write_result,
 )
-from napari_gemscape2.spatial import SPATIAL_COLUMNS, class_groups, restore_spatial
-from napari_gemscape2.spatial_plot import plot_class_map, plot_class_populations, plot_class_selection
+from napari_gemscape2.spatial import HAS_MAP, SPATIAL_COLUMNS, analyze_map, class_groups, describe_map, restore_spatial
+from napari_gemscape2.spatial_plot import plot_class_map, plot_class_populations, plot_class_selection, plot_D_map
 
 PX, DT = 0.1, 0.03
 SLOW, FAST = 0.02, 0.3
@@ -179,3 +179,17 @@ def test_the_populations_table_has_a_row_per_group_and_reads_back(project):
     assert {"result_id", "group", "D_um2_s", "deconvolved"} <= set(res.distributions_D.columns)
     assert res.distributions_alpha.is_empty()
     assert set(res.summaries) == {"cell_1", "cell_2"}
+
+
+@pytest.mark.skipif(not HAS_MAP, reason="this diffusionkit has no spatial.smooth_map")
+def test_the_smooth_map_finds_the_slow_disk_and_draws(project):
+    result_dir = project / "results" / "cell_1"
+    analysis, _s, _saved = _restored(result_dir)
+    tracks_df = load_result(result_dir)[1]
+    base = tracks_df.group_by("track_id").agg(x_px=pl.col("x").mean(), y_px=pl.col("y").mean())
+    m = analyze_map(analysis, base, PX, None, n_shuffles=19, threads=2)
+    assert m.patterned and m.gain > m.null.shuffled_gain.max()
+    inside = np.linalg.norm(m.xy_um - 30.0, axis=1) < 15.0
+    assert np.median(np.exp(m.ln_D[inside])) < np.median(np.exp(m.ln_D[~inside]))
+    assert "spatial pattern" in describe_map(m)
+    plot_D_map(m, shape_px=(600, 600), pixel_size_um=PX)
