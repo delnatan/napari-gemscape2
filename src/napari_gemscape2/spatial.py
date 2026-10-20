@@ -149,8 +149,7 @@ def describe_map(m: "SmoothMap") -> str:
                 f"against {len(m.null.shuffled_gain)} shuffles")
     d = np.exp(m.ln_D)
     lo, hi = np.percentile(d, [5, 95])
-    return (f"{len(m.track_ids)} tracks · {test}
-"
+    return (f"{len(m.track_ids)} tracks · {test}\n"
             f"mapped D from {lo:.3g} to {hi:.3g} µm²/s (5th–95th percentile of tracks)")
 
 
