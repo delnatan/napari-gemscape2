@@ -7,7 +7,6 @@
 - `plot_class_populations`: each class's populations as densities on one axis per parameter: D deconvolved
   from the class's tracks with its band (`diffusion.ensemble`), and alpha's population across them when an
   α · D run is there (`fbm.alpha_population`). No number summarizes a class here.
-- `plot_D_map`: the smooth map of D (`spatial.analyze_map`): each track at its mapped D, and how sure the map is.
 """
 
 from __future__ import annotations
@@ -16,7 +15,7 @@ from typing import Optional
 
 import numpy as np
 from diffusionkit.spatial import SpatialAnalysis
-from matplotlib.colors import LogNorm, to_rgb
+from matplotlib.colors import to_rgb
 from matplotlib.figure import Figure
 from matplotlib.patches import Patch
 
@@ -240,63 +239,3 @@ def plot_class_populations(
                  fontsize=10, x=0.01, ha="left", color=_INK)
     return fig
 
-
-def plot_D_map(
-    m,
-    shape_px: Optional[tuple[int, int]] = None,
-    pixel_size_um: Optional[float] = None,
-    labels: Optional[np.ndarray] = None,
-    region_classes: Optional[dict[int, str]] = None,
-    title: Optional[str] = None,
-) -> Figure:
-    """The smooth map of D (`diffusionkit.spatial.SmoothMap`): left, each track at its mapped D on a log colour
-    scale; right, the map's posterior SD of ln D there. `shape_px` frames the field of view (else the tracks'
-    extent); `labels`/`region_classes` outline the regions. Axes in µm."""
-    xy = m.xy_um
-    if shape_px is not None and pixel_size_um:
-        h, w = shape_px
-        extent = (-0.5 * pixel_size_um, (w - 0.5) * pixel_size_um, -0.5 * pixel_size_um, (h - 0.5) * pixel_size_um)
-    else:
-        pad = 0.03 * float(np.ptp(xy, axis=0).max() or 1.0)
-        extent = (xy[:, 0].min() - pad, xy[:, 0].max() + pad, xy[:, 1].min() - pad, xy[:, 1].max() + pad)
-    aspect = (extent[3] - extent[2]) / max(extent[1] - extent[0], 1e-9)
-    fig = Figure(figsize=(11.0, min(max(5.0 * aspect, 3.0), 8.0) + 0.9), layout="constrained")
-    left, right = fig.subplots(1, 2)
-    d = np.exp(m.ln_D)
-    lo, hi = np.percentile(d, [1, 99])
-    size = float(np.clip(5000 / len(xy), 1.5, 10.0))
-    panels = [
-        (left, d, dict(cmap="viridis", norm=LogNorm(lo, hi if hi > lo else lo * 1.01)),
-         f"mapped D ({units.UM2_S})", "D: the map's value at each track"),
-        (right, m.ln_D_sd, dict(cmap="magma_r", vmin=0), "posterior SD of ln D", "how sure the map is there"),
-    ]
-    for ax, values, cmap, label, sub in panels:
-        sc = ax.scatter(xy[:, 0], xy[:, 1], c=values, s=size, linewidths=0, zorder=2, **cmap)
-        fig.colorbar(sc, ax=ax, shrink=0.8, label=label)
-        if labels is not None and region_classes and pixel_size_um:
-            present = set(np.unique(labels).tolist()) - {0}
-            hh, ww = labels.shape
-            xs, ys = np.arange(ww) * pixel_size_um, np.arange(hh) * pixel_size_um
-            for label_id in sorted(present & set(region_classes)):
-                ax.contour(xs, ys, (labels == label_id).astype(float), levels=[0.5], colors=[_MUTED_INK],
-                           linewidths=0.7)
-        ax.set_xlim(extent[0], extent[1])
-        ax.set_ylim(extent[3], extent[2])
-        ax.set_aspect("equal")
-        ax.set_xlabel(f"x ({units.UM})")
-        ax.set_ylabel(f"y ({units.UM})")
-        for side in ("top", "right"):
-            ax.spines[side].set_visible(False)
-        ax.tick_params(labelsize=8)
-        ax.set_title(sub, fontsize=8, loc="left", color=_MUTED_INK)
-    if m.null is None:
-        verdict = f"evidence gain over no space {m.gain:.1f} nats (no pattern test)"
-    elif m.patterned:
-        verdict = f"spatial pattern: evidence gain over no space {m.gain:.1f} nats, p = {m.null.p:.2g}"
-    else:
-        verdict = (f"no spatial pattern (gain {m.gain:.1f} nats, p = {m.null.p:.2g}): "
-                   "differences between places here are noise")
-    head = f"{title} · " if title else ""
-    fig.suptitle(f"{head}smooth map of D · {len(xy)} tracks\n{verdict}", fontsize=10, x=0.01, ha="left",
-                 color=_INK)
-    return fig
