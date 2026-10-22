@@ -10,8 +10,13 @@ contributions:
     - id: napari-gemscape2.DiffusionAnalysisWidget
       title: Diffusion analysis
       python_name: napari_gemscape2.widgets.diffusion_panel:DiffusionAnalysisWidget
+    - id: napari-gemscape2.FrameExportWidget
+      title: Screenshots and frames
+      python_name: napari_gemscape2.widgets.frame_export:FrameExportWidget
   widgets:
     - command: napari-gemscape2.ExperimentListWidget
       display_name: Experiment list
     - command: napari-gemscape2.DiffusionAnalysisWidget
       display_name: Diffusion analysis
+    - command: napari-gemscape2.FrameExportWidget
+      display_name: Screenshots and frames
