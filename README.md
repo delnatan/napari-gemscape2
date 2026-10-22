@@ -826,6 +826,22 @@ list, or `gemscape2 detect-track` and `gemscape2 diffusion` with one tuned movie
 as the `template`. To compare experiments, read the saved bundles in a script
 (below).
 
+### Screenshots and frames for movies
+
+napari's own **File → Save Screenshot** looks duller than the window on a Mac.
+The canvas is drawn without colour matching, so on a Display P3 screen (any
+recent Mac) its colours are P3's, but the PNG napari writes has no colour
+profile and every viewer reads it as the narrower sRGB.
+
+**Plugins → GEMscape2 → Screenshots and frames** saves the canvas with the
+profile written into the PNG instead (Display P3 by default on macOS, sRGB
+elsewhere). **Screenshot…** saves the current view. **Export frames…** steps a
+slider (time, by default) through a range and saves `frame_00000.png`,
+`frame_00001.png`, … into a folder, together with an `ffmpeg.txt` that holds
+the ffmpeg commands for an MP4 and a GIF. The MP4 command tags the movie's
+colour space, because ffmpeg ignores the PNGs' profile. A GIF is always shown
+as sRGB, so export its frames with the colour set to sRGB.
+
 ### Reading results in a script
 
 `read_results` stacks the saved analyses of every bundle under a folder (searched
