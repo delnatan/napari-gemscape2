@@ -69,9 +69,10 @@ pages within one keep the dock panel's height bounded to a single step
 rather than to the whole form.
 
 `spotsolve`'s detector has one threshold, the least probability that a
-reported spot is real (`p_real`), and its linker one distance
-(`max_step`), so what's left to expose is the camera (offset and gain), the PSF width, those
-two numbers, and the "detector" choice: mixtures (several emitters per
+reported spot is real (`p_real`), and its linker one trade-off
+(`switch_cost`, links against identity swaps) and a search radius it reads
+from the movie unless given, so what's left to expose is the camera
+(offset and gain), the PSF width, those numbers, and the "detector" choice: mixtures (several emitters per
 window, the default) or single fits (one per window, faster for
 well-separated spots), with mixtures' "motion blur" switch for exposures
 long enough that emitters streak.
@@ -108,6 +109,7 @@ is stamped with.
 
 from __future__ import annotations
 
+import math
 import os
 from typing import Optional
 
@@ -136,6 +138,7 @@ from napari_gemscape2.pipeline import (
     DEFAULT_CAMERA_KWARGS,
     DEFAULT_DETECT_KWARGS,
     DEFAULT_EXCLUDE_FLAGS,
+    SWITCH_COST,
     TRACK_METRIC_COLUMNS,
     FilterSpec,
 )
@@ -1005,21 +1008,30 @@ _FLAG_TOOLTIPS = {
 
 
 class _TrackingTab(QWidget):
-    """Three pages -- Link, Filter, Save: the linker's one setting and
-    what to feed it, then a filter stack over the tracks it produced, then
-    the save that finalizes the bundle.
+    """Three pages -- Link, Filter, Save: the linker's settings and what
+    to feed it, then a filter stack over the tracks it produced, then the
+    save that finalizes the bundle.
 
     `spotsolve.link` scores each link between consecutive frames by the
     step density the track predicts from its own steps, against the cost
-    of ending the track, which it reads from the movie. `max_step` (px) is
-    its one setting: no longer step is linked, and three rms steps of the
-    fastest diffusion the linker models fit inside it. spotsolve's advice
-    is about three times the rms step of the fastest particles of
-    interest: smaller breaks their tracks, and larger costs slow particles
-    little, since each track is held to its own scale. The note under it
-    restates the value in µm and as that fastest D, at the current image's
-    pixel size and frame interval, and the status line after a run reports
-    the linked steps' own rms.
+    of ending the track, which it reads from the movie. Two settings:
+
+      - `search_radius` (px): how far it looks for a particle's next
+        detection. "auto" (0, the default) reads it from the movie at each
+        run (`spotsolve.search_radius`: next-frame against own-frame pair
+        distances give the fastest diffusion the movie holds). It is soft
+        -- within it, each track's own scale and the price of a wrong link
+        decide -- so a value larger than needed costs little. A given one
+        should be at least three times the fastest particles' rms step;
+        the note under it restates it in µm and as that fastest D, and the
+        status line after a run reports the radius used and the linked
+        steps' rms.
+      - `switch_cost`: the log odds a link must reach against ending the
+        track there. A wrong link swaps two particles' identities, priced
+        at exp(switch_cost) missed links: lower links more and swaps more.
+        The status line reports the mean `link_p`, the share of links
+        expected right, and the Filter page can cut on each track's
+        `min_link_p`.
 
     What the linker is fed: one checkbox per `spotsolve.FitFlag`, each
     excluding the fits carrying it (by default AT_BOUND and ELONGATED,
@@ -1059,24 +1071,37 @@ class _TrackingTab(QWidget):
             "so an n-point track spans n-1 intervals and its duration_s is\n"
             "(n-1) x dt. 1 = keep everything, including singletons.",
         )
-        # Required by spotsolve and not estimated from the movie. 20 px is
-        # 3 rms steps at D = 5.5 µm²/s at 104 nm/px and 22 ms, above the
-        # fastest GEMs; slow particles lose little to a large value.
-        self.max_step = _dspin(
-            20.0, 0.1, 1000.0, 0.5, decimals=1,
-            tooltip="Largest distance, in PIXELS, a particle may move between\n"
-            "consecutive frames; a longer step ends the track. Each track is\n"
-            "linked at its own diffusion scale, learned from its own steps,\n"
-            "and three rms steps of the fastest one the linker models fit\n"
-            "inside this distance.\n\n"
-            "About 3x the rms step of the fastest particles of interest: smaller\n"
-            "breaks their tracks, larger costs slow particles little. The status\n"
-            "line reports the linked steps' rms after a run.",
+        # 0 is "auto": read from the movie at each run.
+        self.search_radius = _dspin(
+            0.0, 0.0, 1000.0, 0.5, decimals=1,
+            tooltip="How far, in PIXELS, the linker looks for a particle's next\n"
+            "detection. 'auto' reads it from the movie at each run: the\n"
+            "distances between detections in consecutive frames, against\n"
+            "those within one frame, give the fastest diffusion the movie\n"
+            "holds, and the radius is 1.5x three of its rms steps.\n\n"
+            "It is soft: within it, each track's own step size and the price\n"
+            "of a wrong link decide, so a larger value changes the links little.\n"
+            "Give one to override -- at least 3x the rms step of the fastest\n"
+            "particles of interest. The status line reports the radius used.",
         )
+        self.search_radius.setSpecialValueText("auto")
         self._scale: tuple[Optional[float], Optional[float]] = (None, None)
-        self._max_step_note = note_label("")
-        self.max_step.valueChanged.connect(self._update_max_step_note)
-        self._update_max_step_note()
+        self._radius_note = note_label("")
+        self.search_radius.valueChanged.connect(self._update_radius_note)
+        self._update_radius_note()
+        self.switch_cost = _dspin(
+            SWITCH_COST, 0.0, 10.0, 0.25, decimals=2,
+            tooltip="The log odds a link must reach against ending the track there.\n"
+            "A wrong link swaps two particles' identities and is priced at\n"
+            "exp(switch cost) missed links (2.5: about 12).\n\n"
+            "Lower keeps more links, with more swaps; higher, fewer of both.\n"
+            "In crowded simulated movies the default keeps wrong links to a\n"
+            "few percent. A low link_p filter afterwards drops doubtful links\n"
+            "but cannot add any: only a lower switch cost does.",
+        )
+        self._switch_note = note_label("")
+        self.switch_cost.valueChanged.connect(self._update_switch_note)
+        self._update_switch_note()
         # One box per FitFlag, laid out two to a row. Checked = linking
         # does not see fits carrying that flag.
         self._flag_boxes: dict[spotsolve.FitFlag, QCheckBox] = {}
@@ -1095,8 +1120,10 @@ class _TrackingTab(QWidget):
         self._flags_section = CollapsibleSection("Exclude fits flagged", flags_body)
         form = _compact_form(QFormLayout())
         form.setContentsMargins(0, 0, 0, 0)
-        form.addRow("max step (px)", self.max_step)
-        form.addRow(self._max_step_note)
+        form.addRow("search radius (px)", self.search_radius)
+        form.addRow(self._radius_note)
+        form.addRow("switch cost", self.switch_cost)
+        form.addRow(self._switch_note)
         form.addRow("min track length (points)", self.min_track_length)
 
         self.run_button, self.status_label, run_row = _run_row("Run tracking")
@@ -1170,28 +1197,44 @@ class _TrackingTab(QWidget):
         """The checked `FitFlag`s, as the bitmask `run_track_step` takes."""
         return sum(int(flag) for flag, box in self._flag_boxes.items() if box.isChecked())
 
-    def get_max_step(self) -> float:
-        return self.max_step.value()
+    def get_search_radius(self) -> Optional[float]:
+        """The given radius, px, or None for "auto" (read from the movie)."""
+        value = self.search_radius.value()
+        return None if value <= 0 else value
+
+    def get_switch_cost(self) -> float:
+        return self.switch_cost.value()
 
     def set_image_scale(self, pixel_size_um: Optional[float], dt_s: Optional[float]) -> None:
         """The pixel size and frame interval a run would use -- for
-        `_update_max_step_note`."""
+        `_update_radius_note`."""
         self._scale = (pixel_size_um, dt_s)
-        self._update_max_step_note()
+        self._update_radius_note()
 
-    def _update_max_step_note(self) -> None:
-        """`max_step` in µm, and the fastest D the linker models: rms
-        step = max_step / 3 = sqrt(4 D dt), localization error neglected
-        (which makes that D an upper estimate)."""
+    def _update_radius_note(self) -> None:
+        """A given radius in µm, and the fastest D it leaves room for at
+        three rms steps: rms step = radius / 3 = sqrt(4 D dt), localization
+        error neglected (which makes that D an upper estimate)."""
+        radius = self.get_search_radius()
+        if radius is None:
+            self._radius_note.setText("Read from the movie at each run; soft, so rarely worth setting.")
+            return
         pixel_size_um, dt_s = self._scale
         if pixel_size_um is None or dt_s is None:
-            self._max_step_note.setText("≈ 3× the fastest particles' rms step.")
+            self._radius_note.setText("At least 3× the fastest particles' rms step.")
             return
-        step_um = self.max_step.value() * pixel_size_um
+        step_um = radius * pixel_size_um
         d_max = (step_um / 3.0) ** 2 / (4.0 * dt_s)
-        self._max_step_note.setText(
+        self._radius_note.setText(
             f"= {units.fmt_unit(step_um, units.UM)}/frame: at 3 rms steps, "
             f"D up to ≈ {units.fmt(d_max, 'D_est_um2_s')}."
+        )
+
+    def _update_switch_note(self) -> None:
+        """What a swap is priced at, in missed links."""
+        price = math.exp(self.switch_cost.value())
+        self._switch_note.setText(
+            f"A swap costs ≈ {price:.3g} missed links. Lower: more links, more swaps."
         )
 
 
@@ -1381,8 +1424,11 @@ class PipelineParamsWidget(QWidget):
     def get_exclude_flags(self) -> int:
         return self._tracking.get_exclude_flags()
 
-    def get_max_step(self) -> float:
-        return self._tracking.get_max_step()
+    def get_search_radius(self) -> Optional[float]:
+        return self._tracking.get_search_radius()
+
+    def get_switch_cost(self) -> float:
+        return self._tracking.get_switch_cost()
 
     def set_track_status(self, text: str, level: str = "neutral") -> None:
         self._tracking.set_status(text, level)

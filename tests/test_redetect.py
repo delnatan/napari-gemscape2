@@ -24,10 +24,11 @@ def test_detect_clears_the_previous_link_run(tmp_path):
                            stack=(stack, StackMetadata(path=tmp_path / "m.tif", shape=stack.shape)))
     camera = dict(offset=100.0, gain=1.0)
     run_detect_step(session, sigma=1.3, camera_kwargs=camera)
-    run_track_step(session, max_step=4.0, min_track_length=3)
+    run_track_step(session, search_radius=4.0, min_track_length=3)
     assert session.tracks_df is not None and session.tracks_df.height
 
     run_detect_step(session, sigma=1.3, camera_kwargs=camera)
     assert session.points_df.height
     assert session.tracks_df is None
-    assert session.track_summary is None and session.max_step_used is None
+    assert session.track_summary is None and session.search_radius_used is None
+    assert session.switch_cost_used is None

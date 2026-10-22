@@ -10,8 +10,10 @@ Detection and linking are `spotsolve`'s: `spotsolve.localize`/
 `localize_stack` (u-track's detector: each seed fitted on its own window,
 every emitter kept where its probability of being real rather than
 noise, fitted per movie, reaches `p_real`) and
-`spotsolve.link` (frame to frame within a required `max_step`, each track
-held to its own diffusion scale, learned from its own steps).
+`spotsolve.link` (frame to frame within a soft search radius read from
+the movie, each track held to its own diffusion scale, learned from its
+own steps, and every link given the probability `link_p` that it is
+right).
 `spotsolve.loctable` defines the table that passes between them, and this
 module emits it verbatim -- `se_y`/`se_x` (per-detection CRLB), `flux`,
 `flags` (`spotsolve.FitFlag`) and the rest -- so nothing downstream has to
@@ -28,13 +30,17 @@ Two things the previous sfwloc-based pipeline did are gone because
     With mixtures, `motion_blur` reports a close pair as one elongated
     spot unless two fit better, for exposures long enough that emitters
     streak.
-  - Linking takes one number, `max_step` (px): the largest step a
-    particle may take between consecutive frames, set for the fastest
-    particles of interest. The linker learns each track's diffusion scale
-    from the track's own steps as it links, and reads what else it needs
-    (the detector's gap, how often a detection continues, the density)
-    from the movie, so the old bootstrap-link -> estimate-D -> relink
-    dance is gone.
+  - Linking needs no setting. Its search radius is read from the movie
+    (`spotsolve.search_radius`: next-frame against own-frame pair
+    distances give the fastest diffusion the movie holds) and is soft --
+    inside it, each track's own step size and the price of a wrong link
+    decide -- so it can be overridden but rarely needs to be. The linker
+    learns each track's diffusion scale from the track's own steps as it
+    links, and reads what else it needs (the detector's gap, how often a
+    detection continues, the density) from the movie, so the old
+    bootstrap-link -> estimate-D -> relink dance is gone. `switch_cost` is
+    its one trade-off: the log odds a link must reach against ending the
+    track there (lower: more links and more identity swaps).
 
 `PipelineSession` + `load_session`/`run_detect_step`/`run_track_step` let
 each stage run independently and be re-run after tweaking that stage's own
@@ -111,6 +117,10 @@ DEFAULT_CAMERA_KWARGS = dict(
 # spotsolve's linker, pricing track ends by each detection's strength, would
 # let them take a bright particle's step.
 DEFAULT_EXCLUDE_FLAGS = int(spotsolve.FitFlag.AT_BOUND) | int(spotsolve.FitFlag.ELONGATED)
+
+# `spotsolve.link`'s default `switch_cost`: a wrong link, which swaps two
+# particles' identities, is priced at exp(2.5) ~ 12 missed links.
+SWITCH_COST = spotsolve.SWITCH_COST
 
 DEFAULT_DETECT_KWARGS = dict(
     p_real=spotsolve.P_REAL,
@@ -219,10 +229,15 @@ class DetectTrackParams:
     # settled by eye: detect a few frames, read the `fit_sigma` histogram
     # (see this module's docstring).
     sigma: float
-    # `spotsolve.link`'s `max_step`, px: the largest step linked between
-    # consecutive frames. Required for the same reason `sigma` is -- it is
-    # not estimated from the movie (see this module's docstring).
-    max_step: float
+    # `spotsolve.link`'s `search_radius`, px: how far the linker looks for
+    # a particle's next detection. None (the default) reads it from the
+    # movie (`spotsolve.search_radius`); it is soft, so a value larger than
+    # needed changes the links little.
+    search_radius: Optional[float] = None
+    # `spotsolve.link`'s `switch_cost`: the log odds a link must reach
+    # against ending the track there. Lower keeps more links, with more
+    # identity swaps; higher, fewer of both.
+    switch_cost: float = SWITCH_COST
     min_track_length: int = 2
     # `spotsolve.FitFlag` bits whose fits linking does not see (a bitmask;
     # 0 keeps every fit). By default the fits that are not one in-focus
@@ -308,7 +323,10 @@ class PipelineSession:
 
     tracks_df: Optional[pl.DataFrame] = None
     track_summary: Optional[dict] = None
-    max_step_used: Optional[float] = None
+    search_radius_used: Optional[float] = None
+    # "movie" (read by `spotsolve.search_radius`) or "given".
+    search_radius_source: Optional[str] = None
+    switch_cost_used: Optional[float] = None
     exclude_flags_used: Optional[int] = None
     min_track_length_used: Optional[int] = None
     point_filters_used: Optional[FilterSpec] = None
@@ -571,7 +589,9 @@ def run_detect_step(
     # drawn, filtered, analyzed or saved beside a table they didn't come from.
     session.tracks_df = None
     session.track_summary = None
-    session.max_step_used = None
+    session.search_radius_used = None
+    session.search_radius_source = None
+    session.switch_cost_used = None
     session.exclude_flags_used = None
     session.min_track_length_used = None
     session.point_filters_used = None
@@ -585,8 +605,9 @@ def estimate_D_um2_s(linked_df: pl.DataFrame, dt_s: float, pixel_size_um: float,
 
     A direct moment of the finished trajectories in physical units: the
     one number the Track status line and the crowding check read D off.
-    It inherits `max_step`'s truncation (no longer step was linked), so a
-    `max_step` set too tight shows up here as a D biased low."""
+    Links the linker refused (a step too long for the track, or not worth
+    `switch_cost`'s risk of a swap) are missing from it, so it leans low
+    for the fastest particles and a high `switch_cost`."""
     df = linked_df.sort(["track_id", "frame"]).with_columns(
         pl.col("frame").diff().over("track_id").alias("dframe"),
         pl.col("y").diff().over("track_id").alias("dy_px"),
@@ -606,7 +627,7 @@ def estimate_D_um2_s(linked_df: pl.DataFrame, dt_s: float, pixel_size_um: float,
 # track filter can name. Kept as a constant because the Track tab's filter
 # panel has to offer them before any track has been linked -- before
 # there's a table to read column names off.
-TRACK_METRIC_COLUMNS = ("track_length", "duration_s", "mean_step_um")
+TRACK_METRIC_COLUMNS = ("track_length", "duration_s", "mean_step_um", "min_link_p")
 
 
 def track_metrics_df(tracks_df: pl.DataFrame, pixel_size_um: float, dt_s: float) -> pl.DataFrame:
@@ -614,7 +635,11 @@ def track_metrics_df(tracks_df: pl.DataFrame, pixel_size_um: float, dt_s: float)
     `track_length` (points survived by linking), `duration_s` (span between
     its first and last frame), `mean_step_um` (mean single-step
     displacement -- the same quantity `estimate_D_um2_s` pools across every
-    track, kept per-track here instead).
+    track, kept per-track here instead) and, when the table has spotsolve's
+    `link_p`, `min_link_p` (its weakest link: the least probability that
+    one of its links is right, 1.0 for a track with no link). A cut on
+    `min_link_p` keeps the tracks without a doubtful link, which favors
+    short ones, since a long track has more links to be doubtful in.
 
     The per-track shape is what a filter needs (a track either passes or
     doesn't -- one verdict, not one per vertex); `track_features_df`
@@ -643,11 +668,14 @@ def track_metrics_df(tracks_df: pl.DataFrame, pixel_size_um: float, dt_s: float)
         .then((pl.col("_dy_um") ** 2 + pl.col("_dx_um") ** 2).sqrt())
         .alias("_step_um")
     )
-    agg = df.group_by("track_id").agg(
+    exprs = [
         pl.len().alias("track_length"),
         (pl.col("frame").max() - pl.col("frame").min()).alias("_span_frames"),
         pl.col("_step_um").mean().fill_null(0.0).alias("mean_step_um"),
-    )
+    ]
+    if "link_p" in df.columns:
+        exprs.append(pl.col("link_p").fill_nan(None).min().fill_null(1.0).alias("min_link_p"))
+    agg = df.group_by("track_id").agg(exprs)
     return agg.with_columns((pl.col("_span_frames") * dt_s).alias("duration_s")).drop("_span_frames")
 
 
@@ -663,7 +691,15 @@ def track_features_df(tracks_df: pl.DataFrame, pixel_size_um: float, dt_s: float
             pl.lit(0.0).alias("mean_step_um"),
         )
     metrics = track_metrics_df(tracks_df, pixel_size_um, dt_s)
-    return tracks_df.sort(["track_id", "frame"]).join(metrics, on="track_id", how="left")
+    features = tracks_df.sort(["track_id", "frame"])
+    if "link_p" in features.columns:
+        # A track's first row has no link into it. Its color takes the
+        # track's first link's instead (1.0 for a track with none), since a
+        # napari colormap over a property with a NaN in it is all NaN.
+        features = features.with_columns(
+            pl.col("link_p").fill_nan(None).backward_fill().over("track_id").fill_null(1.0)
+        )
+    return features.join(metrics, on="track_id", how="left")
 
 
 def apply_track_filters(
@@ -697,7 +733,8 @@ def apply_track_filters(
 
 def run_track_step(
     session: PipelineSession,
-    max_step: float,
+    search_radius: Optional[float] = None,
+    switch_cost: float = SWITCH_COST,
     min_track_length: int = 2,
     exclude_flags: int = DEFAULT_EXCLUDE_FLAGS,
     point_filters: Optional[FilterSpec] = None,
@@ -709,13 +746,20 @@ def run_track_step(
     then drop tracks shorter than `min_track_length`. Requires
     `session.points_df` from a prior `run_detect_step` call.
 
-    `max_step` (px) is the linker's one setting: no longer step is
-    linked, and three rms steps of the fastest diffusion the linker
-    models fit inside it. Each track is held to its own scale, learned
-    from its own steps, so a value large enough for the fastest particles
-    of interest costs slow ones little. About three times the fastest
-    particles' rms step is spotsolve's advice; `track_summary`'s
-    `rms_step_px` reports what the linked steps came to.
+    `search_radius` (px) is how far the linker looks for a particle's
+    next detection. None reads it from the movie: `spotsolve.search_radius`
+    over every linkable detection, once, so each region below is linked at
+    the same radius rather than at one read from its own few detections.
+    It is soft -- within it, each track's own step size (learned from its
+    own steps) and the price of a wrong link decide -- so a value larger
+    than needed costs little; give one to override.
+    `session.search_radius_source` records which ("movie" or "given").
+
+    `switch_cost` is the log odds a link must reach against ending the
+    track there: lower keeps more links, with more identity swaps; higher,
+    fewer of both. Each linked row carries `link_p`, the probability that
+    the link into it is right (null where a track starts), and
+    `track_summary`'s `mean_link_p` is the share of links expected right.
 
     Frame-to-frame only: a missed detection ENDS a track rather than being
     bridged, so trajectories fragment instead of swapping identity. That
@@ -759,9 +803,13 @@ def run_track_step(
     """
     if session.points_df is None:
         raise ValueError("No points available -- run detect first.")
-    max_step = float(max_step)
-    if not np.isfinite(max_step) or max_step <= 0:
-        raise ValueError(f"max_step must be positive and finite, got {max_step}")
+    if search_radius is not None:
+        search_radius = float(search_radius)
+        if not np.isfinite(search_radius) or search_radius <= 0:
+            raise ValueError(f"search_radius must be positive and finite, got {search_radius}")
+    switch_cost = float(switch_cost)
+    if not np.isfinite(switch_cost) or switch_cost < 0:
+        raise ValueError(f"switch_cost must be finite and not negative, got {switch_cost}")
     _check_cancelled(cancel_event)
 
     def report(done: int, total: int, stage: str) -> None:
@@ -800,17 +848,25 @@ def run_track_step(
         return df
 
     report(0, 1, "linking")
+    radius_source = "given"
+    if search_radius is None:
+        search_radius = float(spotsolve.search_radius(link_input))
+        radius_source = "movie"
+
+    def link(rows: pl.DataFrame) -> pl.DataFrame:
+        return spotsolve.link(rows, search_radius, switch_cost=switch_cost)
+
     class_groups = _region_groups(link_input)
     by_class = None
     if class_groups is None:
-        tracks_df = spotsolve.link(link_input, max_step)
+        tracks_df = link(link_input)
     else:
         class_areas = _class_areas_px(session)
         pieces, by_class, next_id = [], {}, 0
         for name, class_rows, instances in class_groups:
             class_pieces = []
             for rows in instances:
-                linked = spotsolve.link(rows, max_step)
+                linked = link(rows)
                 if linked.height:
                     linked = linked.with_columns(
                         (pl.col("track_id").cast(pl.Int64) + next_id).alias("track_id")
@@ -844,7 +900,9 @@ def run_track_step(
             key: value for key, value in session.source_params.items() if key not in _TRACK_KEYS
         }
     session.tracks_df = tracks_df
-    session.max_step_used = max_step
+    session.search_radius_used = search_radius
+    session.search_radius_source = radius_source
+    session.switch_cost_used = switch_cost
     session.exclude_flags_used = exclude_flags
     session.min_track_length_used = min_track_length
     session.point_filters_used = dict(point_filters) if point_filters else None
@@ -936,16 +994,29 @@ def _link_summary(
         "sigma_loc_um": sigma_loc_um,
         "D_est_um2_s": D_est,
         "n_linked_steps": n_links,
-        # The 2-D rms of the linked steps, px. `max_step` should be about
-        # 3x the fastest particles' rms step, so under 3x this one it is
-        # too small for even the typical particle. Truncated by `max_step`
-        # itself, so read it as a floor.
+        # The 2-D rms of the linked steps, px. The search radius should be
+        # at least 3x the fastest particles' rms step, so under 3x this
+        # one it is too small for even the typical particle. Truncated by
+        # the radius itself, so read it as a floor.
         "rms_step_px": rms_step_px(tracks_df),
+        # The mean of the links' `link_p`: the share of them expected to
+        # join one particle's detections (calibrated to within a point on
+        # spotsolve's simulated movies). None without a link.
+        "mean_link_p": mean_link_p(tracks_df),
         "density_um2": density_um2,
         "crowding_ratio": resolvability["ratio"],
         "resolvability_verdict": resolvability["verdict"],
         "resolvability_message": resolvability["message"],
     }
+
+
+def mean_link_p(tracks_df: pl.DataFrame) -> Optional[float]:
+    """Mean `link_p` over every link in `tracks_df` (track starts carry
+    none); None when there is no link or no `link_p` column."""
+    if "link_p" not in tracks_df.columns:
+        return None
+    value = tracks_df["link_p"].drop_nulls().drop_nans().mean()
+    return float(value) if value is not None else None
 
 
 def rms_step_px(tracks_df: pl.DataFrame) -> Optional[float]:
@@ -990,7 +1061,13 @@ def session_manifest_extra(session: PipelineSession) -> dict:
         "D_est_um2_s": ts.get("D_est_um2_s"),
         "n_linked_steps": ts.get("n_linked_steps"),
         "rms_step_px": ts.get("rms_step_px"),
-        "max_step_px": session.max_step_used,
+        "mean_link_p": ts.get("mean_link_p"),
+        "search_radius_px": session.search_radius_used,
+        # "movie" (read by `spotsolve.search_radius`) or "given": a
+        # template passes only a given radius on (see
+        # `detect_track_params_from_manifest`).
+        "search_radius_source": session.search_radius_source,
+        "switch_cost": session.switch_cost_used,
         "min_track_length": session.min_track_length_used,
         "exclude_flags": (
             flag_names(session.exclude_flags_used)
@@ -1038,7 +1115,8 @@ def session_manifest_extra(session: PipelineSession) -> dict:
 # Manifest keys `run_track_step` produces -- dropped from a rebuilt
 # session's `source_params` as soon as it links again.
 _TRACK_KEYS = frozenset({
-    "sigma_loc_um", "D_est_um2_s", "n_linked_steps", "rms_step_px", "max_step_px",
+    "sigma_loc_um", "D_est_um2_s", "n_linked_steps", "rms_step_px", "mean_link_p",
+    "search_radius_px", "search_radius_source", "switch_cost",
     "min_track_length", "exclude_flags", "n_points_dropped_invalid",
     "n_points_dropped_flagged", "point_filters", "track_filters", "n_points_dropped_by_filter", "n_tracks_linked",
     "density_um2", "crowding_ratio", "resolvability_verdict", "resolvability_message",
@@ -1105,7 +1183,9 @@ def session_from_bundle(
         session.tracks_df = tracks_df
         session.min_track_length_used = params.get("min_track_length")
         session.exclude_flags_used = parse_flag_names(params.get("exclude_flags"))
-        session.max_step_used = params.get("max_step_px")
+        session.search_radius_used = params.get("search_radius_px")
+        session.search_radius_source = params.get("search_radius_source")
+        session.switch_cost_used = params.get("switch_cost")
         session.track_filters_used = filters("track_filters")
         session.track_summary = {key: params.get(key) for key in _TRACK_KEYS}
         session.track_summary["by_class"] = params.get("track_summary_by_class")
@@ -1148,9 +1228,14 @@ def detect_track_params_from_manifest(manifest: dict) -> dict:
         "sigma": params.get("sigma_px"),
         "min_track_length": params.get("min_track_length"),
         "exclude_flags": parse_flag_names(params.get("exclude_flags")),
-        # Absent from a bundle linked by spotsolve 0.1, whose linker took
-        # no step limit: the config then has to supply one.
-        "max_step": params.get("max_step_px"),
+        # Only a radius someone chose: one read from the template's movie
+        # is that movie's, and each movie reads its own.
+        "search_radius": (
+            params.get("search_radius_px")
+            if params.get("search_radius_source") == "given"
+            else None
+        ),
+        "switch_cost": params.get("switch_cost"),
         "detector": detector_name(params.get("detector")),
         "camera_kwargs": params.get("camera_kwargs"),
         "detect_kwargs": _detect_kwargs_from_record(params.get("detect_kwargs")),
@@ -1312,7 +1397,8 @@ def run_detect_track(
 
     run_track_step(
         session,
-        params.max_step,
+        params.search_radius,
+        params.switch_cost,
         min_track_length=params.min_track_length,
         exclude_flags=params.exclude_flags,
         point_filters=params.point_filters,

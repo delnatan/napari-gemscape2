@@ -115,7 +115,7 @@ _EXACT: dict[str, Optional[str]] = {
     "dt_s": "s/frame",
     "dt_spread_s": "s",
     "sigma_px": PX,
-    "max_step_px": PX,
+    "search_radius_px": PX,
     "rms_step_px": PX,
     # Dimensionless by construction, listed so they read as "known with no
     # unit" rather than "unknown".
@@ -127,6 +127,12 @@ _EXACT: dict[str, Optional[str]] = {
     # `p_real` sets), and the probability the emitter is real.
     "detect_z": None,
     "p_real": None,
+    # spotsolve's linking: the probability a link is right, its per-track
+    # least and run mean, and the log odds a link must reach.
+    "link_p": None,
+    "min_link_p": None,
+    "mean_link_p": None,
+    "switch_cost": None,
     # spotsolve's per-fit diagnostics: a `FitFlag` bitmask.
     "flags": None,
     "n_locs": None,

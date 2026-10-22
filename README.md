@@ -78,11 +78,18 @@ Both halves of the problem are handled by `spotsolve` rather than tuned around:
   frames a link is scored by the step density the track predicts from its own
   steps, against the cost of ending the track, which spotsolve reads from the
   movie. So a fast particle passing a slow or immobile one keeps its identity.
-  No step longer than `max_step` (px) is linked. `max_step` is the one setting
-  and is not estimated from the movie: about 3× the rms step of the fastest
-  particles of interest (default 20 px). A large value costs slow particles
-  little. The Track tab restates it in µm and as the fastest D the linker
-  models, and the status line after a run reports the linked steps' rms.
+  The search radius (px) is read from the movie by default: next-frame
+  against own-frame pair distances give the fastest diffusion it holds, and
+  the radius is 1.5× three of its rms steps. It is soft, so a larger value
+  changes the links little; set it on the Track tab to override ("auto" reads
+  it). `switch cost` (default 2.5) is the one trade-off: the log odds a link
+  must reach against ending the track. A wrong link swaps two identities and
+  costs exp(2.5) ≈ 12 missed links; lower it for more links and more swaps.
+  Every link gets `link_p`, the probability that it is right (null where a
+  track starts; on simulated movies its mean is the share of links that are
+  right to within a point). The status line after a run reports the radius
+  used, the linked steps' rms and the share of links expected right, and the
+  Filter page can cut tracks on `min_link_p`, their weakest link.
 
 Linking is frame-to-frame only: a missed detection **ends** a track rather than
 being bridged across the gap. Fragmenting a trajectory is a safe failure and
@@ -153,7 +160,8 @@ stays an auditable fact about the run instead of a silent subtraction. What thos
 judgements change is what the *linker* sees and which tracks the bundle keeps.
 
 `manifest.json` records the source image path, the camera and detection
-parameters, both filter specs, the linking settings (`max_step_px`) and what the
+parameters, both filter specs, the linking settings (`search_radius_px`, where it came
+from, and `switch_cost`) and what the
 run measured (PSF sigma, the linked steps' rms, the MSD estimate of D). Under
 `packages` it records the `version` and `git_sha` of `spotsolve` and
 `napari-gemscape2` at run time. The SHA comes from the source checkout, or else
@@ -193,7 +201,7 @@ One unit caveat, since two are in play: `sigma` is in **pixels**, while `width`
 = fit_sigma / sigma`), so changing `sigma` moves the window with it — the Detect
 tab prints the resulting px window underneath it.
 
-`max_step` is in **pixels** too, like `sigma` and like spotsolve takes it.
+`search_radius` is in **pixels** too, like `sigma` and like spotsolve takes it.
 
 ## Units, and where they come from
 
@@ -350,11 +358,12 @@ Without a template, or to override it:
 # PSF width in px -- required. Read it off the fit_sigma histogram of a few
 # detected frames in the napari widget.
 sigma = 1.3
-# Largest step linked between consecutive frames, px -- required too
-# (a template linked before spotsolve 0.2 has none). About 3x the rms step
-# of the fastest particles of interest; each track is linked at its own
-# scale, so a large value costs slow particles little.
-max_step = 20.0
+# Optional: how far the linker looks between frames, px. Left out, each
+# movie reads its own (a template passes on only a radius someone set).
+# search_radius = 20.0
+# Optional: the log odds a link must reach against ending the track
+# (default 2.5). Lower links more and swaps identities more.
+switch_cost = 2.5
 min_track_length = 2
 # The camera: `offset` (ADU) and `gain`, the pixel variance per ADU of
 # light (conversion gain times any excess-noise factor; 2 for an EMCCD).

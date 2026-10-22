@@ -40,6 +40,7 @@ from qtpy.QtWidgets import (
 )
 
 from napari_gemscape2.pipeline import (
+    SWITCH_COST,
     DetectTrackParams,
     PipelineCancelled,
     detect_track_params_from_manifest,
@@ -73,15 +74,12 @@ class BatchPlan:
 def _detect_track_summary(params: dict) -> str:
     if params.get("sigma") is None:
         return "no PSF width (sigma) saved -- detect+track can't be batched from it"
-    if params.get("max_step") is None:
-        return (
-            "no max step saved (linked before spotsolve 0.2) -- re-run tracking on it "
-            "and save, then batch from it"
-        )
+    radius = params.get("search_radius")
     parts = [
         f"σ {params['sigma']:g} px",
         params.get("detector", "mixtures"),
-        f"max step {params['max_step']:g} px",
+        f"search radius {radius:g} px" if radius is not None else "search radius from each movie",
+        f"switch cost {params.get('switch_cost', SWITCH_COST):g}",
     ]
     if params.get("min_track_length"):
         parts.append(f"tracks ≥ {params['min_track_length']} frames")
@@ -128,7 +126,7 @@ class BatchDialog(QDialog):
         self._detect_params = detect_track_params_from_manifest(load_manifest(template))
         saved = load_diffusion_summary(template)
         self._diffusion_settings = settings_from_summary(saved) if saved is not None else None
-        can_detect = all(self._detect_params.get(key) is not None for key in ("sigma", "max_step"))
+        can_detect = self._detect_params.get("sigma") is not None
 
         title = QLabel(f"<b>Template:</b> {template.name}")
         title.setWordWrap(True)

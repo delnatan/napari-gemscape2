@@ -81,7 +81,11 @@ def detect_track(
 
         [params]
         sigma = 1.3      # PSF width, px (required unless the template has it)
-        max_step = 20.0  # largest linked step, px (likewise required)
+        # optional: linking. The search radius (px) is read from each
+        # movie unless given; switch_cost (default 2.5) trades links for
+        # identity swaps -- lower links more and swaps more.
+        search_radius = 20.0
+        switch_cost = 2.5
         # optional: the camera; without `gain` it is estimated per movie
         camera_kwargs = { offset = 100.0, gain = 2.7 }
         exclude_flags = ["STALLED"]   # optional: spotsolve FitFlag names
@@ -107,12 +111,6 @@ def detect_track(
         raise typer.BadParameter(
             "[params] needs `sigma` (PSF width, px). Detect a few frames in the napari "
             "widget and read it off the fit_sigma histogram.",
-            param_hint="CONFIG",
-        )
-    if param_cfg.get("max_step") is None:
-        raise typer.BadParameter(
-            "[params] needs `max_step` (largest linked step, px) -- about 3x the rms step "
-            "of the fastest particles. A template linked before spotsolve 0.2 has none.",
             param_hint="CONFIG",
         )
     params = DetectTrackParams(**param_cfg)

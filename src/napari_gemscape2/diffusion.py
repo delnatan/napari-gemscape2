@@ -174,6 +174,10 @@ _QC_SKIP_COLUMNS = frozenset(
     {
         "track_id", "loc_id", "frame", "y", "x", "t", "y_um", "x_um",
         "se_y_um", "se_x_um", "sigma", "track_length", "region", "flags",
+        # Per link, and on the Tracks layer with each track's first row
+        # filled from its first link (`pipeline.track_features_df`); its
+        # per-track summary is `min_link_p`.
+        "link_p",
     }
 )
 
