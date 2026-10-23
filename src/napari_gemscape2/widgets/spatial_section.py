@@ -12,10 +12,6 @@ Three figures, each class in its own colour in all of them:
 - "Class populations": each class's D population, deconvolved from its tracks, and alpha's when there is an
   α · D run with its likelihoods, as densities with their bands, all classes on one axis per parameter.
 
-"Map D" asks the other question, with no classes: how D varies over the cell (`spatial.analyze_map`), with its
-own pattern test against the same number of shuffles. Its figure, "D map", shows each track at its mapped D and
-how sure the map is. It is not saved with the analysis.
-
 Every number of classes is a movie's own: classes of different movies are matched by the user, from their
 populations, and pooled by `gemscape2 pool` (`spatial_class` on an input).
 """
@@ -34,10 +30,9 @@ from qtpy.QtWidgets import QComboBox, QFormLayout, QPushButton, QSpinBox, QVBoxL
 from napari_gemscape2.diffusion import LEVEL, ensemble
 from napari_gemscape2.fbm import alpha_population, population_stage
 from napari_gemscape2.spatial import (
-    HAS_MAP, MAX_CLASSES, N_SHUFFLES, analyze_map, analyze_spatial, class_groups, describe, describe_map,
-    spatial_options,
+    MAX_CLASSES, N_SHUFFLES, analyze_spatial, class_groups, describe, spatial_options,
 )
-from napari_gemscape2.spatial_plot import plot_class_map, plot_class_populations, plot_class_selection, plot_D_map
+from napari_gemscape2.spatial_plot import plot_class_map, plot_class_populations, plot_class_selection
 from napari_gemscape2.widgets.msd_widgets import fit_window_to_figure
 
 if TYPE_CHECKING:
@@ -49,11 +44,6 @@ _SUGGESTED = "suggested"
 @thread_worker(start_thread=False)
 def _spatial_worker(analysis, base, pixel_size_um, ids, options, progress) -> SpatialAnalysis:
     return analyze_spatial(analysis, base, pixel_size_um, ids, options, progress=progress)
-
-
-@thread_worker(start_thread=False)
-def _map_worker(analysis, base, pixel_size_um, ids, n_shuffles, progress):
-    return analyze_map(analysis, base, pixel_size_um, ids, n_shuffles, progress=progress)
 
 
 @thread_worker(start_thread=False)
@@ -73,7 +63,6 @@ class SpatialSection(QWidget):
         super().__init__()
         self.host = host
         self._analysis: Optional[SpatialAnalysis] = None
-        self._map = None
         self._windows: dict[str, PlotWindow] = {}
 
         self._classes = QComboBox()
@@ -113,19 +102,6 @@ class SpatialSection(QWidget):
         self._figure_row = flow_row(*self._figure_buttons)
         self._figure_row.setVisible(False)
 
-        self._map_run_button = QPushButton("Map D")
-        self._map_run_button.setToolTip(
-            "A smooth map of D over the cell, with no classes: each track's D shares information with its\n"
-            "neighbours', as much as the evidence says it should. Tested against the same shuffles."
-            if HAS_MAP else "Needs a diffusionkit with spatial.smooth_map.")
-        self._map_run_button.clicked.connect(self._run_map)
-        self._map_button = QPushButton("D map")
-        self._map_button.clicked.connect(self._show_D_map)
-        self._map_button.setVisible(False)
-        self._map_status = status_label("")
-        self._map_summary = note_label("")
-        self._map_summary.setVisible(False)
-
         layout = QVBoxLayout()
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
@@ -139,10 +115,6 @@ class SpatialSection(QWidget):
         layout.addWidget(self._status)
         layout.addWidget(self._summary)
         layout.addWidget(self._figure_row)
-        layout.addWidget(note_label("Or a smooth map of D, with no classes (not saved with the analysis)."))
-        layout.addWidget(flow_row(self._map_run_button, self._map_button))
-        layout.addWidget(self._map_status)
-        layout.addWidget(self._map_summary)
         layout.addStretch()
         self.setLayout(layout)
         self.reset()
@@ -155,15 +127,8 @@ class SpatialSection(QWidget):
         """Forget the run (new tracks, or a new D run it was read from).
         Run is on once there is a D run to read the likelihoods from."""
         self._analysis = None
-        self._map = None
         ready = self.host.posterior is not None
         self._run_button.setEnabled(ready)
-        self._map_run_button.setEnabled(ready and HAS_MAP)
-        self._map_button.setVisible(False)
-        self._map_status.setText("" if HAS_MAP else "Map D needs a diffusionkit with spatial.smooth_map")
-        style_status_label(self._map_status, "neutral")
-        self._map_summary.setText("")
-        self._map_summary.setVisible(False)
         self._status.setText("" if ready else "needs a D run: run it on the D tab first")
         style_status_label(self._status, "neutral")
         self._summary.setText("")
@@ -189,7 +154,7 @@ class SpatialSection(QWidget):
             button.setEnabled(True)
         self._populations_button.setEnabled(s.n_classes > 1)
         for name, window in self._windows.items():
-            if window.isVisible() and name != "D map":  # the map is its own run
+            if window.isVisible():
                 {"selection": self._show_selection, "map": self._show_map,
                  "populations": self._show_populations}[name]()
 
@@ -220,51 +185,6 @@ class SpatialSection(QWidget):
     def _on_error(self, exc: Exception) -> None:
         self._status.setText(f"spatial classes failed: {exc}")
         style_status_label(self._status, "error")
-
-    def _run_map(self) -> None:
-        analysis = self.host.posterior
-        if analysis is None:
-            self._map_status.setText("run D first: the map is read from its likelihoods")
-            style_status_label(self._map_status, "caution")
-            return
-        n_shuffles = self._shuffles.value()
-        try:
-            spatial_options(None, n_shuffles)  # the same check on the shuffles as the classes'
-        except ValueError as exc:
-            self._map_status.setText(str(exc))
-            style_status_label(self._map_status, "error")
-            return
-        self._map_status.setText("mapping…")
-        style_status_label(self._map_status)
-        worker = _map_worker(analysis, self.host.base_track_df, self.host.pixel_size_um,
-                             self.host.combined_filtered_track_ids(), n_shuffles, self.host.progress_callback)
-        self.host.start_worker(worker, self._on_map_finished, self._on_map_error, [self._map_run_button],
-                               "smooth map of D", unit="fits")
-
-    def _on_map_finished(self, m) -> None:
-        self._map = m
-        self._map_status.setText("mapped")
-        style_status_label(self._map_status, "ok")
-        self._map_summary.setText(describe_map(m))
-        self._map_summary.setVisible(True)
-        self._map_button.setVisible(True)
-        window = self._windows.get("D map")
-        if window is not None and window.isVisible():
-            self._show_D_map()
-
-    def _on_map_error(self, exc: Exception) -> None:
-        self._map_status.setText(f"map failed: {exc}")
-        style_status_label(self._map_status, "error")
-
-    def _show_D_map(self) -> None:
-        if self._map is None:
-            return
-        found = self.host.map_regions()
-        labels, classes = found if found is not None else (None, None)
-        figure = plot_D_map(self._map, shape_px=None if labels is None else labels.shape,
-                            pixel_size_um=self.host.pixel_size_um, labels=labels, region_classes=classes,
-                            title=self.host.map_title())
-        self._window("D map", "Spatial: smooth map of D", figure)
 
     def _window(self, name: str, title: str, figure) -> None:
         window = self._windows.get(name)
