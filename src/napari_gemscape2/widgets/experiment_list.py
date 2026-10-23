@@ -1500,7 +1500,8 @@ class ExperimentListWidget(QWidget):
         emitter.updated.connect(self._on_progress)
         worker = _run_track_worker(
             session,
-            self.params_panel.get_max_step(),
+            self.params_panel.get_search_radius(),
+            self.params_panel.get_switch_cost(),
             self.params_panel.get_min_track_length(),
             self.params_panel.get_exclude_flags(),
             # The Detect tab's cuts decide what the linker sees -- applied
@@ -1537,18 +1538,21 @@ class ExperimentListWidget(QWidget):
         # Units from `napari_gemscape2.units` rather than spelled out here, so
         # this line, the diffusion panel's fit summaries and every plot
         # axis say µm²/s the same way.
-        # The linked steps' rms beside max_step: "about 3x the fastest
-        # particles' rms step" is the rule max_step is set by, so under 3x
-        # here it is too small for even the typical particle.
-        rms = summary.get("rms_step_px")
-        step_check = (
-            f"  rms step {rms:.2f} px (max step = {session.max_step_used / rms:.1f}×)"
-            if rms
-            else ""
-        )
+        # The radius beside the linked steps' rms: it should be at least 3x
+        # the fastest particles' rms step, so under 3x the typical one it
+        # is too small for even the typical particle.
+        radius, rms = session.search_radius_used, summary.get("rms_step_px")
+        radius_text = ""
+        if radius is not None:
+            source = "from movie" if session.search_radius_source == "movie" else "given"
+            ratio = f", {radius / rms:.1f}× rms step" if rms else ""
+            radius_text = f"  radius {radius:.1f} px ({source}{ratio})"
+        # The mean link_p is the share of links expected right.
+        p_right = summary.get("mean_link_p")
+        right_text = f"  links right ≈ {100 * p_right:.0f}%" if p_right is not None else ""
         self.params_panel.set_track_status(
             f"{n_tracks} tracks  D ≈ {units.fmt(summary.get('D_est_um2_s'), 'D_est_um2_s')}"
-            f"{step_check}{filtered}"
+            f"{radius_text}{right_text}{filtered}"
             f"{self._region_track_text(session)}\n{message}",
             level=level,
         )
@@ -2105,7 +2109,8 @@ def _estimate_gain_worker(
 @thread_worker(start_thread=False, ignore_errors=True)
 def _run_track_worker(
     session: PipelineSession,
-    max_step: float,
+    search_radius: Optional[float],
+    switch_cost: float,
     min_track_length: int,
     exclude_flags: int,
     point_filters: dict,
@@ -2116,7 +2121,8 @@ def _run_track_worker(
 
     return run_track_step(
         session,
-        max_step,
+        search_radius,
+        switch_cost,
         min_track_length=min_track_length,
         exclude_flags=exclude_flags,
         point_filters=point_filters,
