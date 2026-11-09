@@ -4,6 +4,9 @@ visibility: hidden
 categories: ["Utilities", "Visualization"]
 contributions:
   commands:
+    - id: napari-gemscape2.get_nd2_reader
+      title: Open Nikon .nd2
+      python_name: napari_gemscape2.readers.nd2:get_reader
     - id: napari-gemscape2.ExperimentListWidget
       title: Experiment list
       python_name: napari_gemscape2.widgets.experiment_list:ExperimentListWidget
@@ -20,3 +23,7 @@ contributions:
       display_name: Diffusion analysis
     - command: napari-gemscape2.FrameExportWidget
       display_name: Screenshots and frames
+  readers:
+    - command: napari-gemscape2.get_nd2_reader
+      filename_patterns: ["*.nd2"]
+      accepts_directories: false
