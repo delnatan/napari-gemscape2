@@ -30,6 +30,10 @@ dependencies = [
     "natsort",
     "qtpy",
     "napari[pyqt6]",
+    # Qt 6.12 lays out a QAbstractSpinBox with NoButtons under napari's
+    # stylesheet with a 1px-wide editor, so qtkit's histogram min/max
+    # boxes render blank. 6.11 is fine; lift this once Qt fixes it.
+    "pyqt6-qt6<6.12",
     # One distribution with the Rust extension (`spotsolve_rs`) bundled.
     "spotsolve",
     "diffusionkit",
