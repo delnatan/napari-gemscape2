@@ -89,7 +89,7 @@ IMAGE_PERCENTILES = (0.1, 99.0)
 # visible regardless of which one the image layer is using.
 DETECTED_POINTS_STYLE = dict(
     symbol="disc",
-    size=2,
+    size=7,
     face_color="transparent",
     border_color="magenta",
     border_width=0.08,
