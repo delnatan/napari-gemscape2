@@ -107,4 +107,4 @@ def write_batch_config(
             f"path = {s(_relative(image_path, base))}",
             f"result_id = {s(result_id)}",
         ]
-    config_path.write_text("\n".join(lines) + "\n")
+    config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

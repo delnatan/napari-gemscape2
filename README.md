@@ -41,6 +41,11 @@ its GitHub release for macOS (Apple silicon and Intel), Linux (x86-64 and
 aarch64) and Windows (x86-64). On any other platform, uv builds it from source,
 which needs [Rust](https://rustup.rs).
 
+On Linux, Qt needs the system's XCB cursor library. If `napari` stops with
+"Could not load the Qt platform plugin xcb", install it
+(`sudo apt install libxcb-cursor0` on Debian/Ubuntu, `xcb-util-cursor` on
+Fedora/Arch).
+
 Don't `pip install spotsolve` or `pip install diffusionkit`. On PyPI those names
 belong to unrelated packages. The commands above get ours.
 
@@ -296,6 +301,10 @@ uv run --project dev napari
 uv run --project dev pytest                          # this repo's tests
 uv run --project dev --package spotsolve pytest      # a library's own tests, same env
 ```
+
+`bootstrap.sh` needs bash. On Windows, run it from Git Bash, or clone the three
+repos next to this one yourself and run `uv sync --project dev`. Rust on
+Windows also needs the MSVC build tools; rustup offers to install them.
 
 The environment includes maturin, pytest and ruff.
 It lives in `dev/.venv`, separate from the standard `.venv`. Python edits in

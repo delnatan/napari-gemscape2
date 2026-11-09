@@ -1,0 +1,2 @@
+# Keep shell scripts LF on Windows checkouts (core.autocrlf), or bash fails.
+*.sh text eol=lf

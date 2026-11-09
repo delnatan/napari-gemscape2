@@ -204,7 +204,7 @@ def write_result(
     result_dir.mkdir(parents=True, exist_ok=True)
     points_df.write_parquet(result_dir / POINTS_FILENAME)
     tracks_df.write_parquet(result_dir / TRACKS_FILENAME)
-    (result_dir / MANIFEST_FILENAME).write_text(json.dumps(manifest, indent=2))
+    (result_dir / MANIFEST_FILENAME).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     _write_regions(result_dir, labels, regions)
 
 
@@ -226,7 +226,7 @@ def write_detection_result(
     result_dir = Path(result_dir)
     result_dir.mkdir(parents=True, exist_ok=True)
     points_df.write_parquet(result_dir / POINTS_FILENAME)
-    (result_dir / MANIFEST_FILENAME).write_text(json.dumps(manifest, indent=2))
+    (result_dir / MANIFEST_FILENAME).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     _write_regions(result_dir, labels, regions)
     (result_dir / TRACKS_FILENAME).unlink(missing_ok=True)
 
@@ -244,7 +244,7 @@ def load_regions(result_dir: str | Path) -> tuple[np.ndarray | None, Regions | N
     if not has_regions(result_dir):
         return None, None
     labels = tifffile.imread(result_dir / LABELS_FILENAME).astype(LABELS_DTYPE, copy=False)
-    regions = Regions.from_json(json.loads((result_dir / REGIONS_FILENAME).read_text()))
+    regions = Regions.from_json(json.loads((result_dir / REGIONS_FILENAME).read_text(encoding="utf-8")))
     return labels, regions
 
 
@@ -260,7 +260,7 @@ def save_mask(result_dir: str | Path, labels: np.ndarray | None, regions: Region
         regions = Regions()
     else:
         tifffile.imwrite(tif_path, np.asarray(labels, dtype=LABELS_DTYPE), compression="zlib")
-    (result_dir / MASK_REGIONS_FILENAME).write_text(json.dumps(regions.to_json(), indent=2))
+    (result_dir / MASK_REGIONS_FILENAME).write_text(json.dumps(regions.to_json(), indent=2), encoding="utf-8")
 
 
 def load_mask(result_dir: str | Path) -> tuple[np.ndarray | None, Regions | None]:
@@ -270,7 +270,7 @@ def load_mask(result_dir: str | Path) -> tuple[np.ndarray | None, Regions | None
     json_path = result_dir / MASK_REGIONS_FILENAME
     if not json_path.exists():
         return None, None
-    regions = Regions.from_json(json.loads(json_path.read_text()))
+    regions = Regions.from_json(json.loads(json_path.read_text(encoding="utf-8")))
     tif_path = result_dir / MASK_LABELS_FILENAME
     if not regions.table or not tif_path.exists():
         return None, None
@@ -307,7 +307,7 @@ def _write_regions(result_dir: Path, labels: np.ndarray | None, regions: Regions
     regions_path = result_dir / REGIONS_FILENAME
     if labels is not None and regions is not None:
         tifffile.imwrite(labels_path, np.asarray(labels, dtype=LABELS_DTYPE), compression="zlib")
-        regions_path.write_text(json.dumps(regions.to_json(), indent=2))
+        regions_path.write_text(json.dumps(regions.to_json(), indent=2), encoding="utf-8")
     else:
         labels_path.unlink(missing_ok=True)
         regions_path.unlink(missing_ok=True)
@@ -324,7 +324,7 @@ def load_result(
     points_df = pl.read_parquet(result_dir / POINTS_FILENAME)
     tracks_path = result_dir / TRACKS_FILENAME
     tracks_df = pl.read_parquet(tracks_path) if tracks_path.exists() else pl.DataFrame()
-    manifest = json.loads((result_dir / MANIFEST_FILENAME).read_text())
+    manifest = json.loads((result_dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
     labels, regions = load_regions(result_dir)
     return points_df, tracks_df, manifest, labels, regions
 
@@ -351,7 +351,7 @@ def write_diffusion_results(
     result_dir = Path(result_dir)
     result_dir.mkdir(parents=True, exist_ok=True)
     tracks_summary.write_csv(result_dir / TRACKS_SUMMARY_FILENAME)
-    (result_dir / DIFFUSION_SUMMARY_FILENAME).write_text(json.dumps(summary, indent=2))
+    (result_dir / DIFFUSION_SUMMARY_FILENAME).write_text(json.dumps(summary, indent=2), encoding="utf-8")
     for table, filename in ((loglik_D, LOGLIK_D_FILENAME), (loglik_alpha_D, LOGLIK_ALPHA_D_FILENAME),
                             (profile_alpha, PROFILE_ALPHA_FILENAME), (spatial_classes, SPATIAL_CLASSES_FILENAME)):
         if table is None:
@@ -401,7 +401,7 @@ def write_pooled_results(
     so the directory is always one pooling."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / POOLED_SUMMARY_FILENAME).write_text(json.dumps(summary, indent=2))
+    (out_dir / POOLED_SUMMARY_FILENAME).write_text(json.dumps(summary, indent=2), encoding="utf-8")
     distributions_D.write_csv(out_dir / POOLED_DISTRIBUTIONS_FILENAME)
     populations_D.write_csv(out_dir / POOLED_POPULATIONS_FILENAME)
     lognormal_draws_D.write_csv(out_dir / POOLED_DRAWS_FILENAME)
@@ -421,7 +421,7 @@ def load_diffusion_summary(result_dir: str | Path) -> Optional[dict]:
     """The saved `diffusion_summary.json`, or None if this bundle has no
     saved analysis yet."""
     path = Path(result_dir) / DIFFUSION_SUMMARY_FILENAME
-    return json.loads(path.read_text()) if path.exists() else None
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
 
 
 def load_diffusion_results(result_dir: str | Path) -> Optional[dict]:
@@ -484,7 +484,7 @@ def load_tracks_summary(result_dir: str | Path) -> Optional[pl.DataFrame]:
 def load_manifest(result_dir: str | Path) -> dict:
     """Just the manifest -- what a folder scan needs (`params.n_tracks`)
     without reading either table."""
-    return json.loads((Path(result_dir) / MANIFEST_FILENAME).read_text())
+    return json.loads((Path(result_dir) / MANIFEST_FILENAME).read_text(encoding="utf-8"))
 
 
 def has_result(result_dir: str | Path) -> bool:

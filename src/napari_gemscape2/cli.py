@@ -34,7 +34,7 @@ app = typer.Typer(no_args_is_help=True)
 def _load_config(config: Path) -> tuple[dict, Path]:
     """The parsed config and the folder its relative paths are read
     against -- its own, so a config works from wherever it is run."""
-    return tomllib.loads(config.read_text()), config.resolve().parent
+    return tomllib.loads(config.read_text(encoding="utf-8")), config.resolve().parent
 
 
 def _resolve(base: Path, path: str | Path) -> Path:

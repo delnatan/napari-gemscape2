@@ -143,5 +143,5 @@ class FrameExportWidget(QWidget):
         )
         dialog.close()
         hint = ffmpeg_hint(stem, color)
-        (Path(folder) / "ffmpeg.txt").write_text(hint)
+        (Path(folder) / "ffmpeg.txt").write_text(hint, encoding="utf-8")
         self._status.setText(f"saved {len(written)} frames to {folder} ({color}); ffmpeg command in ffmpeg.txt")
