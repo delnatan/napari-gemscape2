@@ -360,4 +360,4 @@ def write_pool_config(
             f"result_id = {s(result_id)}",
             f"sample = {s(sample)}",
         ]
-    config_path.write_text("\n".join(lines) + "\n")
+    config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

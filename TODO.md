@@ -12,8 +12,6 @@
       around it by hiding a whole row). Skip `item.isEmpty()` in `_do_layout`.
 - [ ] The posterior runs can't be cancelled mid-run. The α · D run costs ~25 ms
       per 40-frame track and ~1 s at 300 frames (dominated by long tracks).
-- [ ] Publish this repo as github.com/delnatan/napari-gemscape2 (the README's
-      clone URL assumes it).
 - [ ] ~/uv-workspaces/microscopy still lists `spotsolve/rust/spotsolve-py`
       (the old `spotsolve-rs`) as a member; spotsolve now bundles it, so that
       workspace no longer locks until the member and dependency are removed.

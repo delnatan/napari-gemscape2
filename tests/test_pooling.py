@@ -46,7 +46,8 @@ def _config(root, pool=""):
         'results_root = "results"\n' + pool +
         '[[inputs]]\npath = "wt_1.tif"\nsample = "wt"\n'
         '[[inputs]]\npath = "wt_2.tif"\nsample = "wt"\n'
-        '[[inputs]]\npath = "mut_1.tif"\nsample = "mut"\n'
+        '[[inputs]]\npath = "mut_1.tif"\nsample = "mut"\n',
+        encoding="utf-8",
     )
     return path
 
@@ -98,7 +99,7 @@ def test_ensemble_msd_recovers_D(project):
 def test_a_bundle_without_an_analysis_stops_the_pooling(project, tmp_path):
     _bundle(tmp_path, "wt_1", 0.05, 1)  # saved tracks, never analyzed
     path = tmp_path / "cfg.toml"
-    path.write_text('results_root = "results"\n[[inputs]]\npath = "wt_1.tif"\n')
+    path.write_text('results_root = "results"\n[[inputs]]\npath = "wt_1.tif"\n', encoding="utf-8")
     result = CliRunner().invoke(app, ["pool", str(path)])
     assert result.exit_code == 1
     assert "gemscape2 diffusion" in result.output
@@ -134,7 +135,7 @@ def test_a_config_written_for_a_pooling_reruns_it(project):
     result = CliRunner().invoke(app, ["pool", str(path)])
     assert result.exit_code == 0, result.output
     out = project / "results" / "written"
-    summary = __import__("json").loads((out / "pooled_summary.json").read_text())
+    summary = __import__("json").loads((out / "pooled_summary.json").read_text(encoding="utf-8"))
     assert summary["samples"] == {"wt": ["wt_1", "wt_2"], "mut": ["mut_1"]}
     assert summary["ensemble_msd"]["ensemble_n_points"] == 3
     assert summary["ensemble_msd"]["ensemble_alpha_points"] == 5

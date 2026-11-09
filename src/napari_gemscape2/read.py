@@ -90,7 +90,7 @@ def read_results(paths: Union[PathLike, Iterable[PathLike]]) -> Results:
     summaries = {}
     for bundle in bundles:
         result_id = bundle.name
-        summaries[result_id] = json.loads((bundle / DIFFUSION_SUMMARY_FILENAME).read_text())
+        summaries[result_id] = json.loads((bundle / DIFFUSION_SUMMARY_FILENAME).read_text(encoding="utf-8"))
         for name, filename in files.items():
             table = _read_csv(bundle / filename, result_id)
             if table is not None:

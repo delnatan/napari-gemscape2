@@ -60,7 +60,7 @@ def _restored(result_dir):
 
 
 def test_a_batch_finds_two_spatially_organized_classes(project):
-    summary = json.loads((project / "results" / "cell_1" / "diffusion_summary.json").read_text())
+    summary = json.loads((project / "results" / "cell_1" / "diffusion_summary.json").read_text(encoding="utf-8"))
     sp = summary["spatial"]
     assert sp["n_classes"] == 2 and sp["patterned"]
     assert sp["null"]["p"] == pytest.approx(1 / 20)
@@ -106,7 +106,7 @@ def test_the_saved_run_restores(project):
 
 
 def test_a_template_reruns_the_spatial_classes_but_not_its_number(project):
-    summary = json.loads((project / "results" / "cell_1" / "diffusion_summary.json").read_text())
+    summary = json.loads((project / "results" / "cell_1" / "diffusion_summary.json").read_text(encoding="utf-8"))
     kw = settings_from_summary(summary)
     assert kw["spatial"] is True and kw["spatial_shuffles"] == 19
     assert "spatial_n_classes" not in kw
@@ -135,7 +135,8 @@ def test_matched_classes_pool_across_movies(project):
         '[[inputs]]\npath = "cell_1.tif"\nsample = "inner"\nspatial_class = 1\n'
         '[[inputs]]\npath = "cell_2.tif"\nsample = "inner"\nspatial_class = 1\n'
         '[[inputs]]\npath = "cell_1.tif"\nsample = "outer"\nspatial_class = 2\n'
-        '[[inputs]]\npath = "cell_2.tif"\nsample = "outer"\nspatial_class = 2\n'
+        '[[inputs]]\npath = "cell_2.tif"\nsample = "outer"\nspatial_class = 2\n',
+        encoding="utf-8",
     )
     result = CliRunner().invoke(app, ["pool", str(cfg)])
     assert result.exit_code == 0, result.output
@@ -150,7 +151,7 @@ def test_matched_classes_pool_across_movies(project):
 
 def test_a_class_a_movie_does_not_have_stops_the_pooling(project):
     cfg = project / "bad.toml"
-    cfg.write_text('results_root = "results"\n[[inputs]]\npath = "cell_1.tif"\nspatial_class = 5\n')
+    cfg.write_text('results_root = "results"\n[[inputs]]\npath = "cell_1.tif"\nspatial_class = 5\n', encoding="utf-8")
     result = CliRunner().invoke(app, ["pool", str(cfg)])
     assert result.exit_code == 1 and "not one of this movie's classes" in result.output
 
