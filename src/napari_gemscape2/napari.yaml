@@ -7,6 +7,9 @@ contributions:
     - id: napari-gemscape2.get_nd2_reader
       title: Open Nikon .nd2
       python_name: napari_gemscape2.readers.nd2:get_reader
+    - id: napari-gemscape2.get_ims_reader
+      title: Open Imaris .ims
+      python_name: napari_gemscape2.readers.ims:get_reader
     - id: napari-gemscape2.ExperimentListWidget
       title: Experiment list
       python_name: napari_gemscape2.widgets.experiment_list:ExperimentListWidget
@@ -26,4 +29,7 @@ contributions:
   readers:
     - command: napari-gemscape2.get_nd2_reader
       filename_patterns: ["*.nd2"]
+      accepts_directories: false
+    - command: napari-gemscape2.get_ims_reader
+      filename_patterns: ["*.ims"]
       accepts_directories: false
